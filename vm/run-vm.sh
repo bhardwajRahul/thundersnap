@@ -27,14 +27,18 @@ while [ ! -S "$SOCKET_PATH" ]; do
     sleep 0.1
 done
 
-# Cleanup virtiofsd on exit
-trap "kill $VIRTIOFSD_PID 2>/dev/null; rm -f $SOCKET_PATH" EXIT
+# Cleanup on exit
+trap "kill $VIRTIOFSD_PID 2>/dev/null; rm -f $SOCKET_PATH /tmp/vm.vsock" EXIT
+
+VSOCK_PATH="/tmp/vm.vsock"
+rm -f "$VSOCK_PATH"
 
 exec ./cloud-hypervisor \
     --kernel vmlinux \
     --cpus boot=1 \
     --memory size=512M,shared=on \
     --fs tag=rootfs,socket="$SOCKET_PATH" \
+    --vsock cid=3,socket="$VSOCK_PATH" \
     --cmdline "console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/sbin/init quiet loglevel=3" \
     --serial tty \
     --console off
