@@ -101,8 +101,11 @@ func main() {
 			homeUser := stripDomain(safeTailscaleUser)
 
 			// Set up the root filesystem for this user
+			// If this is not the "base" user (stripped username), try to clone from
+			// the base user's filesystem first, falling back to the clean snapshot
 			rootFS := filepath.Join(*fsDir, safeTailscaleUser, safeSSHUser)
-			if err := ensureRootFS(rootFS); err != nil {
+			baseUserFS := filepath.Join(*fsDir, safeTailscaleUser, homeUser)
+			if err := ensureRootFS(rootFS, baseUserFS); err != nil {
 				logErr("Failed to set up root filesystem: %v", err)
 				s.Exit(1)
 				return
@@ -277,8 +280,9 @@ func stripDomain(s string) string {
 }
 
 // ensureRootFS ensures the root filesystem exists at the given path.
-// If it doesn't exist, it clones from /snapshots/1 using btrfs.
-func ensureRootFS(rootFS string) error {
+// If it doesn't exist, it clones from baseUserFS if that exists,
+// otherwise falls back to /snapshots/1.
+func ensureRootFS(rootFS, baseUserFS string) error {
 	// Check if the directory already exists
 	if _, err := os.Stat(rootFS); err == nil {
 		return nil // Already exists
@@ -292,11 +296,21 @@ func ensureRootFS(rootFS string) error {
 		return fmt.Errorf("creating parent directory: %w", err)
 	}
 
-	// Clone from /snapshots/1 using btrfs subvolume snapshot
-	cmd := exec.Command("btrfs", "subvolume", "snapshot", "/snapshots/1", rootFS)
+	// Determine which snapshot to clone from:
+	// 1. If baseUserFS exists and is different from rootFS, use it
+	// 2. Otherwise fall back to /snapshots/1
+	snapshotSource := "/snapshots/1"
+	if baseUserFS != rootFS {
+		if _, err := os.Stat(baseUserFS); err == nil {
+			snapshotSource = baseUserFS
+		}
+	}
+
+	// Clone using btrfs subvolume snapshot
+	cmd := exec.Command("btrfs", "subvolume", "snapshot", snapshotSource, rootFS)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("btrfs snapshot failed: %w\noutput: %s", err, string(output))
+		return fmt.Errorf("btrfs snapshot from %s failed: %w\noutput: %s", snapshotSource, err, string(output))
 	}
 
 	return nil
