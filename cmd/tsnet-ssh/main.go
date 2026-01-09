@@ -6,13 +6,17 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"unsafe"
 
+	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/tsnet"
@@ -75,20 +79,53 @@ func main() {
 			tailscaleUser := getTailscaleUser(s.Context(), lc, s.RemoteAddr().String())
 
 			// Print greeting to stderr
-			fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s>\n", tailscaleUser, s.User())
+			fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s>\r\n", tailscaleUser, s.User())
 
-			// Run ps axu and capture output
-			cmd := exec.Command("ps", "axu")
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				fmt.Fprintf(s, "Error running ps axu: %v\n", err)
-				s.Exit(1)
-				return
+			// Start an interactive shell
+			ptyReq, winCh, isPty := s.Pty()
+
+			cmd := exec.Command("/bin/sh")
+			cmd.Env = append(os.Environ(),
+				"SSH_USER="+s.User(),
+				"TAILSCALE_USER="+tailscaleUser,
+			)
+
+			if isPty {
+				cmd.Env = append(cmd.Env, "TERM="+ptyReq.Term)
+				ptmx, err := pty.Start(cmd)
+				if err != nil {
+					fmt.Fprintf(s.Stderr(), "Error starting pty: %v\n", err)
+					s.Exit(1)
+					return
+				}
+				defer ptmx.Close()
+
+				// Handle window size changes
+				go func() {
+					for win := range winCh {
+						setWinsize(ptmx, win.Width, win.Height)
+					}
+				}()
+
+				// Copy data between SSH session and PTY
+				go func() {
+					io.Copy(ptmx, s) // stdin
+				}()
+				io.Copy(s, ptmx) // stdout
+
+				cmd.Wait()
+				s.Exit(cmd.ProcessState.ExitCode())
+			} else {
+				// No PTY requested, run without one
+				cmd.Stdin = s
+				cmd.Stdout = s
+				cmd.Stderr = s.Stderr()
+				if err := cmd.Run(); err != nil {
+					s.Exit(1)
+					return
+				}
+				s.Exit(cmd.ProcessState.ExitCode())
 			}
-
-			// Write output to session
-			s.Write(output)
-			s.Exit(0)
 		},
 		// Accept any public key (no authentication required beyond Tailscale)
 		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
@@ -101,10 +138,6 @@ func main() {
 			return true
 		},
 	}
-
-	// Also allow "none" authentication by setting NoClientAuth
-	// This is what Tailscale SSH does - trust the Tailscale identity
-	sshServer.SetOption(ssh.NoPty())
 
 	log.Printf("Waiting for SSH connections...")
 
@@ -148,4 +181,10 @@ func getTailscaleUser(ctx context.Context, lc *tailscale.LocalClient, remoteAddr
 	}
 
 	return "unknown"
+}
+
+// setWinsize sets the size of the given pty.
+func setWinsize(f *os.File, w, h int) {
+	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCSWINSZ),
+		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0})))
 }
