@@ -25,7 +25,12 @@ import (
 func main() {
 	hostname := flag.String("hostname", "tsnet-ssh", "Tailscale hostname for this server")
 	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state (default: ~/.config/tsnet-ssh)")
+	fsDir := flag.String("fs-dir", "", "Directory to store per-user filesystems (required)")
 	flag.Parse()
+
+	if *fsDir == "" {
+		log.Fatalf("-fs-dir is required")
+	}
 
 	// Set up state directory
 	if *stateDir == "" {
@@ -78,23 +83,58 @@ func main() {
 			// Look up the Tailscale identity of the connecting peer
 			tailscaleUser := getTailscaleUser(s.Context(), lc, s.RemoteAddr().String())
 
-			// Print greeting to stderr
-			fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s>\r\n", tailscaleUser, s.User())
+			// Print greeting to stdout (PTY merges stdout/stderr anyway)
+			fmt.Fprintf(s, "* Hello <%s>, connecting you to <%s>\r\n", tailscaleUser, s.User())
+
+			// Helper to log error to both server log and client
+			logErr := func(format string, args ...any) {
+				msg := fmt.Sprintf(format, args...)
+				log.Print(msg)
+				fmt.Fprintf(s, "* Error: %s\r\n", msg)
+			}
+
+			// Sanitize usernames for filesystem paths (replace unsafe chars)
+			safeTailscaleUser := sanitizeForPath(tailscaleUser)
+			safeSSHUser := sanitizeForPath(s.User())
+
+			// Set up the root filesystem for this user
+			rootFS := filepath.Join(*fsDir, safeTailscaleUser, safeSSHUser)
+			if err := ensureRootFS(rootFS); err != nil {
+				logErr("Failed to set up root filesystem: %v", err)
+				s.Exit(1)
+				return
+			}
+
+			// Create home directory inside the root filesystem
+			homeDir := filepath.Join("home", safeTailscaleUser)
+			homeDirFull := filepath.Join(rootFS, homeDir)
+			if err := os.MkdirAll(homeDirFull, 0755); err != nil {
+				logErr("Failed to create home directory: %v", err)
+				s.Exit(1)
+				return
+			}
 
 			// Start an interactive shell
 			ptyReq, winCh, isPty := s.Pty()
 
 			cmd := exec.Command("/bin/sh")
-			cmd.Env = append(os.Environ(),
-				"SSH_USER="+s.User(),
-				"TAILSCALE_USER="+tailscaleUser,
-			)
+			cmd.Dir = "/" + homeDir
+			cmd.Env = []string{
+				"HOME=/" + homeDir,
+				"SSH_USER=" + s.User(),
+				"TAILSCALE_USER=" + tailscaleUser,
+				"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+				"SHELL=/bin/sh",
+			}
+			cmd.SysProcAttr = &syscall.SysProcAttr{
+				Chroot: rootFS,
+			}
 
 			if isPty {
 				cmd.Env = append(cmd.Env, "TERM="+ptyReq.Term)
 				ptmx, err := pty.Start(cmd)
 				if err != nil {
-					fmt.Fprintf(s.Stderr(), "Error starting pty: %v\n", err)
+					logErr("Failed to start shell: %v", err)
 					s.Exit(1)
 					return
 				}
@@ -121,6 +161,7 @@ func main() {
 				cmd.Stdout = s
 				cmd.Stderr = s.Stderr()
 				if err := cmd.Run(); err != nil {
+					logErr("Failed to run shell: %v", err)
 					s.Exit(1)
 					return
 				}
@@ -187,4 +228,47 @@ func getTailscaleUser(ctx context.Context, lc *tailscale.LocalClient, remoteAddr
 func setWinsize(f *os.File, w, h int) {
 	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCSWINSZ),
 		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0})))
+}
+
+// sanitizeForPath replaces characters that are unsafe for filesystem paths.
+func sanitizeForPath(s string) string {
+	// Replace / and null bytes, and collapse multiple replacements
+	replacer := strings.NewReplacer(
+		"/", "_",
+		"\x00", "_",
+		"..", "_",
+	)
+	result := replacer.Replace(s)
+	// Also handle leading dots to prevent hidden directories
+	result = strings.TrimLeft(result, ".")
+	if result == "" {
+		result = "_"
+	}
+	return result
+}
+
+// ensureRootFS ensures the root filesystem exists at the given path.
+// If it doesn't exist, it clones from /snapshots/1 using btrfs.
+func ensureRootFS(rootFS string) error {
+	// Check if the directory already exists
+	if _, err := os.Stat(rootFS); err == nil {
+		return nil // Already exists
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("checking rootfs: %w", err)
+	}
+
+	// Ensure the parent directory exists
+	parentDir := filepath.Dir(rootFS)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return fmt.Errorf("creating parent directory: %w", err)
+	}
+
+	// Clone from /snapshots/1 using btrfs subvolume snapshot
+	cmd := exec.Command("btrfs", "subvolume", "snapshot", "/snapshots/1", rootFS)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("btrfs snapshot failed: %w\noutput: %s", err, string(output))
+	}
+
+	return nil
 }
