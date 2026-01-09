@@ -97,6 +97,9 @@ func main() {
 			safeTailscaleUser := sanitizeForPath(tailscaleUser)
 			safeSSHUser := sanitizeForPath(s.User())
 
+			// For home directory, strip @host from username for a cleaner look
+			homeUser := stripDomain(safeTailscaleUser)
+
 			// Set up the root filesystem for this user
 			rootFS := filepath.Join(*fsDir, safeTailscaleUser, safeSSHUser)
 			if err := ensureRootFS(rootFS); err != nil {
@@ -105,8 +108,16 @@ func main() {
 				return
 			}
 
+			// Ensure /proc mount point exists in the rootfs
+			procDir := filepath.Join(rootFS, "proc")
+			if err := os.MkdirAll(procDir, 0555); err != nil {
+				logErr("Failed to create /proc directory: %v", err)
+				s.Exit(1)
+				return
+			}
+
 			// Create home directory inside the root filesystem
-			homeDir := filepath.Join("home", safeTailscaleUser)
+			homeDir := filepath.Join("home", homeUser)
 			homeDirFull := filepath.Join(rootFS, homeDir)
 			if err := os.MkdirAll(homeDirFull, 0755); err != nil {
 				logErr("Failed to create home directory: %v", err)
@@ -117,17 +128,25 @@ func main() {
 			// Start an interactive shell
 			ptyReq, winCh, isPty := s.Pty()
 
-			cmd := exec.Command("/bin/sh")
+			// Launch shell with proc mount - the shell script mounts /proc then execs sh
+			cmd := exec.Command("/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec /bin/sh")
 			cmd.Dir = "/" + homeDir
 			cmd.Env = []string{
 				"HOME=/" + homeDir,
+				"USER=" + homeUser,
 				"SSH_USER=" + s.User(),
 				"TAILSCALE_USER=" + tailscaleUser,
 				"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 				"SHELL=/bin/sh",
 			}
 			cmd.SysProcAttr = &syscall.SysProcAttr{
-				Chroot: rootFS,
+				Chroot:     rootFS,
+				Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+			}
+
+			// Try to unmount /proc when session ends
+			cleanup := func() {
+				exec.Command("umount", procDir).Run()
 			}
 
 			if isPty {
@@ -139,6 +158,7 @@ func main() {
 					return
 				}
 				defer ptmx.Close()
+				defer cleanup()
 
 				// Handle window size changes
 				go func() {
@@ -157,6 +177,7 @@ func main() {
 				s.Exit(cmd.ProcessState.ExitCode())
 			} else {
 				// No PTY requested, run without one
+				defer cleanup()
 				cmd.Stdin = s
 				cmd.Stdout = s
 				cmd.Stderr = s.Stderr()
@@ -245,6 +266,14 @@ func sanitizeForPath(s string) string {
 		result = "_"
 	}
 	return result
+}
+
+// stripDomain removes the @domain part from a username (e.g., "user@example.com" -> "user")
+func stripDomain(s string) string {
+	if idx := strings.Index(s, "@"); idx != -1 {
+		return s[:idx]
+	}
+	return s
 }
 
 // ensureRootFS ensures the root filesystem exists at the given path.
