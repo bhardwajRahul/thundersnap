@@ -1,13 +1,16 @@
-// tsnet-ssh is a simple Tailscale tsnet-based SSH server that accepts
-// connections from any user and returns the output of "ps axu".
+// thundersnapd is a Tailscale tsnet-based SSH server that provides
+// isolated container environments for each user session.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -23,8 +26,8 @@ import (
 )
 
 func main() {
-	hostname := flag.String("hostname", "tsnet-ssh", "Tailscale hostname for this server")
-	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state (default: ~/.config/tsnet-ssh)")
+	hostname := flag.String("hostname", "thundersnap", "Tailscale hostname for this server")
+	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
 	fsDir := flag.String("fs-dir", "", "Directory to store per-user filesystems (required)")
 	flag.Parse()
 
@@ -38,7 +41,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to get home directory: %v", err)
 		}
-		*stateDir = filepath.Join(home, ".config", "tsnet-ssh")
+		*stateDir = filepath.Join(home, ".config", "thundersnapd")
 	}
 
 	if err := os.MkdirAll(*stateDir, 0700); err != nil {
@@ -128,6 +131,18 @@ func main() {
 				return
 			}
 
+			// Start control socket server for this container
+			sockPath := filepath.Join(rootFS, "thunder.sock")
+			log.Printf("Creating control socket at %s", sockPath)
+			ctrlServer, err := startControlServer(sockPath)
+			if err != nil {
+				logErr("Failed to start control socket: %v", err)
+				s.Exit(1)
+				return
+			}
+			defer ctrlServer.Close()
+			log.Printf("Control socket created successfully")
+
 			// Start an interactive shell
 			ptyReq, winCh, isPty := s.Pty()
 
@@ -192,16 +207,9 @@ func main() {
 				s.Exit(cmd.ProcessState.ExitCode())
 			}
 		},
-		// Accept any public key (no authentication required beyond Tailscale)
-		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
-			log.Printf("Public key auth attempt from %s (user: %s) - accepting", ctx.RemoteAddr(), ctx.User())
-			return true
-		},
-		// Accept any password (no authentication required beyond Tailscale)
-		PasswordHandler: func(ctx ssh.Context, password string) bool {
-			log.Printf("Password auth attempt from %s (user: %s) - accepting", ctx.RemoteAddr(), ctx.User())
-			return true
-		},
+		// No authentication required - Tailscale already authenticated the connection.
+		// When both PasswordHandler and PublicKeyHandler are nil, gliderlabs/ssh
+		// performs no client authentication.
 	}
 
 	log.Printf("Waiting for SSH connections...")
@@ -314,4 +322,86 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 	}
 
 	return nil
+}
+
+// controlServer wraps the HTTP server and listener for cleanup.
+type controlServer struct {
+	server   *http.Server
+	listener net.Listener
+	sockPath string
+}
+
+// Close shuts down the control server and removes the socket file.
+func (c *controlServer) Close() error {
+	c.server.Close()
+	c.listener.Close()
+	os.Remove(c.sockPath)
+	return nil
+}
+
+// startControlServer starts the HTTP control server on a Unix socket.
+func startControlServer(sockPath string) (*controlServer, error) {
+	// Remove existing socket file if it exists
+	os.Remove(sockPath)
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		return nil, fmt.Errorf("listen on control socket %s: %w", sockPath, err)
+	}
+
+	// Make socket accessible
+	if err := os.Chmod(sockPath, 0666); err != nil {
+		log.Printf("Warning: failed to chmod control socket: %v", err)
+	}
+
+	log.Printf("Control socket listening on %s", sockPath)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", handlePing)
+
+	server := &http.Server{Handler: mux}
+	go server.Serve(ln)
+
+	return &controlServer{
+		server:   server,
+		listener: ln,
+		sockPath: sockPath,
+	}, nil
+}
+
+// ControlRequest represents a request to the control socket.
+type ControlRequest struct {
+	Command string `json:"command"`
+}
+
+// ControlResponse represents a response from the control socket.
+type ControlResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+func handlePing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ControlRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Command != "ping" {
+		http.Error(w, "unknown command", http.StatusBadRequest)
+		return
+	}
+
+	resp := ControlResponse{
+		Status:  "ok",
+		Message: "pong",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
