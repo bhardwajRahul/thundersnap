@@ -5,34 +5,59 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+
+	"github.com/pborman/getopt/v2"
 )
 
-func main() {
-	sockPath := flag.String("sock", "/thunder.sock", "Path to control socket")
-	flag.Parse()
+var sockPath = getopt.StringLong("sock", 0, "/thunder.sock", "path to control socket")
+var help = getopt.BoolLong("help", 'h', "show help")
 
-	args := flag.Args()
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ts [-sock PATH] <command>")
-		fmt.Fprintln(os.Stderr, "commands:")
-		fmt.Fprintln(os.Stderr, "  ping    Send a ping to thundersnapd")
-		os.Exit(1)
+func usage() {
+	getopt.PrintUsage(os.Stderr)
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "commands:")
+	fmt.Fprintln(os.Stderr, "  ping    send a ping to thundersnapd")
+	os.Exit(1)
+}
+
+func main() {
+	getopt.SetParameters("<command> [command-options]")
+	getopt.SetUsage(usage)
+	getopt.Parse()
+	args := getopt.Args()
+
+	if *help || len(args) == 0 {
+		usage()
 	}
 
 	cmd := args[0]
+	cmdArgs := args[1:]
+
 	switch cmd {
 	case "ping":
-		if err := doPing(*sockPath); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
+		cmdPing(cmdArgs)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
+		fmt.Fprintf(os.Stderr, "error: unknown command: %s\n", cmd)
+		os.Exit(1)
+	}
+}
+
+func cmdPing(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts ping")
+	opts.Parse(args)
+
+	if opts.NArgs() > 0 {
+		fmt.Fprintln(os.Stderr, "error: ping takes no arguments")
+		os.Exit(1)
+	}
+
+	if err := doPing(*sockPath); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
