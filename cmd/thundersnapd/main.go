@@ -131,6 +131,13 @@ func main() {
 				return
 			}
 
+			// Copy ts binary into container's /sbin using btrfs reflink
+			if err := copyTsBinary(rootFS); err != nil {
+				logErr("Failed to copy ts binary: %v", err)
+				s.Exit(1)
+				return
+			}
+
 			// Start control socket server for this container
 			sockPath := filepath.Join(rootFS, "thunder.sock")
 			log.Printf("Creating control socket at %s", sockPath)
@@ -319,6 +326,40 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("btrfs snapshot from %s failed: %w\noutput: %s", snapshotSource, err, string(output))
+	}
+
+	return nil
+}
+
+// copyTsBinary copies the ts binary into the container's /sbin using btrfs reflink (COW copy).
+func copyTsBinary(rootFS string) error {
+	// Find the ts binary next to the current executable
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("get executable path: %w", err)
+	}
+	tsSrc := filepath.Join(filepath.Dir(exe), "ts")
+
+	// Destination in container
+	tsDst := filepath.Join(rootFS, "sbin", "ts")
+
+	// Check if source exists
+	if _, err := os.Stat(tsSrc); err != nil {
+		return fmt.Errorf("ts binary not found at %s: %w", tsSrc, err)
+	}
+
+	// Remove existing destination if present (reflink won't overwrite)
+	os.Remove(tsDst)
+
+	// Use cp --reflink=always for btrfs COW copy
+	cmd := exec.Command("cp", "--reflink=always", tsSrc, tsDst)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("cp --reflink=always failed: %w\noutput: %s", err, string(output))
+	}
+
+	// Make it executable
+	if err := os.Chmod(tsDst, 0755); err != nil {
+		return fmt.Errorf("chmod ts binary: %w", err)
 	}
 
 	return nil
