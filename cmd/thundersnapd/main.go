@@ -21,18 +21,34 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
+	"github.com/tailscale/thundersnap/thundersnap"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/tsnet"
+)
+
+var (
+	flagFsDir *string
+	flagVmDir *string
 )
 
 func main() {
 	hostname := flag.String("hostname", "thundersnap", "Tailscale hostname for this server")
 	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
-	fsDir := flag.String("fs-dir", "", "Directory to store per-user filesystems (required)")
+	flagFsDir = flag.String("fs-dir", "", "Directory to store per-user filesystems (required)")
+	flagVmDir = flag.String("vm-dir", "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
 	flag.Parse()
 
-	if *fsDir == "" {
+	if *flagFsDir == "" {
 		log.Fatalf("-fs-dir is required")
+	}
+
+	// Set default vm-dir relative to executable
+	if *flagVmDir == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			log.Fatalf("Failed to get executable path: %v", err)
+		}
+		*flagVmDir = filepath.Join(filepath.Dir(exe), "vm")
 	}
 
 	// Set up state directory
@@ -96,122 +112,21 @@ func main() {
 				fmt.Fprintf(s, "* Error: %s\r\n", msg)
 			}
 
-			// Sanitize usernames for filesystem paths (replace unsafe chars)
-			safeTailscaleUser := sanitizeForPath(tailscaleUser)
-			safeSSHUser := sanitizeForPath(s.User())
-
-			// For home directory, strip @host from username for a cleaner look
-			homeUser := stripDomain(safeTailscaleUser)
-
-			// Set up the root filesystem for this user
-			// If this is not the "base" user (stripped username), try to clone from
-			// the base user's filesystem first, falling back to the clean snapshot
-			rootFS := filepath.Join(*fsDir, safeTailscaleUser, safeSSHUser)
-			baseUserFS := filepath.Join(*fsDir, safeTailscaleUser, homeUser)
-			if err := ensureRootFS(rootFS, baseUserFS); err != nil {
-				logErr("Failed to set up root filesystem: %v", err)
-				s.Exit(1)
-				return
-			}
-
-			// Ensure /proc mount point exists in the rootfs
-			procDir := filepath.Join(rootFS, "proc")
-			if err := os.MkdirAll(procDir, 0555); err != nil {
-				logErr("Failed to create /proc directory: %v", err)
-				s.Exit(1)
-				return
-			}
-
-			// Create home directory inside the root filesystem
-			homeDir := filepath.Join("home", homeUser)
-			homeDirFull := filepath.Join(rootFS, homeDir)
-			if err := os.MkdirAll(homeDirFull, 0755); err != nil {
-				logErr("Failed to create home directory: %v", err)
-				s.Exit(1)
-				return
-			}
-
-			// Copy ts binary into container's /sbin using btrfs reflink
-			if err := copyTsBinary(rootFS); err != nil {
-				logErr("Failed to copy ts binary: %v", err)
-				s.Exit(1)
-				return
-			}
-
-			// Start control socket server for this container
-			sockPath := filepath.Join(rootFS, "thunder.sock")
-			log.Printf("Creating control socket at %s", sockPath)
-			ctrlServer, err := startControlServer(sockPath)
-			if err != nil {
-				logErr("Failed to start control socket: %v", err)
-				s.Exit(1)
-				return
-			}
-			defer ctrlServer.Close()
-			log.Printf("Control socket created successfully")
-
-			// Start an interactive shell
-			ptyReq, winCh, isPty := s.Pty()
-
-			// Launch shell with proc mount - the shell script mounts /proc then execs sh
-			cmd := exec.Command("/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec /bin/sh")
-			cmd.Dir = "/" + homeDir
-			cmd.Env = []string{
-				"HOME=/" + homeDir,
-				"USER=" + homeUser,
-				"SSH_USER=" + s.User(),
-				"TAILSCALE_USER=" + tailscaleUser,
-				"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-				"SHELL=/bin/sh",
-			}
-			cmd.SysProcAttr = &syscall.SysProcAttr{
-				Chroot:     rootFS,
-				Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
-			}
-
-			// Try to unmount /proc when session ends
-			cleanup := func() {
-				exec.Command("umount", procDir).Run()
-			}
-
-			if isPty {
-				cmd.Env = append(cmd.Env, "TERM="+ptyReq.Term)
-				ptmx, err := pty.Start(cmd)
-				if err != nil {
-					logErr("Failed to start shell: %v", err)
+			// Check if this is a VM session (vm/<user>)
+			sshUser := s.User()
+			if strings.HasPrefix(sshUser, "vm/") {
+				vmUser := strings.TrimPrefix(sshUser, "vm/")
+				if err := runVMSession(s, tailscaleUser, vmUser, logErr); err != nil {
+					logErr("VM session failed: %v", err)
 					s.Exit(1)
-					return
 				}
-				defer ptmx.Close()
-				defer cleanup()
+				return
+			}
 
-				// Handle window size changes
-				go func() {
-					for win := range winCh {
-						setWinsize(ptmx, win.Width, win.Height)
-					}
-				}()
-
-				// Copy data between SSH session and PTY
-				go func() {
-					io.Copy(ptmx, s) // stdin
-				}()
-				io.Copy(s, ptmx) // stdout
-
-				cmd.Wait()
-				s.Exit(cmd.ProcessState.ExitCode())
-			} else {
-				// No PTY requested, run without one
-				defer cleanup()
-				cmd.Stdin = s
-				cmd.Stdout = s
-				cmd.Stderr = s.Stderr()
-				if err := cmd.Run(); err != nil {
-					logErr("Failed to run shell: %v", err)
-					s.Exit(1)
-					return
-				}
-				s.Exit(cmd.ProcessState.ExitCode())
+			// Container session
+			if err := runContainerSession(s, tailscaleUser, sshUser, logErr); err != nil {
+				logErr("Container session failed: %v", err)
+				s.Exit(1)
 			}
 		},
 		// No authentication required - Tailscale already authenticated the connection.
@@ -292,6 +207,153 @@ func stripDomain(s string) string {
 		return s[:idx]
 	}
 	return s
+}
+
+// runContainerSession handles a container-based SSH session.
+func runContainerSession(s ssh.Session, tailscaleUser, sshUser string, logErr func(string, ...any)) error {
+	// Sanitize usernames for filesystem paths (replace unsafe chars)
+	safeTailscaleUser := sanitizeForPath(tailscaleUser)
+	safeSSHUser := sanitizeForPath(sshUser)
+
+	// For home directory, strip @host from username for a cleaner look
+	homeUser := stripDomain(safeTailscaleUser)
+
+	// Set up the root filesystem for this user
+	// If this is not the "base" user (stripped username), try to clone from
+	// the base user's filesystem first, falling back to the clean snapshot
+	rootFS := filepath.Join(*flagFsDir, safeTailscaleUser, safeSSHUser)
+	baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
+	if err := ensureRootFS(rootFS, baseUserFS); err != nil {
+		return fmt.Errorf("set up root filesystem: %w", err)
+	}
+
+	// Ensure /proc mount point exists in the rootfs
+	procDir := filepath.Join(rootFS, "proc")
+	if err := os.MkdirAll(procDir, 0555); err != nil {
+		return fmt.Errorf("create /proc directory: %w", err)
+	}
+
+	// Create home directory inside the root filesystem
+	homeDir := filepath.Join("home", homeUser)
+	homeDirFull := filepath.Join(rootFS, homeDir)
+	if err := os.MkdirAll(homeDirFull, 0755); err != nil {
+		return fmt.Errorf("create home directory: %w", err)
+	}
+
+	// Copy ts binary into container's /sbin using btrfs reflink
+	if err := copyTsBinary(rootFS); err != nil {
+		return fmt.Errorf("copy ts binary: %w", err)
+	}
+
+	// Start control socket server for this container
+	sockPath := filepath.Join(rootFS, "thunder.sock")
+	log.Printf("Creating control socket at %s", sockPath)
+	ctrlServer, err := startControlServer(sockPath)
+	if err != nil {
+		return fmt.Errorf("start control socket: %w", err)
+	}
+	defer ctrlServer.Close()
+	log.Printf("Control socket created successfully")
+
+	// Start an interactive shell
+	ptyReq, winCh, isPty := s.Pty()
+
+	// Launch shell with proc mount - the shell script mounts /proc then execs sh
+	cmd := exec.Command("/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec /bin/sh")
+	cmd.Dir = "/" + homeDir
+	cmd.Env = []string{
+		"HOME=/" + homeDir,
+		"USER=" + homeUser,
+		"SSH_USER=" + sshUser,
+		"TAILSCALE_USER=" + tailscaleUser,
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"SHELL=/bin/sh",
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Chroot:     rootFS,
+		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+	}
+
+	// Try to unmount /proc when session ends
+	cleanup := func() {
+		exec.Command("umount", procDir).Run()
+	}
+
+	if isPty {
+		cmd.Env = append(cmd.Env, "TERM="+ptyReq.Term)
+		ptmx, err := pty.Start(cmd)
+		if err != nil {
+			return fmt.Errorf("start shell: %w", err)
+		}
+		defer ptmx.Close()
+		defer cleanup()
+
+		// Handle window size changes
+		go func() {
+			for win := range winCh {
+				setWinsize(ptmx, win.Width, win.Height)
+			}
+		}()
+
+		// Copy data between SSH session and PTY
+		go func() {
+			io.Copy(ptmx, s) // stdin
+		}()
+		io.Copy(s, ptmx) // stdout
+
+		cmd.Wait()
+		s.Exit(cmd.ProcessState.ExitCode())
+	} else {
+		// No PTY requested, run without one
+		defer cleanup()
+		cmd.Stdin = s
+		cmd.Stdout = s
+		cmd.Stderr = s.Stderr()
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("run shell: %w", err)
+		}
+		s.Exit(cmd.ProcessState.ExitCode())
+	}
+	return nil
+}
+
+// runVMSession handles a VM-based SSH session using cloud-hypervisor.
+func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(string, ...any)) error {
+	// Sanitize usernames for filesystem paths
+	safeTailscaleUser := sanitizeForPath(tailscaleUser)
+	safeVMUser := sanitizeForPath(vmUser)
+
+	// Set up the root filesystem for this VM (same as container for now)
+	homeUser := stripDomain(safeTailscaleUser)
+	rootFS := filepath.Join(*flagFsDir, safeTailscaleUser, safeVMUser)
+	baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
+	if err := ensureRootFS(rootFS, baseUserFS); err != nil {
+		return fmt.Errorf("set up root filesystem: %w", err)
+	}
+
+	// Start the VM - use PTY because SSH sessions don't provide a real TTY
+	session, err := thundersnap.StartVM(thundersnap.VMConfig{
+		RootFS: rootFS,
+		VMDir:  *flagVmDir,
+		Stdin:  s,
+		Stdout: s,
+		UsePTY: true,
+	})
+	if err != nil {
+		return fmt.Errorf("start VM: %w", err)
+	}
+
+	// Wait for either the VM to exit or the SSH session to close (stdin EOF)
+	select {
+	case <-session.Done():
+		log.Printf("VM exited on its own")
+	case <-session.StdinClosed():
+		log.Printf("SSH session closed, terminating VM")
+		session.Close()
+	}
+
+	s.Exit(0)
+	return nil
 }
 
 // ensureRootFS ensures the root filesystem exists at the given path.
