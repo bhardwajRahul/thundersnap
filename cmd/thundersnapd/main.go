@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -331,13 +333,24 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(strin
 		return fmt.Errorf("set up root filesystem: %w", err)
 	}
 
+	// Copy ts binary into VM's /sbin
+	// (ts detects vsock via /dev/vsock and connects directly to the host)
+	if err := copyTsBinary(rootFS); err != nil {
+		return fmt.Errorf("copy ts binary: %w", err)
+	}
+
+	// Create control handler for vsock
+	controlMux := http.NewServeMux()
+	controlMux.HandleFunc("/ping", handlePing)
+
 	// Start the VM - use PTY because SSH sessions don't provide a real TTY
 	session, err := thundersnap.StartVM(thundersnap.VMConfig{
-		RootFS: rootFS,
-		VMDir:  *flagVmDir,
-		Stdin:  s,
-		Stdout: s,
-		UsePTY: true,
+		RootFS:         rootFS,
+		VMDir:          *flagVmDir,
+		Stdin:          s,
+		Stdout:         s,
+		UsePTY:         true,
+		ControlHandler: controlMux,
 	})
 	if err != nil {
 		return fmt.Errorf("start VM: %w", err)
@@ -427,22 +440,27 @@ func copyTsBinary(rootFS string) error {
 	return nil
 }
 
+// thunderPort is the vsock port used for the thunder control protocol.
+const thunderPort = 5223
+
 // controlServer wraps the HTTP server and listener for cleanup.
 type controlServer struct {
-	server   *http.Server
+	handler  http.Handler
 	listener net.Listener
 	sockPath string
+	done     chan struct{}
 }
 
 // Close shuts down the control server and removes the socket file.
 func (c *controlServer) Close() error {
-	c.server.Close()
 	c.listener.Close()
+	<-c.done
 	os.Remove(c.sockPath)
 	return nil
 }
 
 // startControlServer starts the HTTP control server on a Unix socket.
+// The server expects a vsock-style handshake (CONNECT/OK) before HTTP.
 func startControlServer(sockPath string) (*controlServer, error) {
 	// Remove existing socket file if it exists
 	os.Remove(sockPath)
@@ -462,14 +480,145 @@ func startControlServer(sockPath string) (*controlServer, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", handlePing)
 
-	server := &http.Server{Handler: mux}
-	go server.Serve(ln)
-
-	return &controlServer{
-		server:   server,
+	cs := &controlServer{
+		handler:  mux,
 		listener: ln,
 		sockPath: sockPath,
-	}, nil
+		done:     make(chan struct{}),
+	}
+
+	go cs.serve()
+
+	return cs, nil
+}
+
+// serve accepts connections and handles the vsock handshake before HTTP.
+func (c *controlServer) serve() {
+	defer close(c.done)
+	for {
+		conn, err := c.listener.Accept()
+		if err != nil {
+			return
+		}
+		go c.handleConn(conn)
+	}
+}
+
+// handleConn handles a single connection with vsock handshake then HTTP.
+func (c *controlServer) handleConn(conn net.Conn) {
+	defer conn.Close()
+
+	// Read vsock-style CONNECT handshake
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("control socket: failed to read handshake: %v", err)
+		return
+	}
+
+	// Parse "CONNECT <port>\n"
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "CONNECT ") {
+		log.Printf("control socket: invalid handshake: %s", line)
+		fmt.Fprintf(conn, "ERROR invalid handshake\n")
+		return
+	}
+	portStr := strings.TrimPrefix(line, "CONNECT ")
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port != thunderPort {
+		log.Printf("control socket: invalid port: %s", portStr)
+		fmt.Fprintf(conn, "ERROR invalid port\n")
+		return
+	}
+
+	// Send OK response
+	fmt.Fprintf(conn, "OK %d\n", port)
+
+	// Now serve HTTP on this connection
+	for {
+		req, err := http.ReadRequest(reader)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("control socket: failed to read request: %v", err)
+			}
+			return
+		}
+
+		// Create response writer
+		rw := newControlResponseWriter(conn)
+		c.handler.ServeHTTP(rw, req)
+		if err := rw.finish(); err != nil {
+			log.Printf("control socket: failed to write response: %v", err)
+			return
+		}
+
+		// HTTP/1.0 style: close after one request
+		return
+	}
+}
+
+// controlResponseWriter implements http.ResponseWriter for control socket connections.
+type controlResponseWriter struct {
+	conn       net.Conn
+	headers    http.Header
+	statusCode int
+	body       []byte
+}
+
+func newControlResponseWriter(conn net.Conn) *controlResponseWriter {
+	return &controlResponseWriter{
+		conn:    conn,
+		headers: make(http.Header),
+	}
+}
+
+func (w *controlResponseWriter) Header() http.Header {
+	return w.headers
+}
+
+func (w *controlResponseWriter) Write(data []byte) (int, error) {
+	w.body = append(w.body, data...)
+	return len(data), nil
+}
+
+func (w *controlResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+}
+
+func (w *controlResponseWriter) finish() error {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+
+	// Write status line
+	statusText := http.StatusText(w.statusCode)
+	if _, err := fmt.Fprintf(w.conn, "HTTP/1.0 %d %s\r\n", w.statusCode, statusText); err != nil {
+		return err
+	}
+
+	// Write content-length header
+	w.headers.Set("Content-Length", strconv.Itoa(len(w.body)))
+
+	// Write headers
+	for key, values := range w.headers {
+		for _, value := range values {
+			if _, err := fmt.Fprintf(w.conn, "%s: %s\r\n", key, value); err != nil {
+				return err
+			}
+		}
+	}
+
+	// End headers
+	if _, err := w.conn.Write([]byte("\r\n")); err != nil {
+		return err
+	}
+
+	// Write body
+	if _, err := w.conn.Write(w.body); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // ControlRequest represents a request to the control socket.

@@ -1,7 +1,13 @@
 // ts is a client for communicating with thundersnapd via its control socket.
+// The protocol uses a vsock-style handshake: after connecting, the client sends
+// "CONNECT <port>\n" and waits for "OK <port>\n" before proceeding with HTTP.
+//
+// In containers, ts connects to /thunder.sock (Unix socket).
+// In VMs, ts connects directly via vsock to the host (CID 2) if /dev/vsock exists.
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,9 +15,17 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 
+	"github.com/mdlayher/vsock"
 	"github.com/pborman/getopt/v2"
 )
+
+// thunderPort is the vsock port used for the thunder control protocol.
+const thunderPort = 5223
+
+// hostCID is the vsock CID for the host (used in VMs).
+const hostCID = 2
 
 var sockPath = getopt.StringLong("sock", 0, "/thunder.sock", "path to control socket")
 var help = getopt.BoolLong("help", 'h', "show help")
@@ -73,11 +87,75 @@ type ControlResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
+// inVM returns true if we're running inside a VM with vsock support.
+func inVM() bool {
+	_, err := os.Stat("/dev/vsock")
+	return err == nil
+}
+
+// dialThunder connects to thundersnapd and performs the vsock handshake.
+// In VMs (when /dev/vsock exists), it connects directly via vsock to the host.
+// In containers, it connects to the Unix socket at sockPath.
+func dialThunder(ctx context.Context, sockPath string) (net.Conn, error) {
+	var conn net.Conn
+	var err error
+
+	if inVM() {
+		// In a VM: connect directly via vsock to host
+		conn, err = vsock.Dial(hostCID, thunderPort, nil)
+		if err != nil {
+			return nil, fmt.Errorf("vsock dial: %w", err)
+		}
+		// vsock connections don't need the CONNECT handshake - they're already
+		// connected to the right port. The host side receives this as a direct
+		// connection on the port-specific Unix socket.
+		return conn, nil
+	}
+
+	// In a container: connect to Unix socket with CONNECT handshake
+	conn, err = net.Dial("unix", sockPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Send vsock-style CONNECT handshake
+	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", thunderPort); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("send CONNECT: %w", err)
+	}
+
+	// Read response - should be "OK <port>\n"
+	reader := bufio.NewReader(conn)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("read handshake response: %w", err)
+	}
+	response = strings.TrimSpace(response)
+	if !strings.HasPrefix(response, "OK") {
+		conn.Close()
+		return nil, fmt.Errorf("handshake failed: %s", response)
+	}
+
+	// Return a conn that uses the buffered reader (in case there's buffered data)
+	return &bufferedConn{Conn: conn, reader: reader}, nil
+}
+
+// bufferedConn wraps a net.Conn with a buffered reader for the handshake.
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
 func doPing(sockPath string) error {
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", sockPath)
+				return dialThunder(ctx, sockPath)
 			},
 		},
 	}

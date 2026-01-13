@@ -2,12 +2,16 @@
 package thundersnap
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/creack/pty"
@@ -26,24 +30,34 @@ type VMConfig struct {
 	// UsePTY indicates whether to allocate a PTY for cloud-hypervisor.
 	// This is needed when Stdin is not a real TTY (e.g., SSH sessions).
 	UsePTY bool
+	// ControlHandler is the HTTP handler for serving the control socket protocol
+	// over vsock. If nil, no vsock control socket is set up.
+	ControlHandler http.Handler
 }
+
+// VsockPort is the vsock port used for the thunder control socket.
+const VsockPort = 5223
 
 // VMSession represents a running VM session.
 type VMSession struct {
-	virtiofsdCmd *exec.Cmd
-	chvCmd       *exec.Cmd
-	virtiofsSock string
-	pty          *os.File // only set if UsePTY is true
-	stdinPipe    io.WriteCloser // only set if UsePTY is false
-	done         chan struct{}
-	stdinClosed  chan struct{}
+	virtiofsdCmd   *exec.Cmd
+	chvCmd         *exec.Cmd
+	virtiofsSock   string
+	vsockSock      string         // cloud-hypervisor vsock unix socket path
+	vsockListener  net.Listener   // listener for vsock connections
+	pty            *os.File       // only set if UsePTY is true
+	stdinPipe      io.WriteCloser // only set if UsePTY is false
+	done           chan struct{}
+	stdinClosed    chan struct{}
+	controlHandler http.Handler
 }
 
 // StartVM starts a new VM session with the given configuration.
 func StartVM(cfg VMConfig) (*VMSession, error) {
-	// Create unique socket path for this session
+	// Create unique socket paths for this session
 	sessionID := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
 	virtiofsSock := filepath.Join("/tmp", fmt.Sprintf("virtiofs-%s.sock", sessionID))
+	vsockSock := filepath.Join("/tmp", fmt.Sprintf("vsock-%s.sock", sessionID))
 
 	// Start virtiofsd
 	log.Printf("Starting virtiofsd with shared-dir=%s", cfg.RootFS)
@@ -80,12 +94,13 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// We wrap the shell in a tiny script that powers off the VM when the shell exits.
 	// This avoids the kernel panic from init exiting, and cloud-hypervisor exits
 	// cleanly on ACPI shutdown. We use busybox poweroff -f which doesn't need /proc.
+	// The ts command inside the VM detects vsock via /dev/vsock and connects directly.
 	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "/bin/sh; /bin/busybox poweroff -f"`
 
 	// Start cloud-hypervisor
 	// --pvpanic enables the pvpanic device which allows the guest to signal panic to the host
 	log.Printf("Starting cloud-hypervisor")
-	chvCmd := exec.Command(chvPath,
+	chvArgs := []string{
 		"--kernel", kernelPath,
 		"--cpus", "boot=1",
 		"--memory", "size=512M,shared=on",
@@ -94,14 +109,21 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		"--serial", "tty",
 		"--console", "off",
 		"--pvpanic",
-	)
+	}
+	// Add vsock if we have a control handler
+	if cfg.ControlHandler != nil {
+		chvArgs = append(chvArgs, "--vsock", fmt.Sprintf("cid=3,socket=%s", vsockSock))
+	}
+	chvCmd := exec.Command(chvPath, chvArgs...)
 
 	session := &VMSession{
-		virtiofsdCmd: virtiofsdCmd,
-		chvCmd:       chvCmd,
-		virtiofsSock: virtiofsSock,
-		done:         make(chan struct{}),
-		stdinClosed:  make(chan struct{}),
+		virtiofsdCmd:   virtiofsdCmd,
+		chvCmd:         chvCmd,
+		virtiofsSock:   virtiofsSock,
+		vsockSock:      vsockSock,
+		done:           make(chan struct{}),
+		stdinClosed:    make(chan struct{}),
+		controlHandler: cfg.ControlHandler,
 	}
 
 	if cfg.UsePTY {
@@ -172,6 +194,25 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		}()
 	}
 
+	// Start vsock listener if we have a control handler
+	// Cloud-hypervisor's vsock uses a naming convention: when guest connects to
+	// CID 2 (host) on port N, it looks for a Unix socket at <vsock-socket>_N
+	if cfg.ControlHandler != nil {
+		vsockPortSock := fmt.Sprintf("%s_%d", vsockSock, VsockPort)
+		log.Printf("Creating vsock listener at %s for port %d", vsockPortSock, VsockPort)
+
+		// Listen on the port-specific Unix socket
+		ln, err := net.Listen("unix", vsockPortSock)
+		if err != nil {
+			session.Close()
+			return nil, fmt.Errorf("listen on vsock socket: %w", err)
+		}
+		session.vsockListener = ln
+
+		// Handle vsock connections in background
+		go session.serveVsock()
+	}
+
 	return session, nil
 }
 
@@ -215,9 +256,123 @@ func (s *VMSession) Close() error {
 	s.virtiofsdCmd.Wait()
 	log.Printf("virtiofsd has exited")
 
-	// Clean up socket
+	// Close vsock listener if we have one
+	if s.vsockListener != nil {
+		s.vsockListener.Close()
+	}
+
+	// Clean up sockets
 	os.Remove(s.virtiofsSock)
-	log.Printf("Cleaned up socket %s", s.virtiofsSock)
+	// Also remove vsock socket and port-specific socket
+	os.Remove(s.vsockSock)
+	os.Remove(fmt.Sprintf("%s_%d", s.vsockSock, VsockPort))
+	log.Printf("Cleaned up sockets")
+
+	return nil
+}
+
+// serveVsock accepts connections on the vsock listener and serves the control protocol.
+func (s *VMSession) serveVsock() {
+	for {
+		conn, err := s.vsockListener.Accept()
+		if err != nil {
+			// Listener was closed
+			return
+		}
+		go s.handleVsockConnection(conn)
+	}
+}
+
+// handleVsockConnection handles a single vsock connection from the guest.
+// The guest opens a raw TCP-like connection, and we serve HTTP over it.
+func (s *VMSession) handleVsockConnection(conn net.Conn) {
+	defer conn.Close()
+
+	// Read the HTTP request line and headers
+	reader := bufio.NewReader(conn)
+	for {
+		// Parse HTTP request
+		req, err := http.ReadRequest(reader)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("vsock: failed to read request: %v", err)
+			}
+			return
+		}
+
+		// Create a response writer that writes to the connection
+		rw := &vsockResponseWriter{
+			conn:    conn,
+			headers: make(http.Header),
+		}
+
+		// Serve the request
+		s.controlHandler.ServeHTTP(rw, req)
+
+		// Flush the response
+		if err := rw.finish(); err != nil {
+			log.Printf("vsock: failed to write response: %v", err)
+			return
+		}
+
+		// Close after handling one request (HTTP/1.0 style)
+		return
+	}
+}
+
+// vsockResponseWriter implements http.ResponseWriter for vsock connections.
+type vsockResponseWriter struct {
+	conn       net.Conn
+	headers    http.Header
+	statusCode int
+	body       []byte
+}
+
+func (w *vsockResponseWriter) Header() http.Header {
+	return w.headers
+}
+
+func (w *vsockResponseWriter) Write(data []byte) (int, error) {
+	w.body = append(w.body, data...)
+	return len(data), nil
+}
+
+func (w *vsockResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+}
+
+func (w *vsockResponseWriter) finish() error {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+
+	// Write status line
+	statusText := http.StatusText(w.statusCode)
+	if _, err := fmt.Fprintf(w.conn, "HTTP/1.0 %d %s\r\n", w.statusCode, statusText); err != nil {
+		return err
+	}
+
+	// Write content-length header
+	w.headers.Set("Content-Length", strconv.Itoa(len(w.body)))
+
+	// Write headers
+	for key, values := range w.headers {
+		for _, value := range values {
+			if _, err := fmt.Fprintf(w.conn, "%s: %s\r\n", key, value); err != nil {
+				return err
+			}
+		}
+	}
+
+	// End headers
+	if _, err := w.conn.Write([]byte("\r\n")); err != nil {
+		return err
+	}
+
+	// Write body
+	if _, err := w.conn.Write(w.body); err != nil {
+		return err
+	}
 
 	return nil
 }
