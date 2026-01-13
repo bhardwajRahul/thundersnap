@@ -47,12 +47,22 @@ type FidxEntry struct {
 	Level uint16   // hierarchical level from content-based chunking
 }
 
+// FileEntry represents a single file within an mfidx
+type FileEntry struct {
+	Filename string
+	FileSize uint64
+	Mtime    uint64
+	Entries  []FidxEntry
+}
+
 // Fidx represents a parsed fidx file
 type Fidx struct {
 	Filename string
 	Entries  []FidxEntry
 	FileSHA  [20]byte // SHA-1 of the entire fidx file (excluding footer)
 	FileSize int64    // total size of reconstructed file
+	IsMFIDX  bool     // true if this is a multi-file index
+	Files    []FileEntry // for mfidx files
 }
 
 // FidxMapping maps a chunk SHA to its location in a local file
@@ -112,12 +122,7 @@ func bupdate(localDir, remoteDir, targetFidx string) error {
 		return fmt.Errorf("loading remote fidx: %w", err)
 	}
 
-	// Determine output filename (strip .fidx extension)
-	outputName := strings.TrimSuffix(targetFidx, ".fidx")
-	outputPath := filepath.Join(localDir, outputName)
-	tmpOutputPath := outputPath + ".tmp"
-
-	// Check if we already have this file
+	// Check if we already have this index
 	localFidxPath := filepath.Join(localDir, targetFidx)
 	if localFidx, err := loadFidx(localFidxPath); err == nil {
 		if bytes.Equal(localFidx.FileSHA[:], remoteFidx.FileSHA[:]) {
@@ -125,6 +130,17 @@ func bupdate(localDir, remoteDir, targetFidx string) error {
 			return nil
 		}
 	}
+
+	if remoteFidx.IsMFIDX {
+		// Multi-file index - extract all files
+		return bupdateMFIDX(localDir, remoteDir, remoteFidx, remoteFidxPath, localFidxPath, mappings)
+	}
+
+	// Single file reconstruction
+	// Determine output filename (strip .fidx extension)
+	outputName := strings.TrimSuffix(targetFidx, ".fidx")
+	outputPath := filepath.Join(localDir, outputName)
+	tmpOutputPath := outputPath + ".tmp"
 
 	// Predict what we need to download
 	missing, chunks := predictDownload(remoteFidx, mappings)
@@ -152,7 +168,74 @@ func bupdate(localDir, remoteDir, targetFidx string) error {
 	return nil
 }
 
-// loadLocalMappings scans the local directory for .fidx files and builds chunk mappings
+// bupdateMFIDX handles reconstruction of all files from a multi-file index
+func bupdateMFIDX(localDir, remoteDir string, remoteFidx *Fidx, remoteFidxPath, localFidxPath string, mappings *FidxMappings) error {
+	fmt.Printf("Multi-file index containing %d files\n", len(remoteFidx.Files))
+
+	// Calculate total missing data across all files
+	var totalMissing int64
+	var totalSize int64
+	for _, fileEntry := range remoteFidx.Files {
+		missing, _ := predictDownloadForEntries(fileEntry.Entries, mappings)
+		totalMissing += missing
+		for _, ent := range fileEntry.Entries {
+			totalSize += int64(ent.Size)
+		}
+	}
+
+	fmt.Printf("  Total size: %d bytes\n", totalSize)
+	fmt.Printf("  Need to download: %d bytes (%.1f%%)\n",
+		totalMissing, float64(totalMissing)*100.0/float64(totalSize))
+
+	// Reconstruct each file
+	for _, fileEntry := range remoteFidx.Files {
+		fmt.Printf("\n%s\n", fileEntry.Filename)
+
+		// Use basename for local output, full path for remote lookup
+		baseName := filepath.Base(fileEntry.Filename)
+		outputPath := filepath.Join(localDir, baseName)
+		tmpOutputPath := outputPath + ".tmp"
+
+		// Ensure parent directory exists
+		if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+			return fmt.Errorf("creating directory for %s: %w", baseName, err)
+		}
+
+		// Create a temporary Fidx struct for this file
+		fileFidx := &Fidx{
+			Entries:  fileEntry.Entries,
+			FileSize: int64(fileEntry.FileSize),
+		}
+
+		// Predict download for this specific file
+		missing, chunks := predictDownloadForEntries(fileEntry.Entries, mappings)
+		fmt.Printf("  need to download %d/%d bytes in %d chunks.\n",
+			missing, fileEntry.FileSize, chunks)
+
+		// Reconstruct from remote - use basename to avoid double path
+		remoteFilePath := filepath.Join(remoteDir, baseName)
+		if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remoteFilePath, fileEntry, mappings); err != nil {
+			os.Remove(tmpOutputPath)
+			return fmt.Errorf("reconstructing %s: %w", fileEntry.Filename, err)
+		}
+
+		// Atomically rename to final location
+		if err := os.Rename(tmpOutputPath, outputPath); err != nil {
+			return fmt.Errorf("rename %s: %w", fileEntry.Filename, err)
+		}
+
+		fmt.Printf("  successfully reconstructed: %s\n", outputPath)
+	}
+
+	// Copy the mfidx file to local
+	if err := copyFile(localFidxPath, remoteFidxPath); err != nil {
+		return fmt.Errorf("copying mfidx: %w", err)
+	}
+
+	return nil
+}
+
+// loadLocalMappings scans the local directory for .fidx and .mfidx files and builds chunk mappings
 func loadLocalMappings(dir string) (*FidxMappings, error) {
 	var allMappings []FidxMapping
 
@@ -162,7 +245,11 @@ func loadLocalMappings(dir string) (*FidxMappings, error) {
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".fidx") {
+		if entry.IsDir() {
+			continue
+		}
+
+		if !strings.HasSuffix(entry.Name(), ".fidx") && !strings.HasSuffix(entry.Name(), ".mfidx") {
 			continue
 		}
 
@@ -173,27 +260,54 @@ func loadLocalMappings(dir string) (*FidxMappings, error) {
 			continue
 		}
 
-		// Get the actual file name (without .fidx)
-		filename := strings.TrimSuffix(entry.Name(), ".fidx")
-		filePath := filepath.Join(dir, filename)
-
-		// Check if the file exists
-		if _, err := os.Stat(filePath); err != nil {
-			continue
-		}
-
 		fmt.Printf("  %s\n", entry.Name())
 
-		// Add mappings for this file
-		var offset int64
-		for _, ent := range fidx.Entries {
-			allMappings = append(allMappings, FidxMapping{
-				SHA:      ent.SHA,
-				Filename: filePath,
-				Offset:   offset,
-				Size:     ent.Size,
-			})
-			offset += int64(ent.Size)
+		if fidx.IsMFIDX {
+			// Multi-file index - process each file within it
+			for _, fileEntry := range fidx.Files {
+				// Use basename to avoid path issues if mfidx has full paths
+				baseName := filepath.Base(fileEntry.Filename)
+				filePath := filepath.Join(dir, baseName)
+
+				// Check if the file exists
+				if _, err := os.Stat(filePath); err != nil {
+					continue
+				}
+
+				// Add mappings for this file
+				var offset int64
+				for _, ent := range fileEntry.Entries {
+					allMappings = append(allMappings, FidxMapping{
+						SHA:      ent.SHA,
+						Filename: filePath,
+						Offset:   offset,
+						Size:     ent.Size,
+					})
+					offset += int64(ent.Size)
+				}
+			}
+		} else {
+			// Single-file index
+			// Get the actual file name (without .fidx)
+			filename := strings.TrimSuffix(entry.Name(), ".fidx")
+			filePath := filepath.Join(dir, filename)
+
+			// Check if the file exists
+			if _, err := os.Stat(filePath); err != nil {
+				continue
+			}
+
+			// Add mappings for this file
+			var offset int64
+			for _, ent := range fidx.Entries {
+				allMappings = append(allMappings, FidxMapping{
+					SHA:      ent.SHA,
+					Filename: filePath,
+					Offset:   offset,
+					Size:     ent.Size,
+				})
+				offset += int64(ent.Size)
+			}
 		}
 	}
 
@@ -205,7 +319,7 @@ func loadLocalMappings(dir string) (*FidxMappings, error) {
 	return &FidxMappings{Mappings: allMappings}, nil
 }
 
-// loadFidx reads and parses a fidx file
+// loadFidx reads and parses a fidx or mfidx file
 func loadFidx(path string) (*Fidx, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -240,6 +354,27 @@ func loadFidx(path string) (*Fidx, error) {
 
 	// Parse entries (skip 8-byte header)
 	entryData := data[8:]
+
+	// Detect if this is an mfidx file by checking for file separator (20 zero bytes)
+	isMFIDX := false
+	if len(entryData) >= 24 {
+		allZero := true
+		for i := 0; i < 20; i++ {
+			if entryData[i] != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			isMFIDX = true
+		}
+	}
+
+	if isMFIDX {
+		return parseMFIDX(path, entryData, computedSHA)
+	}
+
+	// Regular single-file fidx
 	if len(entryData)%24 != 0 {
 		return nil, fmt.Errorf("invalid entry data length")
 	}
@@ -262,6 +397,111 @@ func loadFidx(path string) (*Fidx, error) {
 		Filename: path,
 		Entries:  entries,
 		FileSize: fileSize,
+		IsMFIDX:  false,
+	}
+	copy(fidx.FileSHA[:], computedSHA)
+
+	return fidx, nil
+}
+
+// parseMFIDX parses a multi-file index format
+func parseMFIDX(path string, entryData []byte, computedSHA []byte) (*Fidx, error) {
+	var files []FileEntry
+	offset := 0
+
+	for offset < len(entryData) {
+		if offset+24 > len(entryData) {
+			return nil, fmt.Errorf("unexpected end of mfidx data")
+		}
+
+		// Check for file separator (20 zero bytes)
+		isFileSeparator := true
+		for i := 0; i < 20; i++ {
+			if entryData[offset+i] != 0 {
+				isFileSeparator = false
+				break
+			}
+		}
+
+		if !isFileSeparator {
+			return nil, fmt.Errorf("expected file separator at offset %d", offset)
+		}
+
+		// Read metadata length from separator entry
+		metadataLen := binary.BigEndian.Uint16(entryData[offset+22 : offset+24])
+		offset += 24
+
+		if offset+int(metadataLen) > len(entryData) {
+			return nil, fmt.Errorf("metadata extends beyond file")
+		}
+
+		// Parse metadata
+		metadata := entryData[offset : offset+int(metadataLen)]
+
+		// 1. Read null-terminated filename
+		filenameEnd := bytes.IndexByte(metadata, 0)
+		if filenameEnd == -1 {
+			return nil, fmt.Errorf("filename not null-terminated")
+		}
+		filename := string(metadata[:filenameEnd])
+		metadata = metadata[filenameEnd+1:]
+
+		if len(metadata) < 16 {
+			return nil, fmt.Errorf("insufficient metadata")
+		}
+
+		// 2. Read file size (uint64)
+		fileSize := binary.BigEndian.Uint64(metadata[0:8])
+
+		// 3. Read mtime (uint64)
+		mtime := binary.BigEndian.Uint64(metadata[8:16])
+
+		offset += int(metadataLen)
+
+		// Read chunk entries for this file
+		var entries []FidxEntry
+		var computedSize uint64
+
+		for offset < len(entryData) {
+			if offset+24 > len(entryData) {
+				break
+			}
+
+			// Check if next entry is a file separator
+			isNextSeparator := true
+			for i := 0; i < 20; i++ {
+				if entryData[offset+i] != 0 {
+					isNextSeparator = false
+					break
+				}
+			}
+
+			if isNextSeparator {
+				break // Start of next file
+			}
+
+			// Parse chunk entry
+			var ent FidxEntry
+			copy(ent.SHA[:], entryData[offset:offset+20])
+			ent.Size = binary.BigEndian.Uint16(entryData[offset+20 : offset+22])
+			ent.Level = binary.BigEndian.Uint16(entryData[offset+22 : offset+24])
+			entries = append(entries, ent)
+			computedSize += uint64(ent.Size)
+			offset += 24
+		}
+
+		files = append(files, FileEntry{
+			Filename: filename,
+			FileSize: fileSize,
+			Mtime:    mtime,
+			Entries:  entries,
+		})
+	}
+
+	fidx := &Fidx{
+		Filename: path,
+		IsMFIDX:  true,
+		Files:    files,
 	}
 	copy(fidx.FileSHA[:], computedSHA)
 
@@ -282,13 +522,112 @@ func (m *FidxMappings) findMapping(sha [20]byte) *FidxMapping {
 
 // predictDownload calculates how much data needs to be downloaded
 func predictDownload(fidx *Fidx, mappings *FidxMappings) (missing int64, chunks int) {
-	for _, ent := range fidx.Entries {
+	return predictDownloadForEntries(fidx.Entries, mappings)
+}
+
+// predictDownloadForEntries calculates how much data needs to be downloaded for a list of entries
+func predictDownloadForEntries(entries []FidxEntry, mappings *FidxMappings) (missing int64, chunks int) {
+	for _, ent := range entries {
 		if mappings.findMapping(ent.SHA) == nil {
 			missing += int64(ent.Size)
 			chunks++
 		}
 	}
 	return
+}
+
+// reconstructFileFromMFIDX rebuilds a file from an mfidx by combining local and remote chunks
+func reconstructFileFromMFIDX(outputPath string, fidx *Fidx, remoteFilePath string, fileEntry FileEntry, mappings *FidxMappings) error {
+	outf, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	defer outf.Close()
+
+	// Try to open remote file if it exists
+	var remotef *os.File
+	remotef, err = os.Open(remoteFilePath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("opening remote file: %w", err)
+	}
+	if remotef != nil {
+		defer remotef.Close()
+	}
+
+	var remoteOffset int64
+	got := int64(0)
+	missing := int64(0)
+
+	// Calculate total missing for progress
+	for _, ent := range fidx.Entries {
+		if mappings.findMapping(ent.SHA) == nil {
+			missing += int64(ent.Size)
+		}
+	}
+
+	// Process each chunk
+	for _, ent := range fidx.Entries {
+		chunkSize := int64(ent.Size)
+		mapping := mappings.findMapping(ent.SHA)
+
+		if mapping != nil {
+			// We have this chunk locally - read and verify it
+			localData, err := readChunk(mapping.Filename, mapping.Offset, int64(mapping.Size))
+			if err != nil {
+				// Failed to read local chunk, fall back to remote
+				mapping = nil
+			} else {
+				// Verify SHA matches (as git blob)
+				computedSHA := blobSHA(localData)
+				if bytes.Equal(computedSHA[:], ent.SHA[:]) {
+					// Write verified local chunk
+					if _, err := outf.Write(localData); err != nil {
+						return fmt.Errorf("writing local chunk: %w", err)
+					}
+				} else {
+					// Checksum mismatch, fall back to remote
+					fmt.Printf("    checksum mismatch in local file\n")
+					mapping = nil
+				}
+			}
+		}
+
+		if mapping == nil {
+			// Need to fetch from remote
+			if remotef == nil {
+				return fmt.Errorf("remote file not available and chunk not found locally")
+			}
+
+			remoteData, err := readChunk(remoteFilePath, remoteOffset, chunkSize)
+			if err != nil {
+				return fmt.Errorf("reading remote chunk at offset %d: %w", remoteOffset, err)
+			}
+
+			// Verify remote chunk
+			computedSHA := blobSHA(remoteData)
+			if !bytes.Equal(computedSHA[:], ent.SHA[:]) {
+				return fmt.Errorf("remote chunk checksum mismatch at offset %d", remoteOffset)
+			}
+
+			if _, err := outf.Write(remoteData); err != nil {
+				return fmt.Errorf("writing remote chunk: %w", err)
+			}
+
+			got += chunkSize
+			if missing > 0 {
+				pct := (got * 100) / missing
+				fmt.Printf("\r  Downloading... %d%% (%d/%d bytes)", pct, got, missing)
+			}
+		}
+
+		remoteOffset += chunkSize
+	}
+
+	if missing > 0 {
+		fmt.Println() // newline after progress
+	}
+
+	return nil
 }
 
 // reconstructFile rebuilds the output file by combining local and remote chunks
