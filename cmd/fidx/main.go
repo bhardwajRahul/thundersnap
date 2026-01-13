@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/pborman/getopt/v2"
 )
@@ -196,22 +197,32 @@ func chunkFile(filename string, writeEntry func(FidxEntry) error) error {
 	}
 	defer f.Close()
 
+	// Get file size for progress reporting
+	stat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := stat.Size()
+
 	buf := make([]byte, BLOB_READ_SIZE)
 	var leftover []byte
 	totalBytes := int64(0)
+	lastProgress := int64(-1)
 
 	for {
+		// Prepend any leftover data from previous iteration
+		if len(leftover) > 0 {
+			copy(buf, leftover)
+		}
+
 		n, err := f.Read(buf[len(leftover):])
 		if n > 0 {
-			// Prepend any leftover data from previous iteration
 			data := buf[:len(leftover)+n]
-			if len(leftover) > 0 {
-				copy(buf, leftover)
-			}
 
 			// Find chunks in this buffer
 			offset := 0
 			for {
+				remaining := len(data) - offset
 				ofs, bits := findSplitPoint(data[offset:])
 
 				var chunkSize int
@@ -231,6 +242,10 @@ func chunkFile(filename string, writeEntry func(FidxEntry) error) error {
 					if err == io.EOF {
 						// Last chunk - take everything remaining
 						chunkSize = len(data) - offset
+						level = 0
+					} else if remaining >= BLOB_MAX {
+						// Force a split at BLOB_MAX to avoid accumulating too much data
+						chunkSize = BLOB_MAX
 						level = 0
 					} else {
 						// Need more data, save for next iteration
@@ -254,6 +269,15 @@ func chunkFile(filename string, writeEntry func(FidxEntry) error) error {
 
 					totalBytes += int64(chunkSize)
 					offset += chunkSize
+
+					// Print progress every 10MB for large files
+					if fileSize > 10*1024*1024 {
+						progress := (totalBytes * 100) / fileSize
+						if progress/10 != lastProgress/10 {
+							fmt.Printf("    %d%% (%d MB / %d MB)\n", progress, totalBytes/(1024*1024), fileSize/(1024*1024))
+							lastProgress = progress
+						}
+					}
 				}
 
 				if ofs == 0 {
@@ -290,9 +314,142 @@ func chunkFile(filename string, writeEntry func(FidxEntry) error) error {
 	return nil
 }
 
+// processSymlink handles a symlink by indexing its target path as content
+func processSymlink(filename string, outf *os.File, fidxHash io.Writer) error {
+	// Read the symlink target
+	target, err := os.Readlink(filename)
+	if err != nil {
+		return fmt.Errorf("readlink %s: %w", filename, err)
+	}
+
+	// Get symlink metadata
+	stat, err := os.Lstat(filename)
+	if err != nil {
+		return fmt.Errorf("lstat %s: %w", filename, err)
+	}
+
+	// Write file separator entry
+	// For symlinks, size is the length of the target string
+	sep := FileSeparator{
+		Filename: filename,
+		FileSize: uint64(len(target)),
+		Mtime:    uint64(stat.ModTime().Unix()),
+	}
+
+	var sepBuf []byte
+	sepBuf = make([]byte, 0, 1024)
+	sepWriter := &bytesWriter{buf: &sepBuf}
+
+	if _, err := writeFileSeparator(sepWriter, sep); err != nil {
+		return fmt.Errorf("write separator for %s: %w", filename, err)
+	}
+
+	if _, err := outf.Write(sepBuf); err != nil {
+		return err
+	}
+	fidxHash.Write(sepBuf)
+
+	// Write the link target as a single chunk
+	targetBytes := []byte(target)
+	sha := blobSHA(targetBytes)
+
+	entry := FidxEntry{
+		SHA:   sha,
+		Size:  uint16(len(target)),
+		Level: 0,
+	}
+
+	entryData := make([]byte, 24)
+	copy(entryData[0:20], entry.SHA[:])
+	binary.BigEndian.PutUint16(entryData[20:22], entry.Size)
+	binary.BigEndian.PutUint16(entryData[22:24], entry.Level)
+
+	if _, err := outf.Write(entryData); err != nil {
+		return err
+	}
+	fidxHash.Write(entryData)
+
+	return nil
+}
+
+// collectFiles expands directories into file lists, respecting filesystem boundaries
+func collectFiles(paths []string) ([]string, error) {
+	var result []string
+	seen := make(map[string]bool) // Avoid duplicates
+
+	for _, path := range paths {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return nil, fmt.Errorf("lstat %s: %w", path, err)
+		}
+
+		if !info.IsDir() {
+			// Regular file or symlink - add it
+			if !seen[path] {
+				result = append(result, path)
+				seen[path] = true
+			}
+			continue
+		}
+
+		// It's a directory - get its device ID to detect filesystem boundaries
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil, fmt.Errorf("cannot get device ID for %s", path)
+		}
+		rootDev := stat.Dev
+
+		// Walk the directory tree
+		err = filepath.Walk(path, func(walkPath string, walkInfo os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+
+			// Check if we've crossed a filesystem boundary
+			walkStat, ok := walkInfo.Sys().(*syscall.Stat_t)
+			if !ok {
+				return fmt.Errorf("cannot get device ID for %s", walkPath)
+			}
+
+			if walkStat.Dev != rootDev {
+				// Different filesystem - skip this subtree
+				if walkInfo.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+
+			// Skip directories themselves (we only want files and symlinks)
+			if walkInfo.IsDir() {
+				return nil
+			}
+
+			// Add file or symlink
+			if !seen[walkPath] {
+				result = append(result, walkPath)
+				seen[walkPath] = true
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			return nil, fmt.Errorf("walking %s: %w", path, err)
+		}
+	}
+
+	return result, nil
+}
+
 // processMFIDX creates a multi-file FIDX containing all input files
 func processMFIDX(filenames []string, outpath string) error {
-	fmt.Printf("Creating multi-file index: %s\n", outpath)
+	// Expand directories into file lists
+	allFiles, err := collectFiles(filenames)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Creating multi-file index: %s (%d files)\n", outpath, len(allFiles))
 
 	tmppath := outpath + ".tmp"
 	outf, err := os.Create(tmppath)
@@ -317,13 +474,27 @@ func processMFIDX(filenames []string, outpath string) error {
 	fidxHash.Write(header)
 
 	// Process each file
-	for _, filename := range filenames {
+	for _, filename := range allFiles {
 		fmt.Printf("  %s\n", filename)
 
-		// Get file info
-		stat, err := os.Stat(filename)
+		// Get file info (use Lstat to not follow symlinks)
+		stat, err := os.Lstat(filename)
 		if err != nil {
-			return fmt.Errorf("stat %s: %w", filename, err)
+			return fmt.Errorf("lstat %s: %w", filename, err)
+		}
+
+		// Handle symlinks specially - index the link target
+		if stat.Mode()&os.ModeSymlink != 0 {
+			if err := processSymlink(filename, outf, fidxHash); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Skip non-regular files (devices, sockets, pipes, etc.)
+		if !stat.Mode().IsRegular() {
+			fmt.Printf("    skipping non-regular file\n")
+			continue
 		}
 
 		// Write file separator entry
