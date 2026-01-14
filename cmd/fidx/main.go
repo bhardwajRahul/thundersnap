@@ -282,7 +282,9 @@ func chunkFile(filename string, writeEntry func(FidxEntry) error) error {
 					}
 				}
 
-				if ofs == 0 {
+				// If we found a natural split point, continue looking for more
+				// If we didn't find one and didn't force a split, we need more data
+				if ofs == 0 && chunkSize == 0 {
 					break
 				}
 			}
