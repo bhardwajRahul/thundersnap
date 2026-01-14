@@ -13,29 +13,7 @@ import (
 	"syscall"
 
 	"github.com/pborman/getopt/v2"
-)
-
-const (
-	// FIDX_VERSION is the fidx file format version
-	FIDX_VERSION = 1
-
-	// Content-defined chunking parameters (from bupsplit.h)
-	BUP_BLOBBITS   = 13
-	BUP_BLOBSIZE   = 1 << BUP_BLOBBITS // 8192
-	BUP_WINDOWBITS = 7
-	BUP_WINDOWSIZE = 1 << (BUP_WINDOWBITS - 1) // 64
-
-	// BLOB_MAX is the maximum chunk size
-	BLOB_MAX = 8192 * 4 // 32768 bytes
-
-	// BLOB_READ_SIZE is the buffer size for reading
-	BLOB_READ_SIZE = 1024 * 1024
-
-	// ROLLSUM_CHAR_OFFSET is the character offset for rollsum
-	ROLLSUM_CHAR_OFFSET = 31
-
-	// FANOUT_BITS for hierarchical level calculation
-	FANOUT_BITS = 4
+	"github.com/tailscale/thundersnap/bupdate"
 )
 
 var (
@@ -53,269 +31,21 @@ func usage() {
 	os.Exit(1)
 }
 
-// Rollsum implements the rolling checksum used for content-defined chunking
-type Rollsum struct {
-	s1     uint32
-	s2     uint32
-	window [BUP_WINDOWSIZE]byte
-	wofs   int
-}
-
-func (r *Rollsum) init() {
-	r.s1 = BUP_WINDOWSIZE * ROLLSUM_CHAR_OFFSET
-	r.s2 = BUP_WINDOWSIZE * (BUP_WINDOWSIZE - 1) * ROLLSUM_CHAR_OFFSET
-	r.wofs = 0
-	for i := range r.window {
-		r.window[i] = 0
-	}
-}
-
-func (r *Rollsum) add(drop, add byte) {
-	r.s1 += uint32(add) - uint32(drop)
-	r.s2 += r.s1 - (BUP_WINDOWSIZE * (uint32(drop) + ROLLSUM_CHAR_OFFSET))
-}
-
-func (r *Rollsum) roll(ch byte) {
-	r.add(r.window[r.wofs], ch)
-	r.window[r.wofs] = ch
-	r.wofs = (r.wofs + 1) % BUP_WINDOWSIZE
-}
-
-func (r *Rollsum) digest() uint32 {
-	return (r.s1 << 16) | (r.s2 & 0xffff)
-}
-
-// findSplitPoint finds a content-defined split point in the buffer
-// Returns (offset, bits) where offset is the split position (0 if no split found)
-// and bits is the number of matching bits in the rollsum
-func findSplitPoint(buf []byte) (int, int) {
-	var r Rollsum
-	r.init()
-
-	for count := 0; count < len(buf); count++ {
-		r.roll(buf[count])
-		if (r.s2 & (BUP_BLOBSIZE - 1)) == ((^uint32(0)) & (BUP_BLOBSIZE - 1)) {
-			// Found a split point
-			rsum := r.digest()
-			bits := BUP_BLOBBITS
-			rsum >>= BUP_BLOBBITS
-			for (rsum>>1)&1 != 0 {
-				bits++
-				rsum >>= 1
-			}
-			return count + 1, bits
-		}
-	}
-	return 0, 0
-}
-
-// FidxEntry represents a single chunk entry
-type FidxEntry struct {
-	SHA   [20]byte
-	Size  uint16
-	Level uint16
-}
-
-// FileSeparator represents file metadata in MFIDX format
-type FileSeparator struct {
-	Filename string
-	FileSize uint64
-	Mtime    uint64
-}
-
-// blobSHA computes the git blob SHA-1 of data
-func blobSHA(data []byte) [20]byte {
-	h := sha1.New()
-	// Git blob format: "blob <size>\0<data>"
-	fmt.Fprintf(h, "blob %d\x00", len(data))
-	h.Write(data)
-	var result [20]byte
-	copy(result[:], h.Sum(nil))
-	return result
-}
-
-// writeFileSeparator writes a file separator entry followed by file metadata
-// Returns the number of bytes written
-func writeFileSeparator(w io.Writer, sep FileSeparator) (int, error) {
-	// File separator entry: 24 bytes
-	// - 20 bytes of zeros (special marker)
-	// - 2 bytes reserved (0x0000)
-	// - 2 bytes for metadata length following
-	separatorEntry := make([]byte, 24)
-	// All zeros for SHA (already zero-initialized)
-	// Reserved field at offset 20 is already zero
-
-	// Calculate metadata size
-	metadataSize := len(sep.Filename) + 1 + 8 + 8 // null-terminated filename + uint64 size + uint64 mtime
-	// Align to 8-byte boundary
-	paddingSize := (8 - (metadataSize % 8)) % 8
-	totalMetadataSize := metadataSize + paddingSize
-
-	binary.BigEndian.PutUint16(separatorEntry[22:24], uint16(totalMetadataSize))
-
-	if _, err := w.Write(separatorEntry); err != nil {
-		return 24, err
-	}
-
-	// Write file metadata
-	// 1. Null-terminated filename
-	if _, err := w.Write([]byte(sep.Filename)); err != nil {
-		return 24, err
-	}
-	if _, err := w.Write([]byte{0}); err != nil {
-		return 24 + len(sep.Filename), err
-	}
-
-	// 2. File size (uint64, big-endian)
-	sizeBuf := make([]byte, 8)
-	binary.BigEndian.PutUint64(sizeBuf, sep.FileSize)
-	if _, err := w.Write(sizeBuf); err != nil {
-		return 24 + len(sep.Filename) + 1, err
-	}
-
-	// 3. Modification time (uint64, big-endian, Unix timestamp)
-	mtimeBuf := make([]byte, 8)
-	binary.BigEndian.PutUint64(mtimeBuf, sep.Mtime)
-	if _, err := w.Write(mtimeBuf); err != nil {
-		return 24 + len(sep.Filename) + 1 + 8, err
-	}
-
-	// 4. Padding to 8-byte boundary
-	if paddingSize > 0 {
-		padding := make([]byte, paddingSize)
-		if _, err := w.Write(padding); err != nil {
-			return 24 + len(sep.Filename) + 1 + 8 + 8, err
-		}
-	}
-
-	return 24 + totalMetadataSize, nil
-}
-
-// chunkFile splits a file into content-defined chunks and returns the entries
-func chunkFile(filename string, writeEntry func(FidxEntry) error) error {
-	f, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// Get file size for progress reporting
-	stat, err := f.Stat()
-	if err != nil {
-		return err
-	}
+// chunkFile wraps bupdate.ChunkFile with progress reporting
+func chunkFile(filename string, writeEntry func(bupdate.FidxEntry) error) error {
+	stat, _ := os.Stat(filename)
 	fileSize := stat.Size()
-
-	buf := make([]byte, BLOB_READ_SIZE)
-	var leftover []byte
-	totalBytes := int64(0)
-	lastProgress := int64(-1)
-
-	for {
-		// Prepend any leftover data from previous iteration
-		if len(leftover) > 0 {
-			copy(buf, leftover)
-		}
-
-		n, err := f.Read(buf[len(leftover):])
-		if n > 0 {
-			data := buf[:len(leftover)+n]
-
-			// Find chunks in this buffer
-			offset := 0
-			for {
-				remaining := len(data) - offset
-				ofs, bits := findSplitPoint(data[offset:])
-
-				var chunkSize int
-				var level int
-
-				if ofs > 0 {
-					chunkSize = ofs
-					if chunkSize > BLOB_MAX {
-						chunkSize = BLOB_MAX
-						level = 0
-					} else {
-						// Calculate hierarchical level
-						level = (bits - BUP_BLOBBITS) / FANOUT_BITS
-					}
-				} else {
-					// No split point found
-					if err == io.EOF {
-						// Last chunk - take everything remaining
-						chunkSize = len(data) - offset
-						level = 0
-					} else if remaining >= BLOB_MAX {
-						// Force a split at BLOB_MAX to avoid accumulating too much data
-						chunkSize = BLOB_MAX
-						level = 0
-					} else {
-						// Need more data, save for next iteration
-						break
-					}
-				}
-
-				if chunkSize > 0 {
-					chunk := data[offset : offset+chunkSize]
-					sha := blobSHA(chunk)
-
-					entry := FidxEntry{
-						SHA:   sha,
-						Size:  uint16(chunkSize),
-						Level: uint16(level),
-					}
-
-					if err := writeEntry(entry); err != nil {
-						return err
-					}
-
-					totalBytes += int64(chunkSize)
-					offset += chunkSize
-
-					// Print progress every 10MB for large files
-					if fileSize > 10*1024*1024 {
-						progress := (totalBytes * 100) / fileSize
-						if progress/10 != lastProgress/10 {
-							fmt.Printf("    %d%% (%d MB / %d MB)\n", progress, totalBytes/(1024*1024), fileSize/(1024*1024))
-							lastProgress = progress
-						}
-					}
-				}
-
-				// If we found a natural split point, continue looking for more
-				// If we didn't find one and didn't force a split, we need more data
-				if ofs == 0 && chunkSize == 0 {
-					break
-				}
+	var lastProgress int64 = -1
+	
+	return bupdate.ChunkFile(filename, writeEntry, func(totalBytes, fSize int64) {
+		if fileSize > 10*1024*1024 {
+			progress := (totalBytes * 100) / fSize
+			if progress/10 != lastProgress/10 {
+				fmt.Printf("    %d%% (%d MB / %d MB)\n", progress, totalBytes/(1024*1024), fSize/(1024*1024))
+				lastProgress = progress
 			}
-
-			// Save any unprocessed data for next iteration
-			leftover = make([]byte, len(data)-offset)
-			copy(leftover, data[offset:])
 		}
-
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	// Write any final leftover data as the last chunk
-	if len(leftover) > 0 {
-		sha := blobSHA(leftover)
-		entry := FidxEntry{
-			SHA:   sha,
-			Size:  uint16(len(leftover)),
-			Level: 0,
-		}
-		if err := writeEntry(entry); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	})
 }
 
 // processSymlink handles a symlink by indexing its target path as content
@@ -334,7 +64,7 @@ func processSymlink(filename string, outf *os.File, fidxHash io.Writer) error {
 
 	// Write file separator entry
 	// For symlinks, size is the length of the target string
-	sep := FileSeparator{
+	sep := bupdate.FileSeparator{
 		Filename: filename,
 		FileSize: uint64(len(target)),
 		Mtime:    uint64(stat.ModTime().Unix()),
@@ -344,7 +74,7 @@ func processSymlink(filename string, outf *os.File, fidxHash io.Writer) error {
 	sepBuf = make([]byte, 0, 1024)
 	sepWriter := &bytesWriter{buf: &sepBuf}
 
-	if _, err := writeFileSeparator(sepWriter, sep); err != nil {
+	if _, err := bupdate.WriteFileSeparator(sepWriter, sep); err != nil {
 		return fmt.Errorf("write separator for %s: %w", filename, err)
 	}
 
@@ -355,9 +85,9 @@ func processSymlink(filename string, outf *os.File, fidxHash io.Writer) error {
 
 	// Write the link target as a single chunk
 	targetBytes := []byte(target)
-	sha := blobSHA(targetBytes)
+	sha := bupdate.BlobSHA(targetBytes)
 
-	entry := FidxEntry{
+	entry := bupdate.FidxEntry{
 		SHA:   sha,
 		Size:  uint16(len(target)),
 		Level: 0,
@@ -376,7 +106,7 @@ func processSymlink(filename string, outf *os.File, fidxHash io.Writer) error {
 	return nil
 }
 
-// collectFiles expands directories into file lists, respecting filesystem boundaries
+// collectFiles expands directories into file lists
 func collectFiles(paths []string) ([]string, error) {
 	var result []string
 	seen := make(map[string]bool) // Avoid duplicates
@@ -445,7 +175,7 @@ func collectFiles(paths []string) ([]string, error) {
 	return result, nil
 }
 
-// processMFIDX creates a multi-file FIDX containing all input files
+// processMFIDX creates a multi-file FIDX
 func processMFIDX(filenames []string, outpath string) error {
 	// Expand directories into file lists
 	allFiles, err := collectFiles(filenames)
@@ -471,7 +201,7 @@ func processMFIDX(filenames []string, outpath string) error {
 	// Write header
 	header := make([]byte, 8)
 	copy(header[0:4], "FIDX")
-	binary.BigEndian.PutUint32(header[4:8], FIDX_VERSION)
+	binary.BigEndian.PutUint32(header[4:8], bupdate.FIDX_VERSION)
 	if _, err := outf.Write(header); err != nil {
 		return err
 	}
@@ -502,7 +232,7 @@ func processMFIDX(filenames []string, outpath string) error {
 		}
 
 		// Write file separator entry
-		sep := FileSeparator{
+		sep := bupdate.FileSeparator{
 			Filename: filename,
 			FileSize: uint64(stat.Size()),
 			Mtime:    uint64(stat.ModTime().Unix()),
@@ -513,7 +243,7 @@ func processMFIDX(filenames []string, outpath string) error {
 		sepBuf = make([]byte, 0, 1024)
 		sepWriter := &bytesWriter{buf: &sepBuf}
 
-		if _, err := writeFileSeparator(sepWriter, sep); err != nil {
+		if _, err := bupdate.WriteFileSeparator(sepWriter, sep); err != nil {
 			return fmt.Errorf("write separator for %s: %w", filename, err)
 		}
 
@@ -524,7 +254,7 @@ func processMFIDX(filenames []string, outpath string) error {
 		fidxHash.Write(sepBuf)
 
 		// Write chunk entries for this file
-		if err := chunkFile(filename, func(entry FidxEntry) error {
+		if err := chunkFile(filename, func(entry bupdate.FidxEntry) error {
 			entryData := make([]byte, 24)
 			copy(entryData[0:20], entry.SHA[:])
 			binary.BigEndian.PutUint16(entryData[20:22], entry.Size)
@@ -562,13 +292,12 @@ func processMFIDX(filenames []string, outpath string) error {
 type bytesWriter struct {
 	buf *[]byte
 }
-
 func (bw *bytesWriter) Write(p []byte) (n int, err error) {
 	*bw.buf = append(*bw.buf, p...)
 	return len(p), nil
 }
 
-// printFidx reads and prints the contents of a fidx or mfidx file
+// printFidx reads and prints fidx/mfidx contents
 func printFidx(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -585,7 +314,7 @@ func printFidx(path string) error {
 	}
 
 	version := binary.BigEndian.Uint32(data[4:8])
-	if version != FIDX_VERSION {
+	if version != bupdate.FIDX_VERSION {
 		return fmt.Errorf("unsupported version: %d", version)
 	}
 
@@ -659,6 +388,7 @@ func printFidx(path string) error {
 }
 
 // printMFIDX prints the contents of a multi-file index
+
 func printMFIDX(entryData []byte) error {
 	offset := 0
 	fileNum := 0
@@ -760,6 +490,7 @@ func printMFIDX(entryData []byte) error {
 	return nil
 }
 
+
 func main() {
 	getopt.SetUsage(usage)
 	getopt.Parse()
@@ -833,12 +564,13 @@ func main() {
 	}
 }
 
+
 func processFile(filename string) error {
 	fmt.Printf("%s\n", filename)
 
 	if *ascii {
 		// ASCII mode - print to stdout
-		return chunkFile(filename, func(entry FidxEntry) error {
+		return chunkFile(filename, func(entry bupdate.FidxEntry) error {
 			fmt.Printf("%x %d %d\n", entry.SHA[:], entry.Level, entry.Size)
 			return nil
 		})
@@ -870,14 +602,14 @@ func processFile(filename string) error {
 	// Write header
 	header := make([]byte, 8)
 	copy(header[0:4], "FIDX")
-	binary.BigEndian.PutUint32(header[4:8], FIDX_VERSION)
+	binary.BigEndian.PutUint32(header[4:8], bupdate.FIDX_VERSION)
 	if _, err := outf.Write(header); err != nil {
 		return err
 	}
 	fidxHash.Write(header)
 
 	// Write entries
-	if err := chunkFile(filename, func(entry FidxEntry) error {
+	if err := chunkFile(filename, func(entry bupdate.FidxEntry) error {
 		entryData := make([]byte, 24)
 		copy(entryData[0:20], entry.SHA[:])
 		binary.BigEndian.PutUint16(entryData[20:22], entry.Size)
