@@ -191,14 +191,14 @@ func bupdateMFIDX(localDir, remoteDir string, remoteFidx *Fidx, remoteFidxPath, 
 	for _, fileEntry := range remoteFidx.Files {
 		fmt.Printf("\n%s\n", fileEntry.Filename)
 
-		// Use basename for local output, full path for remote lookup
-		baseName := filepath.Base(fileEntry.Filename)
-		outputPath := filepath.Join(localDir, baseName)
+		// Use the filename as stored in mfidx for local output
+		// This preserves directory structure
+		outputPath := filepath.Join(localDir, fileEntry.Filename)
 		tmpOutputPath := outputPath + ".tmp"
 
 		// Ensure parent directory exists
 		if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
-			return fmt.Errorf("creating directory for %s: %w", baseName, err)
+			return fmt.Errorf("creating directory for %s: %w", fileEntry.Filename, err)
 		}
 
 		// Create a temporary Fidx struct for this file
@@ -212,16 +212,29 @@ func bupdateMFIDX(localDir, remoteDir string, remoteFidx *Fidx, remoteFidxPath, 
 		fmt.Printf("  need to download %d/%d bytes in %d chunks.\n",
 			missing, fileEntry.FileSize, chunks)
 
-		// Reconstruct from remote - use basename to avoid double path
-		remoteFilePath := filepath.Join(remoteDir, baseName)
-		if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remoteFilePath, fileEntry, mappings); err != nil {
-			os.Remove(tmpOutputPath)
-			return fmt.Errorf("reconstructing %s: %w", fileEntry.Filename, err)
-		}
+		// Try to find the remote file using the path from mfidx
+		remoteFilePath := filepath.Join(remoteDir, fileEntry.Filename)
 
-		// Atomically rename to final location
-		if err := os.Rename(tmpOutputPath, outputPath); err != nil {
-			return fmt.Errorf("rename %s: %w", fileEntry.Filename, err)
+		// Check if remote is a symlink
+		remoteInfo, err := os.Lstat(remoteFilePath)
+		isSymlink := err == nil && remoteInfo.Mode()&os.ModeSymlink != 0
+
+		if isSymlink {
+			// For symlinks, reconstruct the target string then create symlink
+			if err := reconstructSymlinkFromMFIDX(outputPath, fileFidx, remoteFilePath, fileEntry, mappings); err != nil {
+				return fmt.Errorf("reconstructing symlink %s: %w", fileEntry.Filename, err)
+			}
+		} else {
+			// Regular file
+			if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remoteFilePath, fileEntry, mappings); err != nil {
+				os.Remove(tmpOutputPath)
+				return fmt.Errorf("reconstructing %s: %w", fileEntry.Filename, err)
+			}
+
+			// Atomically rename to final location
+			if err := os.Rename(tmpOutputPath, outputPath); err != nil {
+				return fmt.Errorf("rename %s: %w", fileEntry.Filename, err)
+			}
 		}
 
 		fmt.Printf("  successfully reconstructed: %s\n", outputPath)
@@ -534,6 +547,106 @@ func predictDownloadForEntries(entries []FidxEntry, mappings *FidxMappings) (mis
 		}
 	}
 	return
+}
+
+// reconstructSymlinkFromMFIDX reconstructs a symlink by getting its target string
+func reconstructSymlinkFromMFIDX(outputPath string, fidx *Fidx, remoteFilePath string, fileEntry FileEntry, mappings *FidxMappings) error {
+	// Remove existing file/symlink if it exists
+	os.Remove(outputPath)
+
+	// Try to read the symlink target from remote (may not exist)
+	symlinkTarget, remoteErr := os.Readlink(remoteFilePath)
+	hasRemote := remoteErr == nil
+
+	// Reconstruct the target string from chunks (should be a single chunk)
+	var reconstructedTarget []byte
+	got := int64(0)
+	missing := int64(0)
+
+	// Calculate missing for progress
+	for _, ent := range fidx.Entries {
+		if mappings.findMapping(ent.SHA) == nil {
+			missing += int64(ent.Size)
+		}
+	}
+
+	for _, ent := range fidx.Entries {
+		chunkSize := int64(ent.Size)
+		mapping := mappings.findMapping(ent.SHA)
+
+		var chunkData []byte
+		if mapping != nil {
+			// Check if the local mapping file is a symlink
+			localInfo, err := os.Lstat(mapping.Filename)
+			isLocalSymlink := err == nil && localInfo.Mode()&os.ModeSymlink != 0
+
+			if isLocalSymlink {
+				// For symlinks, read the target directly
+				target, err := os.Readlink(mapping.Filename)
+				if err != nil {
+					mapping = nil
+				} else {
+					chunkData = []byte(target)
+					// Verify SHA
+					computedSHA := blobSHA(chunkData)
+					if !bytes.Equal(computedSHA[:], ent.SHA[:]) {
+						mapping = nil
+					}
+				}
+			} else {
+				// Regular file - read chunk at offset
+				chunkData, err = readChunk(mapping.Filename, mapping.Offset, int64(mapping.Size))
+				if err != nil {
+					mapping = nil
+				} else {
+					// Verify SHA
+					computedSHA := blobSHA(chunkData)
+					if !bytes.Equal(computedSHA[:], ent.SHA[:]) {
+						mapping = nil
+					}
+				}
+			}
+		}
+
+		if mapping == nil {
+			// Need to get from remote
+			if !hasRemote {
+				return fmt.Errorf("remote symlink not available and chunk not found locally")
+			}
+
+			// Use the remote symlink target
+			chunkData = []byte(symlinkTarget)
+			if int64(len(chunkData)) != chunkSize {
+				return fmt.Errorf("symlink target size mismatch: expected %d, got %d", chunkSize, len(chunkData))
+			}
+
+			// Verify SHA
+			computedSHA := blobSHA(chunkData)
+			if !bytes.Equal(computedSHA[:], ent.SHA[:]) {
+				return fmt.Errorf("symlink target checksum mismatch")
+			}
+
+			got += chunkSize
+			if missing > 0 {
+				pct := (got * 100) / missing
+				fmt.Printf("\r  Downloading... %d%% (%d/%d bytes)", pct, got, missing)
+			}
+		}
+
+		reconstructedTarget = append(reconstructedTarget, chunkData...)
+	}
+
+	if missing > 0 {
+		fmt.Println() // newline after progress
+	}
+
+	// Create the symlink with the reconstructed target
+	targetStr := string(reconstructedTarget)
+	if err := os.Symlink(targetStr, outputPath); err != nil {
+		return fmt.Errorf("creating symlink: %w", err)
+	}
+
+	return nil
 }
 
 // reconstructFileFromMFIDX rebuilds a file from an mfidx by combining local and remote chunks
