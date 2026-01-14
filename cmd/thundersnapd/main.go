@@ -5,7 +5,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -24,6 +27,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
 	"github.com/tailscale/thundersnap/thundersnap"
+	gossh "golang.org/x/crypto/ssh"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/tsnet"
 )
@@ -90,13 +94,19 @@ func main() {
 
 	log.Printf("SSH server listening on port 22")
 
+	// Ensure SSH host key exists
+	hostKeyPath := filepath.Join(*stateDir, "ssh_host_ed25519_key")
+	if err := ensureHostKey(hostKeyPath); err != nil {
+		log.Fatalf("Failed to ensure host key: %v", err)
+	}
+
 	// Get the LocalClient to look up peer info
 	lc, err := srv.LocalClient()
 	if err != nil {
 		log.Fatalf("Failed to get LocalClient: %v", err)
 	}
 
-	// Create SSH server with gliderlabs/ssh
+	// Create SSH server with gliderlabs/ssh and persistent host key
 	sshServer := &ssh.Server{
 		Handler: func(s ssh.Session) {
 			log.Printf("New SSH session from %s (user: %s)", s.RemoteAddr(), s.User())
@@ -136,12 +146,62 @@ func main() {
 		// performs no client authentication.
 	}
 
+	// Load the persistent host key
+	if err := ssh.HostKeyFile(hostKeyPath)(sshServer); err != nil {
+		log.Fatalf("Failed to load host key: %v", err)
+	}
+
 	log.Printf("Waiting for SSH connections...")
 
 	// Serve SSH connections
 	if err := sshServer.Serve(ln); err != nil {
 		log.Fatalf("SSH server error: %v", err)
 	}
+}
+
+// ensureHostKey ensures an SSH host key exists at the given path.
+// If the file doesn't exist, generates a new ED25519 key pair and saves it.
+func ensureHostKey(keyPath string) error {
+	// Check if key already exists
+	if _, err := os.Stat(keyPath); err == nil {
+		log.Printf("Using existing SSH host key: %s", keyPath)
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("checking host key: %w", err)
+	}
+
+	// Generate new ED25519 key pair
+	log.Printf("Generating new SSH host key: %s", keyPath)
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generating ED25519 key: %w", err)
+	}
+
+	// Marshal the private key to OpenSSH PEM format
+	pemBlock, err := gossh.MarshalPrivateKey(privateKey, "")
+	if err != nil {
+		return fmt.Errorf("marshaling private key: %w", err)
+	}
+
+	// Write key file with restricted permissions
+	keyFile, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("creating host key file: %w", err)
+	}
+	defer keyFile.Close()
+
+	if err := pem.Encode(keyFile, pemBlock); err != nil {
+		return fmt.Errorf("writing host key: %w", err)
+	}
+
+	// Create signer to get fingerprint for logging
+	sshPrivateKey, err := gossh.NewSignerFromKey(privateKey)
+	if err != nil {
+		return fmt.Errorf("creating SSH signer: %w", err)
+	}
+
+	log.Printf("SSH host key generated successfully (fingerprint: %s)", gossh.FingerprintSHA256(sshPrivateKey.PublicKey()))
+	return nil
 }
 
 // getTailscaleUser looks up the Tailscale identity for the given remote address.
