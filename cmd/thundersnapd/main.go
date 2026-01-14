@@ -107,6 +107,7 @@ func main() {
 	}
 
 	// Create SSH server with gliderlabs/ssh and persistent host key
+	forwardHandler := &ssh.ForwardedTCPHandler{}
 	sshServer := &ssh.Server{
 		Handler: func(s ssh.Session) {
 			log.Printf("New SSH session from %s (user: %s)", s.RemoteAddr(), s.User())
@@ -144,6 +145,20 @@ func main() {
 		// No authentication required - Tailscale already authenticated the connection.
 		// When both PasswordHandler and PublicKeyHandler are nil, gliderlabs/ssh
 		// performs no client authentication.
+
+		// Enable port forwarding
+		LocalPortForwardingCallback: ssh.LocalPortForwardingCallback(func(ctx ssh.Context, dhost string, dport uint32) bool {
+			log.Printf("Accepted local forward to %s:%d", dhost, dport)
+			return true
+		}),
+		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
+			log.Printf("Accepted reverse forward on %s:%d", host, port)
+			return true
+		}),
+		RequestHandlers: map[string]ssh.RequestHandler{
+			"tcpip-forward":        forwardHandler.HandleSSHRequest,
+			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
+		},
 	}
 
 	// Load the persistent host key
@@ -317,11 +332,23 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser string, logErr fu
 	defer ctrlServer.Close()
 	log.Printf("Control socket created successfully")
 
-	// Start an interactive shell
+	// Check if a command was requested
 	ptyReq, winCh, isPty := s.Pty()
+	cmdArgs := s.Command()
 
-	// Launch shell with proc mount - the shell script mounts /proc then execs sh
-	cmd := exec.Command("/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec /bin/sh")
+	// Prepare the command to execute
+	var cmd *exec.Cmd
+	if len(cmdArgs) > 0 {
+		// Execute the requested command
+		// Mount /proc first, then exec the requested command with proper escaping
+		// Build the command by passing each arg as a separate string to sh -c with "$@"
+		fullArgs := append([]string{"/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec \"$@\"", "--"}, cmdArgs...)
+		cmd = exec.Command(fullArgs[0], fullArgs[1:]...)
+	} else {
+		// Launch interactive shell with proc mount
+		cmd = exec.Command("/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec /bin/sh")
+	}
+
 	cmd.Dir = "/" + homeDir
 	cmd.Env = []string{
 		"HOME=/" + homeDir,
@@ -368,13 +395,35 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser string, logErr fu
 	} else {
 		// No PTY requested, run without one
 		defer cleanup()
-		cmd.Stdin = s
+
+		// Set up pipes for stdin/stdout/stderr
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return fmt.Errorf("create stdin pipe: %w", err)
+		}
 		cmd.Stdout = s
 		cmd.Stderr = s.Stderr()
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("run shell: %w", err)
+
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("start command: %w", err)
 		}
-		s.Exit(cmd.ProcessState.ExitCode())
+
+		// Copy stdin from SSH session to command in background
+		go func() {
+			io.Copy(stdin, s)
+			stdin.Close()
+		}()
+
+		// Wait for the command to complete
+		if err := cmd.Wait(); err != nil {
+			// Check if it's just a non-zero exit code
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				s.Exit(exitErr.ExitCode())
+				return nil
+			}
+			return fmt.Errorf("run command: %w", err)
+		}
+		s.Exit(0)
 	}
 	return nil
 }
