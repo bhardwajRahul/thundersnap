@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/creack/pty"
@@ -457,33 +458,103 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(strin
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("/ping", handlePing)
 
-	// Start the VM - use PTY because SSH sessions don't provide a real TTY
-	session, err := thundersnap.StartVM(thundersnap.VMConfig{
+	// Start the VM in headless mode (console goes to logs, not SSH)
+	vmSession, err := thundersnap.StartVM(thundersnap.VMConfig{
 		RootFS:         rootFS,
 		VMDir:          *flagVmDir,
-		Stdin:          s,
-		Stdout:         s,
-		UsePTY:         true,
 		ControlHandler: controlMux,
 	})
 	if err != nil {
 		return fmt.Errorf("start VM: %w", err)
 	}
 
-	// Print the vsock socket path so users can connect via vsh
-	fmt.Fprintf(s, "* vsh socket: %s\r\n", session.VshSocketPath())
+	// Connect to vshd in the VM via vsock
+	conn, err := connectToVshd(vmSession.VshSocketPath())
+	if err != nil {
+		vmSession.Close()
+		return fmt.Errorf("connect to vshd: %w", err)
+	}
+	defer conn.Close()
 
-	// Wait for either the VM to exit or the SSH session to close (stdin EOF)
+	// Proxy the SSH session to vshd
+	done := make(chan struct{})
+
+	// SSH stdin -> vshd
+	go func() {
+		io.Copy(conn, s)
+		// When SSH session closes, close our write side to vshd
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+	}()
+
+	// vshd -> SSH stdout
+	go func() {
+		io.Copy(s, conn)
+		close(done)
+	}()
+
+	// Wait for either the vshd connection to close or the VM to exit
 	select {
-	case <-session.Done():
-		log.Printf("VM exited on its own")
-	case <-session.StdinClosed():
-		log.Printf("SSH session closed, terminating VM")
-		session.Close()
+	case <-done:
+		log.Printf("vshd connection closed")
+	case <-vmSession.Done():
+		log.Printf("VM exited")
 	}
 
+	// Clean up
+	vmSession.Close()
 	s.Exit(0)
 	return nil
+}
+
+// connectToVshd connects to vshd in a VM via the vsock socket.
+// It performs the cloud-hypervisor vsock CONNECT handshake and retries
+// until vshd is ready (up to 10 seconds).
+func connectToVshd(vsockPath string) (net.Conn, error) {
+	var lastErr error
+
+	// Retry the full connection + handshake for up to 10 seconds while vshd starts up
+	for i := 0; i < 100; i++ {
+		conn, err := tryConnectToVshd(vsockPath)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return nil, lastErr
+}
+
+// tryConnectToVshd attempts a single connection to vshd.
+func tryConnectToVshd(vsockPath string) (net.Conn, error) {
+	conn, err := net.Dial("unix", vsockPath)
+	if err != nil {
+		return nil, fmt.Errorf("dial vsock: %w", err)
+	}
+
+	// Cloud Hypervisor vsock protocol: send "CONNECT <port>\n"
+	_, err = fmt.Fprintf(conn, "CONNECT %d\n", thundersnap.VshPort)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("send CONNECT: %w", err)
+	}
+
+	// Read response - should be "OK <port>\n"
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("read handshake response: %w", err)
+	}
+	response := strings.TrimSpace(string(buf[:n]))
+	if !strings.HasPrefix(response, "OK") {
+		conn.Close()
+		return nil, fmt.Errorf("vsock handshake failed: %s", response)
+	}
+
+	return conn, nil
 }
 
 // ensureRootFS ensures the root filesystem exists at the given path.

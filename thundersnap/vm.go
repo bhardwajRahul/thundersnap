@@ -23,13 +23,6 @@ type VMConfig struct {
 	RootFS string
 	// VMDir is the path to the directory containing cloud-hypervisor and vmlinux.
 	VMDir string
-	// Stdin is the input stream for the VM console.
-	Stdin io.Reader
-	// Stdout is the output stream for the VM console.
-	Stdout io.Writer
-	// UsePTY indicates whether to allocate a PTY for cloud-hypervisor.
-	// This is needed when Stdin is not a real TTY (e.g., SSH sessions).
-	UsePTY bool
 	// ControlHandler is the HTTP handler for serving the control socket protocol
 	// over vsock. If nil, no vsock control socket is set up.
 	ControlHandler http.Handler
@@ -46,12 +39,9 @@ type VMSession struct {
 	virtiofsdCmd   *exec.Cmd
 	chvCmd         *exec.Cmd
 	virtiofsSock   string
-	vsockSock      string         // cloud-hypervisor vsock unix socket path
-	vsockListener  net.Listener   // listener for control vsock connections (guest-to-host)
-	pty            *os.File       // only set if UsePTY is true
-	stdinPipe      io.WriteCloser // only set if UsePTY is false
+	vsockSock      string       // cloud-hypervisor vsock unix socket path
+	vsockListener  net.Listener // listener for control vsock connections (guest-to-host)
 	done           chan struct{}
-	stdinClosed    chan struct{}
 	controlHandler http.Handler
 }
 
@@ -94,13 +84,12 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	kernelPath := filepath.Join(cfg.VMDir, "vmlinux")
 
 	// Build kernel command line
-	// We wrap the shell in a tiny script that powers off the VM when the shell exits.
-	// This avoids the kernel panic from init exiting, and cloud-hypervisor exits
-	// cleanly on ACPI shutdown. We use busybox poweroff -f which doesn't need /proc.
-	// The ts command inside the VM detects vsock via /dev/vsock and connects directly.
-	// We also start vshd in the background to accept shell connections over vsock.
+	// The VM runs vshd in the foreground as init. When vshd exits (or is killed),
+	// we power off the VM cleanly using busybox poweroff.
 	// We must mount devpts for PTY support (required by vshd).
-	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; /sbin/vshd & /bin/sh; /bin/busybox poweroff -f"`
+	// The ts command inside the VM detects vsock via /dev/vsock and connects directly.
+	// We echo status messages to help debug boot issues.
+	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "echo 'init: mounting devpts'; mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; echo 'init: starting vshd'; /sbin/vshd; echo 'init: vshd exited, powering off'; /bin/busybox poweroff -f"`
 
 	// Start cloud-hypervisor
 	// --pvpanic enables the pvpanic device which allows the guest to signal panic to the host
@@ -127,77 +116,35 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		virtiofsSock:   virtiofsSock,
 		vsockSock:      vsockSock,
 		done:           make(chan struct{}),
-		stdinClosed:    make(chan struct{}),
 		controlHandler: cfg.ControlHandler,
 	}
 
-	if cfg.UsePTY {
-		// Use PTY for cloud-hypervisor - needed when stdin is not a real TTY
-		// (e.g., SSH sessions) because cloud-hypervisor's --serial tty expects one
-		ptmx, err := pty.Start(chvCmd)
-		if err != nil {
-			virtiofsdCmd.Process.Kill()
-			virtiofsdCmd.Wait()
-			os.Remove(virtiofsSock)
-			return nil, fmt.Errorf("start cloud-hypervisor with pty: %w", err)
-		}
-		session.pty = ptmx
-		log.Printf("cloud-hypervisor started with PID %d (using PTY)", chvCmd.Process.Pid)
-
-		// Monitor cloud-hypervisor in background
-		go func() {
-			chvCmd.Wait()
-			log.Printf("cloud-hypervisor exited")
-			close(session.done)
-		}()
-
-		// Copy stdout from PTY to cfg.Stdout
-		go func() {
-			io.Copy(cfg.Stdout, ptmx)
-		}()
-
-		// Copy stdin from cfg.Stdin to PTY and detect when it closes
-		go func() {
-			io.Copy(ptmx, cfg.Stdin)
-			log.Printf("stdin closed")
-			close(session.stdinClosed)
-		}()
-	} else {
-		// Direct pipe mode - works when stdin is already a TTY
-		stdinPipe, err := chvCmd.StdinPipe()
-		if err != nil {
-			virtiofsdCmd.Process.Kill()
-			virtiofsdCmd.Wait()
-			os.Remove(virtiofsSock)
-			return nil, fmt.Errorf("create stdin pipe: %w", err)
-		}
-		session.stdinPipe = stdinPipe
-
-		chvCmd.Stdout = cfg.Stdout
-		chvCmd.Stderr = os.Stderr
-
-		if err := chvCmd.Start(); err != nil {
-			virtiofsdCmd.Process.Kill()
-			virtiofsdCmd.Wait()
-			os.Remove(virtiofsSock)
-			return nil, fmt.Errorf("start cloud-hypervisor: %w", err)
-		}
-		log.Printf("cloud-hypervisor started with PID %d", chvCmd.Process.Pid)
-
-		// Monitor cloud-hypervisor in background
-		go func() {
-			chvCmd.Wait()
-			log.Printf("cloud-hypervisor exited")
-			close(session.done)
-		}()
-
-		// Copy stdin to cloud-hypervisor and detect when it closes
-		go func() {
-			io.Copy(stdinPipe, cfg.Stdin)
-			log.Printf("stdin closed")
-			close(session.stdinClosed)
-		}()
+	// Run cloud-hypervisor in headless mode with a PTY (required for --serial tty)
+	// Console output goes to our log system via a goroutine
+	ptmx, err := pty.Start(chvCmd)
+	if err != nil {
+		virtiofsdCmd.Process.Kill()
+		virtiofsdCmd.Wait()
+		os.Remove(virtiofsSock)
+		return nil, fmt.Errorf("start cloud-hypervisor with pty: %w", err)
 	}
+	log.Printf("cloud-hypervisor started with PID %d", chvCmd.Process.Pid)
+
+	// Monitor cloud-hypervisor in background
+	go func() {
+		chvCmd.Wait()
+		ptmx.Close()
+		log.Printf("cloud-hypervisor exited")
+		close(session.done)
+	}()
+
+	// Log console output from VM (prefix each line with "vm:")
+	go func() {
+		scanner := bufio.NewScanner(ptmx)
+		for scanner.Scan() {
+			log.Printf("vm: %s", scanner.Text())
+		}
+	}()
 
 	// Start vsock listener if we have a control handler
 	// Cloud-hypervisor's vsock uses a naming convention: when guest connects to
@@ -232,19 +179,9 @@ func (s *VMSession) Done() <-chan struct{} {
 	return s.done
 }
 
-// StdinClosed returns a channel that is closed when stdin reaches EOF.
-func (s *VMSession) StdinClosed() <-chan struct{} {
-	return s.stdinClosed
-}
-
 // Close terminates the VM session and cleans up resources.
 func (s *VMSession) Close() error {
 	log.Printf("Closing VM session, killing cloud-hypervisor PID %d", s.chvCmd.Process.Pid)
-
-	// Close PTY if we have one (this will help unblock io.Copy goroutines)
-	if s.pty != nil {
-		s.pty.Close()
-	}
 
 	// Kill cloud-hypervisor
 	if err := s.chvCmd.Process.Kill(); err != nil {
