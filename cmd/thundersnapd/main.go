@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -37,6 +38,7 @@ import (
 var (
 	flagFsDir *string
 	flagVmDir *string
+	flagMesh  *bool
 )
 
 // vmSessionManager tracks running VM sessions and allows multiple clients to share them.
@@ -145,6 +147,7 @@ func main() {
 	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
 	flagFsDir = flag.String("fs-dir", "", "Directory to store per-user filesystems (required)")
 	flagVmDir = flag.String("vm-dir", "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
+	flagMesh = flag.Bool("mesh", false, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
 	flag.Parse()
 
 	if *flagFsDir == "" {
@@ -267,6 +270,52 @@ func main() {
 	// Load the persistent host key
 	if err := ssh.HostKeyFile(hostKeyPath)(sshServer); err != nil {
 		log.Fatalf("Failed to load host key: %v", err)
+	}
+
+	// Start HTTP server on port 7575 for mesh discovery and bupdate
+	httpLn, err := srv.Listen("tcp", ":7575")
+	if err != nil {
+		log.Fatalf("Failed to listen on :7575: %v", err)
+	}
+	defer httpLn.Close()
+
+	// Get our own FQDN for mesh pings
+	status, err = srv.Up(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to get status: %v", err)
+	}
+	myFQDN := ""
+	if status.Self != nil && status.Self.DNSName != "" {
+		myFQDN = strings.TrimSuffix(status.Self.DNSName, ".")
+	}
+
+	meshState := newMeshState(myFQDN)
+	httpMux := http.NewServeMux()
+
+	// Mesh discovery endpoint
+	httpMux.HandleFunc("/ts/ping", meshState.handleTsPing)
+
+	// List of known servers (JSON)
+	httpMux.HandleFunc("/ts/servers.json", meshState.handleServersJSON)
+
+	// Web UI showing connected hosts
+	httpMux.HandleFunc("/", meshState.handleIndex)
+
+	// File server for bupdate (serves -fs-dir contents)
+	bupdateServer := &bupdateFileServer{root: *flagFsDir}
+	httpMux.Handle("/bupdate/", http.StripPrefix("/bupdate", bupdateServer))
+
+	httpServer := &http.Server{Handler: httpMux}
+	go func() {
+		log.Printf("HTTP server listening on port 7575")
+		if err := httpServer.Serve(httpLn); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Start mesh ping loop if enabled
+	if *flagMesh {
+		go meshState.pingLoop(context.Background(), srv, lc)
 	}
 
 	log.Printf("Waiting for SSH connections...")
@@ -972,4 +1021,443 @@ func handlePing(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// meshPort is the HTTP port for mesh discovery (TSTS in leetspeak = 7575)
+const meshPort = 7575
+
+// MeshPing is the JSON format for /ts/ping requests and responses
+type MeshPing struct {
+	URL      string `json:"url"`      // Full URL including tsnet FQDN, e.g., "http://host.xxx.ts.net:7575"
+	Hostname string `json:"hostname"` // Just the hostname part
+}
+
+// meshPeer tracks a peer that has successfully pinged or been pinged
+type meshPeer struct {
+	URL      string    `json:"url"`
+	Hostname string    `json:"hostname"`
+	LastSeen time.Time `json:"last_seen"`
+}
+
+// meshState tracks mesh discovery state
+type meshState struct {
+	mu      sync.Mutex
+	myURL   string
+	myFQDN  string
+	peers   map[string]*meshPeer // keyed by hostname
+}
+
+func newMeshState(myFQDN string) *meshState {
+	myURL := ""
+	if myFQDN != "" {
+		myURL = fmt.Sprintf("http://%s:%d", myFQDN, meshPort)
+	}
+	return &meshState{
+		myURL:  myURL,
+		myFQDN: myFQDN,
+		peers:  make(map[string]*meshPeer),
+	}
+}
+
+// recordPeer records or updates a peer that has been seen
+func (m *meshState) recordPeer(ping MeshPing) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.peers[ping.Hostname] = &meshPeer{
+		URL:      ping.URL,
+		Hostname: ping.Hostname,
+		LastSeen: time.Now(),
+	}
+}
+
+// getPeers returns a list of all known peers
+func (m *meshState) getPeers() []meshPeer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	result := make([]meshPeer, 0, len(m.peers))
+	for _, p := range m.peers {
+		result = append(result, *p)
+	}
+	return result
+}
+
+// handleTsPing handles POST /ts/ping - receive a ping from another node
+func (m *meshState) handleTsPing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var ping MeshPing
+	if err := json.NewDecoder(r.Body).Decode(&ping); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if ping.URL == "" || ping.Hostname == "" {
+		http.Error(w, "url and hostname required", http.StatusBadRequest)
+		return
+	}
+
+	// Record this peer
+	m.recordPeer(ping)
+	log.Printf("Mesh ping received from %s (%s)", ping.Hostname, ping.URL)
+
+	// Respond with our own info
+	resp := MeshPing{
+		URL:      m.myURL,
+		Hostname: m.myFQDN,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleServersJSON handles GET /ts/servers.json - list known peers
+func (m *meshState) handleServersJSON(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	peers := m.getPeers()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(peers)
+}
+
+// handleIndex handles GET / - show web UI
+func (m *meshState) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	peers := m.getPeers()
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head>
+<title>Thundersnap Mesh</title>
+<style>
+body { font-family: sans-serif; margin: 2em; }
+table { border-collapse: collapse; }
+th, td { border: 1px solid #ccc; padding: 0.5em 1em; text-align: left; }
+th { background: #f0f0f0; }
+.stale { color: #999; }
+</style>
+</head>
+<body>
+<h1>Thundersnap Mesh</h1>
+<p>My URL: <code>%s</code></p>
+<h2>Known Peers (%d)</h2>
+`, m.myURL, len(peers))
+
+	if len(peers) == 0 {
+		fmt.Fprintf(w, "<p>No peers discovered yet.</p>")
+	} else {
+		fmt.Fprintf(w, `<table>
+<tr><th>Hostname</th><th>URL</th><th>Last Seen</th></tr>
+`)
+		for _, p := range peers {
+			age := time.Since(p.LastSeen)
+			class := ""
+			if age > 2*time.Minute {
+				class = ` class="stale"`
+			}
+			fmt.Fprintf(w, `<tr%s><td>%s</td><td><a href="%s">%s</a></td><td>%s ago</td></tr>
+`, class, p.Hostname, p.URL, p.URL, age.Round(time.Second))
+		}
+		fmt.Fprintf(w, "</table>\n")
+	}
+
+	fmt.Fprintf(w, `<p><a href="/ts/servers.json">JSON API</a></p>
+</body>
+</html>
+`)
+}
+
+// pingLoop runs the mesh discovery loop
+func (m *meshState) pingLoop(ctx context.Context, srv *tsnet.Server, lc *tailscale.LocalClient) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// Run immediately, then on ticker
+	m.pingAllPeers(ctx, lc)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.pingAllPeers(ctx, lc)
+		}
+	}
+}
+
+// pingAllPeers discovers all Tailscale nodes and pings them
+func (m *meshState) pingAllPeers(ctx context.Context, lc *tailscale.LocalClient) {
+	status, err := lc.Status(ctx)
+	if err != nil {
+		log.Printf("Mesh: failed to get tailscale status: %v", err)
+		return
+	}
+
+	// Build our ping message
+	ping := MeshPing{
+		URL:      m.myURL,
+		Hostname: m.myFQDN,
+	}
+	pingBody, _ := json.Marshal(ping)
+
+	// Ping all peers
+	for _, peer := range status.Peer {
+		if peer.DNSName == "" {
+			continue
+		}
+		// Skip ourselves
+		fqdn := strings.TrimSuffix(peer.DNSName, ".")
+		if fqdn == m.myFQDN {
+			continue
+		}
+
+		go m.pingPeer(ctx, fqdn, pingBody)
+	}
+}
+
+// pingPeer sends a ping to a single peer
+func (m *meshState) pingPeer(ctx context.Context, fqdn string, pingBody []byte) {
+	url := fmt.Sprintf("http://%s:%d/ts/ping", fqdn, meshPort)
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(pingBody))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		// Peer might not be running thundersnapd, that's fine
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	var peerPing MeshPing
+	if err := json.NewDecoder(resp.Body).Decode(&peerPing); err != nil {
+		return
+	}
+
+	if peerPing.URL != "" && peerPing.Hostname != "" {
+		m.recordPeer(peerPing)
+		log.Printf("Mesh ping successful: %s", peerPing.Hostname)
+	}
+}
+
+// bupdateFileServer serves files from -fs-dir with range request support
+type bupdateFileServer struct {
+	root string
+}
+
+func (fs *bupdateFileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Clean the path to prevent directory traversal
+	cleanPath := filepath.Clean(r.URL.Path)
+	if strings.HasPrefix(cleanPath, "..") {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	fullPath := filepath.Join(fs.root, cleanPath)
+
+	// Ensure the path is within root
+	if !strings.HasPrefix(fullPath, fs.root) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	// Use Lstat to check file type without following symlinks
+	stat, err := os.Lstat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "error stating file", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	mode := stat.Mode()
+
+	// Only allow regular files and symlinks
+	if !mode.IsRegular() && mode&os.ModeSymlink == 0 {
+		http.Error(w, "not a regular file or symlink", http.StatusForbidden)
+		return
+	}
+
+	// Handle symlinks: return the readlink() result as content
+	if mode&os.ModeSymlink != 0 {
+		target, err := os.Readlink(fullPath)
+		if err != nil {
+			http.Error(w, "error reading symlink", http.StatusInternalServerError)
+			return
+		}
+
+		content := []byte(target)
+		fileSize := int64(len(content))
+
+		rangeHeader := r.Header.Get("Range")
+		if rangeHeader == "" {
+			w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			w.Write(content)
+			return
+		}
+
+		// Handle range request for symlink content
+		start, end, err := parseRangeHeader(rangeHeader, fileSize)
+		if err != nil {
+			http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		contentLength := end - start + 1
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileSize))
+		w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(content[start : end+1])
+		return
+	}
+
+	// Regular file: open with O_NOFOLLOW and O_NONBLOCK
+	fd, err := syscall.Open(fullPath, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if err == syscall.ELOOP {
+			http.Error(w, "unexpected symlink", http.StatusForbidden)
+		} else if err == syscall.ENOENT {
+			http.Error(w, "not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "error opening file", http.StatusInternalServerError)
+		}
+		return
+	}
+	f := os.NewFile(uintptr(fd), fullPath)
+	defer f.Close()
+
+	fileSize := stat.Size()
+
+	// Check for Range header
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader == "" {
+		// No range request - serve entire file
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusOK)
+		io.Copy(w, f)
+		return
+	}
+
+	// Parse Range header
+	start, end, err := parseRangeHeader(rangeHeader, fileSize)
+	if err != nil {
+		http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+
+	// Seek to start position
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		http.Error(w, "seek error", http.StatusInternalServerError)
+		return
+	}
+
+	// Calculate content length
+	contentLength := end - start + 1
+
+	// Set headers for partial content
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileSize))
+	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.WriteHeader(http.StatusPartialContent)
+
+	// Copy the requested range
+	io.CopyN(w, f, contentLength)
+}
+
+// parseRangeHeader parses a Range header like "bytes=0-99" and returns start and end positions.
+func parseRangeHeader(header string, fileSize int64) (start, end int64, err error) {
+	// Must start with "bytes="
+	if !strings.HasPrefix(header, "bytes=") {
+		return 0, 0, fmt.Errorf("invalid range prefix")
+	}
+
+	rangeSpec := strings.TrimPrefix(header, "bytes=")
+
+	// Split on comma for multiple ranges (we only support single range)
+	ranges := strings.Split(rangeSpec, ",")
+	if len(ranges) != 1 {
+		return 0, 0, fmt.Errorf("multiple ranges not supported")
+	}
+
+	// Parse the range
+	parts := strings.Split(strings.TrimSpace(ranges[0]), "-")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid range format")
+	}
+
+	startStr := strings.TrimSpace(parts[0])
+	endStr := strings.TrimSpace(parts[1])
+
+	if startStr == "" {
+		// Suffix range: -500 means last 500 bytes
+		if endStr == "" {
+			return 0, 0, fmt.Errorf("invalid range: empty")
+		}
+		suffixLen, err := strconv.ParseInt(endStr, 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid suffix length")
+		}
+		start = fileSize - suffixLen
+		if start < 0 {
+			start = 0
+		}
+		end = fileSize - 1
+	} else {
+		// Regular range: start-end
+		start, err = strconv.ParseInt(startStr, 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid start")
+		}
+
+		if endStr == "" {
+			// Open-ended range: start-
+			end = fileSize - 1
+		} else {
+			end, err = strconv.ParseInt(endStr, 10, 64)
+			if err != nil {
+				return 0, 0, fmt.Errorf("invalid end")
+			}
+		}
+	}
+
+	// Validate range
+	if start < 0 || start >= fileSize {
+		return 0, 0, fmt.Errorf("start out of range")
+	}
+	if end >= fileSize {
+		end = fileSize - 1
+	}
+	if start > end {
+		return 0, 0, fmt.Errorf("start > end")
+	}
+
+	return start, end, nil
 }
