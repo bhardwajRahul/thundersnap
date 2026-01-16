@@ -19,6 +19,7 @@ import (
 var (
 	outdir  = getopt.StringLong("outdir", 'd', "", "directory to write output (.fidx) files")
 	outfile = getopt.StringLong("outfile", 'o', "", "filename to write fidx/mfidx data")
+	refFile = getopt.StringLong("ref", 'r', "", "reference mfidx file to copy entries from for unchanged files")
 	mfidx   = getopt.BoolLong("mfidx", 'm', "multi-file fidx: write all files into a single .mfidx file (use with -o)")
 	ascii   = getopt.BoolLong("ascii", 'A', "write the index in human-readable ascii format to stdout")
 	print   = getopt.BoolLong("print", 'p', "print contents of existing fidx/mfidx file, record by record")
@@ -176,7 +177,7 @@ func collectFiles(paths []string) ([]string, error) {
 }
 
 // processMFIDX creates a multi-file FIDX
-func processMFIDX(filenames []string, outpath string) error {
+func processMFIDX(filenames []string, outpath string, refMap map[string]*refFileInfo) error {
 	// Expand directories into file lists
 	allFiles, err := collectFiles(filenames)
 	if err != nil {
@@ -207,15 +208,34 @@ func processMFIDX(filenames []string, outpath string) error {
 	}
 	fidxHash.Write(header)
 
+	// Track stats for reference hits
+	var reusedFiles, indexedFiles int
+
 	// Process each file
 	for _, filename := range allFiles {
-		fmt.Printf("  %s\n", filename)
-
 		// Get file info (use Lstat to not follow symlinks)
 		stat, err := os.Lstat(filename)
 		if err != nil {
 			return fmt.Errorf("lstat %s: %w", filename, err)
 		}
+
+		// Check if we can reuse entries from reference mfidx
+		if refMap != nil {
+			if ref, ok := refMap[filename]; ok {
+				if fileMatches(filename, ref) {
+					// File is unchanged - copy entries from reference
+					fmt.Printf("  %s (unchanged)\n", filename)
+					if err := writeRefEntries(outf, fidxHash, filename, stat, ref); err != nil {
+						return err
+					}
+					reusedFiles++
+					continue
+				}
+			}
+		}
+
+		fmt.Printf("  %s\n", filename)
+		indexedFiles++
 
 		// Handle symlinks specially - index the link target
 		if stat.Mode()&os.ModeSymlink != 0 {
@@ -284,7 +304,44 @@ func processMFIDX(filenames []string, outpath string) error {
 		return err
 	}
 
-	fmt.Printf("Wrote %s\n", outpath)
+	fmt.Printf("Wrote %s (%d indexed, %d reused from ref)\n", outpath, indexedFiles, reusedFiles)
+	return nil
+}
+
+// writeRefEntries writes file separator and chunk entries from a reference mfidx
+func writeRefEntries(outf *os.File, fidxHash io.Writer, filename string, stat os.FileInfo, ref *refFileInfo) error {
+	// Write file separator entry (using current file's metadata)
+	sep := bupdate.FileSeparator{
+		Filename: filename,
+		FileSize: ref.entry.FileSize,
+		Mtime:    ref.entry.Mtime,
+	}
+
+	var sepBuf []byte
+	sepBuf = make([]byte, 0, 1024)
+	sepWriter := &bytesWriter{buf: &sepBuf}
+
+	if _, err := bupdate.WriteFileSeparator(sepWriter, sep); err != nil {
+		return fmt.Errorf("write separator for %s: %w", filename, err)
+	}
+
+	if _, err := outf.Write(sepBuf); err != nil {
+		return err
+	}
+	fidxHash.Write(sepBuf)
+
+	// Write chunk entries copied from reference
+	for _, entry := range ref.entry.Entries {
+		entryData := make([]byte, 24)
+		copy(entryData[0:20], entry.SHA[:])
+		binary.BigEndian.PutUint16(entryData[20:22], entry.Size)
+		binary.BigEndian.PutUint16(entryData[22:24], entry.Level)
+		if _, err := outf.Write(entryData); err != nil {
+			return err
+		}
+		fidxHash.Write(entryData)
+	}
+
 	return nil
 }
 
@@ -295,6 +352,88 @@ type bytesWriter struct {
 func (bw *bytesWriter) Write(p []byte) (n int, err error) {
 	*bw.buf = append(*bw.buf, p...)
 	return len(p), nil
+}
+
+// refFileInfo holds metadata about a file in the reference mfidx
+type refFileInfo struct {
+	entry   bupdate.FileEntry
+	refPath string // path to the actual file in the reference filesystem
+}
+
+// loadRefMFIDX loads a reference mfidx and builds a map of filename -> refFileInfo
+// The refBase is the directory containing the files that the mfidx indexes
+func loadRefMFIDX(mfidxPath string) (map[string]*refFileInfo, string, error) {
+	fidx, err := bupdate.LoadFidx(mfidxPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("loading reference mfidx: %w", err)
+	}
+	if !fidx.IsMFIDX {
+		return nil, "", fmt.Errorf("reference file is not an mfidx")
+	}
+
+	// The mfidx contains paths relative to some base directory
+	// We need to figure out the base directory from the mfidx path
+	// Assume the mfidx is in the same directory as the files it indexes,
+	// or that the paths in the mfidx are the actual paths
+	refBase := filepath.Dir(mfidxPath)
+
+	result := make(map[string]*refFileInfo)
+	for _, fe := range fidx.Files {
+		// Store by the filename as recorded in the mfidx
+		result[fe.Filename] = &refFileInfo{
+			entry:   fe,
+			refPath: filepath.Join(refBase, fe.Filename),
+		}
+	}
+
+	return result, refBase, nil
+}
+
+// fileMatches checks if the current file matches the reference file metadata
+// by comparing mtime, ctime, size, and inode number
+func fileMatches(currentPath string, ref *refFileInfo) bool {
+	currentStat, err := os.Lstat(currentPath)
+	if err != nil {
+		return false
+	}
+
+	// Check size
+	if uint64(currentStat.Size()) != ref.entry.FileSize {
+		return false
+	}
+
+	// Check mtime
+	if uint64(currentStat.ModTime().Unix()) != ref.entry.Mtime {
+		return false
+	}
+
+	// Get the reference file stat
+	refStat, err := os.Lstat(ref.refPath)
+	if err != nil {
+		return false
+	}
+
+	// Get syscall.Stat_t for both files to compare ctime and inode
+	currentSys, ok := currentStat.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	refSys, ok := refStat.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+
+	// Compare inode number
+	if currentSys.Ino != refSys.Ino {
+		return false
+	}
+
+	// Compare ctime
+	if currentSys.Ctim != refSys.Ctim {
+		return false
+	}
+
+	return true
 }
 
 // printFidx reads and prints fidx/mfidx contents
@@ -525,6 +664,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if *refFile != "" && !*mfidx {
+		fmt.Fprintln(os.Stderr, "error: --ref requires --mfidx")
+		os.Exit(1)
+	}
+
 	// Print mode - dump existing fidx/mfidx files
 	if *print {
 		for _, filename := range args {
@@ -542,7 +686,20 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error: --mfidx requires --outfile")
 			os.Exit(1)
 		}
-		if err := processMFIDX(args, *outfile); err != nil {
+
+		// Load reference mfidx if specified
+		var refMap map[string]*refFileInfo
+		if *refFile != "" {
+			var err error
+			refMap, _, err = loadRefMFIDX(*refFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error loading reference mfidx: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Loaded reference mfidx with %d files\n", len(refMap))
+		}
+
+		if err := processMFIDX(args, *outfile, refMap); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
