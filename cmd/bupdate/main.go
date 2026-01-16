@@ -11,10 +11,111 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/bupdate"
+	"golang.org/x/term"
 )
+
+// progress tracks the current progress display state
+type progress struct {
+	termWidth    int
+	fileNum      int
+	totalFiles   int
+	sizeStrWidth int       // fixed width for the size portion like "[DL 999M/999M]"
+	lastUpdate   time.Time // last time we printed an update
+}
+
+// newProgress creates a new progress tracker
+func newProgress(totalFiles int, maxFileSize int64) *progress {
+	width := 80 // default
+	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+		width = w
+	}
+
+	// Calculate the width needed for the size string based on max file size
+	// Format: "[DL %dM/%dM]" - DL is the longest prefix (2 chars vs 0)
+	maxM := maxFileSize / (1024 * 1024)
+	maxMStr := fmt.Sprintf("%d", maxM)
+	// "[DL " + maxM + "M/" + maxM + "M]" = 4 + len + 2 + len + 2 = 8 + 2*len
+	sizeStrWidth := 8 + 2*len(maxMStr)
+
+	return &progress{
+		termWidth:    width,
+		totalFiles:   totalFiles,
+		sizeStrWidth: sizeStrWidth,
+	}
+}
+
+// setFile sets the current file number (1-indexed)
+func (p *progress) setFile(n int) {
+	p.fileNum = n
+}
+
+// status prints a status line for the current file
+// mode is "DL" for downloading, "" for writing
+func (p *progress) status(mode string, current, total int64, filename string) {
+	// Rate limit updates to once per 100ms
+	now := time.Now()
+	if now.Sub(p.lastUpdate) < 100*time.Millisecond {
+		return
+	}
+	p.lastUpdate = now
+
+	// Format: [File %d/%d] [%dM/%dM] <filename>
+	// or:     [File %d/%d] [DL %dM/%dM] <filename>
+
+	currentM := current / (1024 * 1024)
+	totalM := total / (1024 * 1024)
+
+	var sizeStr string
+	if mode == "DL" {
+		sizeStr = fmt.Sprintf("[DL %dM/%dM]", currentM, totalM)
+	} else {
+		sizeStr = fmt.Sprintf("[%dM/%dM]", currentM, totalM)
+	}
+	// Left-pad to fixed width
+	if len(sizeStr) < p.sizeStrWidth {
+		sizeStr = strings.Repeat(" ", p.sizeStrWidth-len(sizeStr)) + sizeStr
+	}
+
+	fileStr := fmt.Sprintf("[File %d/%d]", p.fileNum, p.totalFiles)
+
+	// Calculate space for filename
+	prefixLen := len(fileStr) + 1 + p.sizeStrWidth + 1 // +1 for spaces
+	maxFilenameLen := p.termWidth - prefixLen
+	if maxFilenameLen < 3 {
+		maxFilenameLen = 3
+	}
+
+	displayName := filename
+	if len(displayName) > maxFilenameLen {
+		// Truncate with ellipsis at start
+		displayName = "..." + displayName[len(displayName)-maxFilenameLen+3:]
+	}
+
+	line := fmt.Sprintf("%s %s %s", fileStr, sizeStr, displayName)
+
+	// Pad to terminal width to erase previous content
+	if len(line) < p.termWidth {
+		line = line + strings.Repeat(" ", p.termWidth-len(line))
+	} else if len(line) > p.termWidth {
+		line = line[:p.termWidth]
+	}
+
+	fmt.Printf("\r%s", line)
+}
+
+// clear clears the current line
+func (p *progress) clear() {
+	fmt.Printf("\r%s\r", strings.Repeat(" ", p.termWidth))
+}
+
+// done prints a final newline
+func (p *progress) done() {
+	fmt.Println()
+}
 
 // remoteSource abstracts access to remote files, either via filesystem or HTTP.
 type remoteSource struct {
@@ -157,15 +258,11 @@ func main() {
 
 // runBupdate performs the main reconstruction operation
 func runBupdate(localDir, remoteDir, targetFidx string) error {
-	fmt.Printf("Loading local fidx files from: %s\n", localDir)
-
 	// Load all local fidx files to build chunk mappings
 	mappings, err := loadLocalMappings(localDir)
 	if err != nil {
 		return fmt.Errorf("loading local mappings: %w", err)
 	}
-
-	fmt.Printf("Loaded %d chunk mappings from local files.\n", len(mappings.Mappings))
 
 	// Create remote source (filesystem or HTTP)
 	remote, err := newRemoteSource(remoteDir)
@@ -175,8 +272,6 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 	defer remote.close()
 
 	// Load the remote fidx file
-	fmt.Printf("\nProcessing remote fidx: %s/%s\n", remoteDir, targetFidx)
-
 	remoteFidx, err := remote.loadFidx(targetFidx)
 	if err != nil {
 		return fmt.Errorf("loading remote fidx: %w", err)
@@ -186,8 +281,7 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 	localFidxPath := filepath.Join(localDir, targetFidx)
 	if localFidx, err := bupdate.LoadFidx(localFidxPath); err == nil {
 		if bytes.Equal(localFidx.FileSHA[:], remoteFidx.FileSHA[:]) {
-			fmt.Printf("  already up to date.\n")
-			return nil
+			return nil // already up to date
 		}
 	}
 
@@ -197,58 +291,51 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 	}
 
 	// Single file reconstruction
+	prog := newProgress(1, remoteFidx.FileSize)
+	prog.setFile(1)
+
 	// Determine output filename (strip .fidx extension)
 	outputName := strings.TrimSuffix(targetFidx, ".fidx")
 	outputPath := filepath.Join(localDir, outputName)
 	tmpOutputPath := outputPath + ".tmp"
 
-	// Predict what we need to download
-	missing, chunks := predictDownload(remoteFidx, mappings)
-	fmt.Printf("  need to download %d/%d bytes in %d chunks.\n",
-		missing, remoteFidx.FileSize, chunks)
-
 	// Reconstruct the file
-	if err := reconstructFile(tmpOutputPath, remoteFidx, remote, outputName, mappings); err != nil {
+	if err := reconstructFile(tmpOutputPath, remoteFidx, remote, outputName, mappings, prog); err != nil {
 		os.Remove(tmpOutputPath)
+		prog.clear()
 		return fmt.Errorf("reconstructing file: %w", err)
 	}
 
 	// Atomically rename to final location
 	if err := os.Rename(tmpOutputPath, outputPath); err != nil {
+		prog.clear()
 		return fmt.Errorf("rename: %w", err)
 	}
 
 	// Copy the fidx file to local
 	if err := remote.copyFidx(localFidxPath, targetFidx); err != nil {
+		prog.clear()
 		return fmt.Errorf("copying fidx: %w", err)
 	}
 
-	fmt.Printf("  successfully reconstructed: %s\n", outputPath)
+	prog.clear()
 	return nil
 }
 
 // bupdateMFIDX handles reconstruction of all files from a multi-file index
 func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fidx, targetFidx, localFidxPath string, mappings *bupdate.FidxMappings) error {
-	fmt.Printf("Multi-file index containing %d files\n", len(remoteFidx.Files))
-
-	// Calculate total missing data across all files
-	var totalMissing int64
-	var totalSize int64
+	// Find the maximum file size for consistent progress display width
+	var maxFileSize int64
 	for _, fileEntry := range remoteFidx.Files {
-		missing, _ := predictDownloadForEntries(fileEntry.Entries, mappings)
-		totalMissing += missing
-		for _, ent := range fileEntry.Entries {
-			totalSize += int64(ent.Size)
+		if int64(fileEntry.FileSize) > maxFileSize {
+			maxFileSize = int64(fileEntry.FileSize)
 		}
 	}
-
-	fmt.Printf("  Total size: %d bytes\n", totalSize)
-	fmt.Printf("  Need to download: %d bytes (%.1f%%)\n",
-		totalMissing, float64(totalMissing)*100.0/float64(totalSize))
+	prog := newProgress(len(remoteFidx.Files), maxFileSize)
 
 	// Reconstruct each file
-	for _, fileEntry := range remoteFidx.Files {
-		fmt.Printf("\n%s\n", fileEntry.Filename)
+	for i, fileEntry := range remoteFidx.Files {
+		prog.setFile(i + 1)
 
 		// Use the filename as stored in mfidx for local output
 		// This preserves directory structure
@@ -257,6 +344,7 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 
 		// Ensure parent directory exists
 		if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+			prog.clear()
 			return fmt.Errorf("creating directory for %s: %w", fileEntry.Filename, err)
 		}
 
@@ -267,9 +355,7 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 		}
 
 		// Predict download for this specific file
-		missing, chunks := predictDownloadForEntries(fileEntry.Entries, mappings)
-		fmt.Printf("  need to download %d/%d bytes in %d chunks.\n",
-			missing, fileEntry.FileSize, chunks)
+		missing, _ := predictDownloadForEntries(fileEntry.Entries, mappings)
 
 		// Check if remote is a symlink (only possible for filesystem sources)
 		isSymlink := false
@@ -282,24 +368,27 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 		if isSymlink {
 			// For symlinks, reconstruct the target string then create symlink
 			remoteFilePath := remote.filePath(fileEntry.Filename)
-			if err := reconstructSymlinkFromMFIDX(outputPath, fileFidx, remoteFilePath, fileEntry, mappings); err != nil {
+			if err := reconstructSymlinkFromMFIDX(outputPath, fileFidx, remoteFilePath, fileEntry, mappings, prog); err != nil {
+				prog.clear()
 				return fmt.Errorf("reconstructing symlink %s: %w", fileEntry.Filename, err)
 			}
 		} else {
 			// Regular file
-			if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remote, fileEntry, mappings); err != nil {
+			if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remote, fileEntry, mappings, prog, missing); err != nil {
 				os.Remove(tmpOutputPath)
+				prog.clear()
 				return fmt.Errorf("reconstructing %s: %w", fileEntry.Filename, err)
 			}
 
 			// Atomically rename to final location
 			if err := os.Rename(tmpOutputPath, outputPath); err != nil {
+				prog.clear()
 				return fmt.Errorf("rename %s: %w", fileEntry.Filename, err)
 			}
 		}
-
-		fmt.Printf("  successfully reconstructed: %s\n", outputPath)
 	}
+
+	prog.clear()
 
 	// Copy the mfidx file to local
 	if err := remote.copyFidx(localFidxPath, targetFidx); err != nil {
@@ -330,11 +419,8 @@ func loadLocalMappings(dir string) (*bupdate.FidxMappings, error) {
 		fidxPath := filepath.Join(dir, entry.Name())
 		fidx, err := bupdate.LoadFidx(fidxPath)
 		if err != nil {
-			fmt.Printf("  warning: skipping %s: %v\n", entry.Name(), err)
-			continue
+			continue // skip invalid/corrupted fidx files silently
 		}
-
-		fmt.Printf("  %s\n", entry.Name())
 
 		if fidx.IsMFIDX {
 			// Multi-file index - process each file within it
@@ -433,7 +519,7 @@ func predictDownloadForEntries(entries []bupdate.FidxEntry, mappings *bupdate.Fi
 }
 
 // reconstructSymlinkFromMFIDX reconstructs a symlink by getting its target string
-func reconstructSymlinkFromMFIDX(outputPath string, fidx *bupdate.Fidx, remoteFilePath string, fileEntry bupdate.FileEntry, mappings *bupdate.FidxMappings) error {
+func reconstructSymlinkFromMFIDX(outputPath string, fidx *bupdate.Fidx, remoteFilePath string, fileEntry bupdate.FileEntry, mappings *bupdate.FidxMappings, prog *progress) error {
 	// Remove existing file/symlink if it exists
 	os.Remove(outputPath)
 
@@ -443,7 +529,7 @@ func reconstructSymlinkFromMFIDX(outputPath string, fidx *bupdate.Fidx, remoteFi
 
 	// Reconstruct the target string from chunks (should be a single chunk)
 	var reconstructedTarget []byte
-	got := int64(0)
+	downloaded := int64(0)
 	missing := int64(0)
 
 	// Calculate missing for progress
@@ -509,18 +595,11 @@ func reconstructSymlinkFromMFIDX(outputPath string, fidx *bupdate.Fidx, remoteFi
 				return fmt.Errorf("symlink target checksum mismatch")
 			}
 
-			got += chunkSize
-			if missing > 0 {
-				pct := (got * 100) / missing
-				fmt.Printf("\r  Downloading... %d%% (%d/%d bytes)", pct, got, missing)
-			}
+			downloaded += chunkSize
+			prog.status("DL", downloaded, missing, fileEntry.Filename)
 		}
 
 		reconstructedTarget = append(reconstructedTarget, chunkData...)
-	}
-
-	if missing > 0 {
-		fmt.Println() // newline after progress
 	}
 
 	// Create the symlink with the reconstructed target
@@ -533,7 +612,7 @@ func reconstructSymlinkFromMFIDX(outputPath string, fidx *bupdate.Fidx, remoteFi
 }
 
 // reconstructFileFromMFIDX rebuilds a file from an mfidx by combining local and remote chunks
-func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *remoteSource, fileEntry bupdate.FileEntry, mappings *bupdate.FidxMappings) error {
+func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *remoteSource, fileEntry bupdate.FileEntry, mappings *bupdate.FidxMappings, prog *progress, missing int64) error {
 	outf, err := os.Create(outputPath)
 	if err != nil {
 		return err
@@ -543,7 +622,6 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *rem
 	// Build list of chunks we need, marking which are local vs remote
 	var chunks []chunkInfo
 	var remoteOffset int64
-	var missing int64
 
 	for i, ent := range fidx.Entries {
 		mapping := mappings.FindMapping(ent.SHA)
@@ -552,9 +630,6 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *rem
 			localMapping: mapping,
 			remoteOffset: remoteOffset,
 			outputIdx:    i,
-		}
-		if mapping == nil {
-			missing += int64(ent.Size)
 		}
 		chunks = append(chunks, ci)
 		remoteOffset += int64(ent.Size)
@@ -579,14 +654,14 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *rem
 			}
 			defer httpReader.Close()
 
-			remoteData, err = fetchChunksHTTP(httpReader, remoteChunks, missing)
+			remoteData, err = fetchChunksHTTP(httpReader, remoteChunks, missing, prog, fileEntry.Filename)
 			if err != nil {
 				return fmt.Errorf("fetching remote chunks: %w", err)
 			}
 		} else {
 			// Use filesystem
 			remoteFilePath := remote.filePath(fileEntry.Filename)
-			remoteData, err = fetchChunksFilesystem(remoteFilePath, remoteChunks, missing)
+			remoteData, err = fetchChunksFilesystem(remoteFilePath, remoteChunks, missing, prog, fileEntry.Filename)
 			if err != nil {
 				return fmt.Errorf("fetching remote chunks: %w", err)
 			}
@@ -594,6 +669,7 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *rem
 	}
 
 	// Now write all chunks in order
+	var written int64
 	for i, ci := range chunks {
 		var data []byte
 
@@ -631,17 +707,15 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *rem
 		if _, err := outf.Write(data); err != nil {
 			return fmt.Errorf("writing chunk: %w", err)
 		}
-	}
-
-	if missing > 0 {
-		fmt.Println() // newline after progress
+		written += int64(len(data))
+		prog.status("", written, fidx.FileSize, fileEntry.Filename)
 	}
 
 	return nil
 }
 
 // reconstructFile rebuilds the output file by combining local and remote chunks
-func reconstructFile(outputPath string, fidx *bupdate.Fidx, remote *remoteSource, remoteFileName string, mappings *bupdate.FidxMappings) error {
+func reconstructFile(outputPath string, fidx *bupdate.Fidx, remote *remoteSource, remoteFileName string, mappings *bupdate.FidxMappings, prog *progress) error {
 	outf, err := os.Create(outputPath)
 	if err != nil {
 		return err
@@ -687,14 +761,14 @@ func reconstructFile(outputPath string, fidx *bupdate.Fidx, remote *remoteSource
 			}
 			defer httpReader.Close()
 
-			remoteData, err = fetchChunksHTTP(httpReader, remoteChunks, missing)
+			remoteData, err = fetchChunksHTTP(httpReader, remoteChunks, missing, prog, remoteFileName)
 			if err != nil {
 				return fmt.Errorf("fetching remote chunks: %w", err)
 			}
 		} else {
 			// Use filesystem
 			remoteFilePath := remote.filePath(remoteFileName)
-			remoteData, err = fetchChunksFilesystem(remoteFilePath, remoteChunks, missing)
+			remoteData, err = fetchChunksFilesystem(remoteFilePath, remoteChunks, missing, prog, remoteFileName)
 			if err != nil {
 				return fmt.Errorf("fetching remote chunks: %w", err)
 			}
@@ -702,6 +776,7 @@ func reconstructFile(outputPath string, fidx *bupdate.Fidx, remote *remoteSource
 	}
 
 	// Now write all chunks in order
+	var written int64
 	for i, ci := range chunks {
 		var data []byte
 
@@ -739,10 +814,8 @@ func reconstructFile(outputPath string, fidx *bupdate.Fidx, remote *remoteSource
 		if _, err := outf.Write(data); err != nil {
 			return fmt.Errorf("writing chunk: %w", err)
 		}
-	}
-
-	if missing > 0 {
-		fmt.Println() // newline after progress
+		written += int64(len(data))
+		prog.status("", written, fidx.FileSize, remoteFileName)
 	}
 
 	return nil
@@ -758,9 +831,9 @@ type chunkInfo struct {
 
 // fetchChunksHTTP fetches chunks using HTTP pipelining.
 // It batches requests in groups to balance pipelining benefits with memory usage.
-func fetchChunksHTTP(reader *bupdate.HTTPReader, chunks []chunkInfo, totalMissing int64) (map[int][]byte, error) {
+func fetchChunksHTTP(reader *bupdate.HTTPReader, chunks []chunkInfo, totalMissing int64, prog *progress, filename string) (map[int][]byte, error) {
 	result := make(map[int][]byte)
-	got := int64(0)
+	downloaded := int64(0)
 
 	// Process chunks in batches for pipelining
 	// Use batches of up to 16 requests to balance efficiency with memory
@@ -799,12 +872,8 @@ func fetchChunksHTTP(reader *bupdate.HTTPReader, chunks []chunkInfo, totalMissin
 			}
 
 			result[ci.outputIdx] = data
-			got += int64(len(data))
-
-			if totalMissing > 0 {
-				pct := (got * 100) / totalMissing
-				fmt.Printf("\r  Downloading... %d%% (%d/%d bytes)", pct, got, totalMissing)
-			}
+			downloaded += int64(len(data))
+			prog.status("DL", downloaded, totalMissing, filename)
 		}
 	}
 
@@ -812,9 +881,9 @@ func fetchChunksHTTP(reader *bupdate.HTTPReader, chunks []chunkInfo, totalMissin
 }
 
 // fetchChunksFilesystem fetches chunks from a local file.
-func fetchChunksFilesystem(filePath string, chunks []chunkInfo, totalMissing int64) (map[int][]byte, error) {
+func fetchChunksFilesystem(filePath string, chunks []chunkInfo, totalMissing int64, prog *progress, filename string) (map[int][]byte, error) {
 	result := make(map[int][]byte)
-	got := int64(0)
+	downloaded := int64(0)
 
 	for _, ci := range chunks {
 		data, err := bupdate.ReadChunk(filePath, ci.remoteOffset, int64(ci.ent.Size))
@@ -829,12 +898,8 @@ func fetchChunksFilesystem(filePath string, chunks []chunkInfo, totalMissing int
 		}
 
 		result[ci.outputIdx] = data
-		got += int64(len(data))
-
-		if totalMissing > 0 {
-			pct := (got * 100) / totalMissing
-			fmt.Printf("\r  Downloading... %d%% (%d/%d bytes)", pct, got, totalMissing)
-		}
+		downloaded += int64(len(data))
+		prog.status("DL", downloaded, totalMissing, filename)
 	}
 
 	return result, nil

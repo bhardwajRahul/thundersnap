@@ -1,6 +1,6 @@
 module github.com/tailscale/thundersnap
 
-go 1.23.1
+go 1.24.0
 
 toolchain go1.24.3
 
@@ -8,7 +8,7 @@ require (
 	github.com/creack/pty v1.1.23
 	github.com/gliderlabs/ssh v0.3.7
 	github.com/mdlayher/vsock v1.2.1
-	golang.org/x/term v0.22.0
+	golang.org/x/term v0.39.0
 	tailscale.com v1.76.6
 )
 
@@ -86,7 +86,7 @@ require (
 	golang.org/x/mod v0.19.0 // indirect
 	golang.org/x/net v0.27.0 // indirect
 	golang.org/x/sync v0.7.0 // indirect
-	golang.org/x/sys v0.22.0 // indirect
+	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/text v0.16.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 	golang.org/x/tools v0.23.0 // indirect
