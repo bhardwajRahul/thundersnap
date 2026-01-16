@@ -82,29 +82,10 @@ func (r *remoteSource) copyFidx(localPath, relativePath string) error {
 
 // downloadFile downloads a file from an HTTP URL to a local path.
 func downloadFile(rawURL, localPath string) error {
-	u, err := url.Parse(rawURL)
+	data, err := bupdate.FetchFullFile(rawURL)
 	if err != nil {
 		return err
 	}
-	host := u.Host
-	if !strings.Contains(host, ":") {
-		host = host + ":80"
-	}
-
-	reader, err := bupdate.NewHTTPReader(rawURL)
-	if err != nil {
-		return err
-	}
-	defer reader.Close()
-
-	// Use a very large range to get the whole file
-	// We don't know the size, so we request a large chunk and hope it's enough
-	// A better approach would be to do a HEAD request first
-	data, err := reader.ReadRange(0, 10*1024*1024) // 10MB max
-	if err != nil {
-		return err
-	}
-
 	return os.WriteFile(localPath, data, 0644)
 }
 
@@ -358,16 +339,36 @@ func loadLocalMappings(dir string) (*bupdate.FidxMappings, error) {
 		if fidx.IsMFIDX {
 			// Multi-file index - process each file within it
 			for _, fileEntry := range fidx.Files {
-				// Use basename to avoid path issues if mfidx has full paths
-				baseName := filepath.Base(fileEntry.Filename)
-				filePath := filepath.Join(dir, baseName)
+				// Use the full path from the mfidx, preserving directory structure
+				filePath := filepath.Join(dir, fileEntry.Filename)
 
-				// Check if the file exists
-				if _, err := os.Stat(filePath); err != nil {
+				// Check if the file exists (use Lstat to handle symlinks)
+				stat, err := os.Lstat(filePath)
+				if err != nil {
 					continue
 				}
 
-				// Add mappings for this file
+				// Handle symlinks specially - their content is the target path
+				if stat.Mode()&os.ModeSymlink != 0 {
+					target, err := os.Readlink(filePath)
+					if err != nil {
+						continue
+					}
+					// For symlinks, we treat the entire target as a single chunk
+					// The offset is always 0 and size is len(target)
+					for _, ent := range fileEntry.Entries {
+						allMappings = append(allMappings, bupdate.FidxMapping{
+							SHA:      ent.SHA,
+							Filename: filePath,
+							Offset:   0,
+							Size:     ent.Size,
+						})
+					}
+					_ = target // used for documentation
+					continue
+				}
+
+				// Regular file - add mappings for each chunk
 				var offset int64
 				for _, ent := range fileEntry.Entries {
 					allMappings = append(allMappings, bupdate.FidxMapping{

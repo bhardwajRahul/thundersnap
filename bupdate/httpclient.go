@@ -228,8 +228,9 @@ func IsHTTPURL(s string) bool {
 	return strings.Contains(s, "://")
 }
 
-// LoadFidxHTTP loads a fidx file from an HTTP URL.
-func LoadFidxHTTP(rawURL string) (*Fidx, error) {
+// FetchFullFile downloads an entire file from an HTTP URL.
+// Unlike ReadRange, this doesn't use range requests and fetches the complete file.
+func FetchFullFile(rawURL string) ([]byte, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("parsing URL: %w", err)
@@ -250,14 +251,13 @@ func LoadFidxHTTP(rawURL string) (*Fidx, error) {
 	}
 	defer conn.Close()
 
-	// Send request
+	// Send request without Range header to get full file
 	reqStr := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
 		u.Path, u.Host)
 	if _, err := conn.Write([]byte(reqStr)); err != nil {
 		return nil, fmt.Errorf("writing request: %w", err)
 	}
 
-	// Read response
 	br := bufio.NewReader(conn)
 
 	// Read status line
@@ -281,7 +281,6 @@ func LoadFidxHTTP(rawURL string) (*Fidx, error) {
 	}
 
 	// Read headers
-	var contentLength int64 = -1
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
@@ -291,28 +290,22 @@ func LoadFidxHTTP(rawURL string) (*Fidx, error) {
 		if line == "" {
 			break
 		}
-
-		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
-			valStr := strings.TrimSpace(line[len("content-length:"):])
-			contentLength, err = strconv.ParseInt(valStr, 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("parsing content-length: %w", err)
-			}
-		}
 	}
 
-	// Read body
-	var data []byte
-	if contentLength >= 0 {
-		data = make([]byte, contentLength)
-		_, err = io.ReadFull(br, data)
-	} else {
-		data, err = io.ReadAll(br)
-	}
+	// Read entire body (Connection: close means server will close when done)
+	data, err := io.ReadAll(br)
 	if err != nil {
 		return nil, fmt.Errorf("reading body: %w", err)
 	}
 
-	// Parse the fidx data (similar to LoadFidx)
+	return data, nil
+}
+
+// LoadFidxHTTP loads a fidx file from an HTTP URL.
+func LoadFidxHTTP(rawURL string) (*Fidx, error) {
+	data, err := FetchFullFile(rawURL)
+	if err != nil {
+		return nil, err
+	}
 	return ParseFidxData(rawURL, data)
 }

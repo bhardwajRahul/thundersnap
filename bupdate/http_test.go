@@ -191,6 +191,50 @@ func TestIsHTTPURL(t *testing.T) {
 	}
 }
 
+// TestFetchFullFileLarge tests that FetchFullFile can handle files larger than 10MB
+func TestFetchFullFileLarge(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "bupdate-large-test")
+	if err != nil {
+		t.Fatalf("creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create a 15MB test file
+	testContent := make([]byte, 15*1024*1024)
+	for i := range testContent {
+		testContent[i] = byte(i % 256)
+	}
+	testFile := filepath.Join(tmpDir, "large.bin")
+	if err := os.WriteFile(testFile, testContent, 0644); err != nil {
+		t.Fatalf("writing test file: %v", err)
+	}
+
+	server, err := NewFileServer(tmpDir)
+	if err != nil {
+		t.Fatalf("creating file server: %v", err)
+	}
+	addr, err := server.Start()
+	if err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer server.Close()
+
+	// Fetch the full file
+	fileURL := "http://" + addr + "/large.bin"
+	data, err := FetchFullFile(fileURL)
+	if err != nil {
+		t.Fatalf("fetching file: %v", err)
+	}
+
+	if len(data) != len(testContent) {
+		t.Errorf("size mismatch: got %d, want %d", len(data), len(testContent))
+	}
+
+	if !bytes.Equal(data, testContent) {
+		t.Errorf("content mismatch")
+	}
+}
+
 // TestFileServerSymlinks tests that symlinks return readlink() content
 func TestFileServerSymlinks(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "bupdate-symlink-test")
