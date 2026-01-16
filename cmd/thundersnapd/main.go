@@ -448,6 +448,11 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(strin
 		return fmt.Errorf("copy ts binary: %w", err)
 	}
 
+	// Copy vshd binary into VM's /sbin for shell access via vsock
+	if err := copyVshdBinary(rootFS); err != nil {
+		return fmt.Errorf("copy vshd binary: %w", err)
+	}
+
 	// Create control handler for vsock
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("/ping", handlePing)
@@ -464,6 +469,9 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(strin
 	if err != nil {
 		return fmt.Errorf("start VM: %w", err)
 	}
+
+	// Print the vsock socket path so users can connect via vsh
+	fmt.Fprintf(s, "* vsh socket: %s\r\n", session.VshSocketPath())
 
 	// Wait for either the VM to exit or the SSH session to close (stdin EOF)
 	select {
@@ -517,33 +525,48 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 
 // copyTsBinary copies the ts binary into the container's /sbin using btrfs reflink (COW copy).
 func copyTsBinary(rootFS string) error {
-	// Find the ts binary next to the current executable
+	return copyBinaryToRootFS(rootFS, "ts", "sbin/ts")
+}
+
+// copyVshdBinary copies the vshd binary into the VM's /sbin using btrfs reflink (COW copy).
+func copyVshdBinary(rootFS string) error {
+	return copyBinaryToRootFS(rootFS, "vshd", "sbin/vshd")
+}
+
+// copyBinaryToRootFS copies a binary from the executable directory into the rootfs.
+func copyBinaryToRootFS(rootFS, binaryName, destPath string) error {
+	// Find the binary next to the current executable
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("get executable path: %w", err)
 	}
-	tsSrc := filepath.Join(filepath.Dir(exe), "ts")
+	src := filepath.Join(filepath.Dir(exe), binaryName)
 
-	// Destination in container
-	tsDst := filepath.Join(rootFS, "sbin", "ts")
+	// Destination in rootfs
+	dst := filepath.Join(rootFS, destPath)
 
 	// Check if source exists
-	if _, err := os.Stat(tsSrc); err != nil {
-		return fmt.Errorf("ts binary not found at %s: %w", tsSrc, err)
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("%s binary not found at %s: %w", binaryName, src, err)
+	}
+
+	// Ensure destination directory exists
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return fmt.Errorf("create destination directory: %w", err)
 	}
 
 	// Remove existing destination if present (reflink won't overwrite)
-	os.Remove(tsDst)
+	os.Remove(dst)
 
 	// Use cp --reflink=always for btrfs COW copy
-	cmd := exec.Command("cp", "--reflink=always", tsSrc, tsDst)
+	cmd := exec.Command("cp", "--reflink=always", src, dst)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("cp --reflink=always failed: %w\noutput: %s", err, string(output))
 	}
 
 	// Make it executable
-	if err := os.Chmod(tsDst, 0755); err != nil {
-		return fmt.Errorf("chmod ts binary: %w", err)
+	if err := os.Chmod(dst, 0755); err != nil {
+		return fmt.Errorf("chmod %s binary: %w", binaryName, err)
 	}
 
 	return nil

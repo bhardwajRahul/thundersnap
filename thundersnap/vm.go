@@ -38,13 +38,16 @@ type VMConfig struct {
 // VsockPort is the vsock port used for the thunder control socket.
 const VsockPort = 5223
 
+// VshPort is the vsock port used for vsh shell connections.
+const VshPort = 5222
+
 // VMSession represents a running VM session.
 type VMSession struct {
 	virtiofsdCmd   *exec.Cmd
 	chvCmd         *exec.Cmd
 	virtiofsSock   string
 	vsockSock      string         // cloud-hypervisor vsock unix socket path
-	vsockListener  net.Listener   // listener for vsock connections
+	vsockListener  net.Listener   // listener for control vsock connections (guest-to-host)
 	pty            *os.File       // only set if UsePTY is true
 	stdinPipe      io.WriteCloser // only set if UsePTY is false
 	done           chan struct{}
@@ -95,7 +98,9 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// This avoids the kernel panic from init exiting, and cloud-hypervisor exits
 	// cleanly on ACPI shutdown. We use busybox poweroff -f which doesn't need /proc.
 	// The ts command inside the VM detects vsock via /dev/vsock and connects directly.
-	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "/bin/sh; /bin/busybox poweroff -f"`
+	// We also start vshd in the background to accept shell connections over vsock.
+	// We must mount devpts for PTY support (required by vshd).
+	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; /sbin/vshd & /bin/sh; /bin/busybox poweroff -f"`
 
 	// Start cloud-hypervisor
 	// --pvpanic enables the pvpanic device which allows the guest to signal panic to the host
@@ -375,4 +380,11 @@ func (w *vsockResponseWriter) finish() error {
 	}
 
 	return nil
+}
+
+// VshSocketPath returns the Unix socket path for connecting to the VM's vsh daemon.
+// Callers can dial this socket and use the cloud-hypervisor vsock protocol
+// (send "CONNECT <port>\n", wait for "OK <port>\n") to connect to vshd in the guest.
+func (s *VMSession) VshSocketPath() string {
+	return s.vsockSock
 }
