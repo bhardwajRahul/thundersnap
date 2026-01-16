@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/pborman/getopt/v2"
@@ -50,7 +51,8 @@ func chunkFile(filename string, writeEntry func(bupdate.FidxEntry) error) error 
 }
 
 // processSymlink handles a symlink by indexing its target path as content
-func processSymlink(filename string, outf *os.File, fidxHash io.Writer) error {
+// filename is the actual path on disk, storedName is the name to store in the mfidx
+func processSymlink(filename, storedName string, outf *os.File, fidxHash io.Writer) error {
 	// Read the symlink target
 	target, err := os.Readlink(filename)
 	if err != nil {
@@ -66,7 +68,7 @@ func processSymlink(filename string, outf *os.File, fidxHash io.Writer) error {
 	// Write file separator entry
 	// For symlinks, size is the length of the target string
 	sep := bupdate.FileSeparator{
-		Filename: filename,
+		Filename: storedName,
 		FileSize: uint64(len(target)),
 		Mtime:    uint64(stat.ModTime().Unix()),
 	}
@@ -176,6 +178,32 @@ func collectFiles(paths []string) ([]string, error) {
 	return result, nil
 }
 
+// stripPathPrefix returns filename with the mfidx-relative prefix stripped.
+// If outpath is "a/b/c/xyz.mfidx" and filename is "a/b/c/xyz/foo/bar.txt",
+// returns "foo/bar.txt". If filename doesn't start with the prefix, returns it unchanged.
+func stripPathPrefix(outpath, filename string) string {
+	// Get directory containing the mfidx
+	outDir := filepath.Dir(outpath)
+	// Get base name without .mfidx extension
+	base := filepath.Base(outpath)
+	base = strings.TrimSuffix(base, ".mfidx")
+	base = strings.TrimSuffix(base, ".fidx")
+
+	// Build the prefix to strip: dir/base/
+	var prefix string
+	if outDir == "." {
+		prefix = base + "/"
+	} else {
+		prefix = filepath.Join(outDir, base) + "/"
+	}
+
+	// Strip prefix if present
+	if strings.HasPrefix(filename, prefix) {
+		return filename[len(prefix):]
+	}
+	return filename
+}
+
 // processMFIDX creates a multi-file FIDX
 func processMFIDX(filenames []string, outpath string, refMap map[string]*refFileInfo) error {
 	// Expand directories into file lists
@@ -213,6 +241,9 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 
 	// Process each file
 	for _, filename := range allFiles {
+		// Compute the stripped filename for storage in the mfidx
+		storedName := stripPathPrefix(outpath, filename)
+
 		// Get file info (use Lstat to not follow symlinks)
 		stat, err := os.Lstat(filename)
 		if err != nil {
@@ -221,11 +252,11 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 
 		// Check if we can reuse entries from reference mfidx
 		if refMap != nil {
-			if ref, ok := refMap[filename]; ok {
+			if ref, ok := refMap[storedName]; ok {
 				if fileMatches(filename, ref) {
 					// File is unchanged - copy entries from reference
-					fmt.Printf("  %s (unchanged)\n", filename)
-					if err := writeRefEntries(outf, fidxHash, filename, stat, ref); err != nil {
+					fmt.Printf("  %s (unchanged)\n", storedName)
+					if err := writeRefEntries(outf, fidxHash, storedName, stat, ref); err != nil {
 						return err
 					}
 					reusedFiles++
@@ -234,12 +265,12 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 			}
 		}
 
-		fmt.Printf("  %s\n", filename)
+		fmt.Printf("  %s\n", storedName)
 		indexedFiles++
 
 		// Handle symlinks specially - index the link target
 		if stat.Mode()&os.ModeSymlink != 0 {
-			if err := processSymlink(filename, outf, fidxHash); err != nil {
+			if err := processSymlink(filename, storedName, outf, fidxHash); err != nil {
 				return err
 			}
 			continue
@@ -253,7 +284,7 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 
 		// Write file separator entry
 		sep := bupdate.FileSeparator{
-			Filename: filename,
+			Filename: storedName,
 			FileSize: uint64(stat.Size()),
 			Mtime:    uint64(stat.ModTime().Unix()),
 		}
