@@ -88,8 +88,9 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// we power off the VM cleanly using busybox poweroff.
 	// We must mount devpts for PTY support (required by vshd).
 	// The ts command inside the VM detects vsock via /dev/vsock and connects directly.
+	// We start vshd via "sh -l -c 'exec vshd'" to get a proper login environment (PATH, etc).
 	// We echo status messages to help debug boot issues.
-	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "echo 'init: mounting devpts'; mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; echo 'init: starting vshd'; /sbin/vshd; echo 'init: vshd exited, powering off'; /bin/busybox poweroff -f"`
+	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "echo 'init: mounting devpts'; mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; echo 'init: starting vshd'; /bin/sh -l -c 'exec /sbin/vshd'; echo 'init: vshd exited, powering off'; /bin/busybox poweroff -f"`
 
 	// Start cloud-hypervisor
 	// --pvpanic enables the pvpanic device which allows the guest to signal panic to the host

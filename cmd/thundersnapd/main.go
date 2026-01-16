@@ -577,6 +577,15 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(strin
 	}
 	defer conn.Close()
 
+	// Send command protocol to vshd:
+	// First: argument count terminated by \0 (0 = interactive shell)
+	// Then: each argument terminated by \0
+	cmdArgs := s.Command()
+	fmt.Fprintf(conn, "%d\x00", len(cmdArgs))
+	for _, arg := range cmdArgs {
+		fmt.Fprintf(conn, "%s\x00", arg)
+	}
+
 	// Proxy the SSH session to vshd
 	done := make(chan struct{})
 
