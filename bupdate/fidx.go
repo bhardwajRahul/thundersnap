@@ -9,13 +9,19 @@ import (
 	"os"
 )
 
-// LoadFidx reads and parses a fidx or mfidx file
+// LoadFidx reads and parses a fidx or mfidx file from a local path
 func LoadFidx(path string) (*Fidx, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
+	return ParseFidxData(path, data)
+}
+
+// ParseFidxData parses fidx data from a byte slice.
+// The path is used for identification only.
+func ParseFidxData(path string, data []byte) (*Fidx, error) {
 	if len(data) < 8+20 {
 		return nil, fmt.Errorf("file too short")
 	}

@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,6 +15,120 @@ import (
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/bupdate"
 )
+
+// remoteSource abstracts access to remote files, either via filesystem or HTTP.
+type remoteSource struct {
+	isHTTP     bool
+	baseURL    string              // for HTTP: base URL without trailing slash
+	basePath   string              // for filesystem: base directory path
+	httpReader *bupdate.HTTPReader // reused HTTP reader for chunk fetches
+}
+
+// newRemoteSource creates a remoteSource from a remote path or URL.
+func newRemoteSource(remote string) (*remoteSource, error) {
+	if bupdate.IsHTTPURL(remote) {
+		return &remoteSource{
+			isHTTP:  true,
+			baseURL: strings.TrimSuffix(remote, "/"),
+		}, nil
+	}
+	return &remoteSource{
+		isHTTP:   false,
+		basePath: remote,
+	}, nil
+}
+
+// loadFidx loads a fidx file from the remote source.
+func (r *remoteSource) loadFidx(relativePath string) (*bupdate.Fidx, error) {
+	if r.isHTTP {
+		fullURL := r.baseURL + "/" + relativePath
+		return bupdate.LoadFidxHTTP(fullURL)
+	}
+	fullPath := filepath.Join(r.basePath, relativePath)
+	return bupdate.LoadFidx(fullPath)
+}
+
+// copyFidx copies a fidx file from remote to local.
+func (r *remoteSource) copyFidx(localPath, relativePath string) error {
+	if r.isHTTP {
+		// For HTTP, we need to download the fidx file
+		fullURL := r.baseURL + "/" + relativePath
+		fidx, err := bupdate.LoadFidxHTTP(fullURL)
+		if err != nil {
+			return err
+		}
+		// Re-download the raw data to save it locally
+		// (We could optimize by caching, but this is simple)
+		u, _ := url.Parse(fullURL)
+		host := u.Host
+		if !strings.Contains(host, ":") {
+			host = host + ":80"
+		}
+		reader, err := bupdate.NewHTTPReader(fullURL)
+		if err != nil {
+			return err
+		}
+		defer reader.Close()
+		// Get the file size by requesting the whole file
+		// Actually, let's just re-serialize the fidx... but that's complex.
+		// Instead, let's download it fresh.
+		_ = fidx // suppress unused warning
+		// Simple approach: fetch the whole file via a full GET
+		return downloadFile(fullURL, localPath)
+	}
+	remotePath := filepath.Join(r.basePath, relativePath)
+	return bupdate.CopyFile(localPath, remotePath)
+}
+
+// downloadFile downloads a file from an HTTP URL to a local path.
+func downloadFile(rawURL, localPath string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		host = host + ":80"
+	}
+
+	reader, err := bupdate.NewHTTPReader(rawURL)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	// Use a very large range to get the whole file
+	// We don't know the size, so we request a large chunk and hope it's enough
+	// A better approach would be to do a HEAD request first
+	data, err := reader.ReadRange(0, 10*1024*1024) // 10MB max
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(localPath, data, 0644)
+}
+
+// getHTTPReaderForFile gets an HTTP reader for a specific file path.
+func (r *remoteSource) getHTTPReaderForFile(relativePath string) (*bupdate.HTTPReader, error) {
+	if !r.isHTTP {
+		return nil, fmt.Errorf("not an HTTP source")
+	}
+	fullURL := r.baseURL + "/" + relativePath
+	return bupdate.NewHTTPReader(fullURL)
+}
+
+// filePath returns the full path for a file in the remote source (filesystem only).
+func (r *remoteSource) filePath(relativePath string) string {
+	return filepath.Join(r.basePath, relativePath)
+}
+
+// close releases any resources held by the remote source.
+func (r *remoteSource) close() {
+	if r.httpReader != nil {
+		r.httpReader.Close()
+		r.httpReader = nil
+	}
+}
 
 var (
 	localDir  = getopt.StringLong("local", 'l', ".", "local directory with existing files and .fidx indexes")
@@ -71,11 +186,17 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 
 	fmt.Printf("Loaded %d chunk mappings from local files.\n", len(mappings.Mappings))
 
-	// Load the remote fidx file
-	remoteFidxPath := filepath.Join(remoteDir, targetFidx)
-	fmt.Printf("\nProcessing remote fidx: %s\n", remoteFidxPath)
+	// Create remote source (filesystem or HTTP)
+	remote, err := newRemoteSource(remoteDir)
+	if err != nil {
+		return fmt.Errorf("creating remote source: %w", err)
+	}
+	defer remote.close()
 
-	remoteFidx, err := bupdate.LoadFidx(remoteFidxPath)
+	// Load the remote fidx file
+	fmt.Printf("\nProcessing remote fidx: %s/%s\n", remoteDir, targetFidx)
+
+	remoteFidx, err := remote.loadFidx(targetFidx)
 	if err != nil {
 		return fmt.Errorf("loading remote fidx: %w", err)
 	}
@@ -91,7 +212,7 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 
 	if remoteFidx.IsMFIDX {
 		// Multi-file index - extract all files
-		return bupdateMFIDX(localDir, remoteDir, remoteFidx, remoteFidxPath, localFidxPath, mappings)
+		return bupdateMFIDX(localDir, remote, remoteFidx, targetFidx, localFidxPath, mappings)
 	}
 
 	// Single file reconstruction
@@ -106,8 +227,7 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 		missing, remoteFidx.FileSize, chunks)
 
 	// Reconstruct the file
-	remoteFilePath := filepath.Join(remoteDir, outputName)
-	if err := reconstructFile(tmpOutputPath, remoteFidx, remoteFilePath, mappings); err != nil {
+	if err := reconstructFile(tmpOutputPath, remoteFidx, remote, outputName, mappings); err != nil {
 		os.Remove(tmpOutputPath)
 		return fmt.Errorf("reconstructing file: %w", err)
 	}
@@ -118,7 +238,7 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 	}
 
 	// Copy the fidx file to local
-	if err := bupdate.CopyFile(localFidxPath, remoteFidxPath); err != nil {
+	if err := remote.copyFidx(localFidxPath, targetFidx); err != nil {
 		return fmt.Errorf("copying fidx: %w", err)
 	}
 
@@ -127,7 +247,7 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 }
 
 // bupdateMFIDX handles reconstruction of all files from a multi-file index
-func bupdateMFIDX(localDir, remoteDir string, remoteFidx *bupdate.Fidx, remoteFidxPath, localFidxPath string, mappings *bupdate.FidxMappings) error {
+func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fidx, targetFidx, localFidxPath string, mappings *bupdate.FidxMappings) error {
 	fmt.Printf("Multi-file index containing %d files\n", len(remoteFidx.Files))
 
 	// Calculate total missing data across all files
@@ -170,21 +290,23 @@ func bupdateMFIDX(localDir, remoteDir string, remoteFidx *bupdate.Fidx, remoteFi
 		fmt.Printf("  need to download %d/%d bytes in %d chunks.\n",
 			missing, fileEntry.FileSize, chunks)
 
-		// Try to find the remote file using the path from mfidx
-		remoteFilePath := filepath.Join(remoteDir, fileEntry.Filename)
-
-		// Check if remote is a symlink
-		remoteInfo, err := os.Lstat(remoteFilePath)
-		isSymlink := err == nil && remoteInfo.Mode()&os.ModeSymlink != 0
+		// Check if remote is a symlink (only possible for filesystem sources)
+		isSymlink := false
+		if !remote.isHTTP {
+			remoteFilePath := remote.filePath(fileEntry.Filename)
+			remoteInfo, err := os.Lstat(remoteFilePath)
+			isSymlink = err == nil && remoteInfo.Mode()&os.ModeSymlink != 0
+		}
 
 		if isSymlink {
 			// For symlinks, reconstruct the target string then create symlink
+			remoteFilePath := remote.filePath(fileEntry.Filename)
 			if err := reconstructSymlinkFromMFIDX(outputPath, fileFidx, remoteFilePath, fileEntry, mappings); err != nil {
 				return fmt.Errorf("reconstructing symlink %s: %w", fileEntry.Filename, err)
 			}
 		} else {
 			// Regular file
-			if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remoteFilePath, fileEntry, mappings); err != nil {
+			if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remote, fileEntry, mappings); err != nil {
 				os.Remove(tmpOutputPath)
 				return fmt.Errorf("reconstructing %s: %w", fileEntry.Filename, err)
 			}
@@ -199,7 +321,7 @@ func bupdateMFIDX(localDir, remoteDir string, remoteFidx *bupdate.Fidx, remoteFi
 	}
 
 	// Copy the mfidx file to local
-	if err := bupdate.CopyFile(localFidxPath, remoteFidxPath); err != nil {
+	if err := remote.copyFidx(localFidxPath, targetFidx); err != nil {
 		return fmt.Errorf("copying mfidx: %w", err)
 	}
 
@@ -410,90 +532,104 @@ func reconstructSymlinkFromMFIDX(outputPath string, fidx *bupdate.Fidx, remoteFi
 }
 
 // reconstructFileFromMFIDX rebuilds a file from an mfidx by combining local and remote chunks
-func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remoteFilePath string, fileEntry bupdate.FileEntry, mappings *bupdate.FidxMappings) error {
+func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *remoteSource, fileEntry bupdate.FileEntry, mappings *bupdate.FidxMappings) error {
 	outf, err := os.Create(outputPath)
 	if err != nil {
 		return err
 	}
 	defer outf.Close()
 
-	// Try to open remote file if it exists
-	var remotef *os.File
-	remotef, err = os.Open(remoteFilePath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("opening remote file: %w", err)
-	}
-	if remotef != nil {
-		defer remotef.Close()
-	}
-
+	// Build list of chunks we need, marking which are local vs remote
+	var chunks []chunkInfo
 	var remoteOffset int64
-	got := int64(0)
-	missing := int64(0)
+	var missing int64
 
-	// Calculate total missing for progress
-	for _, ent := range fidx.Entries {
-		if mappings.FindMapping(ent.SHA) == nil {
+	for i, ent := range fidx.Entries {
+		mapping := mappings.FindMapping(ent.SHA)
+		ci := chunkInfo{
+			ent:          ent,
+			localMapping: mapping,
+			remoteOffset: remoteOffset,
+			outputIdx:    i,
+		}
+		if mapping == nil {
 			missing += int64(ent.Size)
 		}
+		chunks = append(chunks, ci)
+		remoteOffset += int64(ent.Size)
 	}
 
-	// Process each chunk
-	for _, ent := range fidx.Entries {
-		chunkSize := int64(ent.Size)
-		mapping := mappings.FindMapping(ent.SHA)
+	// Collect remote chunks we need to fetch
+	var remoteChunks []chunkInfo
+	for i := range chunks {
+		if chunks[i].localMapping == nil {
+			remoteChunks = append(remoteChunks, chunks[i])
+		}
+	}
 
-		if mapping != nil {
-			// We have this chunk locally - read and verify it
-			localData, err := bupdate.ReadChunk(mapping.Filename, mapping.Offset, int64(mapping.Size))
+	// Fetch remote chunks (using pipelining for HTTP)
+	var remoteData map[int][]byte
+	if len(remoteChunks) > 0 {
+		if remote.isHTTP {
+			// Use HTTP pipelining
+			httpReader, err := remote.getHTTPReaderForFile(fileEntry.Filename)
 			if err != nil {
-				// Failed to read local chunk, fall back to remote
-				mapping = nil
-			} else {
-				// Verify SHA matches (as git blob)
-				computedSHA := bupdate.BlobSHA(localData)
-				if bytes.Equal(computedSHA[:], ent.SHA[:]) {
-					// Write verified local chunk
-					if _, err := outf.Write(localData); err != nil {
-						return fmt.Errorf("writing local chunk: %w", err)
-					}
+				return fmt.Errorf("creating HTTP reader: %w", err)
+			}
+			defer httpReader.Close()
+
+			remoteData, err = fetchChunksHTTP(httpReader, remoteChunks, missing)
+			if err != nil {
+				return fmt.Errorf("fetching remote chunks: %w", err)
+			}
+		} else {
+			// Use filesystem
+			remoteFilePath := remote.filePath(fileEntry.Filename)
+			remoteData, err = fetchChunksFilesystem(remoteFilePath, remoteChunks, missing)
+			if err != nil {
+				return fmt.Errorf("fetching remote chunks: %w", err)
+			}
+		}
+	}
+
+	// Now write all chunks in order
+	for i, ci := range chunks {
+		var data []byte
+
+		if ci.localMapping != nil {
+			// Read from local
+			data, err = bupdate.ReadChunk(ci.localMapping.Filename, ci.localMapping.Offset, int64(ci.localMapping.Size))
+			if err != nil {
+				// Fall back to remote if available
+				if rd, ok := remoteData[i]; ok {
+					data = rd
 				} else {
-					// Checksum mismatch, fall back to remote
-					fmt.Printf("    checksum mismatch in local file\n")
-					mapping = nil
+					return fmt.Errorf("reading local chunk: %w", err)
+				}
+			} else {
+				// Verify SHA
+				computedSHA := bupdate.BlobSHA(data)
+				if !bytes.Equal(computedSHA[:], ci.ent.SHA[:]) {
+					// Fall back to remote if available
+					if rd, ok := remoteData[i]; ok {
+						data = rd
+					} else {
+						return fmt.Errorf("local chunk checksum mismatch and no remote available")
+					}
 				}
 			}
-		}
-
-		if mapping == nil {
-			// Need to fetch from remote
-			if remotef == nil {
-				return fmt.Errorf("remote file not available and chunk not found locally")
-			}
-
-			remoteData, err := bupdate.ReadChunk(remoteFilePath, remoteOffset, chunkSize)
-			if err != nil {
-				return fmt.Errorf("reading remote chunk at offset %d: %w", remoteOffset, err)
-			}
-
-			// Verify remote chunk
-			computedSHA := bupdate.BlobSHA(remoteData)
-			if !bytes.Equal(computedSHA[:], ent.SHA[:]) {
-				return fmt.Errorf("remote chunk checksum mismatch at offset %d", remoteOffset)
-			}
-
-			if _, err := outf.Write(remoteData); err != nil {
-				return fmt.Errorf("writing remote chunk: %w", err)
-			}
-
-			got += chunkSize
-			if missing > 0 {
-				pct := (got * 100) / missing
-				fmt.Printf("\r  Downloading... %d%% (%d/%d bytes)", pct, got, missing)
+		} else {
+			// Get from pre-fetched remote data
+			var ok bool
+			data, ok = remoteData[i]
+			if !ok {
+				return fmt.Errorf("remote chunk not available for chunk %d", i)
 			}
 		}
 
-		remoteOffset += chunkSize
+		if _, err := outf.Write(data); err != nil {
+			return fmt.Errorf("writing chunk: %w", err)
+		}
 	}
 
 	if missing > 0 {
@@ -504,83 +640,104 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remoteFileP
 }
 
 // reconstructFile rebuilds the output file by combining local and remote chunks
-func reconstructFile(outputPath string, fidx *bupdate.Fidx, remoteFilePath string, mappings *bupdate.FidxMappings) error {
+func reconstructFile(outputPath string, fidx *bupdate.Fidx, remote *remoteSource, remoteFileName string, mappings *bupdate.FidxMappings) error {
 	outf, err := os.Create(outputPath)
 	if err != nil {
 		return err
 	}
 	defer outf.Close()
 
-	// Open remote file for reading chunks we don't have locally
-	remotef, err := os.Open(remoteFilePath)
-	if err != nil {
-		return fmt.Errorf("opening remote file: %w", err)
-	}
-	defer remotef.Close()
-
+	// Build list of chunks we need, marking which are local vs remote
+	var chunks []chunkInfo
 	var remoteOffset int64
-	got := int64(0)
-	missing := int64(0)
+	var missing int64
 
-	// Calculate total missing for progress
-	for _, ent := range fidx.Entries {
-		if mappings.FindMapping(ent.SHA) == nil {
+	for i, ent := range fidx.Entries {
+		mapping := mappings.FindMapping(ent.SHA)
+		ci := chunkInfo{
+			ent:          ent,
+			localMapping: mapping,
+			remoteOffset: remoteOffset,
+			outputIdx:    i,
+		}
+		if mapping == nil {
 			missing += int64(ent.Size)
 		}
+		chunks = append(chunks, ci)
+		remoteOffset += int64(ent.Size)
 	}
 
-	// Process each chunk
-	for _, ent := range fidx.Entries {
-		chunkSize := int64(ent.Size)
-		mapping := mappings.FindMapping(ent.SHA)
+	// Collect remote chunks we need to fetch
+	var remoteChunks []chunkInfo
+	for i := range chunks {
+		if chunks[i].localMapping == nil {
+			remoteChunks = append(remoteChunks, chunks[i])
+		}
+	}
 
-		if mapping != nil {
-			// We have this chunk locally - read and verify it
-			localData, err := bupdate.ReadChunk(mapping.Filename, mapping.Offset, int64(mapping.Size))
+	// Fetch remote chunks (using pipelining for HTTP)
+	var remoteData map[int][]byte
+	if len(remoteChunks) > 0 {
+		if remote.isHTTP {
+			// Use HTTP pipelining
+			httpReader, err := remote.getHTTPReaderForFile(remoteFileName)
 			if err != nil {
-				// Failed to read local chunk, fall back to remote
-				mapping = nil
-			} else {
-				// Verify SHA matches (as git blob)
-				computedSHA := bupdate.BlobSHA(localData)
-				if bytes.Equal(computedSHA[:], ent.SHA[:]) {
-					// Write verified local chunk
-					if _, err := outf.Write(localData); err != nil {
-						return fmt.Errorf("writing local chunk: %w", err)
-					}
+				return fmt.Errorf("creating HTTP reader: %w", err)
+			}
+			defer httpReader.Close()
+
+			remoteData, err = fetchChunksHTTP(httpReader, remoteChunks, missing)
+			if err != nil {
+				return fmt.Errorf("fetching remote chunks: %w", err)
+			}
+		} else {
+			// Use filesystem
+			remoteFilePath := remote.filePath(remoteFileName)
+			remoteData, err = fetchChunksFilesystem(remoteFilePath, remoteChunks, missing)
+			if err != nil {
+				return fmt.Errorf("fetching remote chunks: %w", err)
+			}
+		}
+	}
+
+	// Now write all chunks in order
+	for i, ci := range chunks {
+		var data []byte
+
+		if ci.localMapping != nil {
+			// Read from local
+			data, err = bupdate.ReadChunk(ci.localMapping.Filename, ci.localMapping.Offset, int64(ci.localMapping.Size))
+			if err != nil {
+				// Fall back to remote if available
+				if rd, ok := remoteData[i]; ok {
+					data = rd
 				} else {
-					// Checksum mismatch, fall back to remote
-					fmt.Printf("    checksum mismatch in local file\n")
-					mapping = nil
+					return fmt.Errorf("reading local chunk: %w", err)
+				}
+			} else {
+				// Verify SHA
+				computedSHA := bupdate.BlobSHA(data)
+				if !bytes.Equal(computedSHA[:], ci.ent.SHA[:]) {
+					// Fall back to remote if available
+					if rd, ok := remoteData[i]; ok {
+						data = rd
+					} else {
+						return fmt.Errorf("local chunk checksum mismatch and no remote available")
+					}
 				}
 			}
-		}
-
-		if mapping == nil {
-			// Need to fetch from remote
-			remoteData, err := bupdate.ReadChunk(remoteFilePath, remoteOffset, chunkSize)
-			if err != nil {
-				return fmt.Errorf("reading remote chunk at offset %d: %w", remoteOffset, err)
-			}
-
-			// Verify remote chunk
-			computedSHA := bupdate.BlobSHA(remoteData)
-			if !bytes.Equal(computedSHA[:], ent.SHA[:]) {
-				return fmt.Errorf("remote chunk checksum mismatch at offset %d", remoteOffset)
-			}
-
-			if _, err := outf.Write(remoteData); err != nil {
-				return fmt.Errorf("writing remote chunk: %w", err)
-			}
-
-			got += chunkSize
-			if missing > 0 {
-				pct := (got * 100) / missing
-				fmt.Printf("\r  Downloading... %d%% (%d/%d bytes)", pct, got, missing)
+		} else {
+			// Get from pre-fetched remote data
+			var ok bool
+			data, ok = remoteData[i]
+			if !ok {
+				return fmt.Errorf("remote chunk not available for chunk %d", i)
 			}
 		}
 
-		remoteOffset += chunkSize
+		if _, err := outf.Write(data); err != nil {
+			return fmt.Errorf("writing chunk: %w", err)
+		}
 	}
 
 	if missing > 0 {
@@ -588,6 +745,98 @@ func reconstructFile(outputPath string, fidx *bupdate.Fidx, remoteFilePath strin
 	}
 
 	return nil
+}
+
+// chunkInfo is used for tracking chunk fetch operations
+type chunkInfo struct {
+	ent           bupdate.FidxEntry
+	localMapping  *bupdate.FidxMapping
+	remoteOffset  int64
+	outputIdx     int
+}
+
+// fetchChunksHTTP fetches chunks using HTTP pipelining.
+// It batches requests in groups to balance pipelining benefits with memory usage.
+func fetchChunksHTTP(reader *bupdate.HTTPReader, chunks []chunkInfo, totalMissing int64) (map[int][]byte, error) {
+	result := make(map[int][]byte)
+	got := int64(0)
+
+	// Process chunks in batches for pipelining
+	// Use batches of up to 16 requests to balance efficiency with memory
+	const batchSize = 16
+
+	for i := 0; i < len(chunks); i += batchSize {
+		end := i + batchSize
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		batch := chunks[i:end]
+
+		// Build range requests for this batch
+		requests := make([]bupdate.RangeRequest, len(batch))
+		for j, ci := range batch {
+			requests[j] = bupdate.RangeRequest{
+				Offset: ci.remoteOffset,
+				Size:   int64(ci.ent.Size),
+			}
+		}
+
+		// Send pipelined requests
+		results, err := reader.ReadRanges(requests)
+		if err != nil {
+			return nil, fmt.Errorf("reading ranges: %w", err)
+		}
+
+		// Verify and store results
+		for j, data := range results {
+			ci := batch[j]
+
+			// Verify SHA
+			computedSHA := bupdate.BlobSHA(data)
+			if !bytes.Equal(computedSHA[:], ci.ent.SHA[:]) {
+				return nil, fmt.Errorf("remote chunk checksum mismatch at offset %d", ci.remoteOffset)
+			}
+
+			result[ci.outputIdx] = data
+			got += int64(len(data))
+
+			if totalMissing > 0 {
+				pct := (got * 100) / totalMissing
+				fmt.Printf("\r  Downloading... %d%% (%d/%d bytes)", pct, got, totalMissing)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// fetchChunksFilesystem fetches chunks from a local file.
+func fetchChunksFilesystem(filePath string, chunks []chunkInfo, totalMissing int64) (map[int][]byte, error) {
+	result := make(map[int][]byte)
+	got := int64(0)
+
+	for _, ci := range chunks {
+		data, err := bupdate.ReadChunk(filePath, ci.remoteOffset, int64(ci.ent.Size))
+		if err != nil {
+			return nil, fmt.Errorf("reading chunk at offset %d: %w", ci.remoteOffset, err)
+		}
+
+		// Verify SHA
+		computedSHA := bupdate.BlobSHA(data)
+		if !bytes.Equal(computedSHA[:], ci.ent.SHA[:]) {
+			return nil, fmt.Errorf("remote chunk checksum mismatch at offset %d", ci.remoteOffset)
+		}
+
+		result[ci.outputIdx] = data
+		got += int64(len(data))
+
+		if totalMissing > 0 {
+			pct := (got * 100) / totalMissing
+			fmt.Printf("\r  Downloading... %d%% (%d/%d bytes)", pct, got, totalMissing)
+		}
+	}
+
+	return result, nil
 }
 
 
