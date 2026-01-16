@@ -595,12 +595,17 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(strin
 		close(done)
 	}()
 
-	// Wait for either the vshd connection to close or the VM to exit
+	// Wait for either:
+	// - vshd connection to close (shell exited normally)
+	// - VM to exit unexpectedly
+	// - SSH session to be closed by client (e.g., ~. escape sequence)
 	select {
 	case <-done:
 		log.Printf("vshd connection closed")
 	case <-ms.done:
 		log.Printf("VM exited")
+	case <-s.Context().Done():
+		log.Printf("SSH session closed by client")
 	}
 
 	s.Exit(0)
