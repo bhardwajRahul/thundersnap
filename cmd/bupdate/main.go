@@ -619,6 +619,11 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *rem
 	}
 	defer outf.Close()
 
+	// Pre-allocate the file to its final size (helps filesystem allocate extents)
+	if err := outf.Truncate(fidx.FileSize); err != nil {
+		return fmt.Errorf("truncating file: %w", err)
+	}
+
 	// Build list of chunks we need, marking which are local vs remote
 	var chunks []chunkInfo
 	var remoteOffset int64
@@ -635,10 +640,14 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *rem
 		remoteOffset += int64(ent.Size)
 	}
 
-	// Collect remote chunks we need to fetch
+	// Collect remote chunks we need to fetch (excluding zero blocks)
 	var remoteChunks []chunkInfo
 	for i := range chunks {
 		if chunks[i].localMapping == nil {
+			// Skip zero blocks - we'll leave holes for them
+			if chunks[i].ent.Size == bupdate.BLOB_MAX && chunks[i].ent.SHA == bupdate.ZeroBlockSHA {
+				continue
+			}
 			remoteChunks = append(remoteChunks, chunks[i])
 		}
 	}
@@ -671,6 +680,19 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *rem
 	// Now write all chunks in order
 	var written int64
 	for i, ci := range chunks {
+		chunkSize := int64(ci.ent.Size)
+
+		// Check for zero block - leave a hole instead of writing
+		if ci.ent.Size == bupdate.BLOB_MAX && ci.ent.SHA == bupdate.ZeroBlockSHA {
+			// Seek forward to leave a sparse hole (file was pre-truncated with zeros)
+			if _, err := outf.Seek(chunkSize, 1); err != nil {
+				return fmt.Errorf("seeking past zero block: %w", err)
+			}
+			written += chunkSize
+			prog.status("", written, fidx.FileSize, fileEntry.Filename)
+			continue
+		}
+
 		var data []byte
 
 		if ci.localMapping != nil {
@@ -722,6 +744,11 @@ func reconstructFile(outputPath string, fidx *bupdate.Fidx, remote *remoteSource
 	}
 	defer outf.Close()
 
+	// Pre-allocate the file to its final size (helps filesystem allocate extents)
+	if err := outf.Truncate(fidx.FileSize); err != nil {
+		return fmt.Errorf("truncating file: %w", err)
+	}
+
 	// Build list of chunks we need, marking which are local vs remote
 	var chunks []chunkInfo
 	var remoteOffset int64
@@ -742,10 +769,14 @@ func reconstructFile(outputPath string, fidx *bupdate.Fidx, remote *remoteSource
 		remoteOffset += int64(ent.Size)
 	}
 
-	// Collect remote chunks we need to fetch
+	// Collect remote chunks we need to fetch (excluding zero blocks)
 	var remoteChunks []chunkInfo
 	for i := range chunks {
 		if chunks[i].localMapping == nil {
+			// Skip zero blocks - we'll leave holes for them
+			if chunks[i].ent.Size == bupdate.BLOB_MAX && chunks[i].ent.SHA == bupdate.ZeroBlockSHA {
+				continue
+			}
 			remoteChunks = append(remoteChunks, chunks[i])
 		}
 	}
@@ -778,6 +809,19 @@ func reconstructFile(outputPath string, fidx *bupdate.Fidx, remote *remoteSource
 	// Now write all chunks in order
 	var written int64
 	for i, ci := range chunks {
+		chunkSize := int64(ci.ent.Size)
+
+		// Check for zero block - leave a hole instead of writing
+		if ci.ent.Size == bupdate.BLOB_MAX && ci.ent.SHA == bupdate.ZeroBlockSHA {
+			// Seek forward to leave a sparse hole (file was pre-truncated with zeros)
+			if _, err := outf.Seek(chunkSize, 1); err != nil {
+				return fmt.Errorf("seeking past zero block: %w", err)
+			}
+			written += chunkSize
+			prog.status("", written, fidx.FileSize, remoteFileName)
+			continue
+		}
+
 		var data []byte
 
 		if ci.localMapping != nil {

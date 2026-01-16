@@ -1,6 +1,11 @@
 // Package bupdate provides core functionality for fidx file format and content-defined chunking.
 package bupdate
 
+import (
+	"crypto/sha1"
+	"fmt"
+)
+
 const (
 	// FIDX_VERSION is the fidx file format version
 	FIDX_VERSION = 1
@@ -67,4 +72,16 @@ type FidxMapping struct {
 // FidxMappings is a sorted collection of chunk mappings for fast lookup
 type FidxMappings struct {
 	Mappings []FidxMapping
+}
+
+// ZeroBlockSHA is the SHA of a BLOB_MAX-sized block of all zeros.
+// This is used to detect sparse file holes during reconstruction.
+var ZeroBlockSHA [20]byte
+
+func init() {
+	// Compute SHA of all-zeros block using git blob format
+	h := sha1.New()
+	fmt.Fprintf(h, "blob %d\x00", BLOB_MAX)
+	h.Write(make([]byte, BLOB_MAX))
+	copy(ZeroBlockSHA[:], h.Sum(nil))
 }
