@@ -39,6 +39,8 @@ var (
 	flagFsDir *string
 	flagVmDir *string
 	flagMesh  *bool
+	flagNfsd  *bool
+	flagNfsPort *int
 )
 
 // vmSessionManager tracks running VM sessions and allows multiple clients to share them.
@@ -148,6 +150,8 @@ func main() {
 	flagFsDir = flag.String("fs-dir", "", "Directory to store per-user filesystems (required)")
 	flagVmDir = flag.String("vm-dir", "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
 	flagMesh = flag.Bool("mesh", false, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
+	flagNfsd = flag.Bool("nfsd", false, "Enable NFSv4 server to export -fs-dir")
+	flagNfsPort = flag.Int("nfs-port", 2049, "Port for NFSv4 server (default: 2049)")
 	flag.Parse()
 
 	if *flagFsDir == "" {
@@ -316,6 +320,26 @@ func main() {
 	// Start mesh ping loop if enabled
 	if *flagMesh {
 		go meshState.pingLoop(context.Background(), srv, lc)
+	}
+
+	// Start NFSv3 server if enabled
+	if *flagNfsd {
+		nfsLn, err := srv.Listen("tcp", fmt.Sprintf(":%d", *flagNfsPort))
+		if err != nil {
+			log.Fatalf("Failed to listen on NFS port %d: %v", *flagNfsPort, err)
+		}
+		defer nfsLn.Close()
+
+		nfsSrv, err := startNFSServer(*flagFsDir, nfsLn)
+		if err != nil {
+			log.Fatalf("Failed to start NFS server: %v", err)
+		}
+		go func() {
+			log.Printf("NFSv3 server listening on tsnet port %d", *flagNfsPort)
+			if err := nfsSrv.Serve(); err != nil {
+				log.Printf("NFS server error: %v", err)
+			}
+		}()
 	}
 
 	log.Printf("Waiting for SSH connections...")
