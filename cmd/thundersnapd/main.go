@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -37,6 +38,107 @@ var (
 	flagFsDir *string
 	flagVmDir *string
 )
+
+// vmSessionManager tracks running VM sessions and allows multiple clients to share them.
+type vmSessionManager struct {
+	mu       sync.Mutex
+	sessions map[string]*managedVMSession // key: "tailscaleUser/vmUser"
+}
+
+// managedVMSession wraps a VM session with reference counting.
+type managedVMSession struct {
+	session    *thundersnap.VMSession
+	vsockPath  string
+	refCount   int
+	done       chan struct{} // closed when VM exits
+	rootFS     string
+	tailscaleUser string
+	vmUser     string
+}
+
+var vmSessions = &vmSessionManager{
+	sessions: make(map[string]*managedVMSession),
+}
+
+// getOrCreateVM returns an existing VM session or creates a new one.
+// The caller must call releaseVM when done.
+func (m *vmSessionManager) getOrCreateVM(tailscaleUser, vmUser, rootFS, vmDir string, controlHandler http.Handler) (*managedVMSession, error) {
+	key := tailscaleUser + "/" + vmUser
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check if session already exists
+	if ms, ok := m.sessions[key]; ok {
+		// Make sure it's still running
+		select {
+		case <-ms.done:
+			// VM has exited, remove it and create a new one
+			delete(m.sessions, key)
+		default:
+			// VM is still running, increment ref count
+			ms.refCount++
+			log.Printf("VM session %s: reusing existing session (refCount=%d)", key, ms.refCount)
+			return ms, nil
+		}
+	}
+
+	// Create new VM session
+	log.Printf("VM session %s: starting new VM", key)
+	session, err := thundersnap.StartVM(thundersnap.VMConfig{
+		RootFS:         rootFS,
+		VMDir:          vmDir,
+		ControlHandler: controlHandler,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ms := &managedVMSession{
+		session:       session,
+		vsockPath:     session.VshSocketPath(),
+		refCount:      1,
+		done:          make(chan struct{}),
+		rootFS:        rootFS,
+		tailscaleUser: tailscaleUser,
+		vmUser:        vmUser,
+	}
+
+	// Monitor VM exit in background
+	go func() {
+		<-session.Done()
+		close(ms.done)
+		m.mu.Lock()
+		delete(m.sessions, key)
+		m.mu.Unlock()
+		log.Printf("VM session %s: VM exited, removed from manager", key)
+	}()
+
+	m.sessions[key] = ms
+	return ms, nil
+}
+
+// releaseVM decrements the reference count and shuts down the VM if it reaches zero.
+func (m *vmSessionManager) releaseVM(tailscaleUser, vmUser string) {
+	key := tailscaleUser + "/" + vmUser
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ms, ok := m.sessions[key]
+	if !ok {
+		return
+	}
+
+	ms.refCount--
+	log.Printf("VM session %s: released (refCount=%d)", key, ms.refCount)
+
+	if ms.refCount <= 0 {
+		log.Printf("VM session %s: no more clients, shutting down VM", key)
+		ms.session.Close()
+		delete(m.sessions, key)
+	}
+}
 
 func main() {
 	hostname := flag.String("hostname", "thundersnap", "Tailscale hostname for this server")
@@ -430,6 +532,8 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser string, logErr fu
 }
 
 // runVMSession handles a VM-based SSH session using cloud-hypervisor.
+// Multiple SSH connections to the same VM (same tailscaleUser + vmUser) share
+// the same VM instance. The VM is only shut down when all clients disconnect.
 func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(string, ...any)) error {
 	// Sanitize usernames for filesystem paths
 	safeTailscaleUser := sanitizeForPath(tailscaleUser)
@@ -458,20 +562,17 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(strin
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("/ping", handlePing)
 
-	// Start the VM in headless mode (console goes to logs, not SSH)
-	vmSession, err := thundersnap.StartVM(thundersnap.VMConfig{
-		RootFS:         rootFS,
-		VMDir:          *flagVmDir,
-		ControlHandler: controlMux,
-	})
+	// Get or create VM session (reuses existing VM if one is running)
+	ms, err := vmSessions.getOrCreateVM(safeTailscaleUser, safeVMUser, rootFS, *flagVmDir, controlMux)
 	if err != nil {
 		return fmt.Errorf("start VM: %w", err)
 	}
+	// Release our reference when done (may shut down VM if we're the last client)
+	defer vmSessions.releaseVM(safeTailscaleUser, safeVMUser)
 
 	// Connect to vshd in the VM via vsock
-	conn, err := connectToVshd(vmSession.VshSocketPath())
+	conn, err := connectToVshd(ms.vsockPath)
 	if err != nil {
-		vmSession.Close()
 		return fmt.Errorf("connect to vshd: %w", err)
 	}
 	defer conn.Close()
@@ -498,12 +599,10 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(strin
 	select {
 	case <-done:
 		log.Printf("vshd connection closed")
-	case <-vmSession.Done():
+	case <-ms.done:
 		log.Printf("VM exited")
 	}
 
-	// Clean up
-	vmSession.Close()
 	s.Exit(0)
 	return nil
 }
