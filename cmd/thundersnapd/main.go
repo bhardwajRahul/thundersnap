@@ -332,19 +332,14 @@ func main() {
 		defer pmLn.Close()
 
 		// Also listen on UDP for portmapper (required by some clients)
-		// tsnet requires explicit IPs for UDP, so listen on each Tailscale IP
-		var pmUDPConns []net.PacketConn
-		for _, ip := range status.TailscaleIPs {
-			pc, err := srv.ListenPacket("udp", net.JoinHostPort(ip.String(), "111"))
-			if err != nil {
-				log.Printf("Warning: Failed to listen on UDP portmapper %v: %v", ip, err)
-			} else {
-				log.Printf("UDP portmapper listening on %v", pc.LocalAddr())
-				pmUDPConns = append(pmUDPConns, pc)
-				defer pc.Close()
-			}
+		pmUDP, err := srv.ListenPacket("udp", ":111")
+		if err != nil {
+			log.Fatalf("Failed to listen on UDP portmapper: %v", err)
 		}
-		startPortmapper(pmLn, pmUDPConns, *flagNfsPort)
+		defer pmUDP.Close()
+		log.Printf("UDP portmapper listening on %v", pmUDP.LocalAddr())
+
+		startPortmapper(pmLn, pmUDP, *flagNfsPort)
 
 		// Start NFS server
 		nfsLn, err := srv.Listen("tcp", fmt.Sprintf(":%d", *flagNfsPort))
