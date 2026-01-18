@@ -74,6 +74,44 @@ type FidxMappings struct {
 	Mappings []FidxMapping
 }
 
+// FileByChecksums maps a checksum list key to the file path that has those exact checksums.
+// The key is the concatenated SHA bytes of all chunks in order.
+type FileByChecksums struct {
+	Files map[string]string // checksum key -> file path
+}
+
+// NewFileByChecksums creates a new FileByChecksums
+func NewFileByChecksums() *FileByChecksums {
+	return &FileByChecksums{
+		Files: make(map[string]string),
+	}
+}
+
+// MakeChecksumKey creates a key from a list of FidxEntry checksums
+func MakeChecksumKey(entries []FidxEntry) string {
+	key := make([]byte, len(entries)*20)
+	for i, ent := range entries {
+		copy(key[i*20:(i+1)*20], ent.SHA[:])
+	}
+	return string(key)
+}
+
+// Add registers a file with its checksum list
+func (f *FileByChecksums) Add(entries []FidxEntry, filePath string) {
+	key := MakeChecksumKey(entries)
+	// Only store the first file we encounter with this checksum list
+	if _, exists := f.Files[key]; !exists {
+		f.Files[key] = filePath
+	}
+}
+
+// Find looks up a file that has the exact same checksum list
+func (f *FileByChecksums) Find(entries []FidxEntry) (string, bool) {
+	key := MakeChecksumKey(entries)
+	path, ok := f.Files[key]
+	return path, ok
+}
+
 // ZeroBlockSHA is the SHA of a BLOB_MAX-sized block of all zeros.
 // This is used to detect sparse file holes during reconstruction.
 var ZeroBlockSHA [20]byte

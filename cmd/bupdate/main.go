@@ -259,7 +259,7 @@ func main() {
 // runBupdate performs the main reconstruction operation
 func runBupdate(localDir, remoteDir, targetFidx string) error {
 	// Load all local fidx files to build chunk mappings
-	mappings, err := loadLocalMappings(localDir)
+	mappings, filesByChecksums, err := loadLocalMappings(localDir)
 	if err != nil {
 		return fmt.Errorf("loading local mappings: %w", err)
 	}
@@ -287,7 +287,7 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 
 	if remoteFidx.IsMFIDX {
 		// Multi-file index - extract all files
-		return bupdateMFIDX(localDir, remote, remoteFidx, targetFidx, localFidxPath, mappings)
+		return bupdateMFIDX(localDir, remote, remoteFidx, targetFidx, localFidxPath, mappings, filesByChecksums)
 	}
 
 	// Single file reconstruction
@@ -326,7 +326,7 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 }
 
 // bupdateMFIDX handles reconstruction of all files from a multi-file index
-func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fidx, targetFidx, localFidxPath string, mappings *bupdate.FidxMappings) error {
+func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fidx, targetFidx, localFidxPath string, mappings *bupdate.FidxMappings, filesByChecksums *bupdate.FileByChecksums) error {
 	// Find the maximum file size for consistent progress display width
 	var maxFileSize int64
 	for _, fileEntry := range remoteFidx.Files {
@@ -358,15 +358,6 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 			return fmt.Errorf("creating directory for %s: %w", fileEntry.Filename, err)
 		}
 
-		// Create a temporary Fidx struct for this file
-		fileFidx := &bupdate.Fidx{
-			Entries:  fileEntry.Entries,
-			FileSize: int64(fileEntry.FileSize),
-		}
-
-		// Predict download for this specific file
-		missing, _ := predictDownloadForEntries(fileEntry.Entries, mappings)
-
 		// Check if remote is a symlink (only possible for filesystem sources)
 		isSymlink := false
 		if !remote.isHTTP {
@@ -376,6 +367,11 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 		}
 
 		if isSymlink {
+			// Create a temporary Fidx struct for this file
+			fileFidx := &bupdate.Fidx{
+				Entries:  fileEntry.Entries,
+				FileSize: int64(fileEntry.FileSize),
+			}
 			// For symlinks, reconstruct the target string then create symlink
 			remoteFilePathLocal := remote.filePath(remoteFilePath)
 			if err := reconstructSymlinkFromMFIDX(outputPath, fileFidx, remoteFilePathLocal, fileEntry, mappings, prog); err != nil {
@@ -383,7 +379,26 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 				return fmt.Errorf("reconstructing symlink %s: %w", fileEntry.Filename, err)
 			}
 		} else {
-			// Regular file
+			// Regular file - check if we can use COW clone
+			if cloneSource, ok := filesByChecksums.Find(fileEntry.Entries); ok {
+				// Found an identical file - try COW clone
+				os.Remove(outputPath) // Remove any existing file first
+				if err := bupdate.CloneFile(outputPath, cloneSource); err == nil {
+					// Clone succeeded, skip reconstruction
+					continue
+				}
+				// Clone failed (maybe not on btrfs), fall through to normal reconstruction
+			}
+
+			// Create a temporary Fidx struct for this file
+			fileFidx := &bupdate.Fidx{
+				Entries:  fileEntry.Entries,
+				FileSize: int64(fileEntry.FileSize),
+			}
+
+			// Predict download for this specific file
+			missing, _ := predictDownloadForEntries(fileEntry.Entries, mappings)
+
 			if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remote, remoteFilePath, fileEntry, mappings, prog, missing); err != nil {
 				os.Remove(tmpOutputPath)
 				prog.clear()
@@ -395,6 +410,11 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 				prog.clear()
 				return fmt.Errorf("rename %s: %w", fileEntry.Filename, err)
 			}
+		}
+
+		// Register this newly created file for future COW clones within this run
+		if !isSymlink {
+			filesByChecksums.Add(fileEntry.Entries, outputPath)
 		}
 	}
 
@@ -408,13 +428,15 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 	return nil
 }
 
-// loadLocalMappings scans the local directory for .fidx and .mfidx files and builds chunk mappings
-func loadLocalMappings(dir string) (*bupdate.FidxMappings, error) {
+// loadLocalMappings scans the local directory for .fidx and .mfidx files and builds chunk mappings.
+// It also returns a FileByChecksums map for COW clone optimization.
+func loadLocalMappings(dir string) (*bupdate.FidxMappings, *bupdate.FileByChecksums, error) {
 	var allMappings []bupdate.FidxMapping
+	filesByChecksums := bupdate.NewFileByChecksums()
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	for _, entry := range entries {
@@ -465,6 +487,7 @@ func loadLocalMappings(dir string) (*bupdate.FidxMappings, error) {
 						})
 					}
 					_ = target // used for documentation
+					// Don't add symlinks to filesByChecksums - can't FICLONE symlinks
 					continue
 				}
 
@@ -479,6 +502,9 @@ func loadLocalMappings(dir string) (*bupdate.FidxMappings, error) {
 					})
 					offset += int64(ent.Size)
 				}
+
+				// Register this file for potential COW cloning
+				filesByChecksums.Add(fileEntry.Entries, filePath)
 			}
 		} else {
 			// Single-file index
@@ -502,6 +528,9 @@ func loadLocalMappings(dir string) (*bupdate.FidxMappings, error) {
 				})
 				offset += int64(ent.Size)
 			}
+
+			// Register this file for potential COW cloning
+			filesByChecksums.Add(fidx.Entries, filePath)
 		}
 	}
 
@@ -510,7 +539,7 @@ func loadLocalMappings(dir string) (*bupdate.FidxMappings, error) {
 		return bytes.Compare(allMappings[i].SHA[:], allMappings[j].SHA[:]) < 0
 	})
 
-	return &bupdate.FidxMappings{Mappings: allMappings}, nil
+	return &bupdate.FidxMappings{Mappings: allMappings}, filesByChecksums, nil
 }
 
 
