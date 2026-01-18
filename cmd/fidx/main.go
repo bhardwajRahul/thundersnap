@@ -13,9 +13,11 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/bupdate"
+	"golang.org/x/term"
 )
 
 var (
@@ -34,21 +36,104 @@ func usage() {
 	os.Exit(1)
 }
 
-// chunkFile wraps bupdate.ChunkFile with progress reporting
-func chunkFile(filename string, writeEntry func(bupdate.FidxEntry) error) error {
-	stat, _ := os.Stat(filename)
-	fileSize := stat.Size()
-	var lastProgress int64 = -1
-	
+// progress tracks the current progress display state
+type progress struct {
+	termWidth   int
+	fileCount   int   // number of files processed so far
+	totalBytes  int64 // total bytes in files so far (completed files + current file progress)
+	lastUpdate  time.Time
+	hasRef      bool // whether we're using a reference mfidx
+}
+
+// newProgress creates a new progress tracker
+func newProgress(hasRef bool) *progress {
+	width := 80 // default
+	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+		width = w
+	}
+	return &progress{
+		termWidth: width,
+		hasRef:    hasRef,
+	}
+}
+
+// status prints a status line for the current file
+// mode is "new/changed", "unchanged", or "" (no ref)
+// currentFileBytes is progress within the current file (for large files)
+func (p *progress) status(mode string, filename string, currentFileBytes int64) {
+	// Rate limit updates to once per 100ms
+	now := time.Now()
+	if now.Sub(p.lastUpdate) < 100*time.Millisecond {
+		return
+	}
+	p.lastUpdate = now
+
+	totalM := (p.totalBytes + currentFileBytes) / (1024 * 1024)
+
+	// Format: [%d files] [%dM] <mode> <filename>
+	var prefix string
+	if mode != "" {
+		prefix = fmt.Sprintf("[%d files] [%dM] (%s)", p.fileCount, totalM, mode)
+	} else {
+		prefix = fmt.Sprintf("[%d files] [%dM]", p.fileCount, totalM)
+	}
+
+	// Calculate space for filename
+	prefixLen := len(prefix) + 1 // +1 for space
+	maxFilenameLen := p.termWidth - prefixLen
+	if maxFilenameLen < 3 {
+		maxFilenameLen = 3
+	}
+
+	displayName := filename
+	if len(displayName) > maxFilenameLen {
+		// Truncate with ellipsis at start
+		displayName = "..." + displayName[len(displayName)-maxFilenameLen+3:]
+	}
+
+	line := fmt.Sprintf("%s %s", prefix, displayName)
+
+	// Pad to terminal width to erase previous content
+	if len(line) < p.termWidth {
+		line = line + strings.Repeat(" ", p.termWidth-len(line))
+	} else if len(line) > p.termWidth {
+		line = line[:p.termWidth]
+	}
+
+	fmt.Printf("\r%s", line)
+}
+
+// fileStarted increments the file count
+func (p *progress) fileStarted() {
+	p.fileCount++
+}
+
+// fileCompleted adds the file's size to the total
+func (p *progress) fileCompleted(size int64) {
+	p.totalBytes += size
+}
+
+// clear clears the current line
+func (p *progress) clear() {
+	fmt.Printf("\r%s\r", strings.Repeat(" ", p.termWidth))
+}
+
+// done prints a final newline
+func (p *progress) done() {
+	p.clear()
+	fmt.Printf("Indexed %d files (%dM)\n", p.fileCount, p.totalBytes/(1024*1024))
+}
+
+// chunkFileWithProgress wraps bupdate.ChunkFile with progress reporting
+func chunkFileWithProgress(filename, storedName, mode string, prog *progress, writeEntry func(bupdate.FidxEntry) error) error {
 	return bupdate.ChunkFile(filename, writeEntry, func(totalBytes, fSize int64) {
-		if fileSize > 10*1024*1024 {
-			progress := (totalBytes * 100) / fSize
-			if progress/10 != lastProgress/10 {
-				fmt.Printf("    %d%% (%d MB / %d MB)\n", progress, totalBytes/(1024*1024), fSize/(1024*1024))
-				lastProgress = progress
-			}
-		}
+		prog.status(mode, storedName, totalBytes)
 	})
+}
+
+// chunkFile wraps bupdate.ChunkFile without progress reporting (for single-file mode)
+func chunkFile(filename string, writeEntry func(bupdate.FidxEntry) error) error {
+	return bupdate.ChunkFile(filename, writeEntry, func(totalBytes, fSize int64) {})
 }
 
 // processSymlink handles a symlink by indexing its target path as content
@@ -213,7 +298,7 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 		return err
 	}
 
-	fmt.Printf("Creating multi-file index: %s (%d files)\n", outpath, len(allFiles))
+	fmt.Printf("Creating multi-file index: %s\n", outpath)
 
 	tmppath := outpath + ".tmp"
 	outf, err := os.Create(tmppath)
@@ -240,8 +325,8 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 	}
 	fidxHash.Write(header)
 
-	// Track stats for reference hits
-	var reusedFiles, indexedFiles int
+	// Progress tracker
+	prog := newProgress(refMap != nil)
 
 	// Process each file
 	for _, filename := range allFiles {
@@ -254,39 +339,42 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 			return fmt.Errorf("lstat %s: %w", filename, err)
 		}
 
+		fileSize := stat.Size()
+
 		// Check if we can reuse entries from reference mfidx
 		if refMap != nil {
 			if ref, ok := refMap[storedName]; ok {
 				if fileMatches(filename, ref) {
 					// File is unchanged - copy entries from reference
-					fmt.Printf("  %s (unchanged)\n", storedName)
+					prog.fileStarted()
+					prog.status("unchanged", storedName, 0)
 					if err := writeRefEntries(bufw, fidxHash, storedName, stat, ref); err != nil {
 						return err
 					}
-					reusedFiles++
+					prog.fileCompleted(fileSize)
 					continue
 				}
 			}
 		}
 
+		prog.fileStarted()
+		var mode string
 		if refMap != nil {
-			fmt.Printf("  %s (new/changed)\n", storedName)
-		} else {
-			fmt.Printf("  %s\n", storedName)
+			mode = "new/changed"
 		}
-		indexedFiles++
+		prog.status(mode, storedName, 0)
 
 		// Handle symlinks specially - index the link target
 		if stat.Mode()&os.ModeSymlink != 0 {
 			if err := processSymlink(filename, storedName, bufw, fidxHash); err != nil {
 				return err
 			}
+			prog.fileCompleted(fileSize)
 			continue
 		}
 
 		// Skip non-regular files (devices, sockets, pipes, etc.)
 		if !stat.Mode().IsRegular() {
-			fmt.Printf("    skipping non-regular file\n")
 			continue
 		}
 
@@ -313,7 +401,7 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 		fidxHash.Write(sepBuf)
 
 		// Write chunk entries for this file
-		if err := chunkFile(filename, func(entry bupdate.FidxEntry) error {
+		if err := chunkFileWithProgress(filename, storedName, mode, prog, func(entry bupdate.FidxEntry) error {
 			entryData := make([]byte, 24)
 			copy(entryData[0:20], entry.SHA[:])
 			binary.BigEndian.PutUint16(entryData[20:22], entry.Size)
@@ -326,7 +414,10 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 		}); err != nil {
 			return fmt.Errorf("chunk %s: %w", filename, err)
 		}
+		prog.fileCompleted(fileSize)
 	}
+
+	prog.done()
 
 	// Write mfidx file checksum
 	checksum := fidxHash.Sum(nil)
@@ -346,7 +437,7 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 		return err
 	}
 
-	fmt.Printf("Wrote %s (%d indexed, %d reused from ref)\n", outpath, indexedFiles, reusedFiles)
+	fmt.Printf("Wrote %s\n", outpath)
 	return nil
 }
 
