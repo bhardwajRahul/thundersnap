@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
@@ -36,11 +37,12 @@ import (
 )
 
 var (
-	flagFsDir *string
-	flagVmDir *string
-	flagMesh  *bool
-	flagNfsd  *bool
-	flagNfsPort *int
+	flagFsDir       *string
+	flagSnapshotsDir *string
+	flagVmDir       *string
+	flagMesh        *bool
+	flagNfsd        *bool
+	flagNfsPort     *int
 )
 
 // vmSessionManager tracks running VM sessions and allows multiple clients to share them.
@@ -147,15 +149,19 @@ func (m *vmSessionManager) releaseVM(tailscaleUser, vmUser string) {
 func main() {
 	hostname := flag.String("hostname", "thundersnap", "Tailscale hostname for this server")
 	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
-	flagFsDir = flag.String("fs-dir", "", "Directory to store per-user filesystems (required)")
+	flagFsDir = flag.String("fs-dir", "", "Directory to store per-user live filesystems (required)")
+	flagSnapshotsDir = flag.String("snapshots-dir", "", "Directory to store base snapshots for cloning (required)")
 	flagVmDir = flag.String("vm-dir", "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
 	flagMesh = flag.Bool("mesh", false, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
-	flagNfsd = flag.Bool("nfsd", false, "Enable NFSv4 server to export -fs-dir")
+	flagNfsd = flag.Bool("nfsd", false, "Enable NFSv4 server to export -snapshots-dir")
 	flagNfsPort = flag.Int("nfs-port", 2049, "Port for NFSv4 server (default: 2049)")
 	flag.Parse()
 
 	if *flagFsDir == "" {
 		log.Fatalf("-fs-dir is required")
+	}
+	if *flagSnapshotsDir == "" {
+		log.Fatalf("-snapshots-dir is required")
 	}
 
 	// Set default vm-dir relative to executable
@@ -305,8 +311,8 @@ func main() {
 	// Web UI showing connected hosts
 	httpMux.HandleFunc("/", meshState.handleIndex)
 
-	// File server for bupdate (serves -fs-dir contents)
-	bupdateServer := &bupdateFileServer{root: *flagFsDir}
+	// File server for bupdate (serves -snapshots-dir contents)
+	bupdateServer := &bupdateFileServer{root: *flagSnapshotsDir}
 	httpMux.Handle("/bupdate/", http.StripPrefix("/bupdate", bupdateServer))
 
 	httpServer := &http.Server{Handler: httpMux}
@@ -348,7 +354,7 @@ func main() {
 		}
 		defer nfsLn.Close()
 
-		nfsSrv, err := startNFSServer(*flagFsDir, nfsLn)
+		nfsSrv, err := startNFSServer(*flagSnapshotsDir, nfsLn)
 		if err != nil {
 			log.Fatalf("Failed to start NFS server: %v", err)
 		}
@@ -761,9 +767,40 @@ func tryConnectToVshd(vsockPath string) (net.Conn, error) {
 	return conn, nil
 }
 
+// generateRandomID generates a random hex string for snapshot naming.
+func generateRandomID() (string, error) {
+	b := make([]byte, 16) // 32 hex characters
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// readStampFile reads the snapshot ID from a .stamp file.
+// Returns empty string if file doesn't exist.
+func readStampFile(path string) string {
+	data, err := os.ReadFile(path + ".stamp")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// writeStampFile writes a snapshot ID to a .stamp file.
+func writeStampFile(path, snapshotID string) error {
+	return os.WriteFile(path+".stamp", []byte(snapshotID+"\n"), 0644)
+}
+
 // ensureRootFS ensures the root filesystem exists at the given path.
-// If it doesn't exist, it clones from baseUserFS if that exists,
-// otherwise falls back to /snapshots/1.
+// If it doesn't exist, it first creates an intermediate snapshot in snapshots-dir,
+// then clones from that to the destination. This ensures snapshots-dir contains
+// stable reference points while fs-dir contains the live, changing filesystems.
+//
+// The snapshotting flow:
+// 1. Determine source: baseUserFS (if exists) or $snapshots-dir/1
+// 2. Create intermediate snapshot in $snapshots-dir with random hex ID
+// 3. Clone from intermediate snapshot to rootFS in $fs-dir
+// 4. Create .stamp files tracking the base snapshot ID
 func ensureRootFS(rootFS, baseUserFS string) error {
 	// Check if the directory already exists
 	if _, err := os.Stat(rootFS); err == nil {
@@ -778,21 +815,58 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		return fmt.Errorf("creating parent directory: %w", err)
 	}
 
-	// Determine which snapshot to clone from:
+	// Determine which source to clone from and what stamp ID to use:
 	// 1. If baseUserFS exists and is different from rootFS, use it
-	// 2. Otherwise fall back to /snapshots/1
-	snapshotSource := "/snapshots/1"
+	//    (inherit the stamp from the source's .stamp file)
+	// 2. Otherwise fall back to $snapshots-dir/1 (stamp ID = "1")
+	defaultSnapshot := filepath.Join(*flagSnapshotsDir, "1")
+	snapshotSource := defaultSnapshot
+	baseStampID := "1" // default base is "1"
+
 	if baseUserFS != rootFS {
 		if _, err := os.Stat(baseUserFS); err == nil {
 			snapshotSource = baseUserFS
+			// Inherit stamp from the source (fs-dir has .stamp files)
+			if stamp := readStampFile(baseUserFS); stamp != "" {
+				baseStampID = stamp
+			}
 		}
 	}
 
-	// Clone using btrfs subvolume snapshot
-	cmd := exec.Command("btrfs", "subvolume", "snapshot", snapshotSource, rootFS)
+	// Generate random ID for the intermediate snapshot
+	intermediateID, err := generateRandomID()
+	if err != nil {
+		return fmt.Errorf("generating snapshot ID: %w", err)
+	}
+	intermediatePath := filepath.Join(*flagSnapshotsDir, intermediateID)
+
+	// Step 1: Create intermediate snapshot in snapshots-dir
+	cmd := exec.Command("btrfs", "subvolume", "snapshot", snapshotSource, intermediatePath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("btrfs snapshot from %s failed: %w\noutput: %s", snapshotSource, err, string(output))
+		return fmt.Errorf("btrfs snapshot from %s to %s failed: %w\noutput: %s",
+			snapshotSource, intermediatePath, err, string(output))
+	}
+
+	// Write stamp file for the intermediate snapshot
+	// For snapshots in snapshots-dir, the stamp contains the base snapshot ID it was derived from
+	if err := writeStampFile(intermediatePath, baseStampID); err != nil {
+		log.Printf("Warning: failed to write stamp file for %s: %v", intermediatePath, err)
+	}
+
+	// Step 2: Clone from intermediate snapshot to rootFS
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", intermediatePath, rootFS)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("btrfs snapshot from %s to %s failed: %w\noutput: %s",
+			intermediatePath, rootFS, err, string(output))
+	}
+
+	// Write stamp file for the live filesystem
+	// For fs-dir snapshots, the stamp contains the intermediate snapshot ID
+	// (which is the basename of the snapshot in snapshots-dir)
+	if err := writeStampFile(rootFS, intermediateID); err != nil {
+		log.Printf("Warning: failed to write stamp file for %s: %v", rootFS, err)
 	}
 
 	return nil
