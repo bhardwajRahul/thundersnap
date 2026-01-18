@@ -299,8 +299,11 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 	outputPath := filepath.Join(localDir, outputName)
 	tmpOutputPath := outputPath + ".tmp"
 
+	// Remote file path is <fidx-hash>/bin
+	remoteFilePath := outputName + "/bin"
+
 	// Reconstruct the file
-	if err := reconstructFile(tmpOutputPath, remoteFidx, remote, outputName, mappings, prog); err != nil {
+	if err := reconstructFile(tmpOutputPath, remoteFidx, remote, remoteFilePath, mappings, prog); err != nil {
 		os.Remove(tmpOutputPath)
 		prog.clear()
 		return fmt.Errorf("reconstructing file: %w", err)
@@ -333,6 +336,10 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 	}
 	prog := newProgress(len(remoteFidx.Files), maxFileSize)
 
+	// Remote base path is the fidx name without extension (e.g., "e2682e8932c7c1cd0ca8ce01330f0265")
+	remoteBasePath := strings.TrimSuffix(targetFidx, ".fidx")
+	remoteBasePath = strings.TrimSuffix(remoteBasePath, ".mfidx")
+
 	// Reconstruct each file
 	for i, fileEntry := range remoteFidx.Files {
 		prog.setFile(i + 1)
@@ -341,6 +348,9 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 		// This preserves directory structure
 		outputPath := filepath.Join(localDir, fileEntry.Filename)
 		tmpOutputPath := outputPath + ".tmp"
+
+		// Remote file path includes the fidx base path
+		remoteFilePath := remoteBasePath + "/" + fileEntry.Filename
 
 		// Ensure parent directory exists
 		if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
@@ -360,21 +370,21 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 		// Check if remote is a symlink (only possible for filesystem sources)
 		isSymlink := false
 		if !remote.isHTTP {
-			remoteFilePath := remote.filePath(fileEntry.Filename)
-			remoteInfo, err := os.Lstat(remoteFilePath)
+			remoteFilePathLocal := remote.filePath(remoteFilePath)
+			remoteInfo, err := os.Lstat(remoteFilePathLocal)
 			isSymlink = err == nil && remoteInfo.Mode()&os.ModeSymlink != 0
 		}
 
 		if isSymlink {
 			// For symlinks, reconstruct the target string then create symlink
-			remoteFilePath := remote.filePath(fileEntry.Filename)
-			if err := reconstructSymlinkFromMFIDX(outputPath, fileFidx, remoteFilePath, fileEntry, mappings, prog); err != nil {
+			remoteFilePathLocal := remote.filePath(remoteFilePath)
+			if err := reconstructSymlinkFromMFIDX(outputPath, fileFidx, remoteFilePathLocal, fileEntry, mappings, prog); err != nil {
 				prog.clear()
 				return fmt.Errorf("reconstructing symlink %s: %w", fileEntry.Filename, err)
 			}
 		} else {
 			// Regular file
-			if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remote, fileEntry, mappings, prog, missing); err != nil {
+			if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remote, remoteFilePath, fileEntry, mappings, prog, missing); err != nil {
 				os.Remove(tmpOutputPath)
 				prog.clear()
 				return fmt.Errorf("reconstructing %s: %w", fileEntry.Filename, err)
@@ -612,7 +622,7 @@ func reconstructSymlinkFromMFIDX(outputPath string, fidx *bupdate.Fidx, remoteFi
 }
 
 // reconstructFileFromMFIDX rebuilds a file from an mfidx by combining local and remote chunks
-func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *remoteSource, fileEntry bupdate.FileEntry, mappings *bupdate.FidxMappings, prog *progress, missing int64) error {
+func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *remoteSource, remoteFilePath string, fileEntry bupdate.FileEntry, mappings *bupdate.FidxMappings, prog *progress, missing int64) error {
 	outf, err := os.Create(outputPath)
 	if err != nil {
 		return err
@@ -657,7 +667,7 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *rem
 	if len(remoteChunks) > 0 {
 		if remote.isHTTP {
 			// Use HTTP pipelining
-			httpReader, err := remote.getHTTPReaderForFile(fileEntry.Filename)
+			httpReader, err := remote.getHTTPReaderForFile(remoteFilePath)
 			if err != nil {
 				return fmt.Errorf("creating HTTP reader: %w", err)
 			}
@@ -669,8 +679,8 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *rem
 			}
 		} else {
 			// Use filesystem
-			remoteFilePath := remote.filePath(fileEntry.Filename)
-			remoteData, err = fetchChunksFilesystem(remoteFilePath, remoteChunks, missing, prog, fileEntry.Filename)
+			remoteFilePathFull := remote.filePath(remoteFilePath)
+			remoteData, err = fetchChunksFilesystem(remoteFilePathFull, remoteChunks, missing, prog, fileEntry.Filename)
 			if err != nil {
 				return fmt.Errorf("fetching remote chunks: %w", err)
 			}

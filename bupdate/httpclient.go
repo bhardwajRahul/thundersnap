@@ -158,7 +158,7 @@ func (r *HTTPReader) readResponse(expectedSize int64) ([]byte, error) {
 
 	// 206 Partial Content is expected for range requests
 	if statusCode != http.StatusPartialContent && statusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", statusCode)
+		return nil, fmt.Errorf("unexpected status code %d for %s", statusCode, r.baseURL)
 	}
 
 	// Read headers
@@ -277,7 +277,7 @@ func FetchFullFile(rawURL string) ([]byte, error) {
 	}
 
 	if statusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", statusCode)
+		return nil, fmt.Errorf("unexpected status code %d for %s", statusCode, rawURL)
 	}
 
 	// Read headers
