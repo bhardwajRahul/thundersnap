@@ -840,8 +840,8 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 	}
 	intermediatePath := filepath.Join(*flagSnapshotsDir, intermediateID)
 
-	// Step 1: Create intermediate snapshot in snapshots-dir
-	cmd := exec.Command("btrfs", "subvolume", "snapshot", snapshotSource, intermediatePath)
+	// Step 1: Create intermediate snapshot in snapshots-dir (read-only for stability)
+	cmd := exec.Command("btrfs", "subvolume", "snapshot", "-r", snapshotSource, intermediatePath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("btrfs snapshot from %s to %s failed: %w\noutput: %s",
