@@ -812,9 +812,14 @@ func readStampFile(path string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// writeStampFile writes a snapshot ID to a .stamp file.
+// writeStampFile writes a snapshot ID to a .stamp file atomically.
 func writeStampFile(path, snapshotID string) error {
-	return os.WriteFile(path+".stamp", []byte(snapshotID+"\n"), 0644)
+	stampPath := path + ".stamp"
+	tmpPath := stampPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(snapshotID+"\n"), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, stampPath)
 }
 
 // ensureRootFS ensures the root filesystem exists at the given path.
@@ -1213,6 +1218,12 @@ func createSnapshot(rootFS string) (string, error) {
 	// Create snapshot with fidx
 	if err := createSnapshotWithFidx(rootFS, snapshotID, baseStampID); err != nil {
 		return "", err
+	}
+
+	// Update the source rootFS's stamp to point to the new snapshot
+	// This makes future snapshots use the new snapshot as their parent for faster fidx
+	if err := writeStampFile(rootFS, snapshotID); err != nil {
+		log.Printf("Warning: failed to update stamp file for %s: %v", rootFS, err)
 	}
 
 	return snapshotID, nil
