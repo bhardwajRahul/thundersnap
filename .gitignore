@@ -1,8 +1,9 @@
 *~
 .*~
-thundersnapd
-ts
-tsvm
-vsh
-vshd
-fs
+/thundersnapd
+/ts
+/tsvm
+/vsh
+/vshd
+/fs
+/snaps
