@@ -265,7 +265,11 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 			}
 		}
 
-		fmt.Printf("  %s\n", storedName)
+		if refMap != nil {
+			fmt.Printf("  %s (new/changed)\n", storedName)
+		} else {
+			fmt.Printf("  %s\n", storedName)
+		}
 		indexedFiles++
 
 		// Handle symlinks specially - index the link target
@@ -403,10 +407,17 @@ func loadRefMFIDX(mfidxPath string) (map[string]*refFileInfo, string, error) {
 	}
 
 	// The mfidx contains paths relative to some base directory
-	// We need to figure out the base directory from the mfidx path
-	// Assume the mfidx is in the same directory as the files it indexes,
-	// or that the paths in the mfidx are the actual paths
-	refBase := filepath.Dir(mfidxPath)
+	// The base directory is the mfidx path with .fidx/.mfidx extension removed
+	// e.g., snaps/1.fidx -> snaps/1/
+	refBase := strings.TrimSuffix(mfidxPath, ".mfidx")
+	refBase = strings.TrimSuffix(refBase, ".fidx")
+
+	// Verify the reference base directory exists
+	if info, err := os.Stat(refBase); err != nil {
+		return nil, "", fmt.Errorf("reference base directory %q does not exist (expected directory matching %s)", refBase, mfidxPath)
+	} else if !info.IsDir() {
+		return nil, "", fmt.Errorf("reference base %q is not a directory", refBase)
+	}
 
 	result := make(map[string]*refFileInfo)
 	for _, fe := range fidx.Files {
