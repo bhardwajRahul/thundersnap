@@ -661,29 +661,7 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(strin
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("/ping", handlePing)
 	// Create snap handler with closure over rootFS
-	controlMux.HandleFunc("/snap", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		snapshotID, err := createSnapshot(rootFS)
-		if err != nil {
-			log.Printf("snap failed for %s: %v", rootFS, err)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(SnapResponse{
-				Status:  "error",
-				Message: err.Error(),
-			})
-			return
-		}
-		log.Printf("Created snapshot %s from %s", snapshotID, rootFS)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(SnapResponse{
-			Status:     "ok",
-			SnapshotID: snapshotID,
-		})
-	})
+	controlMux.HandleFunc("/snap", makeSnapHandler(rootFS))
 
 	// Get or create VM session (reuses existing VM if one is running)
 	ms, err := vmSessions.getOrCreateVM(safeTailscaleUser, safeVMUser, rootFS, *flagVmDir, controlMux)
@@ -872,7 +850,8 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 	intermediatePath := filepath.Join(*flagSnapshotsDir, intermediateID)
 
 	// Step 1: Create intermediate snapshot in snapshots-dir with fidx
-	if err := createSnapshotWithFidx(snapshotSource, intermediateID, baseStampID); err != nil {
+	// (no progress reporting for ensureRootFS - happens at SSH login time)
+	if err := createSnapshotWithFidx(snapshotSource, intermediateID, baseStampID, nil, false); err != nil {
 		return fmt.Errorf("create intermediate snapshot: %w", err)
 	}
 
@@ -1066,10 +1045,12 @@ func (c *controlServer) handleConn(conn net.Conn) {
 
 // controlResponseWriter implements http.ResponseWriter for control socket connections.
 type controlResponseWriter struct {
-	conn       net.Conn
-	headers    http.Header
-	statusCode int
-	body       []byte
+	conn          net.Conn
+	headers       http.Header
+	statusCode    int
+	body          []byte
+	headerWritten bool
+	streaming     bool // if true, writes go directly to conn
 }
 
 func newControlResponseWriter(conn net.Conn) *controlResponseWriter {
@@ -1084,6 +1065,16 @@ func (w *controlResponseWriter) Header() http.Header {
 }
 
 func (w *controlResponseWriter) Write(data []byte) (int, error) {
+	if w.streaming {
+		// In streaming mode, write headers on first write, then write directly
+		if !w.headerWritten {
+			if err := w.writeHeaders(); err != nil {
+				return 0, err
+			}
+		}
+		return w.conn.Write(data)
+	}
+	// Buffered mode: accumulate in body
 	w.body = append(w.body, data...)
 	return len(data), nil
 }
@@ -1092,7 +1083,59 @@ func (w *controlResponseWriter) WriteHeader(statusCode int) {
 	w.statusCode = statusCode
 }
 
+// Flush implements http.Flusher for streaming responses
+func (w *controlResponseWriter) Flush() {
+	// Enable streaming mode on first flush
+	if !w.streaming {
+		w.streaming = true
+	}
+	// For net.Conn, writes are typically unbuffered, so nothing extra to do
+}
+
+// writeHeaders writes the HTTP status and headers to the connection
+func (w *controlResponseWriter) writeHeaders() error {
+	if w.headerWritten {
+		return nil
+	}
+	w.headerWritten = true
+
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+
+	// Write status line
+	statusText := http.StatusText(w.statusCode)
+	if _, err := fmt.Fprintf(w.conn, "HTTP/1.0 %d %s\r\n", w.statusCode, statusText); err != nil {
+		return err
+	}
+
+	// For streaming, use chunked-style (no content-length)
+	// Write headers (skip Content-Length for streaming)
+	for key, values := range w.headers {
+		if w.streaming && key == "Content-Length" {
+			continue
+		}
+		for _, value := range values {
+			if _, err := fmt.Fprintf(w.conn, "%s: %s\r\n", key, value); err != nil {
+				return err
+			}
+		}
+	}
+
+	// End headers
+	if _, err := w.conn.Write([]byte("\r\n")); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (w *controlResponseWriter) finish() error {
+	if w.streaming {
+		// Already wrote everything directly
+		return nil
+	}
+
 	if w.statusCode == 0 {
 		w.statusCode = http.StatusOK
 	}
@@ -1172,37 +1215,133 @@ type SnapResponse struct {
 	Message    string `json:"message,omitempty"`
 }
 
-// handleSnap handles POST /snap - create a snapshot of the container's rootFS
-func (c *controlServer) handleSnap(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+// SnapStreamEvent is a single event in the streaming snap response (NDJSON format).
+// Type is "progress" for intermediate progress or "result" for the final result.
+type SnapStreamEvent struct {
+	Type       string `json:"type"`                  // "progress" or "result"
+	Message    string `json:"message,omitempty"`     // progress message
+	Status     string `json:"status,omitempty"`      // "ok" or "error" (for result)
+	SnapshotID string `json:"snapshot_id,omitempty"` // snapshot ID (for result)
+}
+
+// snapProgressWriter wraps an http.ResponseWriter to write progress events
+type snapProgressWriter struct {
+	w       http.ResponseWriter
+	flusher http.Flusher
+	encoder *json.Encoder
+}
+
+func newSnapProgressWriter(w http.ResponseWriter) *snapProgressWriter {
+	pw := &snapProgressWriter{
+		w:       w,
+		encoder: json.NewEncoder(w),
+	}
+	if f, ok := w.(http.Flusher); ok {
+		pw.flusher = f
+	}
+	return pw
+}
+
+func (pw *snapProgressWriter) Write(p []byte) (n int, err error) {
+	// Each write from the progress tracker is a line of progress text
+	msg := strings.TrimSpace(string(p))
+	if msg == "" {
+		return len(p), nil
+	}
+	event := SnapStreamEvent{
+		Type:    "progress",
+		Message: msg,
+	}
+	if err := pw.encoder.Encode(event); err != nil {
+		return 0, err
+	}
+	if pw.flusher != nil {
+		pw.flusher.Flush()
+	}
+	return len(p), nil
+}
+
+// makeSnapHandler creates a /snap handler for the given rootFS.
+// This is used by both container (controlServer) and VM handlers.
+func makeSnapHandler(rootFS string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Check if client wants streaming progress
+		stream := r.URL.Query().Get("stream") == "1"
+		isTTY := r.URL.Query().Get("tty") == "1"
+
+		if stream {
+			handleSnapStreaming(w, rootFS, isTTY)
+			return
+		}
+
+		// Non-streaming: original behavior
+		snapshotID, err := createSnapshot(rootFS, nil, false)
+		if err != nil {
+			log.Printf("snap failed for %s: %v", rootFS, err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SnapResponse{
+				Status:  "error",
+				Message: err.Error(),
+			})
+			return
+		}
+
+		log.Printf("Created snapshot %s from %s", snapshotID, rootFS)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(SnapResponse{
+			Status:     "ok",
+			SnapshotID: snapshotID,
+		})
+	}
+}
+
+// handleSnapStreaming handles the streaming version of /snap
+func handleSnapStreaming(w http.ResponseWriter, rootFS string, isTTY bool) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+
+	// Enable streaming mode immediately by flushing
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
 	}
 
-	snapshotID, err := createSnapshot(c.rootFS)
+	pw := newSnapProgressWriter(w)
+	encoder := json.NewEncoder(w)
+
+	snapshotID, err := createSnapshot(rootFS, pw, isTTY)
 	if err != nil {
-		log.Printf("snap failed for %s: %v", c.rootFS, err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(SnapResponse{
+		log.Printf("snap failed for %s: %v", rootFS, err)
+		encoder.Encode(SnapStreamEvent{
+			Type:    "result",
 			Status:  "error",
 			Message: err.Error(),
 		})
 		return
 	}
 
-	log.Printf("Created snapshot %s from %s", snapshotID, c.rootFS)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(SnapResponse{
+	log.Printf("Created snapshot %s from %s", snapshotID, rootFS)
+	encoder.Encode(SnapStreamEvent{
+		Type:       "result",
 		Status:     "ok",
 		SnapshotID: snapshotID,
 	})
 }
 
+// handleSnap handles POST /snap - create a snapshot of the container's rootFS
+func (c *controlServer) handleSnap(w http.ResponseWriter, r *http.Request) {
+	makeSnapHandler(c.rootFS)(w, r)
+}
+
 // createSnapshot creates a read-only snapshot of the given rootFS in snapshots-dir.
 // Returns the new snapshot ID (random hex string).
-func createSnapshot(rootFS string) (string, error) {
+// If progressWriter is non-nil, progress updates are written to it.
+func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string, error) {
 	// Read the base stamp from the source rootFS to find parent snapshot
 	baseStampID := readStampFile(rootFS)
 	if baseStampID == "" {
@@ -1216,7 +1355,7 @@ func createSnapshot(rootFS string) (string, error) {
 	}
 
 	// Create snapshot with fidx
-	if err := createSnapshotWithFidx(rootFS, snapshotID, baseStampID); err != nil {
+	if err := createSnapshotWithFidx(rootFS, snapshotID, baseStampID, progressWriter, isTTY); err != nil {
 		return "", err
 	}
 
@@ -1235,7 +1374,7 @@ func createSnapshot(rootFS string) (string, error) {
 // 2. Create mfidx $snapshotID.tmp.fidx (with --ref to parent if exists)
 // 3. Create fidx of the fidx: $snapshotID.tmp.fidx.fidx
 // 4. Rename all three to final names atomically
-func createSnapshotWithFidx(source, snapshotID, parentStampID string) error {
+func createSnapshotWithFidx(source, snapshotID, parentStampID string, progressWriter io.Writer, isTTY bool) error {
 	tmpPath := filepath.Join(*flagSnapshotsDir, snapshotID+".tmp")
 	tmpFidxPath := tmpPath + ".fidx"
 	tmpFidxFidxPath := tmpFidxPath + ".fidx"
@@ -1271,8 +1410,10 @@ func createSnapshotWithFidx(source, snapshotID, parentStampID string) error {
 
 	log.Printf("Creating fidx for snapshot %s (ref: %s)", snapshotID, refPath)
 	fidxOpts := bupdate.IndexerOptions{
-		RefPath:  refPath,
-		Progress: false, // no terminal progress in daemon
+		RefPath:        refPath,
+		Progress:       false, // don't use stderr directly
+		ProgressWriter: progressWriter,
+		IsTTY:          isTTY,
 	}
 	if err := bupdate.CreateFidx(tmpPath, tmpFidxPath, fidxOpts); err != nil {
 		// Clean up on error

@@ -25,6 +25,7 @@ import (
 	"github.com/mdlayher/vsock"
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/bupdate"
+	"golang.org/x/term"
 )
 
 // thunderPort is the vsock port used for the thunder control protocol.
@@ -261,11 +262,19 @@ func cmdSnap(args []string) {
 	fmt.Println(snapshotID)
 }
 
-// SnapResponse is the response from the /snap endpoint
+// SnapResponse is the response from the /snap endpoint (non-streaming)
 type SnapResponse struct {
 	Status     string `json:"status"`
 	SnapshotID string `json:"snapshot_id,omitempty"`
 	Message    string `json:"message,omitempty"`
+}
+
+// SnapStreamEvent is a single event in the streaming snap response (NDJSON format).
+type SnapStreamEvent struct {
+	Type       string `json:"type"`                  // "progress" or "result"
+	Message    string `json:"message,omitempty"`     // progress message
+	Status     string `json:"status,omitempty"`      // "ok" or "error" (for result)
+	SnapshotID string `json:"snapshot_id,omitempty"` // snapshot ID (for result)
 }
 
 func doSnap(sockPath string) (string, error) {
@@ -277,32 +286,91 @@ func doSnap(sockPath string) (string, error) {
 		},
 	}
 
-	resp, err := client.Post("http://localhost/snap", "application/json", nil)
+	// Detect if stderr is a TTY for progress display
+	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
+
+	// Get terminal width for formatting
+	termWidth := 80 // default
+	if isTTY {
+		if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w > 0 {
+			termWidth = w
+		}
+	}
+
+	// Build URL with streaming enabled
+	url := "http://localhost/snap?stream=1"
+	if isTTY {
+		url += "&tty=1"
+	}
+
+	resp, err := client.Post(url, "application/json", nil)
 	if err != nil {
 		return "", fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read the full body for better error reporting
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
+	// Parse NDJSON stream
+	scanner := bufio.NewScanner(resp.Body)
+	var lastEvent SnapStreamEvent
+	var lastProgressMsg string
+	var lastLineLen int
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var event SnapStreamEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			return "", fmt.Errorf("parse stream event: %w (line: %q)", err, string(line))
+		}
+
+		if event.Type == "progress" {
+			lastProgressMsg = event.Message
+			// Write progress to stderr
+			if isTTY {
+				// Truncate message to terminal width if needed
+				msg := event.Message
+				if len(msg) > termWidth {
+					msg = msg[:termWidth]
+				}
+				// Pad with spaces to clear previous longer line
+				padding := ""
+				if len(msg) < lastLineLen {
+					padding = strings.Repeat(" ", lastLineLen-len(msg))
+				}
+				fmt.Fprintf(os.Stderr, "\r%s%s", msg, padding)
+				lastLineLen = len(msg)
+			}
+		} else if event.Type == "result" {
+			lastEvent = event
+		}
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("server error %d: %s", resp.StatusCode, string(body))
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read stream: %w", err)
 	}
 
-	var result SnapResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("decode response: %w (body: %q)", err, string(body))
+	// Clear the progress line if TTY
+	if isTTY && lastLineLen > 0 {
+		fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", lastLineLen))
+	}
+	// Print the final summary (works for both TTY and non-TTY since it's the "done" line)
+	if lastProgressMsg != "" {
+		fmt.Fprintln(os.Stderr, lastProgressMsg)
 	}
 
-	if result.Status != "ok" {
-		return "", fmt.Errorf("snap failed: %s", result.Message)
+	// Check result
+	if lastEvent.Type != "result" {
+		return "", fmt.Errorf("no result received from server")
 	}
 
-	return result.SnapshotID, nil
+	if lastEvent.Status != "ok" {
+		return "", fmt.Errorf("snap failed: %s", lastEvent.Message)
+	}
+
+	return lastEvent.SnapshotID, nil
 }
 
 func cmdBupdate(args []string) {

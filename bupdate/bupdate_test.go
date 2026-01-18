@@ -165,12 +165,4 @@ func TestChunkOverflow(t *testing.T) {
 		len(originalData), len(file.Entries))
 }
 
-// bytesWriter wraps a byte slice for io.Writer compatibility
-type bytesWriter struct {
-	buf *[]byte
-}
-
-func (bw *bytesWriter) Write(p []byte) (n int, err error) {
-	*bw.buf = append(*bw.buf, p...)
-	return len(p), nil
-}
+// bytesWriter is defined in indexer.go

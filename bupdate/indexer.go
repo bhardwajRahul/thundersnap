@@ -22,8 +22,17 @@ type IndexerOptions struct {
 	RefPath string
 
 	// Progress enables progress reporting to stderr.
-	// Only reports if stderr is a terminal.
+	// Only reports if stderr is a terminal and ProgressWriter is nil.
 	Progress bool
+
+	// ProgressWriter, if non-nil, receives progress updates.
+	// If IsTTY is true, full progress lines are written.
+	// If IsTTY is false, only final summary is written.
+	ProgressWriter io.Writer
+
+	// IsTTY indicates whether the progress writer is a terminal.
+	// Controls whether to emit interactive progress or just final summary.
+	IsTTY bool
 }
 
 // RefFileInfo holds metadata about a file in the reference mfidx
@@ -40,10 +49,11 @@ type progress struct {
 	totalBytes  int64 // total bytes in files so far (completed files + current file progress)
 	lastUpdate  time.Time
 	hasRef      bool // whether we're using a reference mfidx
+	isTTY       bool // whether output is a terminal
 }
 
 // newProgress creates a new progress tracker
-func newProgress(w io.Writer, hasRef bool) *progress {
+func newProgress(w io.Writer, hasRef, isTTY bool) *progress {
 	width := 80 // default
 	if f, ok := w.(*os.File); ok {
 		if w, _, err := term.GetSize(int(f.Fd())); err == nil && w > 0 {
@@ -54,6 +64,7 @@ func newProgress(w io.Writer, hasRef bool) *progress {
 		w:         w,
 		termWidth: width,
 		hasRef:    hasRef,
+		isTTY:     isTTY,
 	}
 }
 
@@ -61,7 +72,7 @@ func newProgress(w io.Writer, hasRef bool) *progress {
 // mode is "new/changed", "unchanged", or "" (no ref)
 // currentFileBytes is progress within the current file (for large files)
 func (p *progress) status(mode string, filename string, currentFileBytes int64) {
-	if p.w == nil {
+	if p.w == nil || !p.isTTY {
 		return
 	}
 
@@ -75,36 +86,16 @@ func (p *progress) status(mode string, filename string, currentFileBytes int64) 
 	totalM := (p.totalBytes + currentFileBytes) / (1024 * 1024)
 
 	// Format: [%d files] [%dM] <mode> <filename>
-	var prefix string
+	// Output is a single line without terminal control chars - the receiver
+	// is responsible for terminal formatting (padding, \r, etc.)
+	var line string
 	if mode != "" {
-		prefix = fmt.Sprintf("[%d files] [%dM] (%s)", p.fileCount, totalM, mode)
+		line = fmt.Sprintf("[%d files] [%dM] (%s) %s", p.fileCount, totalM, mode, filename)
 	} else {
-		prefix = fmt.Sprintf("[%d files] [%dM]", p.fileCount, totalM)
+		line = fmt.Sprintf("[%d files] [%dM] %s", p.fileCount, totalM, filename)
 	}
 
-	// Calculate space for filename
-	prefixLen := len(prefix) + 1 // +1 for space
-	maxFilenameLen := p.termWidth - prefixLen
-	if maxFilenameLen < 3 {
-		maxFilenameLen = 3
-	}
-
-	displayName := filename
-	if len(displayName) > maxFilenameLen {
-		// Truncate with ellipsis at start
-		displayName = "..." + displayName[len(displayName)-maxFilenameLen+3:]
-	}
-
-	line := fmt.Sprintf("%s %s", prefix, displayName)
-
-	// Pad to terminal width to erase previous content
-	if len(line) < p.termWidth {
-		line = line + strings.Repeat(" ", p.termWidth-len(line))
-	} else if len(line) > p.termWidth {
-		line = line[:p.termWidth]
-	}
-
-	fmt.Fprintf(p.w, "\r%s", line)
+	fmt.Fprintln(p.w, line)
 }
 
 // fileStarted increments the file count
@@ -117,20 +108,11 @@ func (p *progress) fileCompleted(size int64) {
 	p.totalBytes += size
 }
 
-// clear clears the current line
-func (p *progress) clear() {
-	if p.w == nil {
-		return
-	}
-	fmt.Fprintf(p.w, "\r%s\r", strings.Repeat(" ", p.termWidth))
-}
-
-// done prints a final newline
+// done prints the final summary
 func (p *progress) done() {
 	if p.w == nil {
 		return
 	}
-	p.clear()
 	fmt.Fprintf(p.w, "Indexed %d files (%dM)\n", p.fileCount, p.totalBytes/(1024*1024))
 }
 
@@ -264,8 +246,10 @@ func createMFIDX(paths []string, outPath string, opts IndexerOptions) error {
 
 	// Progress tracker
 	var prog *progress
-	if opts.Progress && term.IsTerminal(int(os.Stderr.Fd())) {
-		prog = newProgress(os.Stderr, refMap != nil)
+	if opts.ProgressWriter != nil {
+		prog = newProgress(opts.ProgressWriter, refMap != nil, opts.IsTTY)
+	} else if opts.Progress && term.IsTerminal(int(os.Stderr.Fd())) {
+		prog = newProgress(os.Stderr, refMap != nil, true)
 	}
 
 	// Process each file
