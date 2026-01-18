@@ -17,6 +17,7 @@ const (
 	mountProg   = 100005
 	nfsProg     = 100003
 	nlmProg     = 100021 // NFS Lock Manager (lockd)
+	nfsAclProg  = 100227 // NFS ACL program
 )
 
 // Portmapper v2 procedures
@@ -239,6 +240,9 @@ func (p *portmapServer) makeGetaddrResponse(xid uint32, body []byte) []byte {
 			uaddr = fmt.Sprintf("0.0.0.0.%d.%d", p1, p2)
 		}
 		log.Printf("portmap: GETADDR for NLM (lockd) vers=%d netid=%s -> %q", reqVers, netid, uaddr)
+	case nfsAclProg:
+		// NFS ACL program - not supported, return empty address
+		log.Printf("portmap: GETADDR for NFS_ACL vers=%d netid=%s -> \"\" (not supported)", reqVers, netid)
 	default:
 		log.Printf("portmap: GETADDR for unknown program %d vers=%d netid=%s -> \"\"", reqProg, reqVers, netid)
 	}
@@ -324,6 +328,10 @@ func (p *portmapServer) makeGetportResponse(xid uint32, body []byte) []byte {
 		// NFS Lock Manager - we handle it on port 111 (same as portmap)
 		port = 111
 		log.Printf("portmap: GETPORT for NLM (lockd) vers=%d proto=%d -> %d", reqVers, reqProto, port)
+	case nfsAclProg:
+		// NFS ACL program - not supported
+		port = 0
+		log.Printf("portmap: GETPORT for NFS_ACL vers=%d proto=%d -> 0 (not supported)", reqVers, reqProto)
 	default:
 		port = 0
 		log.Printf("portmap: GETPORT for unknown program %d vers=%d proto=%d -> 0", reqProg, reqVers, reqProto)
