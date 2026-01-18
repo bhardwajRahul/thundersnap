@@ -1700,7 +1700,7 @@ func (m *meshState) pingPeer(ctx context.Context, fqdn string, pingBody []byte) 
 	}
 }
 
-// bupdateFileServer serves files from -fs-dir with range request support
+// bupdateFileServer serves files from -snapshots-dir with range request support
 type bupdateFileServer struct {
 	root string
 }
