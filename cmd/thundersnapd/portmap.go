@@ -216,21 +216,16 @@ func (p *portmapServer) makeGetaddrResponse(xid uint32, body []byte) []byte {
 			p1 := p.nfsPort / 256
 			p2 := p.nfsPort % 256
 			uaddr = fmt.Sprintf("0.0.0.0.%d.%d", p1, p2)
-		} else if isUDP {
-			// Return PROG_UNAVAIL for UDP to make client fail fast
-			log.Printf("portmap: GETADDR for NFS vers=%d netid=%s -> PROG_UNAVAIL", reqVers, netid)
-			return p.makeProgUnavail(xid)
 		}
+		// UDP not supported - uaddr stays empty, client will try TCP
 		log.Printf("portmap: GETADDR for NFS vers=%d netid=%s -> %q", reqVers, netid, uaddr)
 	case mountProg:
 		if isTCP {
 			p1 := p.mountPort / 256
 			p2 := p.mountPort % 256
 			uaddr = fmt.Sprintf("0.0.0.0.%d.%d", p1, p2)
-		} else if isUDP {
-			log.Printf("portmap: GETADDR for MOUNT vers=%d netid=%s -> PROG_UNAVAIL", reqVers, netid)
-			return p.makeProgUnavail(xid)
 		}
+		// UDP not supported - uaddr stays empty, client will try TCP
 		log.Printf("portmap: GETADDR for MOUNT vers=%d netid=%s -> %q", reqVers, netid, uaddr)
 	case nlmProg:
 		// NFS Lock Manager - we handle it on port 111
@@ -337,11 +332,8 @@ func (p *portmapServer) makeGetportResponse(xid uint32, body []byte) []byte {
 		log.Printf("portmap: GETPORT for unknown program %d vers=%d proto=%d -> 0", reqProg, reqVers, reqProto)
 	}
 
-	// If port is 0 and this was a UDP request for a known program, return
-	// PROG_UNAVAIL to make the client fail fast instead of retrying
-	if port == 0 && !isTCP && (reqProg == nfsProg || reqProg == mountProg) {
-		return p.makeProgUnavail(xid)
-	}
+	// Return port 0 for UDP requests - client will try TCP next
+	// (Returning PROG_UNAVAIL causes unnecessary delays)
 
 	// RPC reply with port
 	resp := make([]byte, 28)
