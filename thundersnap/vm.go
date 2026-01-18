@@ -45,6 +45,12 @@ type VMSession struct {
 	controlHandler http.Handler
 }
 
+// SetControlHandler updates the HTTP handler used for vsock control connections.
+// This allows updating the handler for a running VM session.
+func (s *VMSession) SetControlHandler(h http.Handler) {
+	s.controlHandler = h
+}
+
 // StartVM starts a new VM session with the given configuration.
 func StartVM(cfg VMConfig) (*VMSession, error) {
 	// Create unique socket paths for this session
@@ -248,6 +254,8 @@ func (s *VMSession) handleVsockConnection(conn net.Conn) {
 			conn:    conn,
 			headers: make(http.Header),
 		}
+
+		log.Printf("vsock: handling request %s %s", req.Method, req.URL.Path)
 
 		// Serve the request
 		s.controlHandler.ServeHTTP(rw, req)

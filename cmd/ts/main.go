@@ -43,6 +43,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  ping     send a ping to thundersnapd")
 	fmt.Fprintln(os.Stderr, "  bupdate  download and reconstruct files from mesh peers")
 	fmt.Fprintln(os.Stderr, "  fidx     create a file index (.fidx) for a file or directory")
+	fmt.Fprintln(os.Stderr, "  snap     create a snapshot of the current container/VM")
 	os.Exit(1)
 }
 
@@ -66,6 +67,8 @@ func main() {
 		cmdBupdate(cmdArgs)
 	case "fidx":
 		cmdFidx(cmdArgs)
+	case "snap":
+		cmdSnap(cmdArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command: %s\n", cmd)
 		os.Exit(1)
@@ -235,6 +238,71 @@ func cmdFidx(args []string) {
 	}
 
 	fmt.Printf("Wrote %s\n", outPath)
+}
+
+func cmdSnap(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts snap")
+	// Parse expects first element to be program name (like os.Args)
+	opts.Parse(append([]string{"ts snap"}, args...))
+
+	if opts.NArgs() > 0 {
+		fmt.Fprintln(os.Stderr, "error: snap takes no arguments")
+		os.Exit(1)
+	}
+
+	snapshotID, err := doSnap(*sockPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Print just the snapshot ID to stdout
+	fmt.Println(snapshotID)
+}
+
+// SnapResponse is the response from the /snap endpoint
+type SnapResponse struct {
+	Status     string `json:"status"`
+	SnapshotID string `json:"snapshot_id,omitempty"`
+	Message    string `json:"message,omitempty"`
+}
+
+func doSnap(sockPath string) (string, error) {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	resp, err := client.Post("http://localhost/snap", "application/json", nil)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read the full body for better error reporting
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("server error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result SnapResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("decode response: %w (body: %q)", err, string(body))
+	}
+
+	if result.Status != "ok" {
+		return "", fmt.Errorf("snap failed: %s", result.Message)
+	}
+
+	return result.SnapshotID, nil
 }
 
 func cmdBupdate(args []string) {

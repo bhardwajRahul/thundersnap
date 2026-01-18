@@ -82,8 +82,9 @@ func (m *vmSessionManager) getOrCreateVM(tailscaleUser, vmUser, rootFS, vmDir st
 			// VM has exited, remove it and create a new one
 			delete(m.sessions, key)
 		default:
-			// VM is still running, increment ref count
+			// VM is still running, increment ref count and update handler
 			ms.refCount++
+			ms.session.SetControlHandler(controlHandler)
 			log.Printf("VM session %s: reusing existing session (refCount=%d)", key, ms.refCount)
 			return ms, nil
 		}
@@ -525,7 +526,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser string, logErr fu
 	// Start control socket server for this container
 	sockPath := filepath.Join(rootFS, "thunder.sock")
 	log.Printf("Creating control socket at %s", sockPath)
-	ctrlServer, err := startControlServer(sockPath)
+	ctrlServer, err := startControlServer(sockPath, rootFS)
 	if err != nil {
 		return fmt.Errorf("start control socket: %w", err)
 	}
@@ -658,6 +659,30 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(strin
 	// Create control handler for vsock
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("/ping", handlePing)
+	// Create snap handler with closure over rootFS
+	controlMux.HandleFunc("/snap", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		snapshotID, err := createSnapshot(rootFS)
+		if err != nil {
+			log.Printf("snap failed for %s: %v", rootFS, err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SnapResponse{
+				Status:  "error",
+				Message: err.Error(),
+			})
+			return
+		}
+		log.Printf("Created snapshot %s from %s", snapshotID, rootFS)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(SnapResponse{
+			Status:     "ok",
+			SnapshotID: snapshotID,
+		})
+	})
 
 	// Get or create VM session (reuses existing VM if one is running)
 	ms, err := vmSessions.getOrCreateVM(safeTailscaleUser, safeVMUser, rootFS, *flagVmDir, controlMux)
@@ -929,6 +954,7 @@ type controlServer struct {
 	handler  http.Handler
 	listener net.Listener
 	sockPath string
+	rootFS   string // the rootFS this control server is associated with
 	done     chan struct{}
 }
 
@@ -942,7 +968,7 @@ func (c *controlServer) Close() error {
 
 // startControlServer starts the HTTP control server on a Unix socket.
 // The server expects a vsock-style handshake (CONNECT/OK) before HTTP.
-func startControlServer(sockPath string) (*controlServer, error) {
+func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	// Remove existing socket file if it exists
 	os.Remove(sockPath)
 
@@ -958,15 +984,17 @@ func startControlServer(sockPath string) (*controlServer, error) {
 
 	log.Printf("Control socket listening on %s", sockPath)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ping", handlePing)
-
 	cs := &controlServer{
-		handler:  mux,
 		listener: ln,
 		sockPath: sockPath,
+		rootFS:   rootFS,
 		done:     make(chan struct{}),
 	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", handlePing)
+	mux.HandleFunc("/snap", cs.handleSnap)
+	cs.handler = mux
 
 	go cs.serve()
 
@@ -1027,6 +1055,7 @@ func (c *controlServer) handleConn(conn net.Conn) {
 
 		// Create response writer
 		rw := newControlResponseWriter(conn)
+		log.Printf("control socket: handling %s %s", req.Method, req.URL.Path)
 		c.handler.ServeHTTP(rw, req)
 		if err := rw.finish(); err != nil {
 			log.Printf("control socket: failed to write response: %v", err)
@@ -1137,6 +1166,72 @@ func handlePing(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// SnapResponse is the response from the /snap endpoint
+type SnapResponse struct {
+	Status     string `json:"status"`
+	SnapshotID string `json:"snapshot_id,omitempty"`
+	Message    string `json:"message,omitempty"`
+}
+
+// handleSnap handles POST /snap - create a snapshot of the container's rootFS
+func (c *controlServer) handleSnap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	snapshotID, err := createSnapshot(c.rootFS)
+	if err != nil {
+		log.Printf("snap failed for %s: %v", c.rootFS, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(SnapResponse{
+			Status:  "error",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	log.Printf("Created snapshot %s from %s", snapshotID, c.rootFS)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(SnapResponse{
+		Status:     "ok",
+		SnapshotID: snapshotID,
+	})
+}
+
+// createSnapshot creates a read-only snapshot of the given rootFS in snapshots-dir.
+// Returns the new snapshot ID (random hex string).
+func createSnapshot(rootFS string) (string, error) {
+	// Generate random ID for the snapshot
+	snapshotID, err := generateRandomID()
+	if err != nil {
+		return "", fmt.Errorf("generating snapshot ID: %w", err)
+	}
+	snapshotPath := filepath.Join(*flagSnapshotsDir, snapshotID)
+
+	// Create read-only snapshot in snapshots-dir
+	cmd := exec.Command("btrfs", "subvolume", "snapshot", "-r", rootFS, snapshotPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("btrfs snapshot failed: %w\noutput: %s", err, string(output))
+	}
+
+	// Read the base stamp from the source rootFS
+	baseStampID := readStampFile(rootFS)
+	if baseStampID == "" {
+		baseStampID = "1" // default
+	}
+
+	// Write stamp file for the new snapshot
+	if err := writeStampFile(snapshotPath, baseStampID); err != nil {
+		log.Printf("Warning: failed to write stamp file for %s: %v", snapshotPath, err)
+	}
+
+	return snapshotID, nil
 }
 
 // meshPort is the HTTP port for mesh discovery (TSTS in leetspeak = 7575)
