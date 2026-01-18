@@ -344,9 +344,9 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 	for i, fileEntry := range remoteFidx.Files {
 		prog.setFile(i + 1)
 
-		// Use the filename as stored in mfidx for local output
-		// This preserves directory structure
-		outputPath := filepath.Join(localDir, fileEntry.Filename)
+		// Output path includes the fidx basename as a directory prefix
+		// e.g., xyz/e2682e8932c7c1cd0ca8ce01330f0265/bin
+		outputPath := filepath.Join(localDir, remoteBasePath, fileEntry.Filename)
 		tmpOutputPath := outputPath + ".tmp"
 
 		// Remote file path includes the fidx base path
@@ -434,9 +434,13 @@ func loadLocalMappings(dir string) (*bupdate.FidxMappings, error) {
 
 		if fidx.IsMFIDX {
 			// Multi-file index - process each file within it
+			// The fidx basename (without extension) is used as a directory prefix
+			fidxBaseName := strings.TrimSuffix(entry.Name(), ".fidx")
+			fidxBaseName = strings.TrimSuffix(fidxBaseName, ".mfidx")
+
 			for _, fileEntry := range fidx.Files {
-				// Use the full path from the mfidx, preserving directory structure
-				filePath := filepath.Join(dir, fileEntry.Filename)
+				// Files are stored under <dir>/<fidx-basename>/<filename>
+				filePath := filepath.Join(dir, fidxBaseName, fileEntry.Filename)
 
 				// Check if the file exists (use Lstat to handle symlinks)
 				stat, err := os.Lstat(filePath)
