@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
@@ -52,7 +53,7 @@ func chunkFile(filename string, writeEntry func(bupdate.FidxEntry) error) error 
 
 // processSymlink handles a symlink by indexing its target path as content
 // filename is the actual path on disk, storedName is the name to store in the mfidx
-func processSymlink(filename, storedName string, outf *os.File, fidxHash io.Writer) error {
+func processSymlink(filename, storedName string, outf io.Writer, fidxHash io.Writer) error {
 	// Read the symlink target
 	target, err := os.Readlink(filename)
 	if err != nil {
@@ -224,6 +225,9 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 		os.Remove(tmppath) // Clean up on error
 	}()
 
+	// Use buffered writer for performance
+	bufw := bufio.NewWriter(outf)
+
 	// Hash accumulator for the entire mfidx file
 	fidxHash := sha1.New()
 
@@ -231,7 +235,7 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 	header := make([]byte, 8)
 	copy(header[0:4], "FIDX")
 	binary.BigEndian.PutUint32(header[4:8], bupdate.FIDX_VERSION)
-	if _, err := outf.Write(header); err != nil {
+	if _, err := bufw.Write(header); err != nil {
 		return err
 	}
 	fidxHash.Write(header)
@@ -256,7 +260,7 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 				if fileMatches(filename, ref) {
 					// File is unchanged - copy entries from reference
 					fmt.Printf("  %s (unchanged)\n", storedName)
-					if err := writeRefEntries(outf, fidxHash, storedName, stat, ref); err != nil {
+					if err := writeRefEntries(bufw, fidxHash, storedName, stat, ref); err != nil {
 						return err
 					}
 					reusedFiles++
@@ -274,7 +278,7 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 
 		// Handle symlinks specially - index the link target
 		if stat.Mode()&os.ModeSymlink != 0 {
-			if err := processSymlink(filename, storedName, outf, fidxHash); err != nil {
+			if err := processSymlink(filename, storedName, bufw, fidxHash); err != nil {
 				return err
 			}
 			continue
@@ -303,7 +307,7 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 		}
 
 		// Write to file and hash
-		if _, err := outf.Write(sepBuf); err != nil {
+		if _, err := bufw.Write(sepBuf); err != nil {
 			return err
 		}
 		fidxHash.Write(sepBuf)
@@ -314,7 +318,7 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 			copy(entryData[0:20], entry.SHA[:])
 			binary.BigEndian.PutUint16(entryData[20:22], entry.Size)
 			binary.BigEndian.PutUint16(entryData[22:24], entry.Level)
-			if _, err := outf.Write(entryData); err != nil {
+			if _, err := bufw.Write(entryData); err != nil {
 				return err
 			}
 			fidxHash.Write(entryData)
@@ -326,10 +330,13 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 
 	// Write mfidx file checksum
 	checksum := fidxHash.Sum(nil)
-	if _, err := outf.Write(checksum); err != nil {
+	if _, err := bufw.Write(checksum); err != nil {
 		return err
 	}
 
+	if err := bufw.Flush(); err != nil {
+		return err
+	}
 	if err := outf.Close(); err != nil {
 		return err
 	}
@@ -344,7 +351,7 @@ func processMFIDX(filenames []string, outpath string, refMap map[string]*refFile
 }
 
 // writeRefEntries writes file separator and chunk entries from a reference mfidx
-func writeRefEntries(outf *os.File, fidxHash io.Writer, filename string, stat os.FileInfo, ref *refFileInfo) error {
+func writeRefEntries(outf io.Writer, fidxHash io.Writer, filename string, stat os.FileInfo, ref *refFileInfo) error {
 	// Write file separator entry (using current file's metadata)
 	sep := bupdate.FileSeparator{
 		Filename: filename,
@@ -365,17 +372,18 @@ func writeRefEntries(outf *os.File, fidxHash io.Writer, filename string, stat os
 	}
 	fidxHash.Write(sepBuf)
 
-	// Write chunk entries copied from reference
-	for _, entry := range ref.entry.Entries {
-		entryData := make([]byte, 24)
-		copy(entryData[0:20], entry.SHA[:])
-		binary.BigEndian.PutUint16(entryData[20:22], entry.Size)
-		binary.BigEndian.PutUint16(entryData[22:24], entry.Level)
-		if _, err := outf.Write(entryData); err != nil {
-			return err
-		}
-		fidxHash.Write(entryData)
+	// Write chunk entries copied from reference (batched for performance)
+	entryData := make([]byte, 24*len(ref.entry.Entries))
+	for i, entry := range ref.entry.Entries {
+		off := i * 24
+		copy(entryData[off:off+20], entry.SHA[:])
+		binary.BigEndian.PutUint16(entryData[off+20:off+22], entry.Size)
+		binary.BigEndian.PutUint16(entryData[off+22:off+24], entry.Level)
 	}
+	if _, err := outf.Write(entryData); err != nil {
+		return err
+	}
+	fidxHash.Write(entryData)
 
 	return nil
 }
@@ -795,6 +803,9 @@ func processFile(filename string) error {
 		os.Remove(tmppath) // Clean up on error
 	}()
 
+	// Use buffered writer for performance
+	bufw := bufio.NewWriter(outf)
+
 	// Hash accumulator for the entire fidx file
 	fidxHash := sha1.New()
 
@@ -802,7 +813,7 @@ func processFile(filename string) error {
 	header := make([]byte, 8)
 	copy(header[0:4], "FIDX")
 	binary.BigEndian.PutUint32(header[4:8], bupdate.FIDX_VERSION)
-	if _, err := outf.Write(header); err != nil {
+	if _, err := bufw.Write(header); err != nil {
 		return err
 	}
 	fidxHash.Write(header)
@@ -813,7 +824,7 @@ func processFile(filename string) error {
 		copy(entryData[0:20], entry.SHA[:])
 		binary.BigEndian.PutUint16(entryData[20:22], entry.Size)
 		binary.BigEndian.PutUint16(entryData[22:24], entry.Level)
-		if _, err := outf.Write(entryData); err != nil {
+		if _, err := bufw.Write(entryData); err != nil {
 			return err
 		}
 		fidxHash.Write(entryData)
@@ -824,10 +835,13 @@ func processFile(filename string) error {
 
 	// Write fidx file checksum
 	checksum := fidxHash.Sum(nil)
-	if _, err := outf.Write(checksum); err != nil {
+	if _, err := bufw.Write(checksum); err != nil {
 		return err
 	}
 
+	if err := bufw.Flush(); err != nil {
+		return err
+	}
 	if err := outf.Close(); err != nil {
 		return err
 	}
