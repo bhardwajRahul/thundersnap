@@ -37,6 +37,7 @@ const VshPort = 5222
 // VMSession represents a running VM session.
 type VMSession struct {
 	virtiofsdCmd   *exec.Cmd
+	passtCmd       *exec.Cmd    // passt process for user-space networking
 	chvCmd         *exec.Cmd
 	virtiofsSock   string
 	vsockSock      string       // cloud-hypervisor vsock unix socket path
@@ -57,6 +58,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	sessionID := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
 	virtiofsSock := filepath.Join("/tmp", fmt.Sprintf("virtiofs-%s.sock", sessionID))
 	vsockSock := filepath.Join("/tmp", fmt.Sprintf("vsock-%s.sock", sessionID))
+	passtSock := filepath.Join("/tmp", fmt.Sprintf("passt-%s.sock", sessionID))
 
 	// Start virtiofsd
 	log.Printf("Starting virtiofsd with shared-dir=%s", cfg.RootFS)
@@ -85,6 +87,41 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	}
 	log.Printf("virtiofsd socket ready at %s", virtiofsSock)
 
+	// Start passt for user-space networking (provides outgoing network without iptables)
+	// Use --vhost-user mode for cloud-hypervisor's virtio-net socket interface
+	log.Printf("Starting passt for user-space networking")
+	passtCmd := exec.Command("passt",
+		"--socket", passtSock,
+		"--vhost-user",       // vhost-user mode for cloud-hypervisor
+		"--foreground",       // stay in foreground for process management
+		"--quiet",            // reduce log noise
+	)
+	passtCmd.Stderr = os.Stderr
+	if err := passtCmd.Start(); err != nil {
+		virtiofsdCmd.Process.Kill()
+		virtiofsdCmd.Wait()
+		os.Remove(virtiofsSock)
+		return nil, fmt.Errorf("start passt: %w", err)
+	}
+
+	// Wait for passt socket to be created
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(passtSock); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if _, err := os.Stat(passtSock); err != nil {
+		passtCmd.Process.Kill()
+		passtCmd.Wait()
+		virtiofsdCmd.Process.Kill()
+		virtiofsdCmd.Wait()
+		os.Remove(virtiofsSock)
+		os.Remove(passtSock)
+		return nil, fmt.Errorf("passt socket not created: %w", err)
+	}
+	log.Printf("passt socket ready at %s", passtSock)
+
 	// Paths to cloud-hypervisor and kernel
 	chvPath := filepath.Join(cfg.VMDir, "cloud-hypervisor")
 	kernelPath := filepath.Join(cfg.VMDir, "vmlinux")
@@ -96,7 +133,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// The ts command inside the VM detects vsock via /dev/vsock and connects directly.
 	// We start vshd via "sh -l -c 'exec vshd'" to get a proper login environment (PATH, etc).
 	// We echo status messages to help debug boot issues.
-	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "echo 'init: mounting devpts'; mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; echo 'init: starting vshd'; /bin/sh -l -c 'exec /sbin/vshd'; echo 'init: vshd exited, powering off'; /bin/busybox poweroff -f"`
+	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "echo 'init: mounting devpts'; mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; echo 'init: mounting proc'; mount -t proc proc /proc; echo 'init: configuring network'; ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; echo 'nameserver 10.0.2.3' > /etc/resolv.conf; echo 'init: starting vshd'; /bin/sh -l -c 'exec /sbin/vshd'; echo 'init: vshd exited, powering off'; /bin/busybox poweroff -f"`
 
 	// Start cloud-hypervisor
 	// --pvpanic enables the pvpanic device which allows the guest to signal panic to the host
@@ -106,6 +143,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		"--cpus", "boot=1",
 		"--memory", "size=512M,shared=on",
 		"--fs", fmt.Sprintf("tag=rootfs,socket=%s", virtiofsSock),
+		"--net", fmt.Sprintf("vhost_user=true,socket=%s,num_queues=2", passtSock),
 		"--cmdline", cmdline,
 		"--serial", "tty",
 		"--console", "off",
@@ -119,6 +157,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 
 	session := &VMSession{
 		virtiofsdCmd:   virtiofsdCmd,
+		passtCmd:       passtCmd,
 		chvCmd:         chvCmd,
 		virtiofsSock:   virtiofsSock,
 		vsockSock:      vsockSock,
@@ -130,9 +169,12 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// Console output goes to our log system via a goroutine
 	ptmx, err := pty.Start(chvCmd)
 	if err != nil {
+		passtCmd.Process.Kill()
+		passtCmd.Wait()
 		virtiofsdCmd.Process.Kill()
 		virtiofsdCmd.Wait()
 		os.Remove(virtiofsSock)
+		os.Remove(passtSock)
 		return nil, fmt.Errorf("start cloud-hypervisor with pty: %w", err)
 	}
 	log.Printf("cloud-hypervisor started with PID %d", chvCmd.Process.Pid)
@@ -204,6 +246,14 @@ func (s *VMSession) Close() error {
 	s.virtiofsdCmd.Process.Kill()
 	s.virtiofsdCmd.Wait()
 	log.Printf("virtiofsd has exited")
+
+	// Kill passt (it may have already exited when cloud-hypervisor disconnected)
+	if s.passtCmd != nil {
+		log.Printf("Killing passt PID %d", s.passtCmd.Process.Pid)
+		s.passtCmd.Process.Kill()
+		s.passtCmd.Wait()
+		log.Printf("passt has exited")
+	}
 
 	// Close vsock listener if we have one
 	if s.vsockListener != nil {
