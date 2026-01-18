@@ -42,6 +42,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "commands:")
 	fmt.Fprintln(os.Stderr, "  ping     send a ping to thundersnapd")
 	fmt.Fprintln(os.Stderr, "  bupdate  download and reconstruct files from mesh peers")
+	fmt.Fprintln(os.Stderr, "  fidx     create a file index (.fidx) for a file or directory")
 	os.Exit(1)
 }
 
@@ -63,6 +64,8 @@ func main() {
 		cmdPing(cmdArgs)
 	case "bupdate":
 		cmdBupdate(cmdArgs)
+	case "fidx":
+		cmdFidx(cmdArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command: %s\n", cmd)
 		os.Exit(1)
@@ -202,6 +205,36 @@ type meshPeer struct {
 	URL      string    `json:"url"`
 	Hostname string    `json:"hostname"`
 	LastSeen time.Time `json:"last_seen"`
+}
+
+func cmdFidx(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts fidx")
+	opts.SetParameters("<path>")
+	refFile := opts.StringLong("ref", 'r', "", "reference fidx file for incremental indexing")
+	// Parse expects first element to be program name (like os.Args)
+	opts.Parse(append([]string{"ts fidx"}, args...))
+
+	if opts.NArgs() != 1 {
+		fmt.Fprintln(os.Stderr, "error: fidx requires exactly one path argument")
+		fmt.Fprintln(os.Stderr, "usage: ts fidx [--ref <ref.fidx>] <path>")
+		os.Exit(1)
+	}
+
+	path := opts.Arg(0)
+	outPath := path + ".fidx"
+
+	indexOpts := bupdate.IndexerOptions{
+		RefPath:  *refFile,
+		Progress: true,
+	}
+
+	if err := bupdate.CreateFidx(path, outPath, indexOpts); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Wrote %s\n", outPath)
 }
 
 func cmdBupdate(args []string) {

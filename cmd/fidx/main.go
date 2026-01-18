@@ -3,21 +3,15 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strings"
-	"syscall"
-	"time"
 
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/bupdate"
-	"golang.org/x/term"
 )
 
 var (
@@ -36,545 +30,125 @@ func usage() {
 	os.Exit(1)
 }
 
-// progress tracks the current progress display state
-type progress struct {
-	termWidth   int
-	fileCount   int   // number of files processed so far
-	totalBytes  int64 // total bytes in files so far (completed files + current file progress)
-	lastUpdate  time.Time
-	hasRef      bool // whether we're using a reference mfidx
-}
+func main() {
+	getopt.SetUsage(usage)
+	getopt.Parse()
+	args := getopt.Args()
 
-// newProgress creates a new progress tracker
-func newProgress(hasRef bool) *progress {
-	width := 80 // default
-	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
-		width = w
+	if *help || len(args) == 0 {
+		usage()
 	}
-	return &progress{
-		termWidth: width,
-		hasRef:    hasRef,
-	}
-}
 
-// status prints a status line for the current file
-// mode is "new/changed", "unchanged", or "" (no ref)
-// currentFileBytes is progress within the current file (for large files)
-func (p *progress) status(mode string, filename string, currentFileBytes int64) {
-	// Rate limit updates to once per 100ms
-	now := time.Now()
-	if now.Sub(p.lastUpdate) < 100*time.Millisecond {
+	if *outfile != "" && *outdir != "" {
+		fmt.Fprintln(os.Stderr, "error: --outfile is incompatible with --outdir")
+		os.Exit(1)
+	}
+
+	if *mfidx && *outdir != "" {
+		fmt.Fprintln(os.Stderr, "error: --mfidx is incompatible with --outdir")
+		os.Exit(1)
+	}
+
+	if *mfidx && *ascii {
+		fmt.Fprintln(os.Stderr, "error: --mfidx is incompatible with --ascii")
+		os.Exit(1)
+	}
+
+	if *print && *mfidx {
+		fmt.Fprintln(os.Stderr, "error: --print is incompatible with --mfidx (which creates files)")
+		os.Exit(1)
+	}
+
+	if *print && *ascii {
+		fmt.Fprintln(os.Stderr, "error: --print is incompatible with --ascii")
+		os.Exit(1)
+	}
+
+	if *refFile != "" && !*mfidx {
+		fmt.Fprintln(os.Stderr, "error: --ref requires --mfidx")
+		os.Exit(1)
+	}
+
+	// Print mode - dump existing fidx/mfidx files
+	if *print {
+		for _, filename := range args {
+			if err := printFidx(filename); err != nil {
+				fmt.Fprintf(os.Stderr, "error printing %s: %v\n", filename, err)
+				os.Exit(1)
+			}
+		}
 		return
 	}
-	p.lastUpdate = now
 
-	totalM := (p.totalBytes + currentFileBytes) / (1024 * 1024)
-
-	// Format: [%d files] [%dM] <mode> <filename>
-	var prefix string
-	if mode != "" {
-		prefix = fmt.Sprintf("[%d files] [%dM] (%s)", p.fileCount, totalM, mode)
-	} else {
-		prefix = fmt.Sprintf("[%d files] [%dM]", p.fileCount, totalM)
-	}
-
-	// Calculate space for filename
-	prefixLen := len(prefix) + 1 // +1 for space
-	maxFilenameLen := p.termWidth - prefixLen
-	if maxFilenameLen < 3 {
-		maxFilenameLen = 3
-	}
-
-	displayName := filename
-	if len(displayName) > maxFilenameLen {
-		// Truncate with ellipsis at start
-		displayName = "..." + displayName[len(displayName)-maxFilenameLen+3:]
-	}
-
-	line := fmt.Sprintf("%s %s", prefix, displayName)
-
-	// Pad to terminal width to erase previous content
-	if len(line) < p.termWidth {
-		line = line + strings.Repeat(" ", p.termWidth-len(line))
-	} else if len(line) > p.termWidth {
-		line = line[:p.termWidth]
-	}
-
-	fmt.Printf("\r%s", line)
-}
-
-// fileStarted increments the file count
-func (p *progress) fileStarted() {
-	p.fileCount++
-}
-
-// fileCompleted adds the file's size to the total
-func (p *progress) fileCompleted(size int64) {
-	p.totalBytes += size
-}
-
-// clear clears the current line
-func (p *progress) clear() {
-	fmt.Printf("\r%s\r", strings.Repeat(" ", p.termWidth))
-}
-
-// done prints a final newline
-func (p *progress) done() {
-	p.clear()
-	fmt.Printf("Indexed %d files (%dM)\n", p.fileCount, p.totalBytes/(1024*1024))
-}
-
-// chunkFileWithProgress wraps bupdate.ChunkFile with progress reporting
-func chunkFileWithProgress(filename, storedName, mode string, prog *progress, writeEntry func(bupdate.FidxEntry) error) error {
-	return bupdate.ChunkFile(filename, writeEntry, func(totalBytes, fSize int64) {
-		prog.status(mode, storedName, totalBytes)
-	})
-}
-
-// chunkFile wraps bupdate.ChunkFile without progress reporting (for single-file mode)
-func chunkFile(filename string, writeEntry func(bupdate.FidxEntry) error) error {
-	return bupdate.ChunkFile(filename, writeEntry, func(totalBytes, fSize int64) {})
-}
-
-// processSymlink handles a symlink by indexing its target path as content
-// filename is the actual path on disk, storedName is the name to store in the mfidx
-func processSymlink(filename, storedName string, outf io.Writer, fidxHash io.Writer) error {
-	// Read the symlink target
-	target, err := os.Readlink(filename)
-	if err != nil {
-		return fmt.Errorf("readlink %s: %w", filename, err)
-	}
-
-	// Get symlink metadata
-	stat, err := os.Lstat(filename)
-	if err != nil {
-		return fmt.Errorf("lstat %s: %w", filename, err)
-	}
-
-	// Write file separator entry
-	// For symlinks, size is the length of the target string
-	sep := bupdate.FileSeparator{
-		Filename: storedName,
-		FileSize: uint64(len(target)),
-		Mtime:    uint64(stat.ModTime().Unix()),
-	}
-
-	var sepBuf []byte
-	sepBuf = make([]byte, 0, 1024)
-	sepWriter := &bytesWriter{buf: &sepBuf}
-
-	if _, err := bupdate.WriteFileSeparator(sepWriter, sep); err != nil {
-		return fmt.Errorf("write separator for %s: %w", filename, err)
-	}
-
-	if _, err := outf.Write(sepBuf); err != nil {
-		return err
-	}
-	fidxHash.Write(sepBuf)
-
-	// Write the link target as a single chunk
-	targetBytes := []byte(target)
-	sha := bupdate.BlobSHA(targetBytes)
-
-	entry := bupdate.FidxEntry{
-		SHA:   sha,
-		Size:  uint16(len(target)),
-		Level: 0,
-	}
-
-	entryData := make([]byte, 24)
-	copy(entryData[0:20], entry.SHA[:])
-	binary.BigEndian.PutUint16(entryData[20:22], entry.Size)
-	binary.BigEndian.PutUint16(entryData[22:24], entry.Level)
-
-	if _, err := outf.Write(entryData); err != nil {
-		return err
-	}
-	fidxHash.Write(entryData)
-
-	return nil
-}
-
-// collectFiles expands directories into file lists
-func collectFiles(paths []string) ([]string, error) {
-	var result []string
-	seen := make(map[string]bool) // Avoid duplicates
-
-	for _, path := range paths {
-		info, err := os.Lstat(path)
-		if err != nil {
-			return nil, fmt.Errorf("lstat %s: %w", path, err)
+	// Multi-file FIDX mode
+	if *mfidx {
+		if *outfile == "" {
+			fmt.Fprintln(os.Stderr, "error: --mfidx requires --outfile")
+			os.Exit(1)
 		}
 
-		if !info.IsDir() {
-			// Regular file or symlink - add it
-			if !seen[path] {
-				result = append(result, path)
-				seen[path] = true
-			}
-			continue
+		fmt.Printf("Creating multi-file index: %s\n", *outfile)
+
+		opts := bupdate.IndexerOptions{
+			RefPath:  *refFile,
+			Progress: true,
 		}
 
-		// It's a directory - get its device ID to detect filesystem boundaries
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return nil, fmt.Errorf("cannot get device ID for %s", path)
+		if err := bupdate.CreateMFIDX(args, *outfile, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
 		}
-		rootDev := stat.Dev
 
-		// Walk the directory tree
-		err = filepath.Walk(path, func(walkPath string, walkInfo os.FileInfo, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
+		fmt.Printf("Wrote %s\n", *outfile)
+		return
+	}
 
-			// Check if we've crossed a filesystem boundary
-			walkStat, ok := walkInfo.Sys().(*syscall.Stat_t)
-			if !ok {
-				return fmt.Errorf("cannot get device ID for %s", walkPath)
-			}
+	// Regular single-file mode validation
+	if *outfile != "" && len(args) > 1 {
+		fmt.Fprintln(os.Stderr, "error: --outfile only works with a single input file (or use --mfidx for multi-file)")
+		os.Exit(1)
+	}
 
-			if walkStat.Dev != rootDev {
-				// Different filesystem - skip this subtree
-				if walkInfo.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
+	// Regular single-file mode
+	for _, filename := range args {
+		if err := processFile(filename); err != nil {
+			fmt.Fprintf(os.Stderr, "error processing %s: %v\n", filename, err)
+			os.Exit(1)
+		}
+	}
+}
 
-			// Skip directories themselves (we only want files and symlinks)
-			if walkInfo.IsDir() {
-				return nil
-			}
+func processFile(filename string) error {
+	fmt.Printf("%s\n", filename)
 
-			// Add file or symlink
-			if !seen[walkPath] {
-				result = append(result, walkPath)
-				seen[walkPath] = true
-			}
-
+	if *ascii {
+		// ASCII mode - print to stdout
+		return bupdate.ChunkFile(filename, func(entry bupdate.FidxEntry) error {
+			fmt.Printf("%x %d %d\n", entry.SHA[:], entry.Level, entry.Size)
 			return nil
-		})
-
-		if err != nil {
-			return nil, fmt.Errorf("walking %s: %w", path, err)
-		}
+		}, func(totalBytes, fSize int64) {})
 	}
 
-	return result, nil
-}
-
-// stripPathPrefix returns filename with the mfidx-relative prefix stripped.
-// If outpath is "a/b/c/xyz.mfidx" and filename is "a/b/c/xyz/foo/bar.txt",
-// returns "foo/bar.txt". If filename doesn't start with the prefix, returns it unchanged.
-func stripPathPrefix(outpath, filename string) string {
-	// Get directory containing the mfidx
-	outDir := filepath.Dir(outpath)
-	// Get base name without .mfidx extension
-	base := filepath.Base(outpath)
-	base = strings.TrimSuffix(base, ".mfidx")
-	base = strings.TrimSuffix(base, ".fidx")
-
-	// Build the prefix to strip: dir/base/
-	var prefix string
-	if outDir == "." {
-		prefix = base + "/"
+	// Binary mode - write .fidx file
+	var outpath string
+	if *outfile != "" {
+		outpath = *outfile
+	} else if *outdir != "" {
+		outpath = filepath.Join(*outdir, filepath.Base(filename)+".fidx")
 	} else {
-		prefix = filepath.Join(outDir, base) + "/"
+		outpath = filename + ".fidx"
 	}
 
-	// Strip prefix if present
-	if strings.HasPrefix(filename, prefix) {
-		return filename[len(prefix):]
+	opts := bupdate.IndexerOptions{
+		Progress: false, // single file mode doesn't need progress
 	}
-	return filename
-}
 
-// processMFIDX creates a multi-file FIDX
-func processMFIDX(filenames []string, outpath string, refMap map[string]*refFileInfo) error {
-	// Expand directories into file lists
-	allFiles, err := collectFiles(filenames)
-	if err != nil {
+	if err := bupdate.CreateSingleFidx(filename, outpath, opts); err != nil {
 		return err
 	}
 
-	fmt.Printf("Creating multi-file index: %s\n", outpath)
-
-	tmppath := outpath + ".tmp"
-	outf, err := os.Create(tmppath)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		outf.Close()
-		os.Remove(tmppath) // Clean up on error
-	}()
-
-	// Use buffered writer for performance
-	bufw := bufio.NewWriter(outf)
-
-	// Hash accumulator for the entire mfidx file
-	fidxHash := sha1.New()
-
-	// Write header
-	header := make([]byte, 8)
-	copy(header[0:4], "FIDX")
-	binary.BigEndian.PutUint32(header[4:8], bupdate.FIDX_VERSION)
-	if _, err := bufw.Write(header); err != nil {
-		return err
-	}
-	fidxHash.Write(header)
-
-	// Progress tracker
-	prog := newProgress(refMap != nil)
-
-	// Process each file
-	for _, filename := range allFiles {
-		// Compute the stripped filename for storage in the mfidx
-		storedName := stripPathPrefix(outpath, filename)
-
-		// Get file info (use Lstat to not follow symlinks)
-		stat, err := os.Lstat(filename)
-		if err != nil {
-			return fmt.Errorf("lstat %s: %w", filename, err)
-		}
-
-		fileSize := stat.Size()
-
-		// Check if we can reuse entries from reference mfidx
-		if refMap != nil {
-			if ref, ok := refMap[storedName]; ok {
-				if fileMatches(filename, ref) {
-					// File is unchanged - copy entries from reference
-					prog.fileStarted()
-					prog.status("unchanged", storedName, 0)
-					if err := writeRefEntries(bufw, fidxHash, storedName, stat, ref); err != nil {
-						return err
-					}
-					prog.fileCompleted(fileSize)
-					continue
-				}
-			}
-		}
-
-		prog.fileStarted()
-		var mode string
-		if refMap != nil {
-			mode = "new/changed"
-		}
-		prog.status(mode, storedName, 0)
-
-		// Handle symlinks specially - index the link target
-		if stat.Mode()&os.ModeSymlink != 0 {
-			if err := processSymlink(filename, storedName, bufw, fidxHash); err != nil {
-				return err
-			}
-			prog.fileCompleted(fileSize)
-			continue
-		}
-
-		// Skip non-regular files (devices, sockets, pipes, etc.)
-		if !stat.Mode().IsRegular() {
-			continue
-		}
-
-		// Write file separator entry
-		sep := bupdate.FileSeparator{
-			Filename: storedName,
-			FileSize: uint64(stat.Size()),
-			Mtime:    uint64(stat.ModTime().Unix()),
-		}
-
-		// Create a buffer for separator data to add to hash
-		var sepBuf []byte
-		sepBuf = make([]byte, 0, 1024)
-		sepWriter := &bytesWriter{buf: &sepBuf}
-
-		if _, err := bupdate.WriteFileSeparator(sepWriter, sep); err != nil {
-			return fmt.Errorf("write separator for %s: %w", filename, err)
-		}
-
-		// Write to file and hash
-		if _, err := bufw.Write(sepBuf); err != nil {
-			return err
-		}
-		fidxHash.Write(sepBuf)
-
-		// Write chunk entries for this file
-		if err := chunkFileWithProgress(filename, storedName, mode, prog, func(entry bupdate.FidxEntry) error {
-			entryData := make([]byte, 24)
-			copy(entryData[0:20], entry.SHA[:])
-			binary.BigEndian.PutUint16(entryData[20:22], entry.Size)
-			binary.BigEndian.PutUint16(entryData[22:24], entry.Level)
-			if _, err := bufw.Write(entryData); err != nil {
-				return err
-			}
-			fidxHash.Write(entryData)
-			return nil
-		}); err != nil {
-			return fmt.Errorf("chunk %s: %w", filename, err)
-		}
-		prog.fileCompleted(fileSize)
-	}
-
-	prog.done()
-
-	// Write mfidx file checksum
-	checksum := fidxHash.Sum(nil)
-	if _, err := bufw.Write(checksum); err != nil {
-		return err
-	}
-
-	if err := bufw.Flush(); err != nil {
-		return err
-	}
-	if err := outf.Close(); err != nil {
-		return err
-	}
-
-	// Atomically rename to final name
-	if err := os.Rename(tmppath, outpath); err != nil {
-		return err
-	}
-
-	fmt.Printf("Wrote %s\n", outpath)
+	fmt.Printf("  wrote %s\n", outpath)
 	return nil
-}
-
-// writeRefEntries writes file separator and chunk entries from a reference mfidx
-func writeRefEntries(outf io.Writer, fidxHash io.Writer, filename string, stat os.FileInfo, ref *refFileInfo) error {
-	// Write file separator entry (using current file's metadata)
-	sep := bupdate.FileSeparator{
-		Filename: filename,
-		FileSize: ref.entry.FileSize,
-		Mtime:    ref.entry.Mtime,
-	}
-
-	var sepBuf []byte
-	sepBuf = make([]byte, 0, 1024)
-	sepWriter := &bytesWriter{buf: &sepBuf}
-
-	if _, err := bupdate.WriteFileSeparator(sepWriter, sep); err != nil {
-		return fmt.Errorf("write separator for %s: %w", filename, err)
-	}
-
-	if _, err := outf.Write(sepBuf); err != nil {
-		return err
-	}
-	fidxHash.Write(sepBuf)
-
-	// Write chunk entries copied from reference (batched for performance)
-	entryData := make([]byte, 24*len(ref.entry.Entries))
-	for i, entry := range ref.entry.Entries {
-		off := i * 24
-		copy(entryData[off:off+20], entry.SHA[:])
-		binary.BigEndian.PutUint16(entryData[off+20:off+22], entry.Size)
-		binary.BigEndian.PutUint16(entryData[off+22:off+24], entry.Level)
-	}
-	if _, err := outf.Write(entryData); err != nil {
-		return err
-	}
-	fidxHash.Write(entryData)
-
-	return nil
-}
-
-// bytesWriter wraps a byte slice for io.Writer compatibility
-type bytesWriter struct {
-	buf *[]byte
-}
-func (bw *bytesWriter) Write(p []byte) (n int, err error) {
-	*bw.buf = append(*bw.buf, p...)
-	return len(p), nil
-}
-
-// refFileInfo holds metadata about a file in the reference mfidx
-type refFileInfo struct {
-	entry   bupdate.FileEntry
-	refPath string // path to the actual file in the reference filesystem
-}
-
-// loadRefMFIDX loads a reference mfidx and builds a map of filename -> refFileInfo
-// The refBase is the directory containing the files that the mfidx indexes
-func loadRefMFIDX(mfidxPath string) (map[string]*refFileInfo, string, error) {
-	fidx, err := bupdate.LoadFidx(mfidxPath)
-	if err != nil {
-		return nil, "", fmt.Errorf("loading reference mfidx: %w", err)
-	}
-	if !fidx.IsMFIDX {
-		return nil, "", fmt.Errorf("reference file is not an mfidx")
-	}
-
-	// The mfidx contains paths relative to some base directory
-	// The base directory is the mfidx path with .fidx/.mfidx extension removed
-	// e.g., snaps/1.fidx -> snaps/1/
-	refBase := strings.TrimSuffix(mfidxPath, ".mfidx")
-	refBase = strings.TrimSuffix(refBase, ".fidx")
-
-	// Verify the reference base directory exists
-	if info, err := os.Stat(refBase); err != nil {
-		return nil, "", fmt.Errorf("reference base directory %q does not exist (expected directory matching %s)", refBase, mfidxPath)
-	} else if !info.IsDir() {
-		return nil, "", fmt.Errorf("reference base %q is not a directory", refBase)
-	}
-
-	result := make(map[string]*refFileInfo)
-	for _, fe := range fidx.Files {
-		// Store by the filename as recorded in the mfidx
-		result[fe.Filename] = &refFileInfo{
-			entry:   fe,
-			refPath: filepath.Join(refBase, fe.Filename),
-		}
-	}
-
-	return result, refBase, nil
-}
-
-// fileMatches checks if the current file matches the reference file metadata
-// by comparing mtime, ctime, size, and inode number
-func fileMatches(currentPath string, ref *refFileInfo) bool {
-	currentStat, err := os.Lstat(currentPath)
-	if err != nil {
-		return false
-	}
-
-	// Check size
-	if uint64(currentStat.Size()) != ref.entry.FileSize {
-		return false
-	}
-
-	// Check mtime
-	if uint64(currentStat.ModTime().Unix()) != ref.entry.Mtime {
-		return false
-	}
-
-	// Get the reference file stat
-	refStat, err := os.Lstat(ref.refPath)
-	if err != nil {
-		return false
-	}
-
-	// Get syscall.Stat_t for both files to compare ctime and inode
-	currentSys, ok := currentStat.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false
-	}
-	refSys, ok := refStat.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false
-	}
-
-	// Compare inode number
-	if currentSys.Ino != refSys.Ino {
-		return false
-	}
-
-	// Compare ctime
-	if currentSys.Ctim != refSys.Ctim {
-		return false
-	}
-
-	return true
 }
 
 // printFidx reads and prints fidx/mfidx contents
@@ -668,7 +242,6 @@ func printFidx(path string) error {
 }
 
 // printMFIDX prints the contents of a multi-file index
-
 func printMFIDX(entryData []byte) error {
 	offset := 0
 	fileNum := 0
@@ -767,181 +340,5 @@ func printMFIDX(entryData []byte) error {
 	}
 
 	fmt.Printf("Total files: %d\n", fileNum)
-	return nil
-}
-
-
-func main() {
-	getopt.SetUsage(usage)
-	getopt.Parse()
-	args := getopt.Args()
-
-	if *help || len(args) == 0 {
-		usage()
-	}
-
-	if *outfile != "" && *outdir != "" {
-		fmt.Fprintln(os.Stderr, "error: --outfile is incompatible with --outdir")
-		os.Exit(1)
-	}
-
-	if *mfidx && *outdir != "" {
-		fmt.Fprintln(os.Stderr, "error: --mfidx is incompatible with --outdir")
-		os.Exit(1)
-	}
-
-	if *mfidx && *ascii {
-		fmt.Fprintln(os.Stderr, "error: --mfidx is incompatible with --ascii")
-		os.Exit(1)
-	}
-
-	if *print && *mfidx {
-		fmt.Fprintln(os.Stderr, "error: --print is incompatible with --mfidx (which creates files)")
-		os.Exit(1)
-	}
-
-	if *print && *ascii {
-		fmt.Fprintln(os.Stderr, "error: --print is incompatible with --ascii")
-		os.Exit(1)
-	}
-
-	if *refFile != "" && !*mfidx {
-		fmt.Fprintln(os.Stderr, "error: --ref requires --mfidx")
-		os.Exit(1)
-	}
-
-	// Print mode - dump existing fidx/mfidx files
-	if *print {
-		for _, filename := range args {
-			if err := printFidx(filename); err != nil {
-				fmt.Fprintf(os.Stderr, "error printing %s: %v\n", filename, err)
-				os.Exit(1)
-			}
-		}
-		return
-	}
-
-	// Multi-file FIDX mode
-	if *mfidx {
-		if *outfile == "" {
-			fmt.Fprintln(os.Stderr, "error: --mfidx requires --outfile")
-			os.Exit(1)
-		}
-
-		// Load reference mfidx if specified
-		var refMap map[string]*refFileInfo
-		if *refFile != "" {
-			var err error
-			refMap, _, err = loadRefMFIDX(*refFile)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error loading reference mfidx: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("Loaded reference mfidx with %d files\n", len(refMap))
-		}
-
-		if err := processMFIDX(args, *outfile, refMap); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	// Regular single-file mode validation
-	if *outfile != "" && len(args) > 1 {
-		fmt.Fprintln(os.Stderr, "error: --outfile only works with a single input file (or use --mfidx for multi-file)")
-		os.Exit(1)
-	}
-
-	// Regular single-file mode
-	for _, filename := range args {
-		if err := processFile(filename); err != nil {
-			fmt.Fprintf(os.Stderr, "error processing %s: %v\n", filename, err)
-			os.Exit(1)
-		}
-	}
-}
-
-
-func processFile(filename string) error {
-	fmt.Printf("%s\n", filename)
-
-	if *ascii {
-		// ASCII mode - print to stdout
-		return chunkFile(filename, func(entry bupdate.FidxEntry) error {
-			fmt.Printf("%x %d %d\n", entry.SHA[:], entry.Level, entry.Size)
-			return nil
-		})
-	}
-
-	// Binary mode - write .fidx file
-	var outpath string
-	if *outfile != "" {
-		outpath = *outfile
-	} else if *outdir != "" {
-		outpath = filepath.Join(*outdir, filepath.Base(filename)+".fidx")
-	} else {
-		outpath = filename + ".fidx"
-	}
-
-	tmppath := outpath + ".tmp"
-	outf, err := os.Create(tmppath)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		outf.Close()
-		os.Remove(tmppath) // Clean up on error
-	}()
-
-	// Use buffered writer for performance
-	bufw := bufio.NewWriter(outf)
-
-	// Hash accumulator for the entire fidx file
-	fidxHash := sha1.New()
-
-	// Write header
-	header := make([]byte, 8)
-	copy(header[0:4], "FIDX")
-	binary.BigEndian.PutUint32(header[4:8], bupdate.FIDX_VERSION)
-	if _, err := bufw.Write(header); err != nil {
-		return err
-	}
-	fidxHash.Write(header)
-
-	// Write entries
-	if err := chunkFile(filename, func(entry bupdate.FidxEntry) error {
-		entryData := make([]byte, 24)
-		copy(entryData[0:20], entry.SHA[:])
-		binary.BigEndian.PutUint16(entryData[20:22], entry.Size)
-		binary.BigEndian.PutUint16(entryData[22:24], entry.Level)
-		if _, err := bufw.Write(entryData); err != nil {
-			return err
-		}
-		fidxHash.Write(entryData)
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	// Write fidx file checksum
-	checksum := fidxHash.Sum(nil)
-	if _, err := bufw.Write(checksum); err != nil {
-		return err
-	}
-
-	if err := bufw.Flush(); err != nil {
-		return err
-	}
-	if err := outf.Close(); err != nil {
-		return err
-	}
-
-	// Atomically rename to final name
-	if err := os.Rename(tmppath, outpath); err != nil {
-		return err
-	}
-
-	fmt.Printf("  wrote %s\n", outpath)
 	return nil
 }
