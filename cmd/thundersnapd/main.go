@@ -34,6 +34,8 @@ import (
 	"github.com/tailscale/thundersnap/thundersnap"
 	gossh "golang.org/x/crypto/ssh"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
 
@@ -1653,6 +1655,16 @@ func (m *meshState) pingAllPeers(ctx context.Context, lc *tailscale.LocalClient,
 		return
 	}
 
+	// Get our own tags and user ID
+	var myTags []string
+	var myUserID tailcfg.UserID
+	if status.Self != nil {
+		if status.Self.Tags != nil {
+			myTags = status.Self.Tags.AsSlice()
+		}
+		myUserID = status.Self.UserID
+	}
+
 	// Build our ping message
 	ping := MeshPing{
 		URL:      m.myURL,
@@ -1660,7 +1672,7 @@ func (m *meshState) pingAllPeers(ctx context.Context, lc *tailscale.LocalClient,
 	}
 	pingBody, _ := json.Marshal(ping)
 
-	// Ping all peers
+	// Ping peers that match our tags or user
 	for _, peer := range status.Peer {
 		if peer.DNSName == "" {
 			continue
@@ -1671,8 +1683,38 @@ func (m *meshState) pingAllPeers(ctx context.Context, lc *tailscale.LocalClient,
 			continue
 		}
 
+		// Filter: only ping peers that are in our "mesh group"
+		if !shouldPingPeer(myTags, myUserID, peer) {
+			continue
+		}
+
 		go m.pingPeer(ctx, fqdn, pingBody, tsClient)
 	}
+}
+
+// shouldPingPeer returns true if the peer should be pinged based on tag/user matching.
+// If we are tagged: peer must share at least one tag with us.
+// If we are not tagged: peer must have the same user ID and no tags.
+func shouldPingPeer(myTags []string, myUserID tailcfg.UserID, peer *ipnstate.PeerStatus) bool {
+	var peerTags []string
+	if peer.Tags != nil {
+		peerTags = peer.Tags.AsSlice()
+	}
+
+	if len(myTags) > 0 {
+		// We are tagged: peer must share at least one tag
+		for _, myTag := range myTags {
+			for _, peerTag := range peerTags {
+				if myTag == peerTag {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// We are not tagged: peer must have same user and no tags
+	return len(peerTags) == 0 && peer.UserID == myUserID
 }
 
 // pingPeer sends a ping to a single peer using the tsnet HTTP client
