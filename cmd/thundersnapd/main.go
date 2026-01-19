@@ -1622,21 +1622,31 @@ func (m *meshState) pingLoop(ctx context.Context, srv *tsnet.Server, lc *tailsca
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	// Create an HTTP client that uses tsnet for dialing (not the host's network)
+	tsClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return srv.Dial(ctx, network, addr)
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+
 	// Run immediately, then on ticker
-	m.pingAllPeers(ctx, lc)
+	m.pingAllPeers(ctx, lc, tsClient)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.pingAllPeers(ctx, lc)
+			m.pingAllPeers(ctx, lc, tsClient)
 		}
 	}
 }
 
 // pingAllPeers discovers all Tailscale nodes and pings them
-func (m *meshState) pingAllPeers(ctx context.Context, lc *tailscale.LocalClient) {
+func (m *meshState) pingAllPeers(ctx context.Context, lc *tailscale.LocalClient, tsClient *http.Client) {
 	status, err := lc.Status(ctx)
 	if err != nil {
 		log.Printf("Mesh: failed to get tailscale status: %v", err)
@@ -1661,13 +1671,14 @@ func (m *meshState) pingAllPeers(ctx context.Context, lc *tailscale.LocalClient)
 			continue
 		}
 
-		go m.pingPeer(ctx, fqdn, pingBody)
+		go m.pingPeer(ctx, fqdn, pingBody, tsClient)
 	}
 }
 
-// pingPeer sends a ping to a single peer
-func (m *meshState) pingPeer(ctx context.Context, fqdn string, pingBody []byte) {
+// pingPeer sends a ping to a single peer using the tsnet HTTP client
+func (m *meshState) pingPeer(ctx context.Context, fqdn string, pingBody []byte, tsClient *http.Client) {
 	url := fmt.Sprintf("http://%s:%d/ts/ping", fqdn, meshPort)
+	log.Printf("Mesh: pinging %s", fqdn)
 
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -1678,7 +1689,7 @@ func (m *meshState) pingPeer(ctx context.Context, fqdn string, pingBody []byte) 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := tsClient.Do(req)
 	if err != nil {
 		// Peer might not be running thundersnapd, that's fine
 		return
