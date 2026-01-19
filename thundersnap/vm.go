@@ -89,12 +89,17 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 
 	// Start passt for user-space networking (provides outgoing network without iptables)
 	// Use --vhost-user mode for cloud-hypervisor's virtio-net socket interface
+	// Configure NAT-style addressing (like QEMU user networking) so DHCP clients
+	// get predictable private addresses instead of the host's addresses.
 	log.Printf("Starting passt for user-space networking")
 	passtCmd := exec.Command("passt",
 		"--socket", passtSock,
 		"--vhost-user",       // vhost-user mode for cloud-hypervisor
 		"--foreground",       // stay in foreground for process management
 		"--quiet",            // reduce log noise
+		"-a", "10.0.2.15",    // guest address (QEMU-style NAT)
+		"-g", "10.0.2.2",     // gateway address
+		"-D", "none",         // don't intercept DNS
 	)
 	passtCmd.Stderr = os.Stderr
 	if err := passtCmd.Start(); err != nil {
@@ -133,7 +138,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// The ts command inside the VM detects vsock via /dev/vsock and connects directly.
 	// We start vshd via "sh -l -c 'exec vshd'" to get a proper login environment (PATH, etc).
 	// We echo status messages to help debug boot issues.
-	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "echo 'init: mounting devpts'; mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; echo 'init: mounting proc'; mount -t proc proc /proc; echo 'init: configuring network'; ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; echo 'nameserver 10.0.2.3' > /etc/resolv.conf; echo 'init: starting vshd'; /bin/sh -l -c 'exec /sbin/vshd'; echo 'init: vshd exited, powering off'; /bin/busybox poweroff -f"`
+	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "echo 'init: mounting devpts'; mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; echo 'init: mounting proc'; mount -t proc proc /proc; echo 'init: configuring network'; ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; echo 'nameserver 8.8.8.8' > /etc/resolv.conf; echo 'init: starting vshd'; /bin/sh -l -c 'exec /sbin/vshd'; echo 'init: vshd exited, powering off'; /bin/busybox poweroff -f"`
 
 	// Start cloud-hypervisor
 	// --pvpanic enables the pvpanic device which allows the guest to signal panic to the host
