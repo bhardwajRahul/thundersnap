@@ -245,11 +245,20 @@ func main() {
 				fmt.Fprintf(s, "* Error: %s\r\n", msg)
 			}
 
-			// Check if this is a VM session (vm/<user>)
+			// Parse SSH username: can be "<container>" or "<user>@<container>"
+			// If user@ prefix is present, use that specific user
+			// Otherwise, auto-detect from [ubuntu, user] or fall back to root
 			sshUser := s.User()
+			targetUser := "" // empty means auto-detect
+			if idx := strings.Index(sshUser, "@"); idx != -1 {
+				targetUser = sshUser[:idx]
+				sshUser = sshUser[idx+1:]
+			}
+
+			// Check if this is a VM session (vm/<user>)
 			if strings.HasPrefix(sshUser, "vm/") {
 				vmUser := strings.TrimPrefix(sshUser, "vm/")
-				if err := runVMSession(s, tailscaleUser, vmUser, logErr); err != nil {
+				if err := runVMSession(s, tailscaleUser, vmUser, targetUser, logErr); err != nil {
 					logErr("VM session failed: %v", err)
 					s.Exit(1)
 				}
@@ -257,7 +266,7 @@ func main() {
 			}
 
 			// Container session
-			if err := runContainerSession(s, tailscaleUser, sshUser, logErr); err != nil {
+			if err := runContainerSession(s, tailscaleUser, sshUser, targetUser, logErr); err != nil {
 				logErr("Container session failed: %v", err)
 				s.Exit(1)
 			}
@@ -490,8 +499,28 @@ func stripDomain(s string) string {
 	return s
 }
 
+// selectTargetUser determines which Unix user to run as in a container/VM.
+// If targetUser is non-empty, it's used directly (caller specified it).
+// Otherwise, auto-detect by checking if /home/<user> exists for each candidate
+// in order: [ubuntu, user]. If none exist, fall back to root.
+func selectTargetUser(rootFS, targetUser string) string {
+	if targetUser != "" {
+		return targetUser
+	}
+	// Auto-detect: check candidates in order
+	for _, candidate := range []string{"ubuntu", "user"} {
+		homeDir := filepath.Join(rootFS, "home", candidate)
+		if info, err := os.Stat(homeDir); err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+	return "root"
+}
+
 // runContainerSession handles a container-based SSH session.
-func runContainerSession(s ssh.Session, tailscaleUser, sshUser string, logErr func(string, ...any)) error {
+// targetUser specifies the Unix user to run as. If empty, auto-detect from
+// [ubuntu, user] based on which /home/<user> exists, or fall back to root.
+func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser string, logErr func(string, ...any)) error {
 	// Sanitize usernames for filesystem paths (replace unsafe chars)
 	safeTailscaleUser := sanitizeForPath(tailscaleUser)
 	safeSSHUser := sanitizeForPath(sshUser)
@@ -514,13 +543,6 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser string, logErr fu
 		return fmt.Errorf("create /proc directory: %w", err)
 	}
 
-	// Create home directory inside the root filesystem
-	homeDir := filepath.Join("home", homeUser)
-	homeDirFull := filepath.Join(rootFS, homeDir)
-	if err := os.MkdirAll(homeDirFull, 0755); err != nil {
-		return fmt.Errorf("create home directory: %w", err)
-	}
-
 	// Copy ts binary into container's /sbin using btrfs reflink
 	if err := copyTsBinary(rootFS); err != nil {
 		return fmt.Errorf("copy ts binary: %w", err)
@@ -540,27 +562,34 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser string, logErr fu
 	ptyReq, winCh, isPty := s.Pty()
 	cmdArgs := s.Command()
 
-	// Prepare the command to execute
+	// Determine which Unix user to run as
+	runAsUser := selectTargetUser(rootFS, targetUser)
+	log.Printf("Container session: running as user %q (requested: %q)", runAsUser, targetUser)
+
+	// Prepare the command to execute using su to switch to the target user.
+	// For interactive sessions (no command): su - <user> (login shell)
+	// For command execution: su <user> -c '<command>' (non-login shell)
 	var cmd *exec.Cmd
 	if len(cmdArgs) > 0 {
-		// Execute the requested command
-		// Mount /proc first, then exec the requested command with proper escaping
-		// Build the command by passing each arg as a separate string to sh -c with "$@"
-		fullArgs := append([]string{"/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec \"$@\"", "--"}, cmdArgs...)
-		cmd = exec.Command(fullArgs[0], fullArgs[1:]...)
+		// Execute the requested command as the target user (non-login shell)
+		// Mount /proc first, then use su to run the command
+		// We pass each arg through sh to handle quoting properly
+		quotedArgs := make([]string, len(cmdArgs))
+		for i, arg := range cmdArgs {
+			quotedArgs[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
+		}
+		suCmd := fmt.Sprintf("su %s -c %s", runAsUser, strings.Join(quotedArgs, " "))
+		cmd = exec.Command("/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec "+suCmd)
 	} else {
-		// Launch interactive shell with proc mount
-		cmd = exec.Command("/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec /bin/sh")
+		// Launch interactive login shell as the target user
+		cmd = exec.Command("/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec su - "+runAsUser)
 	}
 
-	cmd.Dir = "/" + homeDir
+	cmd.Dir = "/"
 	cmd.Env = []string{
-		"HOME=/" + homeDir,
-		"USER=" + homeUser,
 		"SSH_USER=" + sshUser,
 		"TAILSCALE_USER=" + tailscaleUser,
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"SHELL=/bin/sh",
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Chroot:     rootFS,
@@ -635,7 +664,9 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser string, logErr fu
 // runVMSession handles a VM-based SSH session using cloud-hypervisor.
 // Multiple SSH connections to the same VM (same tailscaleUser + vmUser) share
 // the same VM instance. The VM is only shut down when all clients disconnect.
-func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(string, ...any)) error {
+// targetUser specifies the Unix user to run as. If empty, auto-detect from
+// [ubuntu, user] based on which /home/<user> exists, or fall back to root.
+func runVMSession(s ssh.Session, tailscaleUser, vmUser, targetUser string, logErr func(string, ...any)) error {
 	// Sanitize usernames for filesystem paths
 	safeTailscaleUser := sanitizeForPath(tailscaleUser)
 	safeVMUser := sanitizeForPath(vmUser)
@@ -681,9 +712,11 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser string, logErr func(strin
 	defer conn.Close()
 
 	// Send command protocol to vshd:
-	// First: argument count terminated by \0 (0 = interactive shell)
+	// First: target username terminated by \0 (empty = auto-detect)
+	// Then: argument count terminated by \0 (0 = interactive shell)
 	// Then: each argument terminated by \0
 	cmdArgs := s.Command()
+	fmt.Fprintf(conn, "%s\x00", targetUser)
 	fmt.Fprintf(conn, "%d\x00", len(cmdArgs))
 	for _, arg := range cmdArgs {
 		fmt.Fprintf(conn, "%s\x00", arg)
