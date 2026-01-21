@@ -235,9 +235,6 @@ func main() {
 			// Look up the Tailscale identity of the connecting peer
 			tailscaleUser := getTailscaleUser(s.Context(), lc, s.RemoteAddr().String())
 
-			// Print greeting to stdout (PTY merges stdout/stderr anyway)
-			fmt.Fprintf(s, "* Hello <%s>, connecting you to <%s>\r\n", tailscaleUser, s.User())
-
 			// Helper to log error to both server log and client
 			logErr := func(format string, args ...any) {
 				msg := fmt.Sprintf(format, args...)
@@ -245,28 +242,45 @@ func main() {
 				fmt.Fprintf(s, "* Error: %s\r\n", msg)
 			}
 
-			// Parse SSH username: can be "<container>" or "<user>@<container>"
-			// If user@ prefix is present, use that specific user
-			// Otherwise, auto-detect from [ubuntu, user] or fall back to root
+			// Parse SSH username to extract session type and target user.
+			// Format: [<user>@]<name> or [<user>@]vm/<name>
+			// If user@ prefix is present, use that specific Unix user.
+			// Otherwise, auto-detect from [ubuntu, user] or fall back to root.
 			sshUser := s.User()
-			targetUser := "" // empty means auto-detect
-			if idx := strings.Index(sshUser, "@"); idx != -1 {
-				targetUser = sshUser[:idx]
-				sshUser = sshUser[idx+1:]
-			}
 
-			// Check if this is a VM session (vm/<user>)
+			// Check if this is a VM session (vm/[<user>@]<name>)
 			if strings.HasPrefix(sshUser, "vm/") {
-				vmUser := strings.TrimPrefix(sshUser, "vm/")
-				if err := runVMSession(s, tailscaleUser, vmUser, targetUser, logErr); err != nil {
+				vmPart := strings.TrimPrefix(sshUser, "vm/")
+				// Parse optional user prefix: vm/<user>@<name> or vm/<name>
+				targetUser := ""
+				vmName := vmPart
+				if idx := strings.Index(vmPart, "@"); idx != -1 {
+					targetUser = vmPart[:idx]
+					vmName = vmPart[idx+1:]
+				}
+				rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(vmName))
+				runAsUser := selectTargetUser(rootFS, targetUser)
+				fmt.Fprintf(s, "* Hello <%s>, connecting you to <%s> in <%s> (VM)\r\n", tailscaleUser, runAsUser, vmName)
+				if err := runVMSession(s, tailscaleUser, vmName, targetUser, logErr); err != nil {
 					logErr("VM session failed: %v", err)
 					s.Exit(1)
 				}
 				return
 			}
 
-			// Container session
-			if err := runContainerSession(s, tailscaleUser, sshUser, targetUser, logErr); err != nil {
+			// Container session: [<user>@]<name>
+			targetUser := "" // empty means auto-detect
+			containerName := sshUser
+			if idx := strings.Index(sshUser, "@"); idx != -1 {
+				targetUser = sshUser[:idx]
+				containerName = sshUser[idx+1:]
+			}
+
+			rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(containerName))
+			runAsUser := selectTargetUser(rootFS, targetUser)
+			fmt.Fprintf(s, "* Hello <%s>, connecting you to <%s> in <%s>\r\n", tailscaleUser, runAsUser, containerName)
+
+			if err := runContainerSession(s, tailscaleUser, containerName, targetUser, logErr); err != nil {
 				logErr("Container session failed: %v", err)
 				s.Exit(1)
 			}
