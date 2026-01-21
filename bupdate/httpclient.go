@@ -13,8 +13,9 @@ import (
 	"sync"
 )
 
-// HTTPReader provides access to a remote file over HTTP with range requests.
+// HTTPReader provides access to remote files over HTTP with range requests.
 // It uses HTTP pipelining to efficiently fetch multiple chunks.
+// A single HTTPReader can be reused for multiple files on the same host.
 type HTTPReader struct {
 	baseURL string
 	conn    net.Conn
@@ -22,7 +23,7 @@ type HTTPReader struct {
 	bw      *bufio.Writer
 	mu      sync.Mutex
 	host    string
-	path    string
+	path    string // default path (optional, for single-file use)
 	closed  bool
 }
 
@@ -52,6 +53,28 @@ func NewHTTPReader(rawURL string) (*HTTPReader, error) {
 		baseURL: rawURL,
 		host:    u.Host,
 		path:    u.Path,
+	}, nil
+}
+
+// NewHTTPReaderForHost creates an HTTPReader that can fetch any path on the given host.
+// Use ReadRangesFromPath to fetch ranges from specific paths.
+func NewHTTPReaderForHost(baseURL string) (*HTTPReader, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing URL: %w", err)
+	}
+
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme: %s", u.Scheme)
+	}
+
+	if u.Scheme == "https" {
+		return nil, fmt.Errorf("https not supported, use http")
+	}
+
+	return &HTTPReader{
+		baseURL: baseURL,
+		host:    u.Host,
 	}, nil
 }
 
@@ -94,7 +117,14 @@ func (r *HTTPReader) ReadRange(offset, size int64) ([]byte, error) {
 
 // ReadRanges reads multiple byte ranges using HTTP pipelining.
 // Requests are sent in a pipeline and responses are read in order.
+// Uses the path from the URL provided at construction time.
 func (r *HTTPReader) ReadRanges(requests []RangeRequest) ([][]byte, error) {
+	return r.ReadRangesFromPath(r.path, requests)
+}
+
+// ReadRangesFromPath reads multiple byte ranges from a specific path using HTTP pipelining.
+// This allows reusing a single connection for multiple files on the same host.
+func (r *HTTPReader) ReadRangesFromPath(path string, requests []RangeRequest) ([][]byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -110,7 +140,7 @@ func (r *HTTPReader) ReadRanges(requests []RangeRequest) ([][]byte, error) {
 	for _, req := range requests {
 		rangeHeader := fmt.Sprintf("bytes=%d-%d", req.Offset, req.Offset+req.Size-1)
 		reqStr := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nRange: %s\r\nConnection: keep-alive\r\n\r\n",
-			r.path, r.host, rangeHeader)
+			path, r.host, rangeHeader)
 		if _, err := r.bw.WriteString(reqStr); err != nil {
 			r.closeConn()
 			return nil, fmt.Errorf("writing request: %w", err)

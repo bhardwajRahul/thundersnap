@@ -122,15 +122,22 @@ type remoteSource struct {
 	isHTTP     bool
 	baseURL    string              // for HTTP: base URL without trailing slash
 	basePath   string              // for filesystem: base directory path
-	httpReader *bupdate.HTTPReader // reused HTTP reader for chunk fetches
+	httpReader *bupdate.HTTPReader // reused HTTP reader for chunk fetches (shared across all files)
 }
 
 // newRemoteSource creates a remoteSource from a remote path or URL.
 func newRemoteSource(remote string) (*remoteSource, error) {
 	if bupdate.IsHTTPURL(remote) {
+		baseURL := strings.TrimSuffix(remote, "/")
+		// Create a shared HTTP reader for all files on this host
+		reader, err := bupdate.NewHTTPReaderForHost(baseURL)
+		if err != nil {
+			return nil, fmt.Errorf("creating HTTP reader: %w", err)
+		}
 		return &remoteSource{
-			isHTTP:  true,
-			baseURL: strings.TrimSuffix(remote, "/"),
+			isHTTP:     true,
+			baseURL:    baseURL,
+			httpReader: reader,
 		}, nil
 	}
 	return &remoteSource{
@@ -190,13 +197,10 @@ func downloadFile(rawURL, localPath string) error {
 	return os.WriteFile(localPath, data, 0644)
 }
 
-// getHTTPReaderForFile gets an HTTP reader for a specific file path.
-func (r *remoteSource) getHTTPReaderForFile(relativePath string) (*bupdate.HTTPReader, error) {
-	if !r.isHTTP {
-		return nil, fmt.Errorf("not an HTTP source")
-	}
-	fullURL := r.baseURL + "/" + relativePath
-	return bupdate.NewHTTPReader(fullURL)
+// httpPath returns the URL path for a file (for use with the shared HTTP reader).
+func (r *remoteSource) httpPath(relativePath string) string {
+	u, _ := url.Parse(r.baseURL + "/" + relativePath)
+	return u.Path
 }
 
 // filePath returns the full path for a file in the remote source (filesystem only).
@@ -699,14 +703,9 @@ func reconstructFileFromMFIDX(outputPath string, fidx *bupdate.Fidx, remote *rem
 	var remoteData map[int][]byte
 	if len(remoteChunks) > 0 {
 		if remote.isHTTP {
-			// Use HTTP pipelining
-			httpReader, err := remote.getHTTPReaderForFile(remoteFilePath)
-			if err != nil {
-				return fmt.Errorf("creating HTTP reader: %w", err)
-			}
-			defer httpReader.Close()
-
-			remoteData, err = fetchChunksHTTP(httpReader, remoteChunks, missing, prog, fileEntry.Filename)
+			// Use HTTP pipelining with shared connection
+			httpPath := remote.httpPath(remoteFilePath)
+			remoteData, err = fetchChunksHTTP(remote.httpReader, httpPath, remoteChunks, missing, prog, fileEntry.Filename)
 			if err != nil {
 				return fmt.Errorf("fetching remote chunks: %w", err)
 			}
@@ -828,14 +827,9 @@ func reconstructFile(outputPath string, fidx *bupdate.Fidx, remote *remoteSource
 	var remoteData map[int][]byte
 	if len(remoteChunks) > 0 {
 		if remote.isHTTP {
-			// Use HTTP pipelining
-			httpReader, err := remote.getHTTPReaderForFile(remoteFileName)
-			if err != nil {
-				return fmt.Errorf("creating HTTP reader: %w", err)
-			}
-			defer httpReader.Close()
-
-			remoteData, err = fetchChunksHTTP(httpReader, remoteChunks, missing, prog, remoteFileName)
+			// Use HTTP pipelining with shared connection
+			httpPath := remote.httpPath(remoteFileName)
+			remoteData, err = fetchChunksHTTP(remote.httpReader, httpPath, remoteChunks, missing, prog, remoteFileName)
 			if err != nil {
 				return fmt.Errorf("fetching remote chunks: %w", err)
 			}
@@ -918,7 +912,8 @@ type chunkInfo struct {
 
 // fetchChunksHTTP fetches chunks using HTTP pipelining.
 // It batches requests in groups to balance pipelining benefits with memory usage.
-func fetchChunksHTTP(reader *bupdate.HTTPReader, chunks []chunkInfo, totalMissing int64, prog *progress, filename string) (map[int][]byte, error) {
+// The path parameter specifies which file to fetch from on the server.
+func fetchChunksHTTP(reader *bupdate.HTTPReader, path string, chunks []chunkInfo, totalMissing int64, prog *progress, filename string) (map[int][]byte, error) {
 	result := make(map[int][]byte)
 	downloaded := int64(0)
 
@@ -942,8 +937,8 @@ func fetchChunksHTTP(reader *bupdate.HTTPReader, chunks []chunkInfo, totalMissin
 			}
 		}
 
-		// Send pipelined requests
-		results, err := reader.ReadRanges(requests)
+		// Send pipelined requests using the specified path
+		results, err := reader.ReadRangesFromPath(path, requests)
 		if err != nil {
 			return nil, fmt.Errorf("reading ranges: %w", err)
 		}
