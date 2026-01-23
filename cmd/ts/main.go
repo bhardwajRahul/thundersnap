@@ -377,7 +377,8 @@ func cmdBupdate(args []string) {
 	opts := getopt.New()
 	opts.SetProgram("ts bupdate")
 	opts.SetParameters("<fidx-file>")
-	opts.Parse(args)
+	// Parse expects first element to be program name (like os.Args)
+	opts.Parse(append([]string{"ts bupdate"}, args...))
 
 	if opts.NArgs() != 1 {
 		fmt.Fprintln(os.Stderr, "error: bupdate requires exactly one fidx/mfidx filename argument")
