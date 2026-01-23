@@ -327,6 +327,7 @@ func main() {
 	}
 
 	meshState := newMeshState(myFQDN)
+	globalMeshState = meshState // Set global for control socket access
 	httpMux := http.NewServeMux()
 
 	// Mesh discovery endpoint
@@ -1019,6 +1020,8 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", handlePing)
 	mux.HandleFunc("/snap", cs.handleSnap)
+	mux.HandleFunc("/create", handleCreate)
+	mux.HandleFunc("/ts/servers.json", handleServersJSONControl)
 	cs.handler = mux
 
 	go cs.serve()
@@ -1385,6 +1388,150 @@ func handleSnapStreaming(w http.ResponseWriter, rootFS string, isTTY bool) {
 // handleSnap handles POST /snap - create a snapshot of the container's rootFS
 func (c *controlServer) handleSnap(w http.ResponseWriter, r *http.Request) {
 	makeSnapHandler(c.rootFS)(w, r)
+}
+
+// CreateRequest is the request body for /create
+type CreateRequest struct {
+	TailscaleUser string `json:"tailscale_user"`
+	WorkspaceName string `json:"workspace_name"`
+	SnapshotID    string `json:"snapshot_id"`
+}
+
+// CreateResponse is the response from /create
+type CreateResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+	Path    string `json:"path,omitempty"`
+}
+
+// handleCreate handles POST /create - create a new workspace from a snapshot
+func handleCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req CreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.TailscaleUser == "" || req.WorkspaceName == "" || req.SnapshotID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(CreateResponse{
+			Status:  "error",
+			Message: "tailscale_user, workspace_name, and snapshot_id are required",
+		})
+		return
+	}
+
+	// Sanitize user and workspace names for filesystem paths
+	safeTailscaleUser := sanitizeForPath(req.TailscaleUser)
+	safeWorkspaceName := sanitizeForPath(req.WorkspaceName)
+
+	// Build the target path
+	workspacePath := filepath.Join(*flagFsDir, safeTailscaleUser, safeWorkspaceName)
+
+	// Check if workspace already exists
+	if _, err := os.Stat(workspacePath); err == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(CreateResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("workspace %q already exists", req.WorkspaceName),
+		})
+		return
+	}
+
+	// Verify the snapshot exists
+	snapshotPath := filepath.Join(*flagSnapshotsDir, req.SnapshotID)
+	if _, err := os.Stat(snapshotPath); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(CreateResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("snapshot %q not found", req.SnapshotID),
+		})
+		return
+	}
+
+	// Create workspace from the snapshot
+	if err := createWorkspaceFromSnapshot(workspacePath, req.SnapshotID); err != nil {
+		log.Printf("create workspace failed: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(CreateResponse{
+			Status:  "error",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	log.Printf("Created workspace %s from snapshot %s", workspacePath, req.SnapshotID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(CreateResponse{
+		Status: "ok",
+		Path:   workspacePath,
+	})
+}
+
+// createWorkspaceFromSnapshot creates a new workspace by cloning from a snapshot.
+// This is similar to ensureRootFS but uses a specific snapshot ID instead of
+// auto-detecting the source.
+func createWorkspaceFromSnapshot(workspacePath, snapshotID string) error {
+	snapshotPath := filepath.Join(*flagSnapshotsDir, snapshotID)
+
+	// Ensure the parent directory exists
+	parentDir := filepath.Dir(workspacePath)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return fmt.Errorf("creating parent directory: %w", err)
+	}
+
+	// Clone from the snapshot to the workspace path
+	cmd := exec.Command("btrfs", "subvolume", "snapshot", snapshotPath, workspacePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("btrfs snapshot from %s to %s failed: %w\noutput: %s",
+			snapshotPath, workspacePath, err, string(output))
+	}
+
+	// Write stamp file for the live filesystem
+	// The stamp contains the snapshot ID we cloned from
+	if err := writeStampFile(workspacePath, snapshotID); err != nil {
+		log.Printf("Warning: failed to write stamp file for %s: %v", workspacePath, err)
+	}
+
+	// Copy ts binary into the workspace
+	if err := copyTsBinary(workspacePath); err != nil {
+		log.Printf("Warning: failed to copy ts binary to %s: %v", workspacePath, err)
+	}
+
+	return nil
+}
+
+// handleServersJSONControl handles GET /ts/servers.json on the control socket
+// This allows ts inside containers to access the mesh peer list
+var globalMeshState *meshState
+
+func handleServersJSONControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if globalMeshState == nil {
+		// Mesh not enabled, return empty list
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]meshPeer{})
+		return
+	}
+
+	peers := globalMeshState.getPeers()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(peers)
 }
 
 // createSnapshot creates a read-only snapshot of the given rootFS in snapshots-dir.

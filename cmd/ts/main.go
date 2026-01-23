@@ -45,6 +45,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  bupdate  download and reconstruct files from mesh peers")
 	fmt.Fprintln(os.Stderr, "  fidx     create a file index (.fidx) for a file or directory")
 	fmt.Fprintln(os.Stderr, "  snap     create a snapshot of the current container/VM")
+	fmt.Fprintln(os.Stderr, "  create   create a new workspace from a snapshot")
 	os.Exit(1)
 }
 
@@ -70,6 +71,8 @@ func main() {
 		cmdFidx(cmdArgs)
 	case "snap":
 		cmdSnap(cmdArgs)
+	case "create":
+		cmdCreate(cmdArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command: %s\n", cmd)
 		os.Exit(1)
@@ -798,5 +801,85 @@ func reconstructFileHTTP(outputPath string, fidx *bupdate.Fidx, baseURL, remoteF
 		}
 	}
 
+	return nil
+}
+
+func cmdCreate(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts create")
+	opts.SetParameters("<workspace-name> <snapshot-id>")
+	// Parse expects first element to be program name (like os.Args)
+	opts.Parse(append([]string{"ts create"}, args...))
+
+	if opts.NArgs() != 2 {
+		fmt.Fprintln(os.Stderr, "error: create requires exactly two arguments: workspace-name and snapshot-id")
+		fmt.Fprintln(os.Stderr, "usage: ts create <workspace-name> <snapshot-id>")
+		os.Exit(1)
+	}
+
+	workspaceName := opts.Arg(0)
+	snapshotID := opts.Arg(1)
+
+	if err := doCreate(*sockPath, workspaceName, snapshotID); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// CreateRequest is the request body for /create
+type CreateRequest struct {
+	TailscaleUser string `json:"tailscale_user"`
+	WorkspaceName string `json:"workspace_name"`
+	SnapshotID    string `json:"snapshot_id"`
+}
+
+// CreateResponse is the response from /create
+type CreateResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+	Path    string `json:"path,omitempty"`
+}
+
+func doCreate(sockPath, workspaceName, snapshotID string) error {
+	// Get the tailscale user from the environment
+	tailscaleUser := os.Getenv("TAILSCALE_USER")
+	if tailscaleUser == "" {
+		return fmt.Errorf("TAILSCALE_USER environment variable not set")
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	req := CreateRequest{
+		TailscaleUser: tailscaleUser,
+		WorkspaceName: workspaceName,
+		SnapshotID:    snapshotID,
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := client.Post("http://localhost/create", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result CreateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("%s", result.Message)
+	}
+
+	fmt.Printf("Created workspace at %s\n", result.Path)
 	return nil
 }
