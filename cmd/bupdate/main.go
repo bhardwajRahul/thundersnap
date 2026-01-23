@@ -219,8 +219,15 @@ func (r *remoteSource) close() {
 var (
 	localDir  = getopt.StringLong("local", 'l', ".", "local directory with existing files and .fidx indexes")
 	remoteDir = getopt.StringLong("remote", 'r', "", "remote directory to read from")
+	verbose   = getopt.BoolLong("verbose", 'v', "enable verbose debug output")
 	help      = getopt.BoolLong("help", 'h', "show help")
 )
+
+func debugf(format string, args ...interface{}) {
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[DEBUG] "+format+"\n", args...)
+	}
+}
 
 func usage() {
 	getopt.PrintUsage(os.Stderr)
@@ -262,13 +269,18 @@ func main() {
 
 // runBupdate performs the main reconstruction operation
 func runBupdate(localDir, remoteDir, targetFidx string) error {
+	debugf("runBupdate: localDir=%s remoteDir=%s targetFidx=%s", localDir, remoteDir, targetFidx)
+
 	// Load all local fidx files to build chunk mappings
+	debugf("Loading local mappings from %s", localDir)
 	mappings, filesByChecksums, err := loadLocalMappings(localDir)
 	if err != nil {
 		return fmt.Errorf("loading local mappings: %w", err)
 	}
+	debugf("Loaded %d local chunk mappings", len(mappings.Mappings))
 
 	// Create remote source (filesystem or HTTP)
+	debugf("Creating remote source for %s", remoteDir)
 	remote, err := newRemoteSource(remoteDir)
 	if err != nil {
 		return fmt.Errorf("creating remote source: %w", err)
@@ -276,20 +288,25 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 	defer remote.close()
 
 	// Load the remote fidx file
+	debugf("Loading remote fidx: %s", targetFidx)
 	remoteFidx, err := remote.loadFidx(targetFidx)
 	if err != nil {
 		return fmt.Errorf("loading remote fidx: %w", err)
 	}
+	debugf("Remote fidx loaded: IsMFIDX=%v, FileSize=%d, Files=%d, Entries=%d",
+		remoteFidx.IsMFIDX, remoteFidx.FileSize, len(remoteFidx.Files), len(remoteFidx.Entries))
 
 	// Check if we already have this index
 	localFidxPath := filepath.Join(localDir, targetFidx)
 	if localFidx, err := bupdate.LoadFidx(localFidxPath); err == nil {
 		if bytes.Equal(localFidx.FileSHA[:], remoteFidx.FileSHA[:]) {
+			debugf("Already up to date, skipping")
 			return nil // already up to date
 		}
 	}
 
 	if remoteFidx.IsMFIDX {
+		debugf("Processing as multi-file index (MFIDX)")
 		// Multi-file index - extract all files
 		return bupdateMFIDX(localDir, remote, remoteFidx, targetFidx, localFidxPath, mappings, filesByChecksums)
 	}
@@ -344,81 +361,19 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 	remoteBasePath := strings.TrimSuffix(targetFidx, ".fidx")
 	remoteBasePath = strings.TrimSuffix(remoteBasePath, ".mfidx")
 
-	// Reconstruct each file
-	for i, fileEntry := range remoteFidx.Files {
-		prog.setFile(i + 1)
-
-		// Output path includes the fidx basename as a directory prefix
-		// e.g., xyz/e2682e8932c7c1cd0ca8ce01330f0265/bin
-		outputPath := filepath.Join(localDir, remoteBasePath, fileEntry.Filename)
-		tmpOutputPath := outputPath + ".tmp"
-
-		// Remote file path includes the fidx base path
-		remoteFilePath := remoteBasePath + "/" + fileEntry.Filename
-
-		// Ensure parent directory exists
-		if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+	// Use pipelined fetching for HTTP sources
+	if remote.isHTTP {
+		err := bupdateMFIDXPipelined(localDir, remote, remoteFidx, remoteBasePath, mappings, filesByChecksums, prog)
+		if err != nil {
 			prog.clear()
-			return fmt.Errorf("creating directory for %s: %w", fileEntry.Filename, err)
+			return err
 		}
-
-		// Check if remote is a symlink (only possible for filesystem sources)
-		isSymlink := false
-		if !remote.isHTTP {
-			remoteFilePathLocal := remote.filePath(remoteFilePath)
-			remoteInfo, err := os.Lstat(remoteFilePathLocal)
-			isSymlink = err == nil && remoteInfo.Mode()&os.ModeSymlink != 0
-		}
-
-		if isSymlink {
-			// Create a temporary Fidx struct for this file
-			fileFidx := &bupdate.Fidx{
-				Entries:  fileEntry.Entries,
-				FileSize: int64(fileEntry.FileSize),
-			}
-			// For symlinks, reconstruct the target string then create symlink
-			remoteFilePathLocal := remote.filePath(remoteFilePath)
-			if err := reconstructSymlinkFromMFIDX(outputPath, fileFidx, remoteFilePathLocal, fileEntry, mappings, prog); err != nil {
-				prog.clear()
-				return fmt.Errorf("reconstructing symlink %s: %w", fileEntry.Filename, err)
-			}
-		} else {
-			// Regular file - check if we can use COW clone
-			if cloneSource, ok := filesByChecksums.Find(fileEntry.Entries); ok {
-				// Found an identical file - try COW clone
-				os.Remove(outputPath) // Remove any existing file first
-				if err := bupdate.CloneFile(outputPath, cloneSource); err == nil {
-					// Clone succeeded, skip reconstruction
-					continue
-				}
-				// Clone failed (maybe not on btrfs), fall through to normal reconstruction
-			}
-
-			// Create a temporary Fidx struct for this file
-			fileFidx := &bupdate.Fidx{
-				Entries:  fileEntry.Entries,
-				FileSize: int64(fileEntry.FileSize),
-			}
-
-			// Predict download for this specific file
-			missing, _ := predictDownloadForEntries(fileEntry.Entries, mappings)
-
-			if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remote, remoteFilePath, fileEntry, mappings, prog, missing); err != nil {
-				os.Remove(tmpOutputPath)
-				prog.clear()
-				return fmt.Errorf("reconstructing %s: %w", fileEntry.Filename, err)
-			}
-
-			// Atomically rename to final location
-			if err := os.Rename(tmpOutputPath, outputPath); err != nil {
-				prog.clear()
-				return fmt.Errorf("rename %s: %w", fileEntry.Filename, err)
-			}
-		}
-
-		// Register this newly created file for future COW clones within this run
-		if !isSymlink {
-			filesByChecksums.Add(fileEntry.Entries, outputPath)
+	} else {
+		// Filesystem source - use sequential processing
+		err := bupdateMFIDXSequential(localDir, remote, remoteFidx, remoteBasePath, mappings, filesByChecksums, prog)
+		if err != nil {
+			prog.clear()
+			return err
 		}
 	}
 
@@ -427,6 +382,172 @@ func bupdateMFIDX(localDir string, remote *remoteSource, remoteFidx *bupdate.Fid
 	// Copy the mfidx file to local
 	if err := remote.copyFidx(localFidxPath, targetFidx); err != nil {
 		return fmt.Errorf("copying mfidx: %w", err)
+	}
+
+	return nil
+}
+
+// bupdateMFIDXPipelined uses the pipeline for HTTP sources to maximize throughput.
+func bupdateMFIDXPipelined(localDir string, remote *remoteSource, remoteFidx *bupdate.Fidx, remoteBasePath string, mappings *bupdate.FidxMappings, filesByChecksums *bupdate.FileByChecksums, prog *progress) error {
+	debugf("bupdateMFIDXPipelined: starting with %d files", len(remoteFidx.Files))
+	pipe := newPipeline(remote, mappings, prog)
+	pipe.start()
+	defer pipe.stop()
+
+	// Limit concurrent in-flight files to bound memory usage
+	const maxInflightFiles = 8
+	type pendingFile struct {
+		fw         *fileWork
+		outputPath string
+		fileEntry  bupdate.FileEntry
+	}
+	pending := make([]pendingFile, 0, maxInflightFiles)
+
+	// Helper to wait for oldest pending file and finalize it
+	finishOldest := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		p := pending[0]
+		pending = pending[1:]
+
+		if err := p.fw.wait(); err != nil {
+			os.Remove(p.fw.tmpPath)
+			return fmt.Errorf("reconstructing %s: %w", p.fileEntry.Filename, err)
+		}
+
+		// Atomically rename to final location
+		if err := os.Rename(p.fw.tmpPath, p.outputPath); err != nil {
+			return fmt.Errorf("rename %s: %w", p.fileEntry.Filename, err)
+		}
+
+		// Register for future COW clones
+		filesByChecksums.Add(p.fileEntry.Entries, p.outputPath)
+		return nil
+	}
+
+	for i, fileEntry := range remoteFidx.Files {
+		prog.setFile(i + 1)
+
+		outputPath := filepath.Join(localDir, remoteBasePath, fileEntry.Filename)
+		tmpOutputPath := outputPath + ".tmp"
+		remoteFilePath := remoteBasePath + "/" + fileEntry.Filename
+
+		debugf("Processing file %d/%d: %s (size=%d, entries=%d)",
+			i+1, len(remoteFidx.Files), fileEntry.Filename, fileEntry.FileSize, len(fileEntry.Entries))
+
+		// Ensure parent directory exists
+		if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+			return fmt.Errorf("creating directory for %s: %w", fileEntry.Filename, err)
+		}
+
+		// Check if we can use COW clone
+		if cloneSource, ok := filesByChecksums.Find(fileEntry.Entries); ok {
+			debugf("  Using COW clone from %s", cloneSource)
+			os.Remove(outputPath)
+			if err := bupdate.CloneFile(outputPath, cloneSource); err == nil {
+				continue
+			}
+		}
+
+		// Wait for a slot if we have too many in-flight
+		for len(pending) >= maxInflightFiles {
+			debugf("  Waiting for slot (pending=%d)", len(pending))
+			if err := finishOldest(); err != nil {
+				return err
+			}
+		}
+
+		// Create fidx for this file
+		fileFidx := &bupdate.Fidx{
+			Entries:  fileEntry.Entries,
+			FileSize: int64(fileEntry.FileSize),
+		}
+
+		// Queue file for pipelined processing
+		debugf("  Queuing file for pipelined processing")
+		fw, err := pipe.processFile(outputPath, tmpOutputPath, fileFidx, fileEntry, remoteFilePath)
+		if err != nil {
+			return fmt.Errorf("starting reconstruction of %s: %w", fileEntry.Filename, err)
+		}
+
+		pending = append(pending, pendingFile{
+			fw:         fw,
+			outputPath: outputPath,
+			fileEntry:  fileEntry,
+		})
+		debugf("  Queued, pending count=%d", len(pending))
+	}
+
+	// Wait for all remaining files
+	debugf("Waiting for %d remaining files to complete", len(pending))
+	for len(pending) > 0 {
+		debugf("  finishOldest: pending=%d", len(pending))
+		if err := finishOldest(); err != nil {
+			return err
+		}
+	}
+
+	debugf("All files completed")
+	return nil
+}
+
+// bupdateMFIDXSequential handles filesystem sources sequentially (original behavior).
+func bupdateMFIDXSequential(localDir string, remote *remoteSource, remoteFidx *bupdate.Fidx, remoteBasePath string, mappings *bupdate.FidxMappings, filesByChecksums *bupdate.FileByChecksums, prog *progress) error {
+	for i, fileEntry := range remoteFidx.Files {
+		prog.setFile(i + 1)
+
+		outputPath := filepath.Join(localDir, remoteBasePath, fileEntry.Filename)
+		tmpOutputPath := outputPath + ".tmp"
+		remoteFilePath := remoteBasePath + "/" + fileEntry.Filename
+
+		// Ensure parent directory exists
+		if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+			return fmt.Errorf("creating directory for %s: %w", fileEntry.Filename, err)
+		}
+
+		// Check if remote is a symlink
+		remoteFilePathLocal := remote.filePath(remoteFilePath)
+		remoteInfo, err := os.Lstat(remoteFilePathLocal)
+		isSymlink := err == nil && remoteInfo.Mode()&os.ModeSymlink != 0
+
+		if isSymlink {
+			fileFidx := &bupdate.Fidx{
+				Entries:  fileEntry.Entries,
+				FileSize: int64(fileEntry.FileSize),
+			}
+			if err := reconstructSymlinkFromMFIDX(outputPath, fileFidx, remoteFilePathLocal, fileEntry, mappings, prog); err != nil {
+				return fmt.Errorf("reconstructing symlink %s: %w", fileEntry.Filename, err)
+			}
+		} else {
+			// Check if we can use COW clone
+			if cloneSource, ok := filesByChecksums.Find(fileEntry.Entries); ok {
+				os.Remove(outputPath)
+				if err := bupdate.CloneFile(outputPath, cloneSource); err == nil {
+					continue
+				}
+			}
+
+			fileFidx := &bupdate.Fidx{
+				Entries:  fileEntry.Entries,
+				FileSize: int64(fileEntry.FileSize),
+			}
+
+			missing, _ := predictDownloadForEntries(fileEntry.Entries, mappings)
+
+			if err := reconstructFileFromMFIDX(tmpOutputPath, fileFidx, remote, remoteFilePath, fileEntry, mappings, prog, missing); err != nil {
+				os.Remove(tmpOutputPath)
+				return fmt.Errorf("reconstructing %s: %w", fileEntry.Filename, err)
+			}
+
+			if err := os.Rename(tmpOutputPath, outputPath); err != nil {
+				return fmt.Errorf("rename %s: %w", fileEntry.Filename, err)
+			}
+		}
+
+		if !isSymlink {
+			filesByChecksums.Add(fileEntry.Entries, outputPath)
+		}
 	}
 
 	return nil
