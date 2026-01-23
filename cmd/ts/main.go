@@ -41,11 +41,12 @@ func usage() {
 	getopt.PrintUsage(os.Stderr)
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "commands:")
-	fmt.Fprintln(os.Stderr, "  ping     send a ping to thundersnapd")
-	fmt.Fprintln(os.Stderr, "  bupdate  download and reconstruct files from mesh peers")
-	fmt.Fprintln(os.Stderr, "  fidx     create a file index (.fidx) for a file or directory")
-	fmt.Fprintln(os.Stderr, "  snap     create a snapshot of the current container/VM")
-	fmt.Fprintln(os.Stderr, "  create   create a new workspace from a snapshot")
+	fmt.Fprintln(os.Stderr, "  ping         send a ping to thundersnapd")
+	fmt.Fprintln(os.Stderr, "  bupdate      download and reconstruct files from mesh peers")
+	fmt.Fprintln(os.Stderr, "  fidx         create a file index (.fidx) for a file or directory")
+	fmt.Fprintln(os.Stderr, "  snap         create a snapshot of the current container/VM")
+	fmt.Fprintln(os.Stderr, "  create       create a new workspace from a snapshot")
+	fmt.Fprintln(os.Stderr, "  who-has      query peers to find which ones have a snapshot")
 	os.Exit(1)
 }
 
@@ -73,6 +74,8 @@ func main() {
 		cmdSnap(cmdArgs)
 	case "create":
 		cmdCreate(cmdArgs)
+	case "who-has":
+		cmdWhoHas(cmdArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command: %s\n", cmd)
 		os.Exit(1)
@@ -882,4 +885,75 @@ func doCreate(sockPath, workspaceName, snapshotID string) error {
 
 	fmt.Printf("Created workspace at %s\n", result.Path)
 	return nil
+}
+
+func cmdWhoHas(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts who-has")
+	opts.SetParameters("<snapshot-id>")
+	// Parse expects first element to be program name (like os.Args)
+	opts.Parse(append([]string{"ts who-has"}, args...))
+
+	if opts.NArgs() != 1 {
+		fmt.Fprintln(os.Stderr, "error: who-has requires exactly one argument: snapshot-id")
+		fmt.Fprintln(os.Stderr, "usage: ts who-has <snapshot-id>")
+		os.Exit(1)
+	}
+
+	snapshotID := opts.Arg(0)
+
+	peers, err := doWhoHas(*sockPath, snapshotID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(peers) == 0 {
+		fmt.Printf("No peers have snapshot %s\n", snapshotID)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Peers with snapshot %s:\n", snapshotID)
+	for _, peer := range peers {
+		fmt.Printf("  %s (%s)\n", peer.Hostname, peer.PeerURL)
+	}
+}
+
+func doWhoHas(sockPath, snapshotID string) ([]bupdate.PeerResult, error) {
+	// Get list of servers from thundersnapd
+	servers, err := getServers(sockPath)
+	if err != nil {
+		return nil, fmt.Errorf("getting servers: %w", err)
+	}
+
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("no mesh peers available")
+	}
+
+	// Convert meshPeer to bupdate.PeerInfo
+	peers := make([]bupdate.PeerInfo, len(servers))
+	for i, s := range servers {
+		peers[i] = bupdate.PeerInfo{
+			URL:      s.URL,
+			Hostname: s.Hostname,
+		}
+	}
+
+	// Query all peers in parallel
+	results := bupdate.CheckPeersForSnapshot(peers, snapshotID)
+
+	// Filter to only peers that have the snapshot
+	var hasSnap []bupdate.PeerResult
+	for _, r := range results {
+		if r.HasSnap {
+			hasSnap = append(hasSnap, r)
+		}
+	}
+
+	// Sort by hostname for determinism
+	sort.Slice(hasSnap, func(i, j int) bool {
+		return hasSnap[i].Hostname < hasSnap[j].Hostname
+	})
+
+	return hasSnap, nil
 }

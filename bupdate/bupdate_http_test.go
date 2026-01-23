@@ -472,3 +472,139 @@ func readHTTPResponse(reader io.Reader) ([]byte, error) {
 	_, err := io.Copy(&body, reader)
 	return body.Bytes(), err
 }
+
+// TestCheckURLExists tests the HEAD request functionality
+func TestCheckURLExists(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "bupdate-head-test")
+	if err != nil {
+		t.Fatalf("creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create a test file
+	testFile := filepath.Join(tmpDir, "exists.txt")
+	if err := os.WriteFile(testFile, []byte("hello"), 0644); err != nil {
+		t.Fatalf("writing test file: %v", err)
+	}
+
+	server, err := NewFileServer(tmpDir)
+	if err != nil {
+		t.Fatalf("creating file server: %v", err)
+	}
+	addr, err := server.Start()
+	if err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer server.Close()
+
+	tests := []struct {
+		name   string
+		path   string
+		exists bool
+	}{
+		{"existing file", "/exists.txt", true},
+		{"non-existing file", "/notfound.txt", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			url := "http://" + addr + tc.path
+			exists, err := CheckURLExists(url)
+			if err != nil && tc.exists {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if exists != tc.exists {
+				t.Errorf("CheckURLExists(%q) = %v, want %v", tc.path, exists, tc.exists)
+			}
+		})
+	}
+}
+
+// TestCheckPeersForSnapshot tests parallel peer checking
+func TestCheckPeersForSnapshot(t *testing.T) {
+	// Create two temp directories for two "peers"
+	peer1Dir, err := os.MkdirTemp("", "bupdate-peer1")
+	if err != nil {
+		t.Fatalf("creating peer1 dir: %v", err)
+	}
+	defer os.RemoveAll(peer1Dir)
+
+	peer2Dir, err := os.MkdirTemp("", "bupdate-peer2")
+	if err != nil {
+		t.Fatalf("creating peer2 dir: %v", err)
+	}
+	defer os.RemoveAll(peer2Dir)
+
+	// Create snapshot fidx file only on peer1
+	snapshotID := "abc123def456"
+	fidxFile := filepath.Join(peer1Dir, snapshotID+".fidx")
+	if err := os.WriteFile(fidxFile, []byte("dummy fidx content"), 0644); err != nil {
+		t.Fatalf("writing fidx file: %v", err)
+	}
+
+	// Start servers for both peers
+	server1, err := NewFileServer(peer1Dir)
+	if err != nil {
+		t.Fatalf("creating server1: %v", err)
+	}
+	addr1, err := server1.Start()
+	if err != nil {
+		t.Fatalf("starting server1: %v", err)
+	}
+	defer server1.Close()
+
+	server2, err := NewFileServer(peer2Dir)
+	if err != nil {
+		t.Fatalf("creating server2: %v", err)
+	}
+	addr2, err := server2.Start()
+	if err != nil {
+		t.Fatalf("starting server2: %v", err)
+	}
+	defer server2.Close()
+
+	// Create peer list
+	peers := []PeerInfo{
+		{URL: "http://" + addr1, Hostname: "peer1.example.com"},
+		{URL: "http://" + addr2, Hostname: "peer2.example.com"},
+	}
+
+	// Check for the snapshot - note: CheckPeersForSnapshot adds /bupdate/ prefix
+	// but our test servers serve from root, so we need to adjust
+	// Actually, let's create the proper path structure
+	bupdateDir1 := filepath.Join(peer1Dir, "bupdate")
+	if err := os.MkdirAll(bupdateDir1, 0755); err != nil {
+		t.Fatalf("creating bupdate dir: %v", err)
+	}
+	fidxFile1 := filepath.Join(bupdateDir1, snapshotID+".fidx")
+	if err := os.WriteFile(fidxFile1, []byte("dummy fidx content"), 0644); err != nil {
+		t.Fatalf("writing fidx file: %v", err)
+	}
+	os.Remove(fidxFile) // remove the one at root
+
+	results := CheckPeersForSnapshot(peers, snapshotID)
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+
+	// Find results by hostname
+	var peer1Result, peer2Result PeerResult
+	for _, r := range results {
+		if r.Hostname == "peer1.example.com" {
+			peer1Result = r
+		} else if r.Hostname == "peer2.example.com" {
+			peer2Result = r
+		}
+	}
+
+	if !peer1Result.HasSnap {
+		t.Errorf("peer1 should have snapshot, but HasSnap=%v, err=%v", peer1Result.HasSnap, peer1Result.Err)
+	}
+	if peer2Result.HasSnap {
+		t.Errorf("peer2 should NOT have snapshot, but HasSnap=%v", peer2Result.HasSnap)
+	}
+
+	t.Logf("Peer1 (has snap): HasSnap=%v, Err=%v", peer1Result.HasSnap, peer1Result.Err)
+	t.Logf("Peer2 (no snap): HasSnap=%v, Err=%v", peer2Result.HasSnap, peer2Result.Err)
+}

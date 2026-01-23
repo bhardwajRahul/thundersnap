@@ -339,3 +339,96 @@ func LoadFidxHTTP(rawURL string) (*Fidx, error) {
 	}
 	return ParseFidxData(rawURL, data)
 }
+
+// CheckURLExists checks if a URL exists using a HEAD request.
+// Returns true if the server responds with 200 OK.
+func CheckURLExists(rawURL string) (bool, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false, fmt.Errorf("parsing URL: %w", err)
+	}
+
+	if u.Scheme == "https" {
+		return false, fmt.Errorf("https not supported, use http")
+	}
+
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		host = host + ":80"
+	}
+
+	conn, err := net.Dial("tcp", host)
+	if err != nil {
+		return false, fmt.Errorf("connecting to %s: %w", host, err)
+	}
+	defer conn.Close()
+
+	// Send HEAD request
+	reqStr := fmt.Sprintf("HEAD %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+		u.Path, u.Host)
+	if _, err := conn.Write([]byte(reqStr)); err != nil {
+		return false, fmt.Errorf("writing request: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+
+	// Read status line
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		return false, fmt.Errorf("reading status line: %w", err)
+	}
+
+	parts := strings.SplitN(strings.TrimSpace(statusLine), " ", 3)
+	if len(parts) < 2 {
+		return false, fmt.Errorf("invalid status line: %s", statusLine)
+	}
+
+	statusCode, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false, fmt.Errorf("parsing status code: %w", err)
+	}
+
+	return statusCode == http.StatusOK, nil
+}
+
+// PeerResult represents the result of checking a peer for a snapshot.
+type PeerResult struct {
+	PeerURL  string // Base URL of the peer (e.g., "http://host:7575")
+	Hostname string // Hostname of the peer
+	HasSnap  bool   // Whether this peer has the snapshot
+	Err      error  // Any error that occurred
+}
+
+// CheckPeersForSnapshot queries multiple peers in parallel to find which ones
+// have a given snapshot. Returns results for all peers.
+func CheckPeersForSnapshot(peers []PeerInfo, snapshotID string) []PeerResult {
+	results := make([]PeerResult, len(peers))
+	var wg sync.WaitGroup
+
+	for i, peer := range peers {
+		wg.Add(1)
+		go func(idx int, p PeerInfo) {
+			defer wg.Done()
+
+			baseURL := strings.TrimSuffix(p.URL, "/")
+			fidxURL := baseURL + "/bupdate/" + snapshotID + ".fidx"
+
+			exists, err := CheckURLExists(fidxURL)
+			results[idx] = PeerResult{
+				PeerURL:  baseURL,
+				Hostname: p.Hostname,
+				HasSnap:  exists,
+				Err:      err,
+			}
+		}(i, peer)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// PeerInfo represents basic information about a mesh peer.
+type PeerInfo struct {
+	URL      string
+	Hostname string
+}
