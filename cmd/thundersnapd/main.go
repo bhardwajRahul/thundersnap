@@ -1021,6 +1021,7 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux.HandleFunc("/ping", handlePing)
 	mux.HandleFunc("/snap", cs.handleSnap)
 	mux.HandleFunc("/create", handleCreate)
+	mux.HandleFunc("/download-snap", handleDownloadSnap)
 	mux.HandleFunc("/ts/servers.json", handleServersJSONControl)
 	cs.handler = mux
 
@@ -1532,6 +1533,181 @@ func handleServersJSONControl(w http.ResponseWriter, r *http.Request) {
 	peers := globalMeshState.getPeers()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(peers)
+}
+
+// DownloadSnapRequest is the request body for /download-snap
+type DownloadSnapRequest struct {
+	SnapshotID string `json:"snapshot_id"`
+}
+
+// DownloadSnapResponse is the response from /download-snap
+type DownloadSnapResponse struct {
+	Status       string `json:"status"`
+	Message      string `json:"message,omitempty"`
+	SnapshotPath string `json:"snapshot_path,omitempty"`
+	AlreadyHad   bool   `json:"already_had,omitempty"`
+}
+
+// DownloadSnapStreamEvent is an event in the streaming download response
+type DownloadSnapStreamEvent struct {
+	Type         string `json:"type"`                    // "progress" or "result"
+	Message      string `json:"message,omitempty"`       // progress message
+	Status       string `json:"status,omitempty"`        // "ok" or "error" (for result)
+	SnapshotPath string `json:"snapshot_path,omitempty"` // path (for result)
+	AlreadyHad   bool   `json:"already_had,omitempty"`   // if already present
+}
+
+// handleDownloadSnap handles POST /download-snap - download a snapshot from mesh peers
+func handleDownloadSnap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req DownloadSnapRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.SnapshotID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(DownloadSnapResponse{
+			Status:  "error",
+			Message: "snapshot_id is required",
+		})
+		return
+	}
+
+	// Check if streaming is requested
+	stream := r.URL.Query().Get("stream") == "1"
+	isTTY := r.URL.Query().Get("tty") == "1"
+
+	if stream {
+		handleDownloadSnapStreaming(w, req.SnapshotID, isTTY)
+		return
+	}
+
+	// Non-streaming mode
+	result, err := doDownloadSnap(req.SnapshotID, nil, false)
+	if err != nil {
+		log.Printf("download-snap failed for %s: %v", req.SnapshotID, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(DownloadSnapResponse{
+			Status:  "error",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(DownloadSnapResponse{
+		Status:       "ok",
+		SnapshotPath: result.SnapshotPath,
+		AlreadyHad:   result.AlreadyExists,
+	})
+}
+
+// handleDownloadSnapStreaming handles streaming download with progress
+func handleDownloadSnapStreaming(w http.ResponseWriter, snapshotID string, isTTY bool) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+
+	// Enable streaming mode immediately
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	pw := &downloadProgressWriter{w: w, encoder: json.NewEncoder(w)}
+	if f, ok := w.(http.Flusher); ok {
+		pw.flusher = f
+	}
+
+	result, err := doDownloadSnap(snapshotID, pw, isTTY)
+	if err != nil {
+		log.Printf("download-snap failed for %s: %v", snapshotID, err)
+		pw.encoder.Encode(DownloadSnapStreamEvent{
+			Type:    "result",
+			Status:  "error",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	pw.encoder.Encode(DownloadSnapStreamEvent{
+		Type:         "result",
+		Status:       "ok",
+		SnapshotPath: result.SnapshotPath,
+		AlreadyHad:   result.AlreadyExists,
+	})
+}
+
+// downloadProgressWriter wraps ResponseWriter to write progress events
+type downloadProgressWriter struct {
+	w       http.ResponseWriter
+	flusher http.Flusher
+	encoder *json.Encoder
+}
+
+func (pw *downloadProgressWriter) Write(p []byte) (n int, err error) {
+	msg := strings.TrimSpace(string(p))
+	if msg == "" {
+		return len(p), nil
+	}
+	event := DownloadSnapStreamEvent{
+		Type:    "progress",
+		Message: msg,
+	}
+	if err := pw.encoder.Encode(event); err != nil {
+		return 0, err
+	}
+	if pw.flusher != nil {
+		pw.flusher.Flush()
+	}
+	return len(p), nil
+}
+
+// doDownloadSnap performs the actual download operation
+func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*bupdate.DownloadSnapshotResult, error) {
+	// Check if snapshot already exists
+	snapshotPath := filepath.Join(*flagSnapshotsDir, snapshotID)
+	if _, err := os.Stat(snapshotPath); err == nil {
+		return &bupdate.DownloadSnapshotResult{
+			SnapshotPath:  snapshotPath,
+			AlreadyExists: true,
+		}, nil
+	}
+
+	// Get mesh peers
+	if globalMeshState == nil {
+		return nil, fmt.Errorf("mesh not enabled")
+	}
+
+	meshPeers := globalMeshState.getPeers()
+	if len(meshPeers) == 0 {
+		return nil, fmt.Errorf("no mesh peers available")
+	}
+
+	// Convert to bupdate.PeerInfo
+	peers := make([]bupdate.PeerInfo, len(meshPeers))
+	for i, p := range meshPeers {
+		peers[i] = bupdate.PeerInfo{
+			URL:      p.URL,
+			Hostname: p.Hostname,
+		}
+	}
+
+	// Download the snapshot
+	opts := bupdate.DownloadSnapshotOptions{
+		SnapshotID:     snapshotID,
+		SnapshotsDir:   *flagSnapshotsDir,
+		Peers:          peers,
+		ProgressWriter: progressWriter,
+		IsTTY:          isTTY,
+	}
+
+	return bupdate.DownloadSnapshot(opts)
 }
 
 // createSnapshot creates a read-only snapshot of the given rootFS in snapshots-dir.

@@ -47,6 +47,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  snap         create a snapshot of the current container/VM")
 	fmt.Fprintln(os.Stderr, "  create       create a new workspace from a snapshot")
 	fmt.Fprintln(os.Stderr, "  who-has      query peers to find which ones have a snapshot")
+	fmt.Fprintln(os.Stderr, "  download-snap download a snapshot from mesh peers")
 	os.Exit(1)
 }
 
@@ -76,6 +77,8 @@ func main() {
 		cmdCreate(cmdArgs)
 	case "who-has":
 		cmdWhoHas(cmdArgs)
+	case "download-snap":
+		cmdDownloadSnap(cmdArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command: %s\n", cmd)
 		os.Exit(1)
@@ -956,4 +959,162 @@ func doWhoHas(sockPath, snapshotID string) ([]bupdate.PeerResult, error) {
 	})
 
 	return hasSnap, nil
+}
+
+func cmdDownloadSnap(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts download-snap")
+	opts.SetParameters("<snapshot-id>")
+	// Parse expects first element to be program name (like os.Args)
+	opts.Parse(append([]string{"ts download-snap"}, args...))
+
+	if opts.NArgs() != 1 {
+		fmt.Fprintln(os.Stderr, "error: download-snap requires exactly one argument: snapshot-id")
+		fmt.Fprintln(os.Stderr, "usage: ts download-snap <snapshot-id>")
+		os.Exit(1)
+	}
+
+	snapshotID := opts.Arg(0)
+
+	if err := doDownloadSnap(*sockPath, snapshotID); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// DownloadSnapRequest is the request body for /download-snap
+type DownloadSnapRequest struct {
+	SnapshotID string `json:"snapshot_id"`
+}
+
+// DownloadSnapResponse is the response from /download-snap
+type DownloadSnapResponse struct {
+	Status       string `json:"status"`
+	Message      string `json:"message,omitempty"`
+	SnapshotPath string `json:"snapshot_path,omitempty"`
+	AlreadyHad   bool   `json:"already_had,omitempty"`
+}
+
+// DownloadSnapStreamEvent is an event in the streaming download response
+type DownloadSnapStreamEvent struct {
+	Type         string `json:"type"`
+	Message      string `json:"message,omitempty"`
+	Status       string `json:"status,omitempty"`
+	SnapshotPath string `json:"snapshot_path,omitempty"`
+	AlreadyHad   bool   `json:"already_had,omitempty"`
+}
+
+func doDownloadSnap(sockPath, snapshotID string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	// Detect if stderr is a TTY for progress display
+	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
+
+	// Get terminal width for formatting
+	termWidth := 80 // default
+	if isTTY {
+		if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w > 0 {
+			termWidth = w
+		}
+	}
+
+	// Build URL with streaming enabled
+	url := "http://localhost/download-snap?stream=1"
+	if isTTY {
+		url += "&tty=1"
+	}
+
+	req := DownloadSnapRequest{
+		SnapshotID: snapshotID,
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Parse NDJSON stream
+	scanner := bufio.NewScanner(resp.Body)
+	var lastEvent DownloadSnapStreamEvent
+	var lastProgressMsg string
+	var lastLineLen int
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var event DownloadSnapStreamEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			return fmt.Errorf("parse stream event: %w (line: %q)", err, string(line))
+		}
+
+		if event.Type == "progress" {
+			lastProgressMsg = event.Message
+			// Write progress to stderr
+			if isTTY {
+				// Truncate message to terminal width if needed
+				msg := event.Message
+				if len(msg) > termWidth {
+					msg = msg[:termWidth]
+				}
+				// Pad with spaces to clear previous longer line
+				padding := ""
+				if len(msg) < lastLineLen {
+					padding = strings.Repeat(" ", lastLineLen-len(msg))
+				}
+				fmt.Fprintf(os.Stderr, "\r%s%s", msg, padding)
+				lastLineLen = len(msg)
+			} else {
+				// Non-TTY: print each progress message on its own line
+				fmt.Fprintln(os.Stderr, event.Message)
+			}
+		} else if event.Type == "result" {
+			lastEvent = event
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read stream: %w", err)
+	}
+
+	// Clear the progress line if TTY
+	if isTTY && lastLineLen > 0 {
+		fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", lastLineLen))
+	}
+	// Print the final progress message (the "done" line)
+	if lastProgressMsg != "" && !isTTY {
+		// Already printed for non-TTY
+	} else if lastProgressMsg != "" {
+		fmt.Fprintln(os.Stderr, lastProgressMsg)
+	}
+
+	// Check result
+	if lastEvent.Type != "result" {
+		return fmt.Errorf("no result received from server")
+	}
+
+	if lastEvent.Status != "ok" {
+		return fmt.Errorf("%s", lastEvent.Message)
+	}
+
+	// Success - print nothing if we already had the snapshot (per requirements)
+	// "Return success and no message if we already had the snapshot since it means we're fine."
+	if !lastEvent.AlreadyHad {
+		fmt.Printf("Downloaded snapshot to %s\n", lastEvent.SnapshotPath)
+	}
+
+	return nil
 }

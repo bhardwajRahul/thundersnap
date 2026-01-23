@@ -608,3 +608,173 @@ func TestCheckPeersForSnapshot(t *testing.T) {
 	t.Logf("Peer1 (has snap): HasSnap=%v, Err=%v", peer1Result.HasSnap, peer1Result.Err)
 	t.Logf("Peer2 (no snap): HasSnap=%v, Err=%v", peer2Result.HasSnap, peer2Result.Err)
 }
+
+// TestDownloadSnapshot tests the snapshot download functionality
+func TestDownloadSnapshot(t *testing.T) {
+	// Create "peer" directory with a mock snapshot
+	peerDir, err := os.MkdirTemp("", "bupdate-peer-snap")
+	if err != nil {
+		t.Fatalf("creating peer dir: %v", err)
+	}
+	defer os.RemoveAll(peerDir)
+
+	// Create "local" snapshots directory
+	localSnapsDir, err := os.MkdirTemp("", "bupdate-local-snaps")
+	if err != nil {
+		t.Fatalf("creating local snaps dir: %v", err)
+	}
+	defer os.RemoveAll(localSnapsDir)
+
+	snapshotID := "testsnap123"
+
+	// Create mock snapshot files in bupdate directory structure
+	bupdateDir := filepath.Join(peerDir, "bupdate")
+	if err := os.MkdirAll(bupdateDir, 0755); err != nil {
+		t.Fatalf("creating bupdate dir: %v", err)
+	}
+
+	// Create stamp file
+	stampContent := []byte("parent123")
+	if err := os.WriteFile(filepath.Join(bupdateDir, snapshotID+".stamp"), stampContent, 0644); err != nil {
+		t.Fatalf("writing stamp: %v", err)
+	}
+
+	// Create a simple test file for the snapshot content
+	testContent := []byte("Hello, this is test content for snapshot download!")
+
+	// Create snapshot directory with a file
+	snapDir := filepath.Join(bupdateDir, snapshotID)
+	if err := os.MkdirAll(snapDir, 0755); err != nil {
+		t.Fatalf("creating snap dir: %v", err)
+	}
+	testFilePath := filepath.Join(snapDir, "test.txt")
+	if err := os.WriteFile(testFilePath, testContent, 0644); err != nil {
+		t.Fatalf("writing test file: %v", err)
+	}
+
+	// Create fidx file for the test file
+	fidxPath := filepath.Join(bupdateDir, snapshotID+".fidx")
+	if err := createFidxFile(testFilePath, fidxPath); err != nil {
+		t.Fatalf("creating fidx: %v", err)
+	}
+
+	// Create fidx.fidx (fidx of the fidx)
+	fidxFidxPath := filepath.Join(bupdateDir, snapshotID+".fidx.fidx")
+	if err := createFidxFile(fidxPath, fidxFidxPath); err != nil {
+		t.Fatalf("creating fidx.fidx: %v", err)
+	}
+
+	// Start HTTP server
+	server, err := NewFileServer(peerDir)
+	if err != nil {
+		t.Fatalf("creating server: %v", err)
+	}
+	addr, err := server.Start()
+	if err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer server.Close()
+
+	t.Logf("Server listening on %s", addr)
+
+	// Create peer list
+	peers := []PeerInfo{
+		{URL: "http://" + addr, Hostname: "testpeer.example.com"},
+	}
+
+	// Test 1: Download snapshot that doesn't exist locally
+	opts := DownloadSnapshotOptions{
+		SnapshotID:   snapshotID,
+		SnapshotsDir: localSnapsDir,
+		Peers:        peers,
+	}
+
+	result, err := DownloadSnapshot(opts)
+	if err != nil {
+		t.Fatalf("DownloadSnapshot failed: %v", err)
+	}
+
+	if result.AlreadyExists {
+		t.Errorf("expected AlreadyExists=false for new download")
+	}
+	if result.PeerHostname != "testpeer.example.com" {
+		t.Errorf("expected PeerHostname=testpeer.example.com, got %s", result.PeerHostname)
+	}
+
+	// Verify the stamp file was downloaded
+	localStampPath := filepath.Join(localSnapsDir, snapshotID+".stamp")
+	if _, err := os.Stat(localStampPath); err != nil {
+		t.Errorf("stamp file not downloaded: %v", err)
+	}
+
+	// Verify the fidx file was downloaded
+	localFidxPath := filepath.Join(localSnapsDir, snapshotID+".fidx")
+	if _, err := os.Stat(localFidxPath); err != nil {
+		t.Errorf("fidx file not downloaded: %v", err)
+	}
+
+	// Test 2: Try to download again - should report AlreadyExists
+	result2, err := DownloadSnapshot(opts)
+	if err != nil {
+		t.Fatalf("second DownloadSnapshot failed: %v", err)
+	}
+
+	if !result2.AlreadyExists {
+		t.Errorf("expected AlreadyExists=true for second download")
+	}
+
+	t.Logf("Download test passed: snapshot=%s, peer=%s", result.SnapshotPath, result.PeerHostname)
+}
+
+// TestDownloadSnapshotNotFound tests error handling when no peer has the snapshot
+func TestDownloadSnapshotNotFound(t *testing.T) {
+	// Create empty "peer" directory
+	peerDir, err := os.MkdirTemp("", "bupdate-peer-empty")
+	if err != nil {
+		t.Fatalf("creating peer dir: %v", err)
+	}
+	defer os.RemoveAll(peerDir)
+
+	// Create "local" snapshots directory
+	localSnapsDir, err := os.MkdirTemp("", "bupdate-local-snaps2")
+	if err != nil {
+		t.Fatalf("creating local snaps dir: %v", err)
+	}
+	defer os.RemoveAll(localSnapsDir)
+
+	// Create bupdate directory (empty)
+	bupdateDir := filepath.Join(peerDir, "bupdate")
+	if err := os.MkdirAll(bupdateDir, 0755); err != nil {
+		t.Fatalf("creating bupdate dir: %v", err)
+	}
+
+	// Start HTTP server
+	server, err := NewFileServer(peerDir)
+	if err != nil {
+		t.Fatalf("creating server: %v", err)
+	}
+	addr, err := server.Start()
+	if err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer server.Close()
+
+	// Create peer list
+	peers := []PeerInfo{
+		{URL: "http://" + addr, Hostname: "testpeer.example.com"},
+	}
+
+	// Try to download non-existent snapshot
+	opts := DownloadSnapshotOptions{
+		SnapshotID:   "nonexistent123",
+		SnapshotsDir: localSnapsDir,
+		Peers:        peers,
+	}
+
+	_, err = DownloadSnapshot(opts)
+	if err == nil {
+		t.Fatalf("expected error for non-existent snapshot")
+	}
+
+	t.Logf("Got expected error: %v", err)
+}
