@@ -1446,7 +1446,16 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the snapshot exists
+	// Check if streaming is requested
+	stream := r.URL.Query().Get("stream") == "1"
+	isTTY := r.URL.Query().Get("tty") == "1"
+
+	if stream {
+		handleCreateStreaming(w, req, workspacePath, isTTY)
+		return
+	}
+
+	// Non-streaming mode - no auto-download, just check existence
 	snapshotPath := filepath.Join(*flagSnapshotsDir, req.SnapshotID)
 	if _, err := os.Stat(snapshotPath); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1477,6 +1486,129 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		Status: "ok",
 		Path:   workspacePath,
 	})
+}
+
+// CreateStreamEvent is an event in the streaming create response
+type CreateStreamEvent struct {
+	Type    string `json:"type"`              // "progress" or "result"
+	Message string `json:"message,omitempty"` // progress message
+	Status  string `json:"status,omitempty"`  // "ok" or "error" (for result)
+	Path    string `json:"path,omitempty"`    // workspace path (for result)
+}
+
+// handleCreateStreaming handles streaming create with auto-download
+func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, workspacePath string, isTTY bool) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+
+	// Enable streaming mode immediately
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	pw := &createProgressWriter{w: w, encoder: json.NewEncoder(w)}
+	if f, ok := w.(http.Flusher); ok {
+		pw.flusher = f
+	}
+
+	// Check if snapshot exists locally
+	snapshotPath := filepath.Join(*flagSnapshotsDir, req.SnapshotID)
+	if _, err := os.Stat(snapshotPath); err != nil {
+		// Snapshot doesn't exist - try to download it
+		pw.writeProgress(fmt.Sprintf("Snapshot %s not found locally, downloading from mesh peers...", req.SnapshotID))
+
+		if globalMeshState == nil {
+			pw.writeResult("error", "", fmt.Sprintf("snapshot %q not found locally and mesh not enabled", req.SnapshotID))
+			return
+		}
+
+		meshPeers := globalMeshState.getPeers()
+		if len(meshPeers) == 0 {
+			pw.writeResult("error", "", fmt.Sprintf("snapshot %q not found locally and no mesh peers available", req.SnapshotID))
+			return
+		}
+
+		// Convert to bupdate.PeerInfo
+		peers := make([]bupdate.PeerInfo, len(meshPeers))
+		for i, p := range meshPeers {
+			peers[i] = bupdate.PeerInfo{
+				URL:      p.URL,
+				Hostname: p.Hostname,
+			}
+		}
+
+		// Download the snapshot
+		opts := bupdate.DownloadSnapshotOptions{
+			SnapshotID:     req.SnapshotID,
+			SnapshotsDir:   *flagSnapshotsDir,
+			Peers:          peers,
+			ProgressWriter: pw,
+			IsTTY:          isTTY,
+		}
+
+		result, err := bupdate.DownloadSnapshot(opts)
+		if err != nil {
+			log.Printf("create: auto-download of snapshot %s failed: %v", req.SnapshotID, err)
+			pw.writeResult("error", "", fmt.Sprintf("failed to download snapshot: %v", err))
+			return
+		}
+
+		if result.AlreadyExists {
+			pw.writeProgress("Snapshot already present locally")
+		} else {
+			pw.writeProgress(fmt.Sprintf("Downloaded snapshot from %s", result.PeerHostname))
+		}
+	}
+
+	// Create workspace from the snapshot
+	pw.writeProgress("Creating workspace...")
+	if err := createWorkspaceFromSnapshot(workspacePath, req.SnapshotID); err != nil {
+		log.Printf("create workspace failed: %v", err)
+		pw.writeResult("error", "", err.Error())
+		return
+	}
+
+	log.Printf("Created workspace %s from snapshot %s", workspacePath, req.SnapshotID)
+	pw.writeResult("ok", workspacePath, "")
+}
+
+// createProgressWriter wraps ResponseWriter to write progress events
+type createProgressWriter struct {
+	w       http.ResponseWriter
+	flusher http.Flusher
+	encoder *json.Encoder
+}
+
+func (pw *createProgressWriter) Write(p []byte) (n int, err error) {
+	msg := strings.TrimSpace(string(p))
+	if msg == "" {
+		return len(p), nil
+	}
+	pw.writeProgress(msg)
+	return len(p), nil
+}
+
+func (pw *createProgressWriter) writeProgress(msg string) {
+	event := CreateStreamEvent{
+		Type:    "progress",
+		Message: msg,
+	}
+	pw.encoder.Encode(event)
+	if pw.flusher != nil {
+		pw.flusher.Flush()
+	}
+}
+
+func (pw *createProgressWriter) writeResult(status, path, message string) {
+	event := CreateStreamEvent{
+		Type:    "result",
+		Status:  status,
+		Path:    path,
+		Message: message,
+	}
+	pw.encoder.Encode(event)
+	if pw.flusher != nil {
+		pw.flusher.Flush()
+	}
 }
 
 // createWorkspaceFromSnapshot creates a new workspace by cloning from a snapshot.

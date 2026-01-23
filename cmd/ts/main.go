@@ -846,6 +846,14 @@ type CreateResponse struct {
 	Path    string `json:"path,omitempty"`
 }
 
+// CreateStreamEvent is an event in the streaming create response
+type CreateStreamEvent struct {
+	Type    string `json:"type"`
+	Message string `json:"message,omitempty"`
+	Status  string `json:"status,omitempty"`
+	Path    string `json:"path,omitempty"`
+}
+
 func doCreate(sockPath, workspaceName, snapshotID string) error {
 	// Get the tailscale user from the environment
 	tailscaleUser := os.Getenv("TAILSCALE_USER")
@@ -861,6 +869,23 @@ func doCreate(sockPath, workspaceName, snapshotID string) error {
 		},
 	}
 
+	// Detect if stderr is a TTY for progress display
+	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
+
+	// Get terminal width for formatting
+	termWidth := 80 // default
+	if isTTY {
+		if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w > 0 {
+			termWidth = w
+		}
+	}
+
+	// Build URL with streaming enabled
+	url := "http://localhost/create?stream=1"
+	if isTTY {
+		url += "&tty=1"
+	}
+
 	req := CreateRequest{
 		TailscaleUser: tailscaleUser,
 		WorkspaceName: workspaceName,
@@ -871,22 +896,71 @@ func doCreate(sockPath, workspaceName, snapshotID string) error {
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	resp, err := client.Post("http://localhost/create", "application/json", bytes.NewReader(body))
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	var result CreateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+	// Parse NDJSON stream
+	scanner := bufio.NewScanner(resp.Body)
+	var lastEvent CreateStreamEvent
+	var lastLineLen int
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var event CreateStreamEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			return fmt.Errorf("parse stream event: %w (line: %q)", err, string(line))
+		}
+
+		if event.Type == "progress" {
+			// Write progress to stderr
+			if isTTY {
+				// Truncate message to terminal width if needed
+				msg := event.Message
+				if len(msg) > termWidth {
+					msg = msg[:termWidth]
+				}
+				// Pad with spaces to clear previous longer line
+				padding := ""
+				if len(msg) < lastLineLen {
+					padding = strings.Repeat(" ", lastLineLen-len(msg))
+				}
+				fmt.Fprintf(os.Stderr, "\r%s%s", msg, padding)
+				lastLineLen = len(msg)
+			} else {
+				// Non-TTY: print each progress message on its own line
+				fmt.Fprintln(os.Stderr, event.Message)
+			}
+		} else if event.Type == "result" {
+			lastEvent = event
+		}
 	}
 
-	if result.Status != "ok" {
-		return fmt.Errorf("%s", result.Message)
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read stream: %w", err)
 	}
 
-	fmt.Printf("Created workspace at %s\n", result.Path)
+	// Clear the progress line if TTY
+	if isTTY && lastLineLen > 0 {
+		fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", lastLineLen))
+	}
+
+	// Check result
+	if lastEvent.Type != "result" {
+		return fmt.Errorf("no result received from server")
+	}
+
+	if lastEvent.Status != "ok" {
+		return fmt.Errorf("%s", lastEvent.Message)
+	}
+
+	fmt.Printf("Created workspace at %s\n", lastEvent.Path)
 	return nil
 }
 
