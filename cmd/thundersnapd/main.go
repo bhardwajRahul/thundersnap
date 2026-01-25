@@ -265,7 +265,7 @@ func main() {
 				}
 				rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(vmName))
 				runAsUser := selectTargetUser(rootFS, targetUser)
-				fmt.Fprintf(s, "* Hello <%s>, connecting you to <%s> in <%s> (VM)\r\n", tailscaleUser, runAsUser, vmName)
+				fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s> (VM)\r\n", tailscaleUser, runAsUser, vmName)
 				if err := runVMSession(s, tailscaleUser, vmName, targetUser, logErr); err != nil {
 					logErr("VM session failed: %v", err)
 					s.Exit(1)
@@ -283,7 +283,7 @@ func main() {
 
 			rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(containerName))
 			runAsUser := selectTargetUser(rootFS, targetUser)
-			fmt.Fprintf(s, "* Hello <%s>, connecting you to <%s> in <%s>\r\n", tailscaleUser, runAsUser, containerName)
+			fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s>\r\n", tailscaleUser, runAsUser, containerName)
 
 			if err := runContainerSession(s, tailscaleUser, containerName, targetUser, logErr); err != nil {
 				logErr("Container session failed: %v", err)
