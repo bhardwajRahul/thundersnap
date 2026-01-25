@@ -20,11 +20,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mdlayher/vsock"
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/bupdate"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -79,6 +81,9 @@ func main() {
 		cmdWhoHas(cmdArgs)
 	case "download-snap":
 		cmdDownloadSnap(cmdArgs)
+	case "drop-caps-and-run":
+		// Hidden command - not listed in usage
+		cmdDropCapsAndRun(cmdArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command: %s\n", cmd)
 		os.Exit(1)
@@ -1213,4 +1218,169 @@ func doDownloadSnap(sockPath, snapshotID string) error {
 	}
 
 	return nil
+}
+
+// cmdDropCapsAndRun sets up container isolation and then execs the command
+// specified in the remaining arguments. This is used by thundersnapd to
+// initialize and restrict container processes.
+//
+// Setup performed:
+//   - Makes all mounts private (prevents mount propagation to host)
+//   - Mounts /proc filesystem
+//   - Sets hostname and domainname (if --hostname/--domainname provided)
+//   - Drops dangerous capabilities from the bounding set
+//
+// Capabilities dropped:
+//   - CAP_NET_ADMIN: prevents iptables, routing, interface config changes
+//   - CAP_SYS_MODULE: prevents loading kernel modules
+//   - CAP_SYS_BOOT: prevents reboot
+//   - CAP_SYS_TIME: prevents changing system clock
+//   - CAP_MKNOD: prevents creating device nodes
+//   - CAP_AUDIT_WRITE: prevents writing to audit log
+//   - CAP_SETFCAP: prevents setting file capabilities
+func cmdDropCapsAndRun(args []string) {
+	// Parse our flags manually since we need to pass remaining args to exec
+	var hostname, domainname, chrootPath string
+	var cmdArgs []string
+
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--hostname" && i+1 < len(args) {
+			hostname = args[i+1]
+			i++
+		} else if strings.HasPrefix(args[i], "--hostname=") {
+			hostname = strings.TrimPrefix(args[i], "--hostname=")
+		} else if args[i] == "--domainname" && i+1 < len(args) {
+			domainname = args[i+1]
+			i++
+		} else if strings.HasPrefix(args[i], "--domainname=") {
+			domainname = strings.TrimPrefix(args[i], "--domainname=")
+		} else if args[i] == "--chroot" && i+1 < len(args) {
+			chrootPath = args[i+1]
+			i++
+		} else if strings.HasPrefix(args[i], "--chroot=") {
+			chrootPath = strings.TrimPrefix(args[i], "--chroot=")
+		} else if args[i] == "--" {
+			cmdArgs = args[i+1:]
+			break
+		} else {
+			// First non-flag argument starts the command
+			cmdArgs = args[i:]
+			break
+		}
+	}
+
+	if len(cmdArgs) == 0 {
+		fmt.Fprintln(os.Stderr, "error: drop-caps-and-run requires a command to execute")
+		os.Exit(1)
+	}
+
+	// Make all mounts private so mounts inside the container don't propagate
+	// to the host. This must be done BEFORE chroot while "/" is still a real
+	// mount point. After CLONE_NEWNS, we have our own copy of the mount table
+	// but it still has "shared" propagation. Making it private here only
+	// affects our namespace, not the parent.
+	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to make mounts private: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Chroot into the container rootfs if specified
+	if chrootPath != "" {
+		if err := unix.Chroot(chrootPath); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to chroot to %s: %v\n", chrootPath, err)
+			os.Exit(1)
+		}
+		if err := unix.Chdir("/"); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to chdir to /: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Mount /proc filesystem
+	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+		// Ignore errors - /proc might already be mounted or not exist
+		_ = err
+	}
+
+	// Mount /sys filesystem
+	if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
+		// Ignore errors - /sys might already be mounted or not exist
+		_ = err
+	}
+
+	// Set hostname if provided
+	if hostname != "" {
+		if err := unix.Sethostname([]byte(hostname)); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to set hostname: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Set domainname if provided
+	if domainname != "" {
+		if err := unix.Setdomainname([]byte(domainname)); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to set domainname: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Capabilities to drop from the bounding set
+	capsToDrop := []uintptr{
+		unix.CAP_NET_ADMIN,
+		unix.CAP_SYS_MODULE,
+		unix.CAP_SYS_BOOT,
+		unix.CAP_SYS_TIME,
+		unix.CAP_MKNOD,
+		unix.CAP_AUDIT_WRITE,
+		unix.CAP_SETFCAP,
+	}
+
+	// Drop each capability from the bounding set
+	for _, cap := range capsToDrop {
+		if err := unix.Prctl(unix.PR_CAPBSET_DROP, cap, 0, 0, 0); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to drop capability %d: %v\n", cap, err)
+			os.Exit(1)
+		}
+	}
+
+	// Find the executable in PATH
+	executable, err := findExecutable(cmdArgs[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Exec the command, replacing this process
+	if err := syscall.Exec(executable, cmdArgs, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "error: exec %s: %v\n", cmdArgs[0], err)
+		os.Exit(1)
+	}
+}
+
+// findExecutable looks up the executable path, searching PATH if necessary.
+func findExecutable(name string) (string, error) {
+	// If it contains a slash, use it directly
+	if strings.Contains(name, "/") {
+		if _, err := os.Stat(name); err != nil {
+			return "", fmt.Errorf("executable not found: %s", name)
+		}
+		return name, nil
+	}
+
+	// Search PATH
+	pathEnv := os.Getenv("PATH")
+	if pathEnv == "" {
+		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+
+	for _, dir := range strings.Split(pathEnv, ":") {
+		path := filepath.Join(dir, name)
+		if info, err := os.Stat(path); err == nil {
+			if info.Mode()&0111 != 0 { // executable bit set
+				return path, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("executable not found in PATH: %s", name)
 }

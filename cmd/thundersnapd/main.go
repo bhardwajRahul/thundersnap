@@ -584,20 +584,52 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	// Prepare the command to execute using su to switch to the target user.
 	// For interactive sessions (no command): su - <user> (login shell)
 	// For command execution: su <user> -c '<command>' (non-login shell)
+
+	// Build arguments for "ts drop-caps-and-run" which handles all container
+	// initialization via syscalls (no external commands needed):
+	//   - Makes mounts private (prevents propagation to host)
+	//   - Chroots into the container rootfs
+	//   - Mounts /proc and /sys
+	//   - Sets hostname/domainname
+	//   - Drops dangerous capabilities
+	//
+	// The chroot is done by ts rather than via SysProcAttr so that we can
+	// make mounts private BEFORE the chroot (while / is still a mount point).
+	// The ts binary path must be absolute since we exec it from the host.
+	absRootFS, err := filepath.Abs(rootFS)
+	if err != nil {
+		return fmt.Errorf("get absolute path for rootFS: %w", err)
+	}
+	tsBinary := filepath.Join(absRootFS, "sbin", "ts")
+	tsArgs := []string{"--chroot=" + absRootFS}
+
+	// Set hostname and domainname in the new UTS namespace based on tsnet FQDN.
+	// e.g., "hotdog.corp.ts.net" -> hostname "hotdog", domainname "corp.ts.net"
+	if globalMeshState != nil && globalMeshState.myFQDN != "" {
+		fqdn := globalMeshState.myFQDN
+		if idx := strings.Index(fqdn, "."); idx > 0 {
+			tsArgs = append(tsArgs, "--hostname="+fqdn[:idx])
+			tsArgs = append(tsArgs, "--domainname="+fqdn[idx+1:])
+		} else {
+			tsArgs = append(tsArgs, "--hostname="+fqdn)
+		}
+	}
+
 	var cmd *exec.Cmd
 	if len(cmdArgs) > 0 {
 		// Execute the requested command as the target user (non-login shell)
-		// Mount /proc first, then use su to run the command
 		// We pass each arg through sh to handle quoting properly
 		quotedArgs := make([]string, len(cmdArgs))
 		for i, arg := range cmdArgs {
 			quotedArgs[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
 		}
 		suCmd := fmt.Sprintf("su %s -c %s", runAsUser, strings.Join(quotedArgs, " "))
-		cmd = exec.Command("/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec "+suCmd)
+		tsArgs = append(tsArgs, "--", "/bin/sh", "-c", suCmd)
+		cmd = exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgs...)...)
 	} else {
 		// Launch interactive login shell as the target user
-		cmd = exec.Command("/bin/sh", "-c", "mount -t proc proc /proc 2>/dev/null; exec su - "+runAsUser)
+		tsArgs = append(tsArgs, "--", "su", "-", runAsUser)
+		cmd = exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgs...)...)
 	}
 
 	cmd.Dir = "/"
@@ -607,13 +639,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Chroot:     rootFS,
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
-	}
-
-	// Try to unmount /proc when session ends
-	cleanup := func() {
-		exec.Command("umount", procDir).Run()
+		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
 	}
 
 	if isPty {
@@ -623,7 +649,6 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 			return fmt.Errorf("start shell: %w", err)
 		}
 		defer ptmx.Close()
-		defer cleanup()
 
 		// Handle window size changes
 		go func() {
@@ -642,7 +667,6 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		s.Exit(cmd.ProcessState.ExitCode())
 	} else {
 		// No PTY requested, run without one
-		defer cleanup()
 
 		// Set up pipes for stdin/stdout/stderr
 		stdin, err := cmd.StdinPipe()
