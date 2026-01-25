@@ -307,6 +307,27 @@ func main() {
 			"tcpip-forward":        forwardHandler.HandleSSHRequest,
 			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
 		},
+		SubsystemHandlers: map[string]ssh.SubsystemHandler{
+			"sftp": func(s ssh.Session) {
+				// Handle SFTP subsystem by running sftp-server in the container.
+				// This is invoked by modern scp (which uses SFTP by default).
+				tailscaleUser := getTailscaleUser(s.Context(), lc, s.RemoteAddr().String())
+				sshUser := s.User()
+
+				// Parse user@container format
+				targetUser := ""
+				containerName := sshUser
+				if idx := strings.Index(sshUser, "@"); idx != -1 {
+					targetUser = sshUser[:idx]
+					containerName = sshUser[idx+1:]
+				}
+
+				rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(containerName))
+				if err := runSFTPSession(s, rootFS, targetUser); err != nil {
+					log.Printf("SFTP session failed: %v", err)
+				}
+			},
+		},
 	}
 
 	// Load the persistent host key
@@ -700,6 +721,84 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		}
 		s.Exit(0)
 	}
+	return nil
+}
+
+// runSFTPSession handles an SFTP subsystem request by running sftp-server in the container.
+func runSFTPSession(s ssh.Session, rootFS, targetUser string) error {
+	// Check if rootFS exists
+	if _, err := os.Stat(rootFS); err != nil {
+		return fmt.Errorf("container filesystem not found: %s", rootFS)
+	}
+
+	// Determine which Unix user to run as
+	runAsUser := selectTargetUser(rootFS, targetUser)
+
+	// Build the command to run sftp-server inside the container
+	absRootFS, err := filepath.Abs(rootFS)
+	if err != nil {
+		return fmt.Errorf("get absolute path for rootFS: %w", err)
+	}
+	tsBinary := filepath.Join(absRootFS, "sbin", "ts")
+	tsArgs := []string{"--chroot=" + absRootFS}
+
+	// Find sftp-server - it's typically in /usr/lib/openssh/ or /usr/libexec/
+	sftpServerPaths := []string{
+		"/usr/lib/openssh/sftp-server",
+		"/usr/libexec/openssh/sftp-server",
+		"/usr/lib/sftp-server",
+		"/usr/libexec/sftp-server",
+	}
+	sftpServer := ""
+	for _, p := range sftpServerPaths {
+		if _, err := os.Stat(filepath.Join(rootFS, p)); err == nil {
+			sftpServer = p
+			break
+		}
+	}
+	if sftpServer == "" {
+		return fmt.Errorf("sftp-server not found in container (tried %v)", sftpServerPaths)
+	}
+
+	// Run sftp-server as the target user
+	tsArgs = append(tsArgs, "--", "su", runAsUser, "-c", sftpServer)
+	cmd := exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgs...)...)
+
+	cmd.Dir = "/"
+	cmd.Env = []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
+	}
+
+	// SFTP uses stdin/stdout for the protocol, no PTY
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("create stdin pipe: %w", err)
+	}
+	cmd.Stdout = s
+	cmd.Stderr = s.Stderr()
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start sftp-server: %w", err)
+	}
+
+	// Copy stdin from SSH session to sftp-server
+	go func() {
+		io.Copy(stdin, s)
+		stdin.Close()
+	}()
+
+	// Wait for sftp-server to complete
+	if err := cmd.Wait(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			s.Exit(exitErr.ExitCode())
+			return nil
+		}
+		return fmt.Errorf("sftp-server error: %w", err)
+	}
+	s.Exit(0)
 	return nil
 }
 
