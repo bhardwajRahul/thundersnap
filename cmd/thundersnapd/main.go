@@ -168,6 +168,11 @@ func main() {
 		log.Fatalf("-snapshots-dir is required")
 	}
 
+	// Verify both directories are on btrfs and on the same filesystem
+	if err := checkBtrfsFilesystems(*flagFsDir, *flagSnapshotsDir); err != nil {
+		log.Fatalf("%v", err)
+	}
+
 	// Set default vm-dir relative to executable
 	if *flagVmDir == "" {
 		exe, err := os.Executable()
@@ -2522,6 +2527,56 @@ func (fs *bupdateFileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Copy the requested range
 	io.CopyN(w, f, contentLength)
+}
+
+// btrfsMagic is the magic number for btrfs filesystems (from statfs).
+const btrfsMagic = 0x9123683E
+
+// checkBtrfsFilesystems verifies that both directories exist, are on btrfs,
+// and are on the same btrfs filesystem (required for subvolume snapshots).
+func checkBtrfsFilesystems(fsDir, snapshotsDir string) error {
+	// Ensure both directories exist
+	if err := os.MkdirAll(fsDir, 0755); err != nil {
+		return fmt.Errorf("creating fs-dir %s: %w", fsDir, err)
+	}
+	if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+		return fmt.Errorf("creating snapshots-dir %s: %w", snapshotsDir, err)
+	}
+
+	// Check that fs-dir is on btrfs
+	var fsDirStatfs syscall.Statfs_t
+	if err := syscall.Statfs(fsDir, &fsDirStatfs); err != nil {
+		return fmt.Errorf("statfs on fs-dir %s: %w", fsDir, err)
+	}
+	if fsDirStatfs.Type != btrfsMagic {
+		return fmt.Errorf("-fs-dir %s is not on a btrfs filesystem (type=0x%x, need btrfs=0x%x)", fsDir, fsDirStatfs.Type, btrfsMagic)
+	}
+
+	// Check that snapshots-dir is on btrfs
+	var snapshotsDirStatfs syscall.Statfs_t
+	if err := syscall.Statfs(snapshotsDir, &snapshotsDirStatfs); err != nil {
+		return fmt.Errorf("statfs on snapshots-dir %s: %w", snapshotsDir, err)
+	}
+	if snapshotsDirStatfs.Type != btrfsMagic {
+		return fmt.Errorf("-snapshots-dir %s is not on a btrfs filesystem (type=0x%x, need btrfs=0x%x)", snapshotsDir, snapshotsDirStatfs.Type, btrfsMagic)
+	}
+
+	// Check that both are on the same filesystem by comparing device IDs
+	var fsDirStat syscall.Stat_t
+	if err := syscall.Stat(fsDir, &fsDirStat); err != nil {
+		return fmt.Errorf("stat on fs-dir %s: %w", fsDir, err)
+	}
+
+	var snapshotsDirStat syscall.Stat_t
+	if err := syscall.Stat(snapshotsDir, &snapshotsDirStat); err != nil {
+		return fmt.Errorf("stat on snapshots-dir %s: %w", snapshotsDir, err)
+	}
+
+	if fsDirStat.Dev != snapshotsDirStat.Dev {
+		return fmt.Errorf("-fs-dir and -snapshots-dir must be on the same btrfs filesystem for subvolume snapshots; fs-dir device=%d, snapshots-dir device=%d", fsDirStat.Dev, snapshotsDirStat.Dev)
+	}
+
+	return nil
 }
 
 // parseRangeHeader parses a Range header like "bytes=0-99" and returns start and end positions.
