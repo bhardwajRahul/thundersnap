@@ -580,7 +580,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 
 	// Check if a command was requested
 	ptyReq, winCh, isPty := s.Pty()
-	cmdArgs := s.Command()
+	rawCmd := s.RawCommand()
 
 	// Determine which Unix user to run as
 	runAsUser := selectTargetUser(rootFS, targetUser)
@@ -621,15 +621,13 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	}
 
 	var cmd *exec.Cmd
-	if len(cmdArgs) > 0 {
-		// Execute the requested command as the target user (non-login shell)
-		// We pass each arg through sh to handle quoting properly
-		quotedArgs := make([]string, len(cmdArgs))
-		for i, arg := range cmdArgs {
-			quotedArgs[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
-		}
-		suCmd := fmt.Sprintf("su %s -c %s", runAsUser, strings.Join(quotedArgs, " "))
-		tsArgs = append(tsArgs, "--", "/bin/sh", "-c", suCmd)
+	if rawCmd != "" {
+		// Execute the requested command as the target user (non-login shell).
+		// The SSH protocol sends a raw command string that the user expects to
+		// be interpreted by a shell, so we pass it directly to su -c without
+		// any re-quoting. This avoids shell quoting bugs and matches standard
+		// SSH server behavior.
+		tsArgs = append(tsArgs, "--", "su", runAsUser, "-c", rawCmd)
 		cmd = exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgs...)...)
 	} else {
 		// Launch interactive login shell as the target user
