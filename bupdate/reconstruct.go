@@ -65,11 +65,4 @@ func ReadChunk(filename string, offset, size int64) ([]byte, error) {
 	return data, nil
 }
 
-// CopyFile copies a file from src to dst
-func CopyFile(dst, src string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dst, data, 0644)
-}
+// CopyFile is implemented in clone_linux.go using copy_file_range() for efficiency

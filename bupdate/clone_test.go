@@ -222,6 +222,90 @@ func TestCloneAndChecksumIntegration(t *testing.T) {
 	t.Log("COW clone integration test passed")
 }
 
+// TestCopyFileRange tests that CopyFile uses copy_file_range efficiently
+func TestCopyFileRange(t *testing.T) {
+	// Create a temp directory
+	tmpDir, err := os.MkdirTemp(".", "copy_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create source file with some content
+	srcPath := filepath.Join(tmpDir, "source.bin")
+	content := bytes.Repeat([]byte("Copy file range test content! "), 10000) // ~300KB
+	if err := os.WriteFile(srcPath, content, 0644); err != nil {
+		t.Fatalf("Failed to write source file: %v", err)
+	}
+
+	// Copy the file
+	dstPath := filepath.Join(tmpDir, "dest.bin")
+	if err := CopyFile(dstPath, srcPath); err != nil {
+		t.Fatalf("CopyFile failed: %v", err)
+	}
+
+	// Verify the destination file exists and has the same content
+	dstContent, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatalf("Failed to read destination file: %v", err)
+	}
+
+	if !bytes.Equal(content, dstContent) {
+		t.Fatalf("Destination content doesn't match source. Source: %d bytes, Dest: %d bytes",
+			len(content), len(dstContent))
+	}
+
+	t.Logf("Successfully copied %d bytes using copy_file_range", len(content))
+}
+
+// TestCloneOrCopyFile tests the combined clone-or-copy function
+func TestCloneOrCopyFile(t *testing.T) {
+	// Create a temp directory using current directory (should be on btrfs)
+	tmpDir, err := os.MkdirTemp(".", "clone_or_copy_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create source file
+	srcPath := filepath.Join(tmpDir, "source.bin")
+	content := bytes.Repeat([]byte("Clone or copy test! "), 5000)
+	if err := os.WriteFile(srcPath, content, 0644); err != nil {
+		t.Fatalf("Failed to write source file: %v", err)
+	}
+
+	// Use CloneOrCopyFile
+	dstPath := filepath.Join(tmpDir, "dest.bin")
+	cloned, err := CloneOrCopyFile(dstPath, srcPath)
+	if err != nil {
+		t.Fatalf("CloneOrCopyFile failed: %v", err)
+	}
+
+	// Verify content
+	dstContent, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatalf("Failed to read destination file: %v", err)
+	}
+
+	if !bytes.Equal(content, dstContent) {
+		t.Fatalf("Destination content doesn't match source")
+	}
+
+	if isBtrfs(tmpDir) {
+		if cloned {
+			t.Log("Used COW clone (as expected on btrfs)")
+		} else {
+			t.Log("Used copy_file_range (FICLONE failed, possibly NOCOW)")
+		}
+	} else {
+		if cloned {
+			t.Error("Reported clone on non-btrfs filesystem - unexpected")
+		} else {
+			t.Log("Used copy_file_range (as expected on non-btrfs)")
+		}
+	}
+}
+
 // isBtrfs checks if the given path is on a btrfs filesystem
 func isBtrfs(path string) bool {
 	var stat syscall.Statfs_t

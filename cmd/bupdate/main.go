@@ -277,7 +277,7 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 	if err != nil {
 		return fmt.Errorf("loading local mappings: %w", err)
 	}
-	debugf("Loaded %d local chunk mappings", len(mappings.Mappings))
+	debugf("Loaded %d local chunk mappings, %d files by checksum", len(mappings.Mappings), len(filesByChecksums.Files))
 
 	// Create remote source (filesystem or HTTP)
 	debugf("Creating remote source for %s", remoteDir)
@@ -323,12 +323,17 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 	// Remote file path is <fidx-hash>/bin
 	remoteFilePath := outputName + "/bin"
 
-	// Check if we can use COW clone from a file with identical checksums
+	// Check if we can use COW clone or fast copy from a file with identical checksums
 	if cloneSource, ok := filesByChecksums.Find(remoteFidx.Entries); ok {
-		debugf("Using COW clone from %s", cloneSource)
 		os.Remove(outputPath)
-		if err := bupdate.CloneFile(outputPath, cloneSource); err == nil {
-			// Clone succeeded, register file and copy fidx
+		cloned, err := bupdate.CloneOrCopyFile(outputPath, cloneSource)
+		if err == nil {
+			if cloned {
+				debugf("COW clone from %s", cloneSource)
+			} else {
+				debugf("Fast copy from %s", cloneSource)
+			}
+			// Success, register file and copy fidx
 			filesByChecksums.Add(remoteFidx.Entries, outputPath)
 			if err := remote.copyFidx(localFidxPath, targetFidx); err != nil {
 				prog.clear()
@@ -337,8 +342,8 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 			prog.clear()
 			return nil
 		}
-		// Clone failed, fall back to reconstruction
-		debugf("COW clone failed, falling back to reconstruction")
+		// Clone/copy failed, fall back to reconstruction
+		debugf("Clone/copy failed, falling back to reconstruction: %v", err)
 	}
 
 	// Reconstruct the file
@@ -462,11 +467,16 @@ func bupdateMFIDXPipelined(localDir string, remote *remoteSource, remoteFidx *bu
 			return fmt.Errorf("creating directory for %s: %w", fileEntry.Filename, err)
 		}
 
-		// Check if we can use COW clone
+		// Check if we can use COW clone or fast copy
 		if cloneSource, ok := filesByChecksums.Find(fileEntry.Entries); ok {
-			debugf("  Using COW clone from %s", cloneSource)
 			os.Remove(outputPath)
-			if err := bupdate.CloneFile(outputPath, cloneSource); err == nil {
+			cloned, err := bupdate.CloneOrCopyFile(outputPath, cloneSource)
+			if err == nil {
+				if cloned {
+					debugf("  COW clone from %s", cloneSource)
+				} else {
+					debugf("  Fast copy from %s", cloneSource)
+				}
 				continue
 			}
 		}
@@ -541,12 +551,19 @@ func bupdateMFIDXSequential(localDir string, remote *remoteSource, remoteFidx *b
 				return fmt.Errorf("reconstructing symlink %s: %w", fileEntry.Filename, err)
 			}
 		} else {
-			// Check if we can use COW clone
+			// Check if we can use COW clone or fast copy
 			if cloneSource, ok := filesByChecksums.Find(fileEntry.Entries); ok {
 				os.Remove(outputPath)
-				if err := bupdate.CloneFile(outputPath, cloneSource); err == nil {
+				cloned, err := bupdate.CloneOrCopyFile(outputPath, cloneSource)
+				if err == nil {
+					if cloned {
+						debugf("  COW clone from %s for %s", cloneSource, fileEntry.Filename)
+					} else {
+						debugf("  Fast copy from %s for %s", cloneSource, fileEntry.Filename)
+					}
 					continue
 				}
+				debugf("  Clone/copy failed for %s: %v", fileEntry.Filename, err)
 			}
 
 			fileFidx := &bupdate.Fidx{
