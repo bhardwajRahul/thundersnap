@@ -520,6 +520,149 @@ func TestCheckURLExists(t *testing.T) {
 	}
 }
 
+// TestCheckLocalSnapshot tests that CheckLocalSnapshot correctly identifies local snapshots
+func TestCheckLocalSnapshot(t *testing.T) {
+	// Create temp directory for local snapshots
+	localDir, err := os.MkdirTemp("", "bupdate-local-check")
+	if err != nil {
+		t.Fatalf("creating local dir: %v", err)
+	}
+	defer os.RemoveAll(localDir)
+
+	snapshotID := "localsnap789"
+
+	// Test 1: Snapshot doesn't exist locally
+	exists := CheckLocalSnapshot(localDir, snapshotID)
+	if exists {
+		t.Errorf("expected snapshot to NOT exist locally, but CheckLocalSnapshot returned true")
+	}
+
+	// Test 2: Create the fidx file, now it should exist
+	fidxPath := filepath.Join(localDir, snapshotID+".fidx")
+	if err := os.WriteFile(fidxPath, []byte("dummy fidx"), 0644); err != nil {
+		t.Fatalf("writing fidx: %v", err)
+	}
+
+	exists = CheckLocalSnapshot(localDir, snapshotID)
+	if !exists {
+		t.Errorf("expected snapshot to exist locally after creating fidx, but CheckLocalSnapshot returned false")
+	}
+
+	// Test 3: Different snapshot ID should not exist
+	exists = CheckLocalSnapshot(localDir, "nonexistent123")
+	if exists {
+		t.Errorf("expected nonexistent snapshot to NOT exist, but CheckLocalSnapshot returned true")
+	}
+}
+
+// TestWhoHasIncludesLocalPeer tests the scenario where a snapshot exists on the local
+// node but not on any remote peers. This is the bug that was fixed where "who-has"
+// would report "No peers have snapshot" even when the local node had it.
+//
+// The fix was to have the daemon include itself in the list of peers returned by
+// /ts/servers.json, so CheckPeersForSnapshot will also query the local node.
+func TestWhoHasIncludesLocalPeer(t *testing.T) {
+	// Create a "local" directory that acts as both the local snapshots dir
+	// and serves via HTTP (simulating the local node's /bupdate/ endpoint)
+	localDir, err := os.MkdirTemp("", "bupdate-whohas-local")
+	if err != nil {
+		t.Fatalf("creating local dir: %v", err)
+	}
+	defer os.RemoveAll(localDir)
+
+	snapshotID := "newsnap123"
+
+	// Create the bupdate directory structure (as served by /bupdate/)
+	bupdateDir := filepath.Join(localDir, "bupdate")
+	if err := os.MkdirAll(bupdateDir, 0755); err != nil {
+		t.Fatalf("creating bupdate dir: %v", err)
+	}
+
+	// Create a snapshot fidx file in the bupdate dir
+	fidxPath := filepath.Join(bupdateDir, snapshotID+".fidx")
+	if err := os.WriteFile(fidxPath, []byte("dummy fidx"), 0644); err != nil {
+		t.Fatalf("writing fidx: %v", err)
+	}
+
+	// Start an HTTP server simulating the local node
+	localServer, err := NewFileServer(localDir)
+	if err != nil {
+		t.Fatalf("creating local server: %v", err)
+	}
+	localAddr, err := localServer.Start()
+	if err != nil {
+		t.Fatalf("starting local server: %v", err)
+	}
+	defer localServer.Close()
+
+	// Create a "remote" peer that does NOT have the snapshot
+	remoteDir, err := os.MkdirTemp("", "bupdate-whohas-remote")
+	if err != nil {
+		t.Fatalf("creating remote dir: %v", err)
+	}
+	defer os.RemoveAll(remoteDir)
+
+	// Create empty bupdate dir for remote (no snapshot)
+	remoteBupdateDir := filepath.Join(remoteDir, "bupdate")
+	if err := os.MkdirAll(remoteBupdateDir, 0755); err != nil {
+		t.Fatalf("creating remote bupdate dir: %v", err)
+	}
+
+	remoteServer, err := NewFileServer(remoteDir)
+	if err != nil {
+		t.Fatalf("creating remote server: %v", err)
+	}
+	remoteAddr, err := remoteServer.Start()
+	if err != nil {
+		t.Fatalf("starting remote server: %v", err)
+	}
+	defer remoteServer.Close()
+
+	// Simulate the bug: if only remote peers are checked (not including local),
+	// we would get 0 peers with the snapshot
+	remotePeersOnly := []PeerInfo{
+		{URL: "http://" + remoteAddr, Hostname: "remote.example.com"},
+	}
+
+	results := CheckPeersForSnapshot(remotePeersOnly, snapshotID)
+	hasSnapCount := 0
+	for _, r := range results {
+		if r.HasSnap {
+			hasSnapCount++
+		}
+	}
+	if hasSnapCount != 0 {
+		t.Errorf("expected 0 remote peers to have snapshot (bug scenario), got %d", hasSnapCount)
+	}
+
+	// The fix: include local peer in the list (as getPeersIncludingSelf does)
+	allPeersIncludingLocal := []PeerInfo{
+		{URL: "http://" + localAddr, Hostname: "local.example.com"},
+		{URL: "http://" + remoteAddr, Hostname: "remote.example.com"},
+	}
+
+	results = CheckPeersForSnapshot(allPeersIncludingLocal, snapshotID)
+	hasSnapCount = 0
+	var localHasSnap bool
+	for _, r := range results {
+		if r.HasSnap {
+			hasSnapCount++
+			if r.Hostname == "local.example.com" {
+				localHasSnap = true
+			}
+		}
+	}
+
+	if hasSnapCount != 1 {
+		t.Errorf("expected exactly 1 peer to have snapshot (the local node), got %d", hasSnapCount)
+	}
+	if !localHasSnap {
+		t.Errorf("expected local node to have the snapshot, but it doesn't")
+	}
+
+	t.Log("who-has correctly finds snapshot when local peer is included")
+}
+
 // TestCheckPeersForSnapshot tests parallel peer checking
 func TestCheckPeersForSnapshot(t *testing.T) {
 	// Create two temp directories for two "peers"

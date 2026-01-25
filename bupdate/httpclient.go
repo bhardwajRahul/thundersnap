@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -402,6 +404,15 @@ type PeerResult struct {
 // CheckPeersForSnapshot queries multiple peers in parallel to find which ones
 // have a given snapshot. Returns results for all peers.
 func CheckPeersForSnapshot(peers []PeerInfo, snapshotID string) []PeerResult {
+	return checkPeersForSnapshotImpl(peers, snapshotID, false)
+}
+
+// CheckPeersForSnapshotDebug is like CheckPeersForSnapshot but prints debug info.
+func CheckPeersForSnapshotDebug(peers []PeerInfo, snapshotID string) []PeerResult {
+	return checkPeersForSnapshotImpl(peers, snapshotID, true)
+}
+
+func checkPeersForSnapshotImpl(peers []PeerInfo, snapshotID string, debug bool) []PeerResult {
 	results := make([]PeerResult, len(peers))
 	var wg sync.WaitGroup
 
@@ -413,7 +424,16 @@ func CheckPeersForSnapshot(peers []PeerInfo, snapshotID string) []PeerResult {
 			baseURL := strings.TrimSuffix(p.URL, "/")
 			fidxURL := baseURL + "/bupdate/" + snapshotID + ".fidx"
 
+			if debug {
+				fmt.Fprintf(os.Stderr, "[debug] Checking URL: %s\n", fidxURL)
+			}
+
 			exists, err := CheckURLExists(fidxURL)
+
+			if debug {
+				fmt.Fprintf(os.Stderr, "[debug]   Result for %s: exists=%v, err=%v\n", p.Hostname, exists, err)
+			}
+
 			results[idx] = PeerResult{
 				PeerURL:  baseURL,
 				Hostname: p.Hostname,
@@ -431,4 +451,12 @@ func CheckPeersForSnapshot(peers []PeerInfo, snapshotID string) []PeerResult {
 type PeerInfo struct {
 	URL      string
 	Hostname string
+}
+
+// CheckLocalSnapshot checks if a snapshot exists in the local snapshots directory.
+// A snapshot is considered to exist if its .fidx file is present.
+func CheckLocalSnapshot(snapshotsDir, snapshotID string) bool {
+	fidxPath := filepath.Join(snapshotsDir, snapshotID+".fidx")
+	_, err := os.Stat(fidxPath)
+	return err == nil
 }

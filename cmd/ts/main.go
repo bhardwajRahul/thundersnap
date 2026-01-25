@@ -986,53 +986,75 @@ func cmdWhoHas(args []string) {
 	}
 
 	if len(peers) == 0 {
-		fmt.Printf("No peers have snapshot %s\n", snapshotID)
+		fmt.Fprintf(os.Stderr, "No peers have snapshot %s\n", snapshotID)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Peers with snapshot %s:\n", snapshotID)
+	// Print machine-readable list of bupdate URLs (one per line)
 	for _, peer := range peers {
-		fmt.Printf("  %s (%s)\n", peer.Hostname, peer.PeerURL)
+		fmt.Printf("%s/bupdate/\n", strings.TrimSuffix(peer.PeerURL, "/"))
 	}
 }
 
+// WhoHasRequest is the request body for /who-has
+type WhoHasRequest struct {
+	SnapshotID string `json:"snapshot_id"`
+}
+
+// WhoHasResponse is the response from /who-has
+type WhoHasResponse struct {
+	Status string           `json:"status"`
+	Peers  []WhoHasPeerInfo `json:"peers,omitempty"`
+	Error  string           `json:"error,omitempty"`
+}
+
+// WhoHasPeerInfo represents a peer that has the snapshot
+type WhoHasPeerInfo struct {
+	Hostname string `json:"hostname"`
+	URL      string `json:"url"`
+}
+
 func doWhoHas(sockPath, snapshotID string) ([]bupdate.PeerResult, error) {
-	// Get list of servers from thundersnapd
-	servers, err := getServers(sockPath)
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	req := WhoHasRequest{SnapshotID: snapshotID}
+	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("getting servers: %w", err)
+		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	if len(servers) == 0 {
-		return nil, fmt.Errorf("no mesh peers available")
+	resp, err := client.Post("http://localhost/who-has", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result WhoHasResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
-	// Convert meshPeer to bupdate.PeerInfo
-	peers := make([]bupdate.PeerInfo, len(servers))
-	for i, s := range servers {
-		peers[i] = bupdate.PeerInfo{
-			URL:      s.URL,
-			Hostname: s.Hostname,
-		}
+	if result.Status != "ok" {
+		return nil, fmt.Errorf("%s", result.Error)
 	}
 
-	// Query all peers in parallel
-	results := bupdate.CheckPeersForSnapshot(peers, snapshotID)
-
-	// Filter to only peers that have the snapshot
-	var hasSnap []bupdate.PeerResult
-	for _, r := range results {
-		if r.HasSnap {
-			hasSnap = append(hasSnap, r)
-		}
+	// Convert to bupdate.PeerResult for compatibility with existing code
+	var peers []bupdate.PeerResult
+	for _, p := range result.Peers {
+		peers = append(peers, bupdate.PeerResult{
+			Hostname: p.Hostname,
+			PeerURL:  p.URL,
+			HasSnap:  true,
+		})
 	}
 
-	// Sort by hostname for determinism
-	sort.Slice(hasSnap, func(i, j int) bool {
-		return hasSnap[i].Hostname < hasSnap[j].Hostname
-	})
-
-	return hasSnap, nil
+	return peers, nil
 }
 
 func cmdDownloadSnap(args []string) {

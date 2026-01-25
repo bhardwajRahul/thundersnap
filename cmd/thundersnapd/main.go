@@ -1022,6 +1022,7 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux.HandleFunc("/snap", cs.handleSnap)
 	mux.HandleFunc("/create", handleCreate)
 	mux.HandleFunc("/download-snap", handleDownloadSnap)
+	mux.HandleFunc("/who-has", handleWhoHas)
 	mux.HandleFunc("/ts/servers.json", handleServersJSONControl)
 	cs.handler = mux
 
@@ -1662,9 +1663,100 @@ func handleServersJSONControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	peers := globalMeshState.getPeers()
+	peers := globalMeshState.getPeersIncludingSelf()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(peers)
+}
+
+// WhoHasRequest is the request body for /who-has
+type WhoHasRequest struct {
+	SnapshotID string `json:"snapshot_id"`
+}
+
+// WhoHasResponse is the response from /who-has
+type WhoHasResponse struct {
+	Status string           `json:"status"`
+	Peers  []WhoHasPeerInfo `json:"peers,omitempty"`
+	Error  string           `json:"error,omitempty"`
+}
+
+// WhoHasPeerInfo represents a peer that has the snapshot
+type WhoHasPeerInfo struct {
+	Hostname string `json:"hostname"`
+	URL      string `json:"url"`
+}
+
+// handleWhoHas handles POST /who-has - find which peers have a snapshot
+func handleWhoHas(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req WhoHasRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.SnapshotID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(WhoHasResponse{
+			Status: "error",
+			Error:  "snapshot_id is required",
+		})
+		return
+	}
+
+	// Get mesh peers
+	if globalMeshState == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(WhoHasResponse{
+			Status: "error",
+			Error:  "mesh not enabled",
+		})
+		return
+	}
+
+	meshPeers := globalMeshState.getPeersIncludingSelf()
+	if len(meshPeers) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(WhoHasResponse{
+			Status: "error",
+			Error:  "no mesh peers available",
+		})
+		return
+	}
+
+	// Convert to bupdate.PeerInfo
+	peers := make([]bupdate.PeerInfo, len(meshPeers))
+	for i, p := range meshPeers {
+		peers[i] = bupdate.PeerInfo{
+			URL:      p.URL,
+			Hostname: p.Hostname,
+		}
+	}
+
+	// Check all peers for the snapshot
+	results := bupdate.CheckPeersForSnapshot(peers, req.SnapshotID)
+
+	// Filter to peers that have the snapshot
+	var peersWithSnap []WhoHasPeerInfo
+	for _, r := range results {
+		if r.HasSnap {
+			peersWithSnap = append(peersWithSnap, WhoHasPeerInfo{
+				Hostname: r.Hostname,
+				URL:      r.PeerURL,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(WhoHasResponse{
+		Status: "ok",
+		Peers:  peersWithSnap,
+	})
 }
 
 // DownloadSnapRequest is the request body for /download-snap
@@ -2013,12 +2105,35 @@ func (m *meshState) recordPeer(ping MeshPing) {
 	}
 }
 
-// getPeers returns a list of all known peers
+// getPeers returns a list of all known peers (excluding self)
 func (m *meshState) getPeers() []meshPeer {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	result := make([]meshPeer, 0, len(m.peers))
+	for _, p := range m.peers {
+		result = append(result, *p)
+	}
+	return result
+}
+
+// getPeersIncludingSelf returns a list of all known peers plus the local node.
+// This is used by who-has to also check if the snapshot exists locally.
+func (m *meshState) getPeersIncludingSelf() []meshPeer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Start with self if we have a URL
+	result := make([]meshPeer, 0, len(m.peers)+1)
+	if m.myURL != "" {
+		result = append(result, meshPeer{
+			URL:      m.myURL,
+			Hostname: m.myFQDN,
+			LastSeen: time.Now(),
+		})
+	}
+
+	// Add all known peers
 	for _, p := range m.peers {
 		result = append(result, *p)
 	}
