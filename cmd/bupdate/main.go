@@ -323,6 +323,24 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 	// Remote file path is <fidx-hash>/bin
 	remoteFilePath := outputName + "/bin"
 
+	// Check if we can use COW clone from a file with identical checksums
+	if cloneSource, ok := filesByChecksums.Find(remoteFidx.Entries); ok {
+		debugf("Using COW clone from %s", cloneSource)
+		os.Remove(outputPath)
+		if err := bupdate.CloneFile(outputPath, cloneSource); err == nil {
+			// Clone succeeded, register file and copy fidx
+			filesByChecksums.Add(remoteFidx.Entries, outputPath)
+			if err := remote.copyFidx(localFidxPath, targetFidx); err != nil {
+				prog.clear()
+				return fmt.Errorf("copying fidx: %w", err)
+			}
+			prog.clear()
+			return nil
+		}
+		// Clone failed, fall back to reconstruction
+		debugf("COW clone failed, falling back to reconstruction")
+	}
+
 	// Reconstruct the file
 	if err := reconstructFile(tmpOutputPath, remoteFidx, remote, remoteFilePath, mappings, prog); err != nil {
 		os.Remove(tmpOutputPath)
@@ -335,6 +353,9 @@ func runBupdate(localDir, remoteDir, targetFidx string) error {
 		prog.clear()
 		return fmt.Errorf("rename: %w", err)
 	}
+
+	// Register for future COW clones
+	filesByChecksums.Add(remoteFidx.Entries, outputPath)
 
 	// Copy the fidx file to local
 	if err := remote.copyFidx(localFidxPath, targetFidx); err != nil {
