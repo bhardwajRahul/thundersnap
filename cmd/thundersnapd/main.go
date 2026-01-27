@@ -1142,7 +1142,7 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", handlePing)
 	mux.HandleFunc("/snap", cs.handleSnap)
-	mux.HandleFunc("/create", handleCreate)
+	mux.HandleFunc("/create", cs.handleCreate)
 	mux.HandleFunc("/download-snap", handleDownloadSnap)
 	mux.HandleFunc("/who-has", handleWhoHas)
 	mux.HandleFunc("/ts/servers.json", handleServersJSONControl)
@@ -1516,7 +1516,7 @@ func (c *controlServer) handleSnap(w http.ResponseWriter, r *http.Request) {
 
 // CreateRequest is the request body for /create
 type CreateRequest struct {
-	TailscaleUser string `json:"tailscale_user"`
+	TailscaleUser string `json:"tailscale_user,omitempty"` // deprecated, ignored - user is determined from socket
 	WorkspaceName string `json:"workspace_name"`
 	SnapshotID    string `json:"snapshot_id"`
 }
@@ -1529,7 +1529,7 @@ type CreateResponse struct {
 }
 
 // handleCreate handles POST /create - create a new workspace from a snapshot
-func handleCreate(w http.ResponseWriter, r *http.Request) {
+func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1541,18 +1541,32 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.TailscaleUser == "" || req.WorkspaceName == "" || req.SnapshotID == "" {
+	if req.WorkspaceName == "" || req.SnapshotID == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(CreateResponse{
 			Status:  "error",
-			Message: "tailscale_user, workspace_name, and snapshot_id are required",
+			Message: "workspace_name and snapshot_id are required",
 		})
 		return
 	}
 
-	// Sanitize user and workspace names for filesystem paths
-	safeTailscaleUser := sanitizeForPath(req.TailscaleUser)
+	// Extract tailscale user from rootFS path: /fs-dir/<tailscale-user>/<container>
+	// The tailscale user is the second-to-last path component
+	rootFSRel, _ := filepath.Rel(*flagFsDir, c.rootFS)
+	parts := strings.Split(rootFSRel, string(filepath.Separator))
+	if len(parts) < 2 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(CreateResponse{
+			Status:  "error",
+			Message: "cannot determine tailscale user from rootFS path",
+		})
+		return
+	}
+	safeTailscaleUser := parts[0]
+
+	// Sanitize workspace name for filesystem path
 	safeWorkspaceName := sanitizeForPath(req.WorkspaceName)
 
 	// Build the target path

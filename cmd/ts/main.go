@@ -839,7 +839,6 @@ func cmdCreate(args []string) {
 
 // CreateRequest is the request body for /create
 type CreateRequest struct {
-	TailscaleUser string `json:"tailscale_user"`
 	WorkspaceName string `json:"workspace_name"`
 	SnapshotID    string `json:"snapshot_id"`
 }
@@ -860,12 +859,6 @@ type CreateStreamEvent struct {
 }
 
 func doCreate(sockPath, workspaceName, snapshotID string) error {
-	// Get the tailscale user from the environment
-	tailscaleUser := os.Getenv("TAILSCALE_USER")
-	if tailscaleUser == "" {
-		return fmt.Errorf("TAILSCALE_USER environment variable not set")
-	}
-
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -892,7 +885,6 @@ func doCreate(sockPath, workspaceName, snapshotID string) error {
 	}
 
 	req := CreateRequest{
-		TailscaleUser: tailscaleUser,
 		WorkspaceName: workspaceName,
 		SnapshotID:    snapshotID,
 	}
