@@ -1018,18 +1018,14 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		}
 	}
 
-	// Generate random ID for the intermediate snapshot
-	intermediateID, err := generateRandomID()
-	if err != nil {
-		return fmt.Errorf("generating snapshot ID: %w", err)
-	}
-	intermediatePath := filepath.Join(*flagSnapshotsDir, intermediateID)
-
 	// Step 1: Create intermediate snapshot in snapshots-dir with fidx
 	// (no progress reporting for ensureRootFS - happens at SSH login time)
-	if err := createSnapshotWithFidx(snapshotSource, intermediateID, baseStampID, nil, false); err != nil {
+	// The snapshot ID is based on the fidx checksum, so duplicates are detected.
+	intermediateID, err := createSnapshotWithFidx(snapshotSource, baseStampID, nil, false)
+	if err != nil {
 		return fmt.Errorf("create intermediate snapshot: %w", err)
 	}
+	intermediatePath := filepath.Join(*flagSnapshotsDir, intermediateID)
 
 	// Step 2: Clone from intermediate snapshot to rootFS
 	cmd := exec.Command("btrfs", "subvolume", "snapshot", intermediatePath, rootFS)
@@ -2061,7 +2057,7 @@ func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*b
 }
 
 // createSnapshot creates a read-only snapshot of the given rootFS in snapshots-dir.
-// Returns the new snapshot ID (random hex string).
+// Returns the snapshot ID (based on the fidx checksum).
 // If progressWriter is non-nil, progress updates are written to it.
 func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string, error) {
 	// Read the base stamp from the source rootFS to find parent snapshot
@@ -2070,14 +2066,9 @@ func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string
 		baseStampID = "1" // default
 	}
 
-	// Generate random ID for the snapshot
-	snapshotID, err := generateRandomID()
+	// Create snapshot with fidx (returns ID based on fidx checksum)
+	snapshotID, err := createSnapshotWithFidx(rootFS, baseStampID, progressWriter, isTTY)
 	if err != nil {
-		return "", fmt.Errorf("generating snapshot ID: %w", err)
-	}
-
-	// Create snapshot with fidx
-	if err := createSnapshotWithFidx(rootFS, snapshotID, baseStampID, progressWriter, isTTY); err != nil {
 		return "", err
 	}
 
@@ -2091,25 +2082,31 @@ func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string
 }
 
 // createSnapshotWithFidx creates a read-only snapshot in snapshots-dir and generates
-// fidx files for it. The process is:
-// 1. Create btrfs snapshot to $snapshotID.tmp
-// 2. Create mfidx $snapshotID.tmp.fidx (with --ref to parent if exists)
-// 3. Create fidx of the fidx: $snapshotID.tmp.fidx.fidx
-// 4. Rename all three to final names atomically
-func createSnapshotWithFidx(source, snapshotID, parentStampID string, progressWriter io.Writer, isTTY bool) error {
-	tmpPath := filepath.Join(*flagSnapshotsDir, snapshotID+".tmp")
-	tmpFidxPath := tmpPath + ".fidx"
-	tmpFidxFidxPath := tmpFidxPath + ".fidx"
+// fidx files for it. The snapshot is named after the checksum of its fidx file.
+// If a snapshot with the same checksum already exists, it returns the existing ID
+// and discards the new snapshot.
+// The process is:
+// 1. Create btrfs snapshot to a random tmp name
+// 2. Create mfidx (with --ref to parent if exists)
+// 3. Load fidx to get its checksum, use that as the final snapshot ID
+// 4. If snapshot already exists with that ID, discard the new one
+// 5. Otherwise rename all files to the checksum-based final names
+// 6. Create fidx of the fidx: $snapshotID.fidx.fidx
+func createSnapshotWithFidx(source, parentStampID string, progressWriter io.Writer, isTTY bool) (string, error) {
+	// Generate a random temporary ID for the work-in-progress snapshot
+	tmpID, err := generateRandomID()
+	if err != nil {
+		return "", fmt.Errorf("generating temporary ID: %w", err)
+	}
 
-	finalPath := filepath.Join(*flagSnapshotsDir, snapshotID)
-	finalFidxPath := finalPath + ".fidx"
-	finalFidxFidxPath := finalFidxPath + ".fidx"
+	tmpPath := filepath.Join(*flagSnapshotsDir, tmpID+".tmp")
+	tmpFidxPath := tmpPath + ".fidx"
 
 	// Step 1: Create read-only btrfs snapshot to tmp path
 	cmd := exec.Command("btrfs", "subvolume", "snapshot", "-r", source, tmpPath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("btrfs snapshot failed: %w\noutput: %s", err, string(output))
+		return "", fmt.Errorf("btrfs snapshot failed: %w\noutput: %s", err, string(output))
 	}
 
 	// Write stamp file for the snapshot (in tmp location)
@@ -2117,7 +2114,7 @@ func createSnapshotWithFidx(source, snapshotID, parentStampID string, progressWr
 		// Clean up on error
 		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
 		os.Remove(tmpPath + ".stamp")
-		return fmt.Errorf("write stamp file: %w", err)
+		return "", fmt.Errorf("write stamp file: %w", err)
 	}
 
 	// Step 2: Create mfidx for the snapshot
@@ -2130,7 +2127,7 @@ func createSnapshotWithFidx(source, snapshotID, parentStampID string, progressWr
 		}
 	}
 
-	log.Printf("Creating fidx for snapshot %s (ref: %s)", snapshotID, refPath)
+	log.Printf("Creating fidx for snapshot (ref: %s)", refPath)
 	fidxOpts := bupdate.IndexerOptions{
 		RefPath:        refPath,
 		Progress:       false, // don't use stderr directly
@@ -2141,30 +2138,42 @@ func createSnapshotWithFidx(source, snapshotID, parentStampID string, progressWr
 		// Clean up on error
 		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
 		os.Remove(tmpPath + ".stamp")
-		return fmt.Errorf("create fidx: %w", err)
+		return "", fmt.Errorf("create fidx: %w", err)
 	}
 
-	// Step 3: Create fidx of the fidx (single file fidx)
-	fidxFidxOpts := bupdate.IndexerOptions{
-		Progress: false,
-	}
-	if err := bupdate.CreateSingleFidx(tmpFidxPath, tmpFidxFidxPath, fidxFidxOpts); err != nil {
+	// Step 3: Load the fidx to get its checksum, which becomes the snapshot ID
+	fidx, err := bupdate.LoadFidx(tmpFidxPath)
+	if err != nil {
 		// Clean up on error
 		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
 		os.Remove(tmpPath + ".stamp")
 		os.Remove(tmpFidxPath)
-		return fmt.Errorf("create fidx.fidx: %w", err)
+		return "", fmt.Errorf("load fidx for checksum: %w", err)
+	}
+	snapshotID := hex.EncodeToString(fidx.FileSHA[:])
+
+	finalPath := filepath.Join(*flagSnapshotsDir, snapshotID)
+	finalFidxPath := finalPath + ".fidx"
+	finalFidxFidxPath := finalFidxPath + ".fidx"
+
+	// Step 4: Check if a snapshot with this checksum already exists
+	if _, err := os.Stat(finalPath); err == nil {
+		// Snapshot already exists! Discard the new one.
+		log.Printf("Snapshot %s already exists, discarding duplicate", snapshotID)
+		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
+		os.Remove(tmpPath + ".stamp")
+		os.Remove(tmpFidxPath)
+		return snapshotID, nil
 	}
 
-	// Step 4: Rename all to final names (order matters for consistency)
-	// First the directory, then fidx, then fidx.fidx
+	// Step 5: Rename all to final names (order matters for consistency)
+	// First the directory, then stamp, then fidx
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		// Clean up on error
 		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
 		os.Remove(tmpPath + ".stamp")
 		os.Remove(tmpFidxPath)
-		os.Remove(tmpFidxFidxPath)
-		return fmt.Errorf("rename snapshot: %w", err)
+		return "", fmt.Errorf("rename snapshot: %w", err)
 	}
 	// Also rename the stamp file
 	os.Rename(tmpPath+".stamp", finalPath+".stamp")
@@ -2174,13 +2183,17 @@ func createSnapshotWithFidx(source, snapshotID, parentStampID string, progressWr
 		log.Printf("Warning: failed to rename fidx: %v", err)
 	}
 
-	if err := os.Rename(tmpFidxFidxPath, finalFidxFidxPath); err != nil {
-		// Snapshot and fidx are already renamed, just log the error
-		log.Printf("Warning: failed to rename fidx.fidx: %v", err)
+	// Step 6: Create fidx of the fidx (single file fidx)
+	fidxFidxOpts := bupdate.IndexerOptions{
+		Progress: false,
+	}
+	if err := bupdate.CreateSingleFidx(finalFidxPath, finalFidxFidxPath, fidxFidxOpts); err != nil {
+		// Snapshot and fidx are already in place, just log the error
+		log.Printf("Warning: failed to create fidx.fidx: %v", err)
 	}
 
 	log.Printf("Created snapshot %s with fidx", snapshotID)
-	return nil
+	return snapshotID, nil
 }
 
 // meshPort is the HTTP port for mesh discovery (TSTS in leetspeak = 7575)
