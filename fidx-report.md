@@ -17,6 +17,12 @@ synchronization, incremental downloads, and chunk retrieval from slab files.
 
 This split provides the best trade-offs for all required operations.
 
+**Hash algorithm**: SHA-256 (32 bytes). Git is transitioning from SHA-1 to
+SHA-256, with SHA-256 becoming the default in Git 3.0 (targeted end of 2026).
+Using SHA-256 now future-proofs the format and provides stronger collision
+resistance. The 12-byte increase per hash is acceptable given the security
+and compatibility benefits.
+
 ---
 
 ## Requirements Analysis
@@ -128,20 +134,20 @@ For **hardlinks**: 4-byte link target index (file entry number of target).
 
 For **devices**: 4-byte major + 4-byte minor device numbers.
 
-### Footer (40 bytes)
+### Footer (64 bytes)
 
 ```
 Offset  Size  Field
-0       20    SHA-1 of all preceding bytes
-20      20    SHA-1 of the corresponding .tsc file (for integrity check)
+0       32    SHA-256 of all preceding bytes
+32      32    SHA-256 of the corresponding .tsc file (for integrity check)
 ```
 
 ### Design Notes
 
 - **Sorted by path**: Enables binary search for file lookup, merge-based diffing.
 - **Chunk indices, not SHAs**: Files reference chunks by index into the chunk
-  file, saving 20 bytes per reference (4 vs 24). A file with 1000 chunks saves
-  20KB.
+  file, saving 28 bytes per reference (4 vs 32). A file with 1000 chunks saves
+  28KB.
 - **Fixed metadata fields**: Most fields are fixed-width for easy parsing.
   Variable parts (path, symlink target) have explicit lengths.
 - **Directories included**: Empty directories are preserved; they have
@@ -170,28 +176,28 @@ Offset  Size  Field
 32      32    Reserved (zero)
 ```
 
-### Chunk Entries (28 or 36 bytes each, sorted by SHA)
+### Chunk Entries (40 or 48 bytes each, sorted by SHA)
 
-Without slab locations (28 bytes):
+Without slab locations (40 bytes):
 ```
 Offset  Size  Field
-0       20    SHA-1
-20      4     Size (uint32, allows chunks > 64KB if needed)
-24      2     Level (uint16, bupsplit level for hierarchical grouping)
-26      2     Flags (uint16)
+0       32    SHA-256
+32      4     Size (uint32, allows chunks > 64KB if needed)
+36      2     Level (uint16, bupsplit level for hierarchical grouping)
+38      2     Flags (uint16)
               Bit 0: is_zero_block (don't store/fetch, reconstruct as zeros)
               Bit 1: is_literal (stored uncompressed in slab)
               Bits 2-15: reserved
 ```
 
-With slab locations (36 bytes):
+With slab locations (48 bytes):
 ```
 Offset  Size  Field
-0       20    SHA-1
-20      4     Size (uint32)
-24      2     Level (uint16)
-26      2     Slab index (uint16, index into slab name table)
-28      8     Offset in slab (uint64)
+0       32    SHA-256
+32      4     Size (uint32)
+36      2     Level (uint16)
+38      2     Slab index (uint16, index into slab name table)
+40      8     Offset in slab (uint64)
 ```
 
 ### Slab Name Table (variable, at end before footer)
@@ -206,11 +212,11 @@ Offset  Size  Field
               N     Slab name/URL (UTF-8)
 ```
 
-### Footer (20 bytes)
+### Footer (32 bytes)
 
 ```
 Offset  Size  Field
-0       20    SHA-1 of all preceding bytes (header + entries + slab table)
+0       32    SHA-256 of all preceding bytes (header + entries + slab table)
 ```
 
 ### Design Notes
@@ -337,7 +343,7 @@ For a filesystem with 1 million files and 10 million unique chunks:
 ### Proposed Format (streaming)
 
 - One file entry in flight: ~100 bytes
-- One chunk entry in flight: 36 bytes
+- One chunk entry in flight: 48 bytes
 - Binary search buffer (for lookups): ~4KB
 - **Total: < 1 MB for streaming operations**
 
@@ -367,32 +373,34 @@ Estimated:          74M (files) + 240M (chunks with duplication) = ~314 MB
 .tsm file:
   Header:           64 bytes
   Per file:         ~58 bytes avg (without inline chunk SHAs)
-  Footer:           40 bytes
+  Footer:           64 bytes
   Total:            ~58 MB
 
 .tsc file:
   Header:           64 bytes
-  Per chunk:        36 bytes (with slab locations)
-  Footer:           20 bytes
-  Total:            ~360 MB
+  Per chunk:        48 bytes (with slab locations)
+  Footer:           32 bytes
+  Total:            ~480 MB
 
-Combined:           ~418 MB
+Combined:           ~538 MB
 ```
 
-Wait, that's larger! The issue is we're storing more metadata and slab locations.
+Wait, that's larger! The issue is we're storing more metadata, slab locations,
+and using SHA-256 (32 bytes vs SHA-1's 20 bytes).
 
 **Without slab locations** (pure manifest, no external chunk storage):
 
 ```
-.tsc per chunk:     28 bytes
-Total .tsc:         ~280 MB
-Combined:           ~338 MB
+.tsc per chunk:     40 bytes
+Total .tsc:         ~400 MB
+Combined:           ~458 MB
 ```
 
-Still slightly larger due to richer metadata. But:
+Still larger due to richer metadata and SHA-256. But:
 - We gain uid/gid/ctime/atime that mfidx lacks
 - We gain chunk deduplication (important for diffing)
 - We gain O(log n) lookups vs O(n)
+- We gain SHA-256 security (future-proof, Git 3.0 default)
 
 **Space optimization**: If files are sorted and we use delta encoding for paths:
 
@@ -401,8 +409,8 @@ Per file:           ~40 bytes avg (with path prefix compression)
 .tsm total:         ~40 MB
 ```
 
-This brings combined size to ~320 MB, competitive with mfidx while providing
-much richer functionality.
+This brings combined size to ~440 MB. The ~40% increase over mfidx is the cost
+of SHA-256 + richer metadata, but we gain significant functionality.
 
 ---
 
@@ -490,7 +498,7 @@ simpler incremental sync.
 | ...              |
 | File Entry N     |
 +------------------+
-| Footer (40B)     |
+| Footer (64B)     |
 +------------------+
 ```
 
@@ -500,14 +508,14 @@ simpler incremental sync.
 +------------------+
 | Header (64B)     |
 +------------------+
-| Chunk Entry 1    |
+| Chunk Entry 1    |  (40B or 48B each)
 | Chunk Entry 2    |
 | ...              |
 | Chunk Entry M    |
 +------------------+
 | Slab Table       |  (optional)
 +------------------+
-| Footer (20B)     |
+| Footer (32B)     |
 +------------------+
 ```
 
