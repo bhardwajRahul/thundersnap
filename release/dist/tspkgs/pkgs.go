@@ -15,6 +15,17 @@ import (
 	"github.com/goreleaser/nfpm/v2/files"
 )
 
+// symlinkLatest creates a thundersnap_latest_<arch>.<ext> symlink pointing to filename.
+// filename is e.g. "thundersnap_1.2.3_amd64.deb"; the symlink replaces the version with "latest".
+func symlinkLatest(outDir, filename, arch, ext string) {
+	link := fmt.Sprintf("thundersnap_latest_%s.%s", arch, ext)
+	linkPath := filepath.Join(outDir, link)
+	os.Remove(linkPath)
+	if err := os.Symlink(filename, linkPath); err != nil {
+		log.Printf("Warning: failed to create symlink %s: %v", link, err)
+	}
+}
+
 type tgzTarget struct {
 	goEnv map[string]string
 }
@@ -127,6 +138,7 @@ func (t *tgzTarget) Build(b *Build) ([]string, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
+	symlinkLatest(b.Out, filename, t.arch(), "tgz")
 	return []string{filename}, nil
 }
 
@@ -224,6 +236,7 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
+	symlinkLatest(b.Out, filename, arch, "deb")
 	return []string{filename}, nil
 }
 
@@ -327,6 +340,7 @@ func (t *rpmTarget) Build(b *Build) ([]string, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
+	symlinkLatest(b.Out, filename, arch, "rpm")
 	return []string{filename}, nil
 }
 
