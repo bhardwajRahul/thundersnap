@@ -1087,12 +1087,20 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		}
 	}
 
+	// Verify the snapshot source exists before trying to clone it.
+	if _, err := os.Stat(snapshotSource); err != nil {
+		if os.IsNotExist(err) && snapshotSource == defaultSnapshot {
+			return fmt.Errorf("%s does not exist; create a base filesystem snapshot there before starting", snapshotSource)
+		}
+		return fmt.Errorf("snapshot source %s: %w", snapshotSource, err)
+	}
+
 	// Step 1: Create intermediate snapshot in snapshots-dir with fidx
 	// (no progress reporting for ensureRootFS - happens at SSH login time)
 	// The snapshot ID is based on the fidx checksum, so duplicates are detected.
 	intermediateID, err := createSnapshotWithFidx(snapshotSource, baseStampID, nil, false)
 	if err != nil {
-		return fmt.Errorf("create intermediate snapshot: %w", err)
+		return fmt.Errorf("create intermediate snapshot from %s: %w", snapshotSource, err)
 	}
 	intermediatePath := filepath.Join(*flagSnapshotsDir, intermediateID)
 
