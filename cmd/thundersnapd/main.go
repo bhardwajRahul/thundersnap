@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -468,7 +469,13 @@ func runActivate() {
 			fmt.Fprintf(os.Stderr, "No auth URL found at %s.\nThe server may already be authenticated, or may not be running yet.\n", authURLFile)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", authURLFile, err)
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			fmt.Fprintf(os.Stderr, "%s: %s\n", authURLFile, errno)
+		} else {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", authURLFile, err)
+		}
+		fmt.Fprintf(os.Stderr, "Try running as root.\n")
 		os.Exit(1)
 	}
 
