@@ -1,0 +1,17 @@
+[Unit]
+Description=Thundersnap daemon
+Wants=network-pre.target
+After=network-pre.target
+
+[Service]
+EnvironmentFile=/etc/default/thundersnapd
+ExecStart=/usr/sbin/thundersnapd --libexec-dir=/usr/libexec/thundersnap $FLAGS
+Restart=on-failure
+RuntimeDirectory=thundersnap
+RuntimeDirectoryMode=0755
+StateDirectory=thundersnap
+StateDirectoryMode=0700
+Type=simple
+
+[Install]
+WantedBy=multi-user.target

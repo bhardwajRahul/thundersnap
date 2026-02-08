@@ -40,12 +40,17 @@ import (
 )
 
 var (
-	flagFsDir       *string
+	flagFsDir        *string
 	flagSnapshotsDir *string
-	flagVmDir       *string
-	flagMesh        *bool
-	flagNfsd        *bool
-	flagNfsPort     *int
+	flagVmDir        *string
+	flagLibexecDir   *string
+	flagMesh         *bool
+	flagNfsd         *bool
+	flagNfsPort      *int
+
+	// authURLFile is the path where the server writes the auth URL
+	// while waiting for Tailscale login. The --activate client reads it.
+	authURLFile = "/run/thundersnap/auth-url"
 )
 
 // vmSessionManager tracks running VM sessions and allows multiple clients to share them.
@@ -151,15 +156,22 @@ func (m *vmSessionManager) releaseVM(tailscaleUser, vmUser string) {
 }
 
 func main() {
+	activate := flag.Bool("activate", false, "Print the Tailscale auth URL and wait for login to complete")
 	hostname := flag.String("hostname", "thundersnap", "Tailscale hostname for this server")
 	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
 	flagFsDir = flag.String("fs-dir", "", "Directory to store per-user live filesystems (required)")
 	flagSnapshotsDir = flag.String("snapshots-dir", "", "Directory to store base snapshots for cloning (required)")
 	flagVmDir = flag.String("vm-dir", "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
+	flagLibexecDir = flag.String("libexec-dir", "", "Directory containing helper binaries like ts and vshd (default: <exe-dir>)")
 	flagMesh = flag.Bool("mesh", false, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
 	flagNfsd = flag.Bool("nfsd", false, "Enable NFSv4 server to export -snapshots-dir")
 	flagNfsPort = flag.Int("nfs-port", 2049, "Port for NFSv4 server (default: 2049)")
 	flag.Parse()
+
+	if *activate {
+		runActivate()
+		return
+	}
 
 	if *flagFsDir == "" {
 		log.Fatalf("-fs-dir is required")
@@ -173,13 +185,16 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 
-	// Set default vm-dir relative to executable
+	// Set default vm-dir and libexec-dir relative to executable
+	exe, err := os.Executable()
+	if err != nil {
+		log.Fatalf("Failed to get executable path: %v", err)
+	}
 	if *flagVmDir == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			log.Fatalf("Failed to get executable path: %v", err)
-		}
 		*flagVmDir = filepath.Join(filepath.Dir(exe), "vm")
+	}
+	if *flagLibexecDir == "" {
+		*flagLibexecDir = filepath.Dir(exe)
 	}
 
 	// Set up state directory
@@ -199,6 +214,19 @@ func main() {
 	srv := &tsnet.Server{
 		Hostname: *hostname,
 		Dir:      *stateDir,
+		UserLogf: func(format string, a ...any) {
+			msg := fmt.Sprintf(format, a...)
+			log.Print(msg)
+			// If the log contains an auth URL, write it to a file so
+			// "thundersnapd --activate" can read and display it.
+			const prefix = "or go to: "
+			if idx := strings.Index(msg, prefix); idx != -1 {
+				url := strings.TrimSpace(msg[idx+len(prefix):])
+				if url != "" {
+					os.WriteFile(authURLFile, []byte(url+"\n"), 0600)
+				}
+			}
+		},
 	}
 	defer srv.Close()
 
@@ -208,6 +236,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to start tsnet server: %v", err)
 	}
+	// Auth is complete; remove the auth URL file if it was written.
+	os.Remove(authURLFile)
 	log.Printf("tsnet server is up! Tailscale IP: %v", status.TailscaleIPs)
 
 	// Listen on port 22 for SSH connections
@@ -425,6 +455,38 @@ func main() {
 	// Serve SSH connections
 	if err := sshServer.Serve(ln); err != nil {
 		log.Fatalf("SSH server error: %v", err)
+	}
+}
+
+// runActivate implements the --activate client mode.
+// It reads the auth URL file written by the running server, prints the URL,
+// then polls until the file is deleted (meaning authentication completed).
+func runActivate() {
+	data, err := os.ReadFile(authURLFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "No auth URL found at %s.\nThe server may already be authenticated, or may not be running yet.\n", authURLFile)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", authURLFile, err)
+		os.Exit(1)
+	}
+
+	url := strings.TrimSpace(string(data))
+	if url == "" {
+		fmt.Fprintf(os.Stderr, "Auth URL file %s is empty.\n", authURLFile)
+		os.Exit(1)
+	}
+
+	fmt.Printf("To authenticate this node, visit:\n\n  %s\n\nWaiting for login to complete...\n", url)
+
+	// Poll until the file is deleted (server removes it after successful auth).
+	for {
+		time.Sleep(1 * time.Second)
+		if _, err := os.Stat(authURLFile); os.IsNotExist(err) {
+			fmt.Println("Login complete.")
+			return
+		}
 	}
 }
 
@@ -1055,14 +1117,9 @@ func copyVshdBinary(rootFS string) error {
 	return copyBinaryToRootFS(rootFS, "vshd", "sbin/vshd")
 }
 
-// copyBinaryToRootFS copies a binary from the executable directory into the rootfs.
+// copyBinaryToRootFS copies a binary from the libexec directory into the rootfs.
 func copyBinaryToRootFS(rootFS, binaryName, destPath string) error {
-	// Find the binary next to the current executable
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("get executable path: %w", err)
-	}
-	src := filepath.Join(filepath.Dir(exe), binaryName)
+	src := filepath.Join(*flagLibexecDir, binaryName)
 
 	// Destination in rootfs
 	dst := filepath.Join(rootFS, destPath)
