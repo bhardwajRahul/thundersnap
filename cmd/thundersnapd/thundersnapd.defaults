@@ -1,2 +1,3 @@
-# Extra flags for thundersnapd.
-FLAGS=""
+# Flags for thundersnapd. Both directories must be on the same btrfs filesystem.
+# Populate --snapshots-dir with at least one base snapshot named "1" before starting.
+FLAGS="--fs-dir=/var/lib/thundersnap/fs --snapshots-dir=/var/lib/thundersnap/snapshots"
