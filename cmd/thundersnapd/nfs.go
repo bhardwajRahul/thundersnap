@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/go-git/go-billy/v5/osfs"
@@ -19,8 +20,47 @@ import (
 )
 
 // billyHandler implements nfs.Handler using go-billy filesystem.
+//
+// root is the absolute path of the filesystem root, used by the Change
+// implementation to perform chown/chtimes/lchown operations that the
+// underlying go-billy osfs (BoundOS) does not implement directly.
 type billyHandler struct {
-	fs billy.Filesystem
+	fs   billy.Filesystem
+	root string
+}
+
+// osfsChanger implements billy.Change for an osfs-backed filesystem
+// rooted at root. The standard go-billy BoundOS only implements Chmod,
+// so we provide Lchown/Chown/Chtimes here as direct syscalls on the
+// joined absolute path. Without this, NFS clients calling CREATE with
+// any setattr (mode, uid, gid, mtime) get NFS3ERR_IO because the server
+// reports the operation as unsupported.
+type osfsChanger struct {
+	fs   billy.Filesystem
+	root string
+}
+
+func (c *osfsChanger) abs(name string) string {
+	if c.root == "" {
+		return name
+	}
+	return filepath.Join(c.root, name)
+}
+
+func (c *osfsChanger) Chmod(name string, mode os.FileMode) error {
+	return os.Chmod(c.abs(name), mode)
+}
+
+func (c *osfsChanger) Lchown(name string, uid, gid int) error {
+	return os.Lchown(c.abs(name), uid, gid)
+}
+
+func (c *osfsChanger) Chown(name string, uid, gid int) error {
+	return os.Chown(c.abs(name), uid, gid)
+}
+
+func (c *osfsChanger) Chtimes(name string, atime, mtime time.Time) error {
+	return os.Chtimes(c.abs(name), atime, mtime)
 }
 
 // Mount returns the root billy.Filesystem for the given connection.
@@ -30,11 +70,26 @@ func (h *billyHandler) Mount(ctx context.Context, conn net.Conn, req nfs.MountRe
 
 // Change returns the billy.Change interface for the filesystem.
 // This enables write operations (chmod, chown, chtimes).
+//
+// We can't simply assert fs.(billy.Change): go-billy's osfs.BoundOS only
+// implements Chmod, not Lchown/Chown/Chtimes, so the type assertion fails
+// and the NFS server then reports "operation not supported" for every
+// CREATE that includes a setattr (which is every CREATE the standard
+// clients send). Instead, return our own osfsChanger that performs the
+// operations directly via the os package against h.root.
 func (h *billyHandler) Change(fs billy.Filesystem) billy.Change {
 	if c, ok := fs.(billy.Change); ok {
+		// Promote any partial implementer (BoundOS implements Chmod only)
+		// by wrapping with our own changer if the assertion succeeded but
+		// the type lacks the full interface. The interface assertion in
+		// Go succeeds only if all methods are present, so reaching here
+		// means c has all four methods.
 		return c
 	}
-	return nil
+	if h.root == "" {
+		return nil
+	}
+	return &osfsChanger{fs: fs, root: h.root}
 }
 
 // FSStat returns filesystem statistics.
@@ -236,7 +291,7 @@ func startNFSServer(root string, listener net.Listener) (*nfsServer, error) {
 	fs := osfs.New(absRoot)
 
 	// Create handler with caching wrapper for optimal performance
-	handler := &billyHandler{fs: fs}
+	handler := &billyHandler{fs: fs, root: absRoot}
 	cachingHandler := nfshelper.NewCachingHandler(handler, handler.HandleLimit())
 
 	log.Printf("NFSv3 server exporting %s", absRoot)

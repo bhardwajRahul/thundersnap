@@ -73,7 +73,7 @@ func setupNFSTest(t *testing.T) *testNFSSetup {
 
 	// Start the NFS server
 	fs := osfs.New(setup.tmpDir)
-	handler := &billyHandler{fs: fs}
+	handler := &billyHandler{fs: fs, root: setup.tmpDir}
 	cachingHandler := nfshelper.NewCachingHandler(handler, 100000)
 
 	addr := fmt.Sprintf(":%d", setup.port)
