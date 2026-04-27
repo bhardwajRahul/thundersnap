@@ -33,6 +33,7 @@ import (
 	"github.com/gliderlabs/ssh"
 	"github.com/tailscale/thundersnap/bupdate"
 	"github.com/tailscale/thundersnap/thundersnap"
+	"github.com/tailscale/thundersnap/tsm"
 	gossh "golang.org/x/crypto/ssh"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn/ipnstate"
@@ -1119,6 +1120,17 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		log.Printf("Warning: failed to write stamp file for %s: %v", rootFS, err)
 	}
 
+	// Apply the simplified UID model to the live filesystem before any
+	// session enters it. All non-root users in /etc/passwd resolve to the
+	// shared UID, all non-root groups in /etc/group to the shared GID, and
+	// every file owned by a non-root UID/GID is chowned to match. This
+	// runs once per fresh fs-dir clone, never against the read-only
+	// snapshots-dir subvolumes. See strip-all-uids-design.md.
+	stripOpts := tsm.StripOptions{ChownFiles: true}
+	if err := tsm.StripRootfs(rootFS, stripOpts); err != nil {
+		log.Printf("Warning: strip-uids on %s: %v", rootFS, err)
+	}
+
 	return nil
 }
 
@@ -1851,6 +1863,13 @@ func createWorkspaceFromSnapshot(workspacePath, snapshotID string) error {
 		log.Printf("Warning: failed to copy ts binary to %s: %v", workspacePath, err)
 	}
 
+	// Apply the simplified UID model so this workspace works regardless of
+	// whether the source snapshot was stripped already. Idempotent: calling
+	// it on an already-stripped tree leaves it unchanged.
+	if err := tsm.StripRootfs(workspacePath, tsm.StripOptions{ChownFiles: true}); err != nil {
+		log.Printf("Warning: strip-uids on %s: %v", workspacePath, err)
+	}
+
 	return nil
 }
 
@@ -2278,7 +2297,22 @@ func createSnapshotWithFidx(source, parentStampID string, progressWriter io.Writ
 		log.Printf("Warning: failed to create fidx.fidx: %v", err)
 	}
 
-	log.Printf("Created snapshot %s with fidx", snapshotID)
+	// Step 7: Generate the new TSM/TSC manifest pair alongside the fidx files.
+	// These supersede the older bupmeta/mfidx representation: .tsm holds
+	// per-file metadata + chunk references, .tsc holds the deduplicated
+	// chunk index. See fidx-report.md.
+	tsmOpts := tsm.IndexerOptions{
+		Progress:       false,
+		ProgressWriter: progressWriter,
+		IsTTY:          isTTY,
+	}
+	if err := tsm.Create(finalPath, finalPath, tsmOpts); err != nil {
+		// Don't fail the snapshot for this — the fidx files are still
+		// usable. But log loudly so the regression is visible.
+		log.Printf("Warning: failed to create tsm/tsc for %s: %v", snapshotID, err)
+	}
+
+	log.Printf("Created snapshot %s with fidx and tsm", snapshotID)
 	return snapshotID, nil
 }
 
