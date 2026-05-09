@@ -10,7 +10,7 @@ require (
 	github.com/mdlayher/vsock v1.2.1
 	github.com/pborman/getopt/v2 v2.1.0
 	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd
-	github.com/willscott/go-nfs v0.0.3
+	github.com/willscott/go-nfs v0.0.4
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00
 	golang.org/x/crypto v0.46.0
 	golang.org/x/sys v0.43.0
