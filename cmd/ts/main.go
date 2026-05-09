@@ -47,7 +47,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  bupdate        download and reconstruct files from mesh peers")
 	fmt.Fprintln(os.Stderr, "  fidx           create a file index (.fidx) for a file or directory")
 	fmt.Fprintln(os.Stderr, "  snap           create a snapshot of the current container/VM")
-	fmt.Fprintln(os.Stderr, "  create         create a new workspace from a snapshot")
+	fmt.Fprintln(os.Stderr, "  create         create a new frame from a snapshot")
 	fmt.Fprintln(os.Stderr, "  taint          add a taint to the current frame")
 	fmt.Fprintln(os.Stderr, "  download-docker download a Docker image as a snapshot")
 	fmt.Fprintln(os.Stderr, "  who-has        query peers to find which ones have a snapshot")
@@ -824,7 +824,7 @@ func reconstructFileHTTP(outputPath string, fidx *bupdate.Fidx, baseURL, remoteF
 func cmdCreate(args []string) {
 	opts := getopt.New()
 	opts.SetProgram("ts create")
-	opts.SetParameters("<workspace-name> <snapshot-spec>")
+	opts.SetParameters("<frame-name> <snapshot-spec>")
 	isolation := opts.StringLong("isolation", 0, "", "isolation level: vm, container, none")
 	// Parse expects first element to be program name (like os.Args)
 	opts.Parse(append([]string{"ts create"}, args...))
@@ -832,7 +832,7 @@ func cmdCreate(args []string) {
 	if opts.NArgs() != 2 {
 		fmt.Fprintln(os.Stderr, "error: create requires exactly two arguments")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "usage: ts create [--isolation=<level>] <workspace-name> <snapshot-spec>")
+		fmt.Fprintln(os.Stderr, "usage: ts create [--isolation=<level>] <frame-name> <snapshot-spec>")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "snapshot-spec can be:")
 		fmt.Fprintln(os.Stderr, "  <snapshot-id>                    single snapshot (legacy)")
@@ -846,10 +846,10 @@ func cmdCreate(args []string) {
 		os.Exit(1)
 	}
 
-	workspaceName := opts.Arg(0)
+	frameName := opts.Arg(0)
 	snapshotSpec := opts.Arg(1)
 
-	if err := doCreate(*sockPath, workspaceName, snapshotSpec, *isolation); err != nil {
+	if err := doCreate(*sockPath, frameName, snapshotSpec, *isolation); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -857,9 +857,9 @@ func cmdCreate(args []string) {
 
 // CreateRequest is the request body for /create
 type CreateRequest struct {
-	WorkspaceName string `json:"workspace_name"`
-	SnapshotID    string `json:"snapshot_id"`
-	Isolation     string `json:"isolation,omitempty"`
+	FrameName  string `json:"frame_name"`
+	SnapshotID string `json:"snapshot_id"`
+	Isolation  string `json:"isolation,omitempty"`
 }
 
 // CreateResponse is the response from /create
@@ -877,7 +877,7 @@ type CreateStreamEvent struct {
 	Path    string `json:"path,omitempty"`
 }
 
-func doCreate(sockPath, workspaceName, snapshotID, isolation string) error {
+func doCreate(sockPath, frameName, snapshotID, isolation string) error {
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -904,9 +904,9 @@ func doCreate(sockPath, workspaceName, snapshotID, isolation string) error {
 	}
 
 	req := CreateRequest{
-		WorkspaceName: workspaceName,
-		SnapshotID:    snapshotID,
-		Isolation:     isolation,
+		FrameName:  frameName,
+		SnapshotID: snapshotID,
+		Isolation:  isolation,
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -977,7 +977,7 @@ func doCreate(sockPath, workspaceName, snapshotID, isolation string) error {
 		return fmt.Errorf("%s", lastEvent.Message)
 	}
 
-	fmt.Printf("Created workspace at %s\n", lastEvent.Path)
+	fmt.Printf("Created frame at %s\n", lastEvent.Path)
 	return nil
 }
 

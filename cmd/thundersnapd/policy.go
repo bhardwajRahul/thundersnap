@@ -28,20 +28,20 @@ type ThundersnapCap struct {
 	// "none": no sub-isolation (single-user thundersnap instance)
 	Isolation string `json:"isolation,omitempty"`
 
-	// MaxWorkspaces limits how many concurrent workspaces the user can have.
-	// -1 means unlimited. Default: 10.
-	MaxWorkspaces int `json:"maxWorkspaces,omitempty"`
+	// MaxFrames limits how many concurrent frames the user can have.
+	// -1 means unlimited. Default: 5.
+	MaxFrames int `json:"maxFrames,omitempty"`
 
-	// Ephemeral means workspaces are deleted when the last session disconnects.
+	// Ephemeral means frames are deleted when the last session disconnects.
 	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
 // DefaultCap is the default capability when no grant matches.
 var DefaultCap = ThundersnapCap{
-	Role:          "developer",
-	Isolation:     "container",
-	MaxWorkspaces: 5,
-	Ephemeral:     false,
+	Role:      "developer",
+	Isolation: "container",
+	MaxFrames: 5,
+	Ephemeral: false,
 }
 
 // PolicyFile represents the local policy file structure.
@@ -181,8 +181,8 @@ func fillDefaults(cap ThundersnapCap) ThundersnapCap {
 	if cap.Isolation == "" {
 		cap.Isolation = DefaultCap.Isolation
 	}
-	if cap.MaxWorkspaces == 0 {
-		cap.MaxWorkspaces = DefaultCap.MaxWorkspaces
+	if cap.MaxFrames == 0 {
+		cap.MaxFrames = DefaultCap.MaxFrames
 	}
 	return cap
 }

@@ -88,7 +88,7 @@ func TestPolicyFileMatchGrant(t *testing.T) {
 					ThundersnapCapName: {{
 						Role:          "admin",
 						Isolation:     "none",
-						MaxWorkspaces: -1,
+						MaxFrames: -1,
 					}},
 				},
 			},
@@ -99,7 +99,7 @@ func TestPolicyFileMatchGrant(t *testing.T) {
 					ThundersnapCapName: {{
 						Role:          "ephemeral",
 						Isolation:     "container",
-						MaxWorkspaces: 50,
+						MaxFrames: 50,
 						Ephemeral:     true,
 					}},
 				},
@@ -111,7 +111,7 @@ func TestPolicyFileMatchGrant(t *testing.T) {
 					ThundersnapCapName: {{
 						Role:          "developer",
 						Isolation:     "vm",
-						MaxWorkspaces: 10,
+						MaxFrames: 10,
 					}},
 				},
 			},
@@ -191,7 +191,7 @@ func TestLoadPolicyFile(t *testing.T) {
         "tailscale.com/cap/thundersnap": [{
           "role": "developer",
           "isolation": "vm",
-          "maxWorkspaces": 10,
+          "maxFrames": 10,
         }],
       },
     },
@@ -293,12 +293,12 @@ func TestFillDefaults(t *testing.T) {
 		{
 			name:  "partial preserves set values",
 			input: ThundersnapCap{Role: "admin", Isolation: "none"},
-			want:  ThundersnapCap{Role: "admin", Isolation: "none", MaxWorkspaces: 5},
+			want:  ThundersnapCap{Role: "admin", Isolation: "none", MaxFrames: 5},
 		},
 		{
 			name:  "full stays unchanged",
-			input: ThundersnapCap{Role: "admin", Isolation: "none", MaxWorkspaces: -1, Ephemeral: true},
-			want:  ThundersnapCap{Role: "admin", Isolation: "none", MaxWorkspaces: -1, Ephemeral: true},
+			input: ThundersnapCap{Role: "admin", Isolation: "none", MaxFrames: -1, Ephemeral: true},
+			want:  ThundersnapCap{Role: "admin", Isolation: "none", MaxFrames: -1, Ephemeral: true},
 		},
 	}
 

@@ -20,9 +20,9 @@
           "role": "developer",
           // Isolation level: "container", "vm", or "none"
           "isolation": "container",
-          // Maximum concurrent workspaces (-1 = unlimited)
-          "maxWorkspaces": 10,
-          // Whether workspaces are deleted on disconnect
+          // Maximum concurrent frames (-1 = unlimited)
+          "maxFrames": 10,
+          // Whether frames are deleted on disconnect
           "ephemeral": false,
         }],
       },

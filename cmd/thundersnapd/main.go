@@ -1873,14 +1873,13 @@ func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
 
 // CreateRequest is the request body for /create
 type CreateRequest struct {
-	TailscaleUser string `json:"tailscale_user,omitempty"` // deprecated, ignored - user is determined from socket
-	WorkspaceName string `json:"workspace_name"`
-	SnapshotID    string `json:"snapshot_id"` // Can be single ID or frame spec "rootfs:home:work"
+	FrameName  string `json:"frame_name"`
+	SnapshotID string `json:"snapshot_id"` // Can be single ID or frame spec "rootfs:home:work"
 
 	// Frame-specific fields (alternative to parsing snapshot_id)
-	RootfsSnap string `json:"rootfs,omitempty"` // Rootfs snap ID
-	HomeSnap   string `json:"home,omitempty"`   // Home snap ID (empty = new empty subvolume)
-	WorkSnap   string `json:"work,omitempty"`   // Work snap ID (empty = new empty subvolume)
+	RootfsSnap string `json:"rootfs,omitempty"`    // Rootfs snap ID
+	HomeSnap   string `json:"home,omitempty"`      // Home snap ID (empty = new empty subvolume)
+	WorkSnap   string `json:"work,omitempty"`      // Work snap ID (empty = new empty subvolume)
 	Isolation  string `json:"isolation,omitempty"` // "vm", "container", "none"
 }
 
@@ -1912,7 +1911,7 @@ type CreateResponse struct {
 	Path    string `json:"path,omitempty"`
 }
 
-// handleCreate handles POST /create - create a new workspace from a snapshot
+// handleCreate handles POST /create - create a new frame from a snapshot
 func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1930,17 +1929,17 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		req.SnapshotID = req.RootfsSnap
 	}
 
-	if req.WorkspaceName == "" || req.SnapshotID == "" {
+	if req.FrameName == "" || req.SnapshotID == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(CreateResponse{
 			Status:  "error",
-			Message: "workspace_name and snapshot_id (or rootfs) are required",
+			Message: "frame_name and snapshot_id (or rootfs) are required",
 		})
 		return
 	}
 
-	// Extract tailscale user from rootFS path: /fs-dir/<tailscale-user>/<container>
+	// Extract tailscale user from rootFS path: /fs-dir/<tailscale-user>/<frame>
 	// The tailscale user is the second-to-last path component
 	rootFSRel, _ := filepath.Rel(*flagFsDir, c.rootFS)
 	parts := strings.Split(rootFSRel, string(filepath.Separator))
@@ -1955,19 +1954,19 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	safeTailscaleUser := parts[0]
 
-	// Sanitize workspace name for filesystem path
-	safeWorkspaceName := sanitizeForPath(req.WorkspaceName)
+	// Sanitize frame name for filesystem path
+	safeFrameName := sanitizeForPath(req.FrameName)
 
 	// Build the target path
-	workspacePath := filepath.Join(*flagFsDir, safeTailscaleUser, safeWorkspaceName)
+	framePath := filepath.Join(*flagFsDir, safeTailscaleUser, safeFrameName)
 
-	// Check if workspace already exists
-	if _, err := os.Stat(workspacePath); err == nil {
+	// Check if frame already exists
+	if _, err := os.Stat(framePath); err == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		json.NewEncoder(w).Encode(CreateResponse{
 			Status:  "error",
-			Message: fmt.Sprintf("workspace %q already exists", req.WorkspaceName),
+			Message: fmt.Sprintf("frame %q already exists", req.FrameName),
 		})
 		return
 	}
@@ -1977,7 +1976,7 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	isTTY := r.URL.Query().Get("tty") == "1"
 
 	if stream {
-		handleCreateStreaming(w, req, workspacePath, isTTY)
+		handleCreateStreaming(w, req, framePath, isTTY)
 		return
 	}
 
@@ -1997,9 +1996,9 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create workspace from the snapshot/frame spec
-	if err := createWorkspaceFromFrame(workspacePath, req.SnapshotID, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
-		log.Printf("create workspace failed: %v", err)
+	// Create frame from the snapshot/frame spec
+	if err := createFrame(framePath, req.SnapshotID, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
+		log.Printf("create frame failed: %v", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(CreateResponse{
@@ -2009,12 +2008,12 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Created workspace %s from snapshot %s", workspacePath, req.SnapshotID)
+	log.Printf("Created frame %s from snapshot %s", framePath, req.SnapshotID)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(CreateResponse{
 		Status: "ok",
-		Path:   workspacePath,
+		Path:   framePath,
 	})
 }
 
@@ -2023,11 +2022,11 @@ type CreateStreamEvent struct {
 	Type    string `json:"type"`              // "progress" or "result"
 	Message string `json:"message,omitempty"` // progress message
 	Status  string `json:"status,omitempty"`  // "ok" or "error" (for result)
-	Path    string `json:"path,omitempty"`    // workspace path (for result)
+	Path    string `json:"path,omitempty"`    // frame path (for result)
 }
 
 // handleCreateStreaming handles streaming create with auto-download
-func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, workspacePath string, isTTY bool) {
+func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, framePath string, isTTY bool) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 
 	// Enable streaming mode immediately
@@ -2093,16 +2092,16 @@ func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, workspacePa
 		}
 	}
 
-	// Create workspace from the snapshot/frame spec
-	pw.writeProgress("Creating workspace...")
-	if err := createWorkspaceFromFrame(workspacePath, req.SnapshotID, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
-		log.Printf("create workspace failed: %v", err)
+	// Create frame from the snapshot/frame spec
+	pw.writeProgress("Creating frame...")
+	if err := createFrame(framePath, req.SnapshotID, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
+		log.Printf("create frame failed: %v", err)
 		pw.writeResult("error", "", err.Error())
 		return
 	}
 
-	log.Printf("Created workspace %s from snapshot %s", workspacePath, req.SnapshotID)
-	pw.writeResult("ok", workspacePath, "")
+	log.Printf("Created frame %s from snapshot %s", framePath, req.SnapshotID)
+	pw.writeResult("ok", framePath, "")
 }
 
 // createProgressWriter wraps ResponseWriter to write progress events
@@ -2145,19 +2144,19 @@ func (pw *createProgressWriter) writeResult(status, path, message string) {
 	}
 }
 
-// createWorkspaceFromSnapshot creates a new workspace by cloning from a snapshot.
+// createFrameFromSnapshot creates a new frame by cloning from a snapshot.
 // This is similar to ensureRootFS but uses a specific snapshot ID instead of
 // auto-detecting the source.
 //
 // If snapshotID contains ":" it's treated as a frame spec "rootfs:home:work".
-func createWorkspaceFromSnapshot(workspacePath, snapshotID string) error {
-	return createWorkspaceFromFrame(workspacePath, snapshotID, "", "", "")
+func createFrameFromSnapshot(framePath, snapshotID string) error {
+	return createFrame(framePath, snapshotID, "", "", "")
 }
 
-// createWorkspaceFromFrame creates a workspace with explicit frame components.
+// createFrame creates a frame with explicit components.
 // If homeSnap or workSnap are empty, empty subvolumes are created.
 // If isolation is non-empty, it's stored in the frame metadata.
-func createWorkspaceFromFrame(workspacePath, snapshotID, homeSnap, workSnap, isolation string) error {
+func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) error {
 	// Check if snapshotID is a frame spec
 	rootfsSnap := snapshotID
 	if isFrameSpec(snapshotID) {
@@ -2173,15 +2172,15 @@ func createWorkspaceFromFrame(workspacePath, snapshotID, homeSnap, workSnap, iso
 			Isolation: isolation,
 		}
 		// Write the frame.jsonc first so ensureFrameFS can find it
-		if err := writeFrameMeta(workspacePath, meta); err != nil {
+		if err := writeFrameMeta(framePath, meta); err != nil {
 			return fmt.Errorf("write frame meta: %w", err)
 		}
-		if err := ensureFrameFS(workspacePath, meta); err != nil {
+		if err := ensureFrameFS(framePath, meta); err != nil {
 			return err
 		}
-		// Copy ts binary into the workspace
-		if err := copyTsBinary(workspacePath); err != nil {
-			log.Printf("Warning: failed to copy ts binary to %s: %v", workspacePath, err)
+		// Copy ts binary into the frame
+		if err := copyTsBinary(framePath); err != nil {
+			log.Printf("Warning: failed to copy ts binary to %s: %v", framePath, err)
 		}
 		return nil
 	}
@@ -2190,35 +2189,35 @@ func createWorkspaceFromFrame(workspacePath, snapshotID, homeSnap, workSnap, iso
 	snapshotPath := filepath.Join(*flagSnapshotsDir, rootfsSnap)
 
 	// Ensure the parent directory exists
-	parentDir := filepath.Dir(workspacePath)
+	parentDir := filepath.Dir(framePath)
 	if err := os.MkdirAll(parentDir, 0755); err != nil {
 		return fmt.Errorf("creating parent directory: %w", err)
 	}
 
-	// Clone from the snapshot to the workspace path
-	cmd := exec.Command("btrfs", "subvolume", "snapshot", snapshotPath, workspacePath)
+	// Clone from the snapshot to the frame path
+	cmd := exec.Command("btrfs", "subvolume", "snapshot", snapshotPath, framePath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("btrfs snapshot from %s to %s failed: %w\noutput: %s",
-			snapshotPath, workspacePath, err, string(output))
+			snapshotPath, framePath, err, string(output))
 	}
 
 	// Write stamp file for the live filesystem
 	// The stamp contains the snapshot ID we cloned from
-	if err := writeStampFile(workspacePath, rootfsSnap); err != nil {
-		log.Printf("Warning: failed to write stamp file for %s: %v", workspacePath, err)
+	if err := writeStampFile(framePath, rootfsSnap); err != nil {
+		log.Printf("Warning: failed to write stamp file for %s: %v", framePath, err)
 	}
 
-	// Copy ts binary into the workspace
-	if err := copyTsBinary(workspacePath); err != nil {
-		log.Printf("Warning: failed to copy ts binary to %s: %v", workspacePath, err)
+	// Copy ts binary into the frame
+	if err := copyTsBinary(framePath); err != nil {
+		log.Printf("Warning: failed to copy ts binary to %s: %v", framePath, err)
 	}
 
-	// Apply the simplified UID model so this workspace works regardless of
+	// Apply the simplified UID model so this frame works regardless of
 	// whether the source snapshot was stripped already. Idempotent: calling
 	// it on an already-stripped tree leaves it unchanged.
-	if err := tsm.StripRootfs(workspacePath, tsm.StripOptions{ChownFiles: true}); err != nil {
-		log.Printf("Warning: strip-uids on %s: %v", workspacePath, err)
+	if err := tsm.StripRootfs(framePath, tsm.StripOptions{ChownFiles: true}); err != nil {
+		log.Printf("Warning: strip-uids on %s: %v", framePath, err)
 	}
 
 	return nil

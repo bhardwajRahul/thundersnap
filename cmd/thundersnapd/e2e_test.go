@@ -8,13 +8,13 @@ package main
 // Tailscale auth and an external network. What it covers:
 //
 //   1. Fresh btrfs subvolume "1" used as a base snapshot.
-//   2. ensureRootFS clones it into fs-dir/<user>/<workspace>, runs the
+//   2. ensureRootFS clones it into fs-dir/<user>/<frame>, runs the
 //      strip-uids pass, and writes a .stamp file.
-//   3. createSnapshot from the live workspace produces .tsm and .tsc
+//   3. createSnapshot from the live frame produces .tsm and .tsc
 //      files in snapshots-dir alongside .fidx/.fidx.fidx/.stamp.
-//   4. createWorkspaceFromSnapshot from that newly-created snapshot
-//      produces a usable workspace with a /sbin/ts binary.
-//   5. The ts binary inside the workspace is executable.
+//   4. createFrameFromSnapshot from that newly-created snapshot
+//      produces a usable frame with a /sbin/ts binary.
+//   5. The ts binary inside the frame is executable.
 //
 // The test requires root + btrfs. It skips otherwise.
 
@@ -164,7 +164,7 @@ func setupTestEnv(t *testing.T) (string, string, string, func()) {
 }
 
 // walkAndDeleteSubvols recursively deletes any btrfs subvolumes under root.
-// It walks two levels deep which is enough for fs-dir/<user>/<workspace>.
+// It walks two levels deep which is enough for fs-dir/<user>/<frame>.
 func walkAndDeleteSubvols(root string) {
 	users, err := os.ReadDir(root)
 	if err != nil {
@@ -294,7 +294,7 @@ func TestE2ESnapshotCloneStripUIDs(t *testing.T) {
 		}
 	}
 
-	// Step 3: Make a change inside the workspace, then snapshot it.
+	// Step 3: Make a change inside the frame, then snapshot it.
 	// We expect a *new* snapshot ID different from the intermediate.
 	if err := os.WriteFile(filepath.Join(rootFS, "home", "ubuntu", "hello.txt"),
 		[]byte("hello from e2e\n"), 0644); err != nil {
@@ -314,21 +314,21 @@ func TestE2ESnapshotCloneStripUIDs(t *testing.T) {
 		}
 	}
 
-	// Step 4: Clone the new snapshot into a fresh workspace via
-	// createWorkspaceFromSnapshot.
-	clonedWS := filepath.Join(fsDir, tailscaleUser, "cloned")
-	if err := createWorkspaceFromSnapshot(clonedWS, newID); err != nil {
-		t.Fatalf("createWorkspaceFromSnapshot: %v", err)
+	// Step 4: Clone the new snapshot into a fresh frame via
+	// createFrameFromSnapshot.
+	clonedFrame := filepath.Join(fsDir, tailscaleUser, "cloned")
+	if err := createFrameFromSnapshot(clonedFrame, newID); err != nil {
+		t.Fatalf("createFrameFromSnapshot: %v", err)
 	}
-	hello := filepath.Join(clonedWS, "home", "ubuntu", "hello.txt")
+	hello := filepath.Join(clonedFrame, "home", "ubuntu", "hello.txt")
 	if data, err := os.ReadFile(hello); err != nil {
-		t.Errorf("cloned workspace missing hello.txt: %v", err)
+		t.Errorf("cloned frame missing hello.txt: %v", err)
 	} else if string(data) != "hello from e2e\n" {
 		t.Errorf("hello.txt content: %q", data)
 	}
 
 	// Verify strip-uids was applied to the clone too (idempotent).
-	pwBytes2, _ := os.ReadFile(filepath.Join(clonedWS, "etc", "passwd"))
+	pwBytes2, _ := os.ReadFile(filepath.Join(clonedFrame, "etc", "passwd"))
 	if !strings.Contains(string(pwBytes2), "postgres:x:1000:1000:") {
 		t.Errorf("clone passwd not stripped:\n%s", pwBytes2)
 	}
