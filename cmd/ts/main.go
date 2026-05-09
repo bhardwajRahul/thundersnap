@@ -47,7 +47,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  bupdate        download and reconstruct files from mesh peers")
 	fmt.Fprintln(os.Stderr, "  fidx           create a file index (.fidx) for a file or directory")
 	fmt.Fprintln(os.Stderr, "  snap           create a snapshot of the current container/VM")
-	fmt.Fprintln(os.Stderr, "  create         create a new frame from a snapshot")
+	fmt.Fprintln(os.Stderr, "  frame          create a new frame from a snapshot")
 	fmt.Fprintln(os.Stderr, "  taint          add a taint to the current frame")
 	fmt.Fprintln(os.Stderr, "  download-docker download a Docker image as a snapshot")
 	fmt.Fprintln(os.Stderr, "  who-has        query peers to find which ones have a snapshot")
@@ -77,8 +77,8 @@ func main() {
 		cmdFidx(cmdArgs)
 	case "snap":
 		cmdSnap(cmdArgs)
-	case "create":
-		cmdCreate(cmdArgs)
+	case "frame":
+		cmdFrame(cmdArgs)
 	case "taint":
 		cmdTaint(cmdArgs)
 	case "download-docker":
@@ -821,18 +821,18 @@ func reconstructFileHTTP(outputPath string, fidx *bupdate.Fidx, baseURL, remoteF
 	return nil
 }
 
-func cmdCreate(args []string) {
+func cmdFrame(args []string) {
 	opts := getopt.New()
-	opts.SetProgram("ts create")
+	opts.SetProgram("ts frame")
 	opts.SetParameters("<frame-name> <snapshot-spec>")
 	isolation := opts.StringLong("isolation", 0, "", "isolation level: vm, container, none")
 	// Parse expects first element to be program name (like os.Args)
-	opts.Parse(append([]string{"ts create"}, args...))
+	opts.Parse(append([]string{"ts frame"}, args...))
 
 	if opts.NArgs() != 2 {
-		fmt.Fprintln(os.Stderr, "error: create requires exactly two arguments")
+		fmt.Fprintln(os.Stderr, "error: frame requires exactly two arguments")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "usage: ts create [--isolation=<level>] <frame-name> <snapshot-spec>")
+		fmt.Fprintln(os.Stderr, "usage: ts frame [--isolation=<level>] <frame-name> <snapshot-spec>")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "snapshot-spec can be:")
 		fmt.Fprintln(os.Stderr, "  <snapshot-id>                    single snapshot (legacy)")
@@ -840,9 +840,9 @@ func cmdCreate(args []string) {
 		fmt.Fprintln(os.Stderr, "  <rootfs>::                       frame with empty home/work")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "examples:")
-		fmt.Fprintln(os.Stderr, "  ts create dev abc123             single snapshot")
-		fmt.Fprintln(os.Stderr, "  ts create dev abc123::           rootfs only, empty home/work")
-		fmt.Fprintln(os.Stderr, "  ts create dev abc123:def456:     rootfs + home, empty work")
+		fmt.Fprintln(os.Stderr, "  ts frame dev abc123             single snapshot")
+		fmt.Fprintln(os.Stderr, "  ts frame dev abc123::           rootfs only, empty home/work")
+		fmt.Fprintln(os.Stderr, "  ts frame dev abc123:def456:     rootfs + home, empty work")
 		os.Exit(1)
 	}
 
