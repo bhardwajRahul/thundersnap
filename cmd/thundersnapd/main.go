@@ -36,6 +36,7 @@ import (
 	"github.com/tailscale/thundersnap/tsm"
 	gossh "golang.org/x/crypto/ssh"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
@@ -46,9 +47,13 @@ var (
 	flagSnapshotsDir *string
 	flagVmDir        *string
 	flagLibexecDir   *string
+	flagPolicyPath   *string
 	flagMesh         *bool
 	flagNfsd         *bool
 	flagNfsPort      *int
+
+	// globalPolicy holds the loaded policy file for grant matching
+	globalPolicy *PolicyFile
 
 	// authURLFile is the path where the server writes the auth URL
 	// while waiting for Tailscale login. The --activate client reads it.
@@ -165,6 +170,7 @@ func main() {
 	flagSnapshotsDir = flag.String("snapshots-dir", "", "Directory to store base snapshots for cloning (required)")
 	flagVmDir = flag.String("vm-dir", "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
 	flagLibexecDir = flag.String("libexec-dir", "", "Directory containing helper binaries like ts and vshd (default: <exe-dir>)")
+	flagPolicyPath = flag.String("policy", "", "Path to policy file (required)")
 	flagMesh = flag.Bool("mesh", false, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
 	flagNfsd = flag.Bool("nfsd", false, "Enable NFSv4 server to export -snapshots-dir")
 	flagNfsPort = flag.Int("nfs-port", 2049, "Port for NFSv4 server (default: 2049)")
@@ -181,6 +187,17 @@ func main() {
 	if *flagSnapshotsDir == "" {
 		log.Fatalf("-snapshots-dir is required")
 	}
+	if *flagPolicyPath == "" {
+		log.Fatalf("-policy is required")
+	}
+
+	// Load policy file
+	var err error
+	globalPolicy, err = LoadPolicyFile(*flagPolicyPath)
+	if err != nil {
+		log.Fatalf("Failed to load policy file: %v", err)
+	}
+	log.Printf("Loaded policy with %d grants", len(globalPolicy.Grants))
 
 	// Verify both directories are on btrfs and on the same filesystem
 	if err := checkBtrfsFilesystems(*flagFsDir, *flagSnapshotsDir); err != nil {
@@ -270,7 +287,19 @@ func main() {
 			log.Printf("New SSH session from %s (user: %s)", s.RemoteAddr(), s.User())
 
 			// Look up the Tailscale identity of the connecting peer
-			tailscaleUser := getTailscaleUser(s.Context(), lc, s.RemoteAddr().String())
+			who := getWhoIs(s.Context(), lc, s.RemoteAddr().String())
+			tailscaleUser := "unknown"
+			if who != nil {
+				if who.Node != nil && len(who.Node.Tags) > 0 {
+					tailscaleUser = fmt.Sprintf("tags: %s", strings.Join(who.Node.Tags, ", "))
+				} else if who.UserProfile != nil && who.UserProfile.LoginName != "" {
+					tailscaleUser = who.UserProfile.LoginName
+				}
+			}
+
+			// Resolve capability from policy
+			cap := ResolveCap(who, globalPolicy)
+			log.Printf("Resolved cap for %s: role=%s isolation=%s", tailscaleUser, cap.Role, cap.Isolation)
 
 			// Helper to log error to both server log and client
 			logErr := func(format string, args ...any) {
@@ -279,48 +308,53 @@ func main() {
 				fmt.Fprintf(s, "* Error: %s\r\n", msg)
 			}
 
-			// Parse SSH username to extract session type and target user.
-			// Format: [<user>@]<name> or [<user>@]vm/<name>
+			// Parse SSH username to extract target user and frame name.
+			// Format: [<user>@]<name> or [<user>@]vm/<name> (legacy)
 			// If user@ prefix is present, use that specific Unix user.
 			// Otherwise, auto-detect from [ubuntu, user] or fall back to root.
 			sshUser := s.User()
 
-			// Check if this is a VM session (vm/[<user>@]<name>)
+			// Legacy support: vm/ prefix overrides isolation to "vm"
 			if strings.HasPrefix(sshUser, "vm/") {
-				vmPart := strings.TrimPrefix(sshUser, "vm/")
-				// Parse optional user prefix: vm/<user>@<name> or vm/<name>
-				targetUser := ""
-				vmName := vmPart
-				if idx := strings.Index(vmPart, "@"); idx != -1 {
-					targetUser = vmPart[:idx]
-					vmName = vmPart[idx+1:]
-				}
-				rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(vmName))
-				runAsUser := selectTargetUser(rootFS, targetUser)
-				fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s> (VM)\r\n", tailscaleUser, runAsUser, vmName)
-				if err := runVMSession(s, tailscaleUser, vmName, targetUser, logErr); err != nil {
+				cap.Isolation = "vm"
+				sshUser = strings.TrimPrefix(sshUser, "vm/")
+			}
+
+			// Parse optional user prefix: <user>@<name> or <name>
+			targetUser := "" // empty means auto-detect
+			frameName := sshUser
+			if idx := strings.Index(sshUser, "@"); idx != -1 {
+				targetUser = sshUser[:idx]
+				frameName = sshUser[idx+1:]
+			}
+
+			rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(frameName))
+			runAsUser := selectTargetUser(rootFS, targetUser)
+
+			// Route based on isolation level
+			switch cap.Isolation {
+			case "vm":
+				fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s> (VM)\r\n", tailscaleUser, runAsUser, frameName)
+				if err := runVMSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
 					logErr("VM session failed: %v", err)
 					s.Exit(1)
 				}
-				return
+			case "none":
+				// Direct session on host (no isolation)
+				fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s> (no isolation)\r\n", tailscaleUser, runAsUser, frameName)
+				if err := runContainerSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
+					logErr("Session failed: %v", err)
+					s.Exit(1)
+				}
+			default: // "container" is the default
+				fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s>\r\n", tailscaleUser, runAsUser, frameName)
+				if err := runContainerSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
+					logErr("Container session failed: %v", err)
+					s.Exit(1)
+				}
 			}
 
-			// Container session: [<user>@]<name>
-			targetUser := "" // empty means auto-detect
-			containerName := sshUser
-			if idx := strings.Index(sshUser, "@"); idx != -1 {
-				targetUser = sshUser[:idx]
-				containerName = sshUser[idx+1:]
-			}
-
-			rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(containerName))
-			runAsUser := selectTargetUser(rootFS, targetUser)
-			fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s>\r\n", tailscaleUser, runAsUser, containerName)
-
-			if err := runContainerSession(s, tailscaleUser, containerName, targetUser, logErr); err != nil {
-				logErr("Container session failed: %v", err)
-				s.Exit(1)
-			}
+			// TODO: Handle ephemeral cleanup if cap.Ephemeral is true
 		},
 		// No authentication required - Tailscale already authenticated the connection.
 		// When both PasswordHandler and PublicKeyHandler are nil, gliderlabs/ssh
@@ -543,9 +577,9 @@ func ensureHostKey(keyPath string) error {
 	return nil
 }
 
-// getTailscaleUser looks up the Tailscale identity for the given remote address.
-// Returns the user's login name, or tags if it's a tagged node, or the IP if lookup fails.
-func getTailscaleUser(ctx context.Context, lc *tailscale.LocalClient, remoteAddr string) string {
+// getWhoIs looks up the full WhoIs response for the given remote address.
+// Returns the WhoIs response, or nil if lookup fails.
+func getWhoIs(ctx context.Context, lc *tailscale.LocalClient, remoteAddr string) *apitype.WhoIsResponse {
 	// Parse the IP from the remote address (format is "ip:port")
 	host := remoteAddr
 	if idx := strings.LastIndex(remoteAddr, ":"); idx != -1 {
@@ -557,13 +591,24 @@ func getTailscaleUser(ctx context.Context, lc *tailscale.LocalClient, remoteAddr
 
 	ip, err := netip.ParseAddr(host)
 	if err != nil {
-		return fmt.Sprintf("unknown (bad IP: %v)", err)
+		return nil
 	}
 
 	// Look up who owns this IP
 	whois, err := lc.WhoIs(ctx, ip.String())
 	if err != nil {
-		return fmt.Sprintf("unknown (whois error: %v)", err)
+		return nil
+	}
+
+	return whois
+}
+
+// getTailscaleUser looks up the Tailscale identity for the given remote address.
+// Returns the user's login name, or tags if it's a tagged node, or the IP if lookup fails.
+func getTailscaleUser(ctx context.Context, lc *tailscale.LocalClient, remoteAddr string) string {
+	whois := getWhoIs(ctx, lc, remoteAddr)
+	if whois == nil {
+		return "unknown"
 	}
 
 	// If it's a tagged node, return the tags
@@ -1051,7 +1096,12 @@ func writeStampFile(path, snapshotID string) error {
 // then clones from that to the destination. This ensures snapshots-dir contains
 // stable reference points while fs-dir contains the live, changing filesystems.
 //
-// The snapshotting flow:
+// If a frame.jsonc file exists at rootFS+".jsonc", the frame model is used:
+// - The rootfs, home, and work snaps are cloned to create a three-component frame
+// - Nested /home and /work subvolumes are created within the rootfs
+// - Taints are computed as the union of all component snaps' taints
+//
+// The snapshotting flow (legacy single-component):
 // 1. Determine source: baseUserFS (if exists) or $snapshots-dir/1
 // 2. Create intermediate snapshot in $snapshots-dir with random hex ID
 // 3. Clone from intermediate snapshot to rootFS in $fs-dir
@@ -1064,6 +1114,18 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		return fmt.Errorf("checking rootfs: %w", err)
 	}
 
+	// Check if a frame.jsonc exists specifying the frame composition
+	frameMeta, err := readFrameMeta(rootFS)
+	if err != nil {
+		return fmt.Errorf("reading frame meta: %w", err)
+	}
+
+	if frameMeta != nil && frameMeta.Rootfs != "" {
+		// Use the new three-component frame model
+		return ensureFrameFS(rootFS, frameMeta)
+	}
+
+	// Legacy single-component mode
 	// Ensure the parent directory exists
 	parentDir := filepath.Dir(rootFS)
 	if err := os.MkdirAll(parentDir, 0755); err != nil {
@@ -1098,7 +1160,7 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 
 	// Step 1: Create intermediate snapshot in snapshots-dir with fidx
 	// (no progress reporting for ensureRootFS - happens at SSH login time)
-	// The snapshot ID is based on the fidx checksum, so duplicates are detected.
+	// The snapshot ID is based on the TSM SHA-256, so duplicates are detected.
 	intermediateID, err := createSnapshotWithFidx(snapshotSource, baseStampID, nil, false)
 	if err != nil {
 		return fmt.Errorf("create intermediate snapshot from %s: %w", snapshotSource, err)
@@ -1132,6 +1194,127 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 	}
 
 	return nil
+}
+
+// ensureFrameFS creates a three-component frame from the given FrameMeta.
+// It creates:
+// - rootFS: the rootfs subvolume (the frame directory itself)
+// - rootFS/home: nested home subvolume
+// - rootFS/work: nested work subvolume
+func ensureFrameFS(rootFS string, meta *FrameMeta) error {
+	// Ensure the parent directory exists
+	parentDir := filepath.Dir(rootFS)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return fmt.Errorf("creating parent directory: %w", err)
+	}
+
+	// Step 1: Clone rootfs component from snapshot
+	rootfsSnapPath := filepath.Join(*flagSnapshotsDir, meta.Rootfs)
+	if _, err := os.Stat(rootfsSnapPath); err != nil {
+		return fmt.Errorf("rootfs snap %s: %w", meta.Rootfs, err)
+	}
+
+	cmd := exec.Command("btrfs", "subvolume", "snapshot", rootfsSnapPath, rootFS)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("btrfs snapshot rootfs from %s to %s failed: %w\noutput: %s",
+			rootfsSnapPath, rootFS, err, string(output))
+	}
+
+	// Step 2: Create or clone home subvolume
+	homePath := filepath.Join(rootFS, "home")
+	// Remove existing /home directory if it's not a subvolume (from the rootfs snap)
+	if fi, err := os.Stat(homePath); err == nil && fi.IsDir() && !isSubvolume(homePath) {
+		if err := os.RemoveAll(homePath); err != nil {
+			log.Printf("Warning: failed to remove existing /home directory: %v", err)
+		}
+	}
+
+	if meta.Home != "" {
+		// Clone from home snap
+		homeSnapPath := filepath.Join(*flagSnapshotsDir, meta.Home)
+		if _, err := os.Stat(homeSnapPath); err != nil {
+			return fmt.Errorf("home snap %s: %w", meta.Home, err)
+		}
+		cmd := exec.Command("btrfs", "subvolume", "snapshot", homeSnapPath, homePath)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("btrfs snapshot home from %s to %s failed: %w\noutput: %s",
+				homeSnapPath, homePath, err, string(output))
+		}
+	} else {
+		// Create empty home subvolume
+		cmd := exec.Command("btrfs", "subvolume", "create", homePath)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("btrfs subvolume create home at %s failed: %w\noutput: %s",
+				homePath, err, string(output))
+		}
+	}
+
+	// Step 3: Create or clone work subvolume
+	workPath := filepath.Join(rootFS, "work")
+	// Remove existing /work directory if it's not a subvolume
+	if fi, err := os.Stat(workPath); err == nil && fi.IsDir() && !isSubvolume(workPath) {
+		if err := os.RemoveAll(workPath); err != nil {
+			log.Printf("Warning: failed to remove existing /work directory: %v", err)
+		}
+	}
+
+	if meta.Work != "" {
+		// Clone from work snap
+		workSnapPath := filepath.Join(*flagSnapshotsDir, meta.Work)
+		if _, err := os.Stat(workSnapPath); err != nil {
+			return fmt.Errorf("work snap %s: %w", meta.Work, err)
+		}
+		cmd := exec.Command("btrfs", "subvolume", "snapshot", workSnapPath, workPath)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("btrfs snapshot work from %s to %s failed: %w\noutput: %s",
+				workSnapPath, workPath, err, string(output))
+		}
+	} else {
+		// Create empty work subvolume
+		cmd := exec.Command("btrfs", "subvolume", "create", workPath)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("btrfs subvolume create work at %s failed: %w\noutput: %s",
+				workPath, err, string(output))
+		}
+	}
+
+	// Step 4: Compute taints as union of all component snaps' taints
+	rootfsTaints := getSnapTaints(*flagSnapshotsDir, meta.Rootfs)
+	homeTaints := getSnapTaints(*flagSnapshotsDir, meta.Home)
+	workTaints := getSnapTaints(*flagSnapshotsDir, meta.Work)
+	meta.Taints = UnionTaints(rootfsTaints, homeTaints, workTaints)
+
+	// Step 5: Write frame.jsonc with updated taints
+	if err := writeFrameMeta(rootFS, meta); err != nil {
+		log.Printf("Warning: failed to write frame.jsonc for %s: %v", rootFS, err)
+	}
+
+	// Step 6: Write stamp file (rootfs snap ID for compatibility)
+	if err := writeStampFile(rootFS, meta.Rootfs); err != nil {
+		log.Printf("Warning: failed to write stamp file for %s: %v", rootFS, err)
+	}
+
+	// Step 7: Apply strip-uids to the rootfs
+	stripOpts := tsm.StripOptions{ChownFiles: true}
+	if err := tsm.StripRootfs(rootFS, stripOpts); err != nil {
+		log.Printf("Warning: strip-uids on %s: %v", rootFS, err)
+	}
+
+	log.Printf("Created frame %s with rootfs:%s home:%s work:%s taints:%v",
+		rootFS, meta.Rootfs, meta.Home, meta.Work, meta.Taints)
+	return nil
+}
+
+// isSubvolume returns true if the path is a btrfs subvolume.
+func isSubvolume(path string) bool {
+	cmd := exec.Command("btrfs", "subvolume", "show", path)
+	err := cmd.Run()
+	return err == nil
 }
 
 // copyTsBinary copies the ts binary into the container's /sbin using btrfs reflink (COW copy).
@@ -1227,6 +1410,8 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux.HandleFunc("/ping", handlePing)
 	mux.HandleFunc("/snap", cs.handleSnap)
 	mux.HandleFunc("/create", cs.handleCreate)
+	mux.HandleFunc("/taint", cs.handleTaint)
+	mux.HandleFunc("/download-docker", handleDownloadDocker)
 	mux.HandleFunc("/download-snap", handleDownloadSnap)
 	mux.HandleFunc("/who-has", handleWhoHas)
 	mux.HandleFunc("/ts/servers.json", handleServersJSONControl)
@@ -1598,11 +1783,126 @@ func (c *controlServer) handleSnap(w http.ResponseWriter, r *http.Request) {
 	makeSnapHandler(c.rootFS)(w, r)
 }
 
+// TaintRequest is the request body for /taint
+type TaintRequest struct {
+	TaintName string `json:"taint_name"`
+}
+
+// TaintResponse is the response from /taint
+type TaintResponse struct {
+	Status  string   `json:"status"`
+	Message string   `json:"message,omitempty"`
+	Taints  []string `json:"taints,omitempty"`
+}
+
+// handleTaint handles POST /taint - add a taint to the current frame
+func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req TaintRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.TaintName == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(TaintResponse{
+			Status:  "error",
+			Message: "taint_name is required",
+		})
+		return
+	}
+
+	// Read existing frame metadata
+	frameMeta, err := readFrameMeta(c.rootFS)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(TaintResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("read frame meta: %v", err),
+		})
+		return
+	}
+
+	// Create default frame metadata if none exists
+	if frameMeta == nil {
+		frameMeta = &FrameMeta{
+			Rootfs: readStampFile(c.rootFS), // Use stamp file as rootfs ID
+		}
+	}
+
+	// Add the taint if not already present
+	found := false
+	for _, t := range frameMeta.Taints {
+		if t == req.TaintName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		frameMeta.Taints = append(frameMeta.Taints, req.TaintName)
+		// Keep taints sorted
+		frameMeta.Taints = UnionTaints(frameMeta.Taints)
+	}
+
+	// Write updated frame metadata
+	if err := writeFrameMeta(c.rootFS, frameMeta); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(TaintResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("write frame meta: %v", err),
+		})
+		return
+	}
+
+	log.Printf("Added taint %q to %s, taints now: %v", req.TaintName, c.rootFS, frameMeta.Taints)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(TaintResponse{
+		Status: "ok",
+		Taints: frameMeta.Taints,
+	})
+}
+
 // CreateRequest is the request body for /create
 type CreateRequest struct {
 	TailscaleUser string `json:"tailscale_user,omitempty"` // deprecated, ignored - user is determined from socket
 	WorkspaceName string `json:"workspace_name"`
-	SnapshotID    string `json:"snapshot_id"`
+	SnapshotID    string `json:"snapshot_id"` // Can be single ID or frame spec "rootfs:home:work"
+
+	// Frame-specific fields (alternative to parsing snapshot_id)
+	RootfsSnap string `json:"rootfs,omitempty"` // Rootfs snap ID
+	HomeSnap   string `json:"home,omitempty"`   // Home snap ID (empty = new empty subvolume)
+	WorkSnap   string `json:"work,omitempty"`   // Work snap ID (empty = new empty subvolume)
+	Isolation  string `json:"isolation,omitempty"` // "vm", "container", "none"
+}
+
+// parseFrameSpec parses a frame spec string "rootfs:home:work" into components.
+// Returns rootfs, home, work snap IDs.
+func parseFrameSpec(spec string) (rootfs, home, work string) {
+	parts := strings.Split(spec, ":")
+	if len(parts) >= 1 {
+		rootfs = parts[0]
+	}
+	if len(parts) >= 2 {
+		home = parts[1]
+	}
+	if len(parts) >= 3 {
+		work = parts[2]
+	}
+	return
+}
+
+// isFrameSpec returns true if the spec contains ":" indicating a frame spec.
+func isFrameSpec(spec string) bool {
+	return strings.Contains(spec, ":")
 }
 
 // CreateResponse is the response from /create
@@ -1625,12 +1925,17 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Allow either snapshot_id or rootfs field for specifying the rootfs
+	if req.RootfsSnap != "" && req.SnapshotID == "" {
+		req.SnapshotID = req.RootfsSnap
+	}
+
 	if req.WorkspaceName == "" || req.SnapshotID == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(CreateResponse{
 			Status:  "error",
-			Message: "workspace_name and snapshot_id are required",
+			Message: "workspace_name and snapshot_id (or rootfs) are required",
 		})
 		return
 	}
@@ -1676,20 +1981,24 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Non-streaming mode - no auto-download, just check existence
-	snapshotPath := filepath.Join(*flagSnapshotsDir, req.SnapshotID)
+	// Non-streaming mode - no auto-download, just check existence of rootfs snap
+	rootfsSnap := req.SnapshotID
+	if isFrameSpec(req.SnapshotID) {
+		rootfsSnap, _, _ = parseFrameSpec(req.SnapshotID)
+	}
+	snapshotPath := filepath.Join(*flagSnapshotsDir, rootfsSnap)
 	if _, err := os.Stat(snapshotPath); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(CreateResponse{
 			Status:  "error",
-			Message: fmt.Sprintf("snapshot %q not found", req.SnapshotID),
+			Message: fmt.Sprintf("snapshot %q not found", rootfsSnap),
 		})
 		return
 	}
 
-	// Create workspace from the snapshot
-	if err := createWorkspaceFromSnapshot(workspacePath, req.SnapshotID); err != nil {
+	// Create workspace from the snapshot/frame spec
+	if err := createWorkspaceFromFrame(workspacePath, req.SnapshotID, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
 		log.Printf("create workspace failed: %v", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -1731,20 +2040,24 @@ func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, workspacePa
 		pw.flusher = f
 	}
 
-	// Check if snapshot exists locally
-	snapshotPath := filepath.Join(*flagSnapshotsDir, req.SnapshotID)
+	// Check if rootfs snapshot exists locally (parse frame spec if needed)
+	rootfsSnap := req.SnapshotID
+	if isFrameSpec(req.SnapshotID) {
+		rootfsSnap, _, _ = parseFrameSpec(req.SnapshotID)
+	}
+	snapshotPath := filepath.Join(*flagSnapshotsDir, rootfsSnap)
 	if _, err := os.Stat(snapshotPath); err != nil {
 		// Snapshot doesn't exist - try to download it
-		pw.writeProgress(fmt.Sprintf("Snapshot %s not found locally, downloading from mesh peers...", req.SnapshotID))
+		pw.writeProgress(fmt.Sprintf("Snapshot %s not found locally, downloading from mesh peers...", rootfsSnap))
 
 		if globalMeshState == nil {
-			pw.writeResult("error", "", fmt.Sprintf("snapshot %q not found locally and mesh not enabled", req.SnapshotID))
+			pw.writeResult("error", "", fmt.Sprintf("snapshot %q not found locally and mesh not enabled", rootfsSnap))
 			return
 		}
 
 		meshPeers := globalMeshState.getPeers()
 		if len(meshPeers) == 0 {
-			pw.writeResult("error", "", fmt.Sprintf("snapshot %q not found locally and no mesh peers available", req.SnapshotID))
+			pw.writeResult("error", "", fmt.Sprintf("snapshot %q not found locally and no mesh peers available", rootfsSnap))
 			return
 		}
 
@@ -1759,7 +2072,7 @@ func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, workspacePa
 
 		// Download the snapshot
 		opts := bupdate.DownloadSnapshotOptions{
-			SnapshotID:     req.SnapshotID,
+			SnapshotID:     rootfsSnap,
 			SnapshotsDir:   *flagSnapshotsDir,
 			Peers:          peers,
 			ProgressWriter: pw,
@@ -1768,7 +2081,7 @@ func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, workspacePa
 
 		result, err := bupdate.DownloadSnapshot(opts)
 		if err != nil {
-			log.Printf("create: auto-download of snapshot %s failed: %v", req.SnapshotID, err)
+			log.Printf("create: auto-download of snapshot %s failed: %v", rootfsSnap, err)
 			pw.writeResult("error", "", fmt.Sprintf("failed to download snapshot: %v", err))
 			return
 		}
@@ -1780,9 +2093,9 @@ func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, workspacePa
 		}
 	}
 
-	// Create workspace from the snapshot
+	// Create workspace from the snapshot/frame spec
 	pw.writeProgress("Creating workspace...")
-	if err := createWorkspaceFromSnapshot(workspacePath, req.SnapshotID); err != nil {
+	if err := createWorkspaceFromFrame(workspacePath, req.SnapshotID, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
 		log.Printf("create workspace failed: %v", err)
 		pw.writeResult("error", "", err.Error())
 		return
@@ -1835,8 +2148,46 @@ func (pw *createProgressWriter) writeResult(status, path, message string) {
 // createWorkspaceFromSnapshot creates a new workspace by cloning from a snapshot.
 // This is similar to ensureRootFS but uses a specific snapshot ID instead of
 // auto-detecting the source.
+//
+// If snapshotID contains ":" it's treated as a frame spec "rootfs:home:work".
 func createWorkspaceFromSnapshot(workspacePath, snapshotID string) error {
-	snapshotPath := filepath.Join(*flagSnapshotsDir, snapshotID)
+	return createWorkspaceFromFrame(workspacePath, snapshotID, "", "", "")
+}
+
+// createWorkspaceFromFrame creates a workspace with explicit frame components.
+// If homeSnap or workSnap are empty, empty subvolumes are created.
+// If isolation is non-empty, it's stored in the frame metadata.
+func createWorkspaceFromFrame(workspacePath, snapshotID, homeSnap, workSnap, isolation string) error {
+	// Check if snapshotID is a frame spec
+	rootfsSnap := snapshotID
+	if isFrameSpec(snapshotID) {
+		rootfsSnap, homeSnap, workSnap = parseFrameSpec(snapshotID)
+	}
+
+	// If we have any frame components, use the frame model
+	if homeSnap != "" || workSnap != "" || strings.Contains(snapshotID, ":") {
+		meta := &FrameMeta{
+			Rootfs:    rootfsSnap,
+			Home:      homeSnap,
+			Work:      workSnap,
+			Isolation: isolation,
+		}
+		// Write the frame.jsonc first so ensureFrameFS can find it
+		if err := writeFrameMeta(workspacePath, meta); err != nil {
+			return fmt.Errorf("write frame meta: %w", err)
+		}
+		if err := ensureFrameFS(workspacePath, meta); err != nil {
+			return err
+		}
+		// Copy ts binary into the workspace
+		if err := copyTsBinary(workspacePath); err != nil {
+			log.Printf("Warning: failed to copy ts binary to %s: %v", workspacePath, err)
+		}
+		return nil
+	}
+
+	// Legacy single-snapshot mode
+	snapshotPath := filepath.Join(*flagSnapshotsDir, rootfsSnap)
 
 	// Ensure the parent directory exists
 	parentDir := filepath.Dir(workspacePath)
@@ -1854,7 +2205,7 @@ func createWorkspaceFromSnapshot(workspacePath, snapshotID string) error {
 
 	// Write stamp file for the live filesystem
 	// The stamp contains the snapshot ID we cloned from
-	if err := writeStampFile(workspacePath, snapshotID); err != nil {
+	if err := writeStampFile(workspacePath, rootfsSnap); err != nil {
 		log.Printf("Warning: failed to write stamp file for %s: %v", workspacePath, err)
 	}
 
@@ -2165,39 +2516,102 @@ func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*b
 // Returns the snapshot ID (based on the fidx checksum).
 // If progressWriter is non-nil, progress updates are written to it.
 func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string, error) {
+	// Check if this is a three-component frame (has nested home/work subvolumes)
+	homePath := filepath.Join(rootFS, "home")
+	workPath := filepath.Join(rootFS, "work")
+	hasHomeSubvol := isSubvolume(homePath)
+	hasWorkSubvol := isSubvolume(workPath)
+
+	// Read the frame metadata for taints
+	frameMeta, _ := readFrameMeta(rootFS)
+	var frameTaints []string
+	if frameMeta != nil {
+		frameTaints = frameMeta.Taints
+	}
+
 	// Read the base stamp from the source rootFS to find parent snapshot
 	baseStampID := readStampFile(rootFS)
 	if baseStampID == "" {
 		baseStampID = "1" // default
 	}
 
-	// Create snapshot with fidx (returns ID based on fidx checksum)
-	snapshotID, err := createSnapshotWithFidx(rootFS, baseStampID, progressWriter, isTTY)
+	// Snapshot the rootfs (btrfs automatically excludes nested subvolumes)
+	rootfsID, err := createSnapshotWithTaints(rootFS, baseStampID, frameTaints, progressWriter, isTTY)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("snapshot rootfs: %w", err)
 	}
 
 	// Update the source rootFS's stamp to point to the new snapshot
-	// This makes future snapshots use the new snapshot as their parent for faster fidx
-	if err := writeStampFile(rootFS, snapshotID); err != nil {
+	if err := writeStampFile(rootFS, rootfsID); err != nil {
 		log.Printf("Warning: failed to update stamp file for %s: %v", rootFS, err)
 	}
 
-	return snapshotID, nil
+	// If no nested subvolumes, return single ID (legacy format)
+	if !hasHomeSubvol && !hasWorkSubvol {
+		return rootfsID, nil
+	}
+
+	// Snapshot home if it's a subvolume
+	homeID := ""
+	if hasHomeSubvol {
+		homeParent := ""
+		if frameMeta != nil && frameMeta.Home != "" {
+			homeParent = frameMeta.Home
+		}
+		homeID, err = createSnapshotWithTaints(homePath, homeParent, frameTaints, progressWriter, isTTY)
+		if err != nil {
+			return "", fmt.Errorf("snapshot home: %w", err)
+		}
+	}
+
+	// Snapshot work if it's a subvolume
+	workID := ""
+	if hasWorkSubvol {
+		workParent := ""
+		if frameMeta != nil && frameMeta.Work != "" {
+			workParent = frameMeta.Work
+		}
+		workID, err = createSnapshotWithTaints(workPath, workParent, frameTaints, progressWriter, isTTY)
+		if err != nil {
+			return "", fmt.Errorf("snapshot work: %w", err)
+		}
+	}
+
+	// Update frame metadata with new snap IDs
+	if frameMeta == nil {
+		frameMeta = &FrameMeta{}
+	}
+	frameMeta.Rootfs = rootfsID
+	frameMeta.Home = homeID
+	frameMeta.Work = workID
+	if err := writeFrameMeta(rootFS, frameMeta); err != nil {
+		log.Printf("Warning: failed to update frame.jsonc for %s: %v", rootFS, err)
+	}
+
+	// Return frame spec format: rootfs:home:work
+	return fmt.Sprintf("%s:%s:%s", rootfsID, homeID, workID), nil
 }
 
 // createSnapshotWithFidx creates a read-only snapshot in snapshots-dir and generates
-// fidx files for it. The snapshot is named after the checksum of its fidx file.
-// If a snapshot with the same checksum already exists, it returns the existing ID
-// and discards the new snapshot.
+// fidx and tsm files for it. The snapshot is named after the SHA-256 of its TSM manifest.
+// If a snapshot with the same SHA-256 already exists, it returns the existing ID
+// and discards the new snapshot, performing taint intersection on the metadata.
+//
 // The process is:
 // 1. Create btrfs snapshot to a random tmp name
 // 2. Create mfidx (with --ref to parent if exists)
-// 3. Load fidx to get its checksum, use that as the final snapshot ID
-// 4. If snapshot already exists with that ID, discard the new one
-// 5. Otherwise rename all files to the checksum-based final names
-// 6. Create fidx of the fidx: $snapshotID.fidx.fidx
+// 3. Create TSM/TSC manifests
+// 4. Load TSM to get its SHA-256, use that as the final snapshot ID
+// 5. If snapshot already exists with that ID, perform taint intersection and discard new one
+// 6. Otherwise rename all files to the SHA-256-based final names
+// 7. Create fidx of the fidx and write snap.jsonc metadata
 func createSnapshotWithFidx(source, parentStampID string, progressWriter io.Writer, isTTY bool) (string, error) {
+	return createSnapshotWithTaints(source, parentStampID, nil, progressWriter, isTTY)
+}
+
+// createSnapshotWithTaints is like createSnapshotWithFidx but accepts explicit taints.
+// If taints is nil, taints are inherited from the parent snap.
+func createSnapshotWithTaints(source, parentStampID string, taints []string, progressWriter io.Writer, isTTY bool) (string, error) {
 	// Generate a random temporary ID for the work-in-progress snapshot
 	tmpID, err := generateRandomID()
 	if err != nil {
@@ -2206,6 +2620,17 @@ func createSnapshotWithFidx(source, parentStampID string, progressWriter io.Writ
 
 	tmpPath := filepath.Join(*flagSnapshotsDir, tmpID+".tmp")
 	tmpFidxPath := tmpPath + ".fidx"
+	tmpTSMPath := tmpPath + ".tsm"
+	tmpTSCPath := tmpPath + ".tsc"
+
+	// Cleanup helper
+	cleanupTmp := func() {
+		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
+		os.Remove(tmpPath + ".stamp")
+		os.Remove(tmpFidxPath)
+		os.Remove(tmpTSMPath)
+		os.Remove(tmpTSCPath)
+	}
 
 	// Step 1: Create read-only btrfs snapshot to tmp path
 	cmd := exec.Command("btrfs", "subvolume", "snapshot", "-r", source, tmpPath)
@@ -2216,9 +2641,7 @@ func createSnapshotWithFidx(source, parentStampID string, progressWriter io.Writ
 
 	// Write stamp file for the snapshot (in tmp location)
 	if err := writeStampFile(tmpPath, parentStampID); err != nil {
-		// Clean up on error
-		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
-		os.Remove(tmpPath + ".stamp")
+		cleanupTmp()
 		return "", fmt.Errorf("write stamp file: %w", err)
 	}
 
@@ -2240,79 +2663,102 @@ func createSnapshotWithFidx(source, parentStampID string, progressWriter io.Writ
 		IsTTY:          isTTY,
 	}
 	if err := bupdate.CreateFidx(tmpPath, tmpFidxPath, fidxOpts); err != nil {
-		// Clean up on error
-		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
-		os.Remove(tmpPath + ".stamp")
+		cleanupTmp()
 		return "", fmt.Errorf("create fidx: %w", err)
 	}
 
-	// Step 3: Load the fidx to get its checksum, which becomes the snapshot ID
-	fidx, err := bupdate.LoadFidx(tmpFidxPath)
-	if err != nil {
-		// Clean up on error
-		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
-		os.Remove(tmpPath + ".stamp")
-		os.Remove(tmpFidxPath)
-		return "", fmt.Errorf("load fidx for checksum: %w", err)
+	// Step 3: Create TSM/TSC manifests in tmp location
+	tsmOpts := tsm.IndexerOptions{
+		Progress:       false,
+		ProgressWriter: progressWriter,
+		IsTTY:          isTTY,
 	}
-	snapshotID := hex.EncodeToString(fidx.FileSHA[:])
+	if err := tsm.Create(tmpPath, tmpPath, tsmOpts); err != nil {
+		cleanupTmp()
+		return "", fmt.Errorf("create tsm/tsc: %w", err)
+	}
+
+	// Step 4: Load TSM to get its SHA-256, which becomes the snapshot ID
+	tsmReader, err := tsm.ReadTSM(tmpTSMPath)
+	if err != nil {
+		cleanupTmp()
+		return "", fmt.Errorf("read tsm for checksum: %w", err)
+	}
+	snapshotID := hex.EncodeToString(tsmReader.SHA256[:])
 
 	finalPath := filepath.Join(*flagSnapshotsDir, snapshotID)
 	finalFidxPath := finalPath + ".fidx"
 	finalFidxFidxPath := finalFidxPath + ".fidx"
+	finalTSMPath := finalPath + ".tsm"
+	finalTSCPath := finalPath + ".tsc"
 
-	// Step 4: Check if a snapshot with this checksum already exists
+	// Determine taints for this snapshot
+	if taints == nil {
+		// Inherit from parent if available
+		taints = getSnapTaints(*flagSnapshotsDir, parentStampID)
+	}
+
+	// Step 5: Check if a snapshot with this SHA-256 already exists
 	if _, err := os.Stat(finalPath); err == nil {
-		// Snapshot already exists! Discard the new one.
-		log.Printf("Snapshot %s already exists, discarding duplicate", snapshotID)
-		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
-		os.Remove(tmpPath + ".stamp")
-		os.Remove(tmpFidxPath)
+		// Snapshot already exists! Perform taint intersection and discard the new one.
+		log.Printf("Snapshot %s already exists, checking taints", snapshotID)
+
+		existingMeta, _ := readSnapMeta(*flagSnapshotsDir, snapshotID)
+		if existingMeta != nil && len(taints) > 0 {
+			// Taint intersection: if we can produce the same content with fewer taints,
+			// the removed taints are not inherent to the content.
+			intersected := IntersectTaints(existingMeta.Taints, taints)
+			if !taintsEqual(existingMeta.Taints, intersected) {
+				existingMeta.Taints = intersected
+				if err := writeSnapMeta(*flagSnapshotsDir, snapshotID, existingMeta); err != nil {
+					log.Printf("Warning: failed to update snap meta for taint intersection: %v", err)
+				} else {
+					log.Printf("Taint intersection for %s: %v", snapshotID, intersected)
+				}
+			}
+		}
+
+		cleanupTmp()
 		return snapshotID, nil
 	}
 
-	// Step 5: Rename all to final names (order matters for consistency)
-	// First the directory, then stamp, then fidx
+	// Step 6: Rename all to final names (order matters for consistency)
+	// First the directory, then stamp, then index files
 	if err := os.Rename(tmpPath, finalPath); err != nil {
-		// Clean up on error
-		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
-		os.Remove(tmpPath + ".stamp")
-		os.Remove(tmpFidxPath)
+		cleanupTmp()
 		return "", fmt.Errorf("rename snapshot: %w", err)
 	}
 	// Also rename the stamp file
 	os.Rename(tmpPath+".stamp", finalPath+".stamp")
 
 	if err := os.Rename(tmpFidxPath, finalFidxPath); err != nil {
-		// Snapshot is already renamed, just log the error
 		log.Printf("Warning: failed to rename fidx: %v", err)
 	}
+	if err := os.Rename(tmpTSMPath, finalTSMPath); err != nil {
+		log.Printf("Warning: failed to rename tsm: %v", err)
+	}
+	if err := os.Rename(tmpTSCPath, finalTSCPath); err != nil {
+		log.Printf("Warning: failed to rename tsc: %v", err)
+	}
 
-	// Step 6: Create fidx of the fidx (single file fidx)
+	// Step 7: Create fidx of the fidx (single file fidx)
 	fidxFidxOpts := bupdate.IndexerOptions{
 		Progress: false,
 	}
 	if err := bupdate.CreateSingleFidx(finalFidxPath, finalFidxFidxPath, fidxFidxOpts); err != nil {
-		// Snapshot and fidx are already in place, just log the error
 		log.Printf("Warning: failed to create fidx.fidx: %v", err)
 	}
 
-	// Step 7: Generate the new TSM/TSC manifest pair alongside the fidx files.
-	// These supersede the older bupmeta/mfidx representation: .tsm holds
-	// per-file metadata + chunk references, .tsc holds the deduplicated
-	// chunk index. See fidx-report.md.
-	tsmOpts := tsm.IndexerOptions{
-		Progress:       false,
-		ProgressWriter: progressWriter,
-		IsTTY:          isTTY,
+	// Step 8: Write snap.jsonc metadata
+	snapMeta := &SnapMeta{
+		Parent: parentStampID,
+		Taints: taints,
 	}
-	if err := tsm.Create(finalPath, finalPath, tsmOpts); err != nil {
-		// Don't fail the snapshot for this — the fidx files are still
-		// usable. But log loudly so the regression is visible.
-		log.Printf("Warning: failed to create tsm/tsc for %s: %v", snapshotID, err)
+	if err := writeSnapMeta(*flagSnapshotsDir, snapshotID, snapMeta); err != nil {
+		log.Printf("Warning: failed to write snap.jsonc for %s: %v", snapshotID, err)
 	}
 
-	log.Printf("Created snapshot %s with fidx and tsm", snapshotID)
+	log.Printf("Created snapshot %s (SHA-256) with fidx and tsm", snapshotID)
 	return snapshotID, nil
 }
 

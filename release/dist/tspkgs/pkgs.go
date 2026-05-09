@@ -128,6 +128,9 @@ func (t *tgzTarget) Build(b *Build) ([]string, error) {
 	if err := addFile(filepath.Join(thundersnapdDir, "thundersnapd.defaults"), filepath.Join(sysDir, "thundersnapd.defaults"), 0644); err != nil {
 		return nil, err
 	}
+	if err := addFile(filepath.Join(thundersnapdDir, "policy.jsonc"), filepath.Join(sysDir, "policy.jsonc"), 0644); err != nil {
+		return nil, err
+	}
 
 	if err := tw.Close(); err != nil {
 		return nil, err
@@ -193,6 +196,11 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 			Type:        files.TypeConfigNoReplace,
 			Source:      filepath.Join(thundersnapdDir, "thundersnapd.defaults"),
 			Destination: "/etc/default/thundersnapd",
+		},
+		&files.Content{
+			Type:        files.TypeConfigNoReplace,
+			Source:      filepath.Join(thundersnapdDir, "policy.jsonc"),
+			Destination: "/etc/thundersnap/policy.jsonc",
 		},
 	}, 0, "deb", false, b.Time)
 	if err != nil {
@@ -291,6 +299,11 @@ func (t *rpmTarget) Build(b *Build) ([]string, error) {
 			Type:        files.TypeConfigNoReplace,
 			Source:      filepath.Join(thundersnapdDir, "thundersnapd.defaults"),
 			Destination: "/etc/default/thundersnapd",
+		},
+		&files.Content{
+			Type:        files.TypeConfigNoReplace,
+			Source:      filepath.Join(thundersnapdDir, "policy.jsonc"),
+			Destination: "/etc/thundersnap/policy.jsonc",
 		},
 		&files.Content{
 			Type:        files.TypeDir,

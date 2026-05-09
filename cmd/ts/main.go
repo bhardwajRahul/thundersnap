@@ -43,13 +43,15 @@ func usage() {
 	getopt.PrintUsage(os.Stderr)
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "commands:")
-	fmt.Fprintln(os.Stderr, "  ping         send a ping to thundersnapd")
-	fmt.Fprintln(os.Stderr, "  bupdate      download and reconstruct files from mesh peers")
-	fmt.Fprintln(os.Stderr, "  fidx         create a file index (.fidx) for a file or directory")
-	fmt.Fprintln(os.Stderr, "  snap         create a snapshot of the current container/VM")
-	fmt.Fprintln(os.Stderr, "  create       create a new workspace from a snapshot")
-	fmt.Fprintln(os.Stderr, "  who-has      query peers to find which ones have a snapshot")
-	fmt.Fprintln(os.Stderr, "  download-snap download a snapshot from mesh peers")
+	fmt.Fprintln(os.Stderr, "  ping           send a ping to thundersnapd")
+	fmt.Fprintln(os.Stderr, "  bupdate        download and reconstruct files from mesh peers")
+	fmt.Fprintln(os.Stderr, "  fidx           create a file index (.fidx) for a file or directory")
+	fmt.Fprintln(os.Stderr, "  snap           create a snapshot of the current container/VM")
+	fmt.Fprintln(os.Stderr, "  create         create a new workspace from a snapshot")
+	fmt.Fprintln(os.Stderr, "  taint          add a taint to the current frame")
+	fmt.Fprintln(os.Stderr, "  download-docker download a Docker image as a snapshot")
+	fmt.Fprintln(os.Stderr, "  who-has        query peers to find which ones have a snapshot")
+	fmt.Fprintln(os.Stderr, "  download-snap  download a snapshot from mesh peers")
 	os.Exit(1)
 }
 
@@ -77,6 +79,10 @@ func main() {
 		cmdSnap(cmdArgs)
 	case "create":
 		cmdCreate(cmdArgs)
+	case "taint":
+		cmdTaint(cmdArgs)
+	case "download-docker":
+		cmdDownloadDocker(cmdArgs)
 	case "who-has":
 		cmdWhoHas(cmdArgs)
 	case "download-snap":
@@ -818,20 +824,32 @@ func reconstructFileHTTP(outputPath string, fidx *bupdate.Fidx, baseURL, remoteF
 func cmdCreate(args []string) {
 	opts := getopt.New()
 	opts.SetProgram("ts create")
-	opts.SetParameters("<workspace-name> <snapshot-id>")
+	opts.SetParameters("<workspace-name> <snapshot-spec>")
+	isolation := opts.StringLong("isolation", 0, "", "isolation level: vm, container, none")
 	// Parse expects first element to be program name (like os.Args)
 	opts.Parse(append([]string{"ts create"}, args...))
 
 	if opts.NArgs() != 2 {
-		fmt.Fprintln(os.Stderr, "error: create requires exactly two arguments: workspace-name and snapshot-id")
-		fmt.Fprintln(os.Stderr, "usage: ts create <workspace-name> <snapshot-id>")
+		fmt.Fprintln(os.Stderr, "error: create requires exactly two arguments")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "usage: ts create [--isolation=<level>] <workspace-name> <snapshot-spec>")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "snapshot-spec can be:")
+		fmt.Fprintln(os.Stderr, "  <snapshot-id>                    single snapshot (legacy)")
+		fmt.Fprintln(os.Stderr, "  <rootfs>:<home>:<work>           frame with three components")
+		fmt.Fprintln(os.Stderr, "  <rootfs>::                       frame with empty home/work")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "examples:")
+		fmt.Fprintln(os.Stderr, "  ts create dev abc123             single snapshot")
+		fmt.Fprintln(os.Stderr, "  ts create dev abc123::           rootfs only, empty home/work")
+		fmt.Fprintln(os.Stderr, "  ts create dev abc123:def456:     rootfs + home, empty work")
 		os.Exit(1)
 	}
 
 	workspaceName := opts.Arg(0)
-	snapshotID := opts.Arg(1)
+	snapshotSpec := opts.Arg(1)
 
-	if err := doCreate(*sockPath, workspaceName, snapshotID); err != nil {
+	if err := doCreate(*sockPath, workspaceName, snapshotSpec, *isolation); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -841,6 +859,7 @@ func cmdCreate(args []string) {
 type CreateRequest struct {
 	WorkspaceName string `json:"workspace_name"`
 	SnapshotID    string `json:"snapshot_id"`
+	Isolation     string `json:"isolation,omitempty"`
 }
 
 // CreateResponse is the response from /create
@@ -858,7 +877,7 @@ type CreateStreamEvent struct {
 	Path    string `json:"path,omitempty"`
 }
 
-func doCreate(sockPath, workspaceName, snapshotID string) error {
+func doCreate(sockPath, workspaceName, snapshotID, isolation string) error {
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -887,6 +906,7 @@ func doCreate(sockPath, workspaceName, snapshotID string) error {
 	req := CreateRequest{
 		WorkspaceName: workspaceName,
 		SnapshotID:    snapshotID,
+		Isolation:     isolation,
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -1052,6 +1072,232 @@ func doWhoHas(sockPath, snapshotID string) ([]bupdate.PeerResult, error) {
 	}
 
 	return peers, nil
+}
+
+func cmdTaint(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts taint")
+	opts.SetParameters("<taint-name>")
+	// Parse expects first element to be program name (like os.Args)
+	opts.Parse(append([]string{"ts taint"}, args...))
+
+	if opts.NArgs() != 1 {
+		fmt.Fprintln(os.Stderr, "error: taint requires exactly one argument: taint-name")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "usage: ts taint <taint-name>")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "examples:")
+		fmt.Fprintln(os.Stderr, "  ts taint pii:customers")
+		fmt.Fprintln(os.Stderr, "  ts taint unsafe-permissions")
+		fmt.Fprintln(os.Stderr, "  ts taint untrusted-code")
+		os.Exit(1)
+	}
+
+	taintName := opts.Arg(0)
+
+	if err := doTaint(*sockPath, taintName); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// TaintRequest is the request body for /taint
+type TaintRequest struct {
+	TaintName string `json:"taint_name"`
+}
+
+// TaintResponse is the response from /taint
+type TaintResponse struct {
+	Status  string   `json:"status"`
+	Message string   `json:"message,omitempty"`
+	Taints  []string `json:"taints,omitempty"`
+}
+
+func doTaint(sockPath, taintName string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	req := TaintRequest{
+		TaintName: taintName,
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := client.Post("http://localhost/taint", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result TaintResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("server error: %s", result.Message)
+	}
+
+	fmt.Printf("Added taint: %s\n", taintName)
+	if len(result.Taints) > 0 {
+		fmt.Printf("Current taints: %v\n", result.Taints)
+	}
+	return nil
+}
+
+func cmdDownloadDocker(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts download-docker")
+	opts.SetParameters("<image-reference>")
+	// Parse expects first element to be program name (like os.Args)
+	opts.Parse(append([]string{"ts download-docker"}, args...))
+
+	if opts.NArgs() != 1 {
+		fmt.Fprintln(os.Stderr, "error: download-docker requires exactly one argument: image-reference")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "usage: ts download-docker <image-reference>")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "examples:")
+		fmt.Fprintln(os.Stderr, "  ts download-docker ubuntu:24.04")
+		fmt.Fprintln(os.Stderr, "  ts download-docker docker.io/library/golang:1.22")
+		os.Exit(1)
+	}
+
+	imageRef := opts.Arg(0)
+
+	if err := doDownloadDocker(*sockPath, imageRef); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// DownloadDockerRequest is the request body for /download-docker
+type DownloadDockerRequest struct {
+	ImageRef string `json:"image_ref"`
+}
+
+// DownloadDockerResponse is the response from /download-docker
+type DownloadDockerResponse struct {
+	Status     string `json:"status"`
+	Message    string `json:"message,omitempty"`
+	SnapshotID string `json:"snapshot_id,omitempty"`
+	Cached     bool   `json:"cached,omitempty"`
+}
+
+// DownloadDockerStreamEvent is an event in the streaming download response
+type DownloadDockerStreamEvent struct {
+	Type       string `json:"type"`
+	Message    string `json:"message,omitempty"`
+	Status     string `json:"status,omitempty"`
+	SnapshotID string `json:"snapshot_id,omitempty"`
+	Cached     bool   `json:"cached,omitempty"`
+}
+
+func doDownloadDocker(sockPath, imageRef string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+		// Docker downloads can be slow
+		Timeout: 30 * time.Minute,
+	}
+
+	// Detect if stderr is a TTY for progress display
+	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
+
+	// Get terminal width for formatting
+	termWidth := 80 // default
+	if isTTY {
+		if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w > 0 {
+			termWidth = w
+		}
+	}
+
+	// Build URL with streaming enabled
+	url := "http://localhost/download-docker?stream=1"
+	if isTTY {
+		url += "&tty=1"
+	}
+
+	req := DownloadDockerRequest{
+		ImageRef: imageRef,
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Parse NDJSON stream
+	scanner := bufio.NewScanner(resp.Body)
+	var lastEvent DownloadDockerStreamEvent
+	var lastLineLen int
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var event DownloadDockerStreamEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			return fmt.Errorf("parse stream event: %w (line: %q)", err, string(line))
+		}
+
+		lastEvent = event
+
+		if event.Type == "progress" && isTTY {
+			// Clear line and show progress
+			msg := event.Message
+			if len(msg) > termWidth-2 {
+				msg = msg[:termWidth-5] + "..."
+			}
+			// Pad to clear previous line
+			padding := ""
+			if len(msg) < lastLineLen {
+				padding = strings.Repeat(" ", lastLineLen-len(msg))
+			}
+			fmt.Fprintf(os.Stderr, "\r%s%s", msg, padding)
+			lastLineLen = len(msg)
+		} else if event.Type == "progress" {
+			fmt.Fprintf(os.Stderr, "%s\n", event.Message)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read stream: %w", err)
+	}
+
+	// Clear progress line
+	if isTTY && lastLineLen > 0 {
+		fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", lastLineLen))
+	}
+
+	if lastEvent.Status == "error" {
+		return fmt.Errorf("server error: %s", lastEvent.Message)
+	}
+
+	if lastEvent.Cached {
+		fmt.Printf("%s (cached)\n", lastEvent.SnapshotID)
+	} else {
+		fmt.Printf("%s\n", lastEvent.SnapshotID)
+	}
+
+	return nil
 }
 
 func cmdDownloadSnap(args []string) {

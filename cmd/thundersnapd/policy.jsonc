@@ -1,0 +1,31 @@
+{
+  // Default thundersnap policy file.
+  // This file uses hujson format (JSON with comments and trailing commas).
+  //
+  // Each grant defines who can access thundersnap and what capabilities they get:
+  // - src: identity patterns (users, tags, or autogroups)
+  // - dst: where the connection goes (required for Tailscale compat, ignored locally)
+  // - app: capabilities granted for the connection
+  //
+  // For more information, see:
+  // https://tailscale.com/kb/1337/acl-syntax#grants
+  "grants": [
+    {
+      // All authenticated Tailscale users get developer access
+      "src": ["autogroup:member"],
+      "dst": ["tag:thundersnap"],
+      "app": {
+        "tailscale.com/cap/thundersnap": [{
+          // Role determines the session type
+          "role": "developer",
+          // Isolation level: "container", "vm", or "none"
+          "isolation": "container",
+          // Maximum concurrent workspaces (-1 = unlimited)
+          "maxWorkspaces": 10,
+          // Whether workspaces are deleted on disconnect
+          "ephemeral": false,
+        }],
+      },
+    },
+  ],
+}
