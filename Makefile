@@ -1,11 +1,71 @@
+# Thundersnap Makefile
+#
+# Development targets:
+#   make test       - run all tests
+#   make binaries   - build all binaries for local development
+#   make ts         - build just the ts binary
+#
+# Distribution targets:
+#   make build      - build distribution packages (deb, rpm, tgz)
+#   make build-deb  - build only .deb packages
+#   make list       - list all available build targets
+#
+# Note: cmd/ts requires CGO_ENABLED=0 because it runs inside containers/VMs
+# where dynamically linked binaries may not work. The Makefile handles this.
+
 DIST_CMD = go run ./cmd/dist
 
 # Default output directory for packages
 OUT ?= dist
 
-.PHONY: all list build build-deb build-rpm build-tgz clean
+# Output directory for local binaries
+BIN ?= ./bin
+
+.PHONY: all test binaries ts vsh vshd thundersnapd bupdate tsm fidx slab \
+        list build build-deb build-rpm build-tgz clean
 
 all: build
+
+# Run all tests (requires CGO_ENABLED=0 for cmd/ts tests)
+test:
+	CGO_ENABLED=0 go test ./...
+
+# Build all binaries for local development
+binaries: ts vsh vshd thundersnapd bupdate tsm fidx slab
+
+# Binaries that need CGO_ENABLED=0 (run inside containers/VMs)
+ts:
+	@mkdir -p $(BIN)
+	CGO_ENABLED=0 go build -o $(BIN)/$@ ./cmd/$@
+
+vshd:
+	@mkdir -p $(BIN)
+	CGO_ENABLED=0 go build -o $(BIN)/$@ ./cmd/$@
+
+# Binaries that can use default CGO setting
+vsh:
+	@mkdir -p $(BIN)
+	go build -o $(BIN)/$@ ./cmd/$@
+
+thundersnapd:
+	@mkdir -p $(BIN)
+	go build -o $(BIN)/$@ ./cmd/$@
+
+bupdate:
+	@mkdir -p $(BIN)
+	go build -o $(BIN)/$@ ./cmd/$@
+
+tsm:
+	@mkdir -p $(BIN)
+	go build -o $(BIN)/$@ ./cmd/$@
+
+fidx:
+	@mkdir -p $(BIN)
+	go build -o $(BIN)/$@ ./cmd/$@
+
+slab:
+	@mkdir -p $(BIN)
+	go build -o $(BIN)/$@ ./cmd/$@
 
 # List all available build targets
 list:
@@ -35,4 +95,4 @@ build-arm64:
 	$(DIST_CMD) build --out "$(OUT)" "linux/arm64"
 
 clean:
-	rm -rf "$(OUT)"
+	rm -rf "$(OUT)" "$(BIN)"
