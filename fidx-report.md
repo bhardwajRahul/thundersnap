@@ -576,3 +576,136 @@ The two-file TSM+TSC design provides:
 
 The added complexity of two files is justified by the significant capability
 gains over the current mfidx format.
+
+---
+
+## Appendix: Alternative Storage Format Systems
+
+We evaluated several external storage format systems as potential replacements
+for TSM+TSC. After analysis, we decided to keep our current format but remain
+open to revisiting this decision as the ecosystem evolves.
+
+### casync / desync
+
+[casync](https://github.com/systemd/casync) is Lennart Poettering's
+content-addressable sync tool, with [desync](https://github.com/folbricht/desync)
+being a mature Go reimplementation.
+
+**Architecture:**
+- `.catar` - Linear archive format (like tar, but deterministic)
+- `.caidx` - Chunk index referencing the `.catar` as a chunked blob
+- `.castr` - Chunk store directory with one file per chunk
+
+**Pros:**
+- Mature Go implementation (desync) with active maintenance
+- Multiple storage backends (local, HTTP, S3, GCS, SFTP)
+- Well-tested in production environments
+- CDN-friendly (each chunk is independently cacheable)
+
+**Cons:**
+- **No hardlink support** in `.catar` format. Hardlinks must be dereferenced,
+  causing a busybox container to bloat from 1.3MB to 431MB. This is a
+  fundamental architectural limitation stemming from casync's "chunk across
+  file boundaries" design. See [issue #183](https://github.com/systemd/casync/issues/183).
+- **One HTTP request per chunk**. For a 10GB file with 64KB chunks (~160K chunks),
+  this means 160K HTTP round-trips even with concurrent workers. Our current
+  pipelined byte-range approach is significantly more efficient.
+- **SHA512/256 + buzhash only**. Locked into older algorithms; cannot adopt
+  BLAKE3 or FastCDC without forking.
+- `.caidx` is just a chunk list, not a file manifest. All file metadata lives
+  in the `.catar` stream, which complicates direct file lookups.
+
+**Verdict:** The hardlink limitation and per-chunk HTTP model make desync
+unsuitable for container image distribution where cold-pull performance and
+filesystem fidelity matter.
+
+### Lore (Epic Games)
+
+[Lore](https://github.com/epicgames/lore) is Epic Games' newly open-sourced
+version control system designed for large binary assets.
+
+**Architecture:**
+- BLAKE3 for chunk hashing (32 bytes)
+- FastCDC for content-defined chunking (64KB avg, 32KB min, 256KB max)
+- 48-byte addresses: 32-byte hash + 16-byte context (file identity tracking)
+- Merkle trees for directory representation
+- Recursive fragment trees for large files
+
+**Pros:**
+- Modern algorithms (BLAKE3, FastCDC) with excellent performance
+- Thoughtful design for large binary assets
+- Handles hardlinks properly
+- MIT licensed, fully open source
+- Context field enables move/copy tracking and scoped obliteration
+
+**Cons:**
+- **Go SDK is FFI bindings**, not pure Go. Requires native `liblore.so` dependency,
+  complicating deployment and cross-compilation.
+- **Full VCS, not just storage format**. Significantly more complex than needed
+  for our snapshot distribution use case.
+- **Young ecosystem**. Just open-sourced; less battle-tested than alternatives.
+- The 16-byte context field adds 50% overhead to every chunk address, which may
+  not be needed for our use case.
+
+**Verdict:** Architecturally appealing, but the FFI dependency is a significant
+drawback. Worth monitoring as the ecosystem matures. The algorithms (BLAKE3,
+FastCDC) could be adopted independently.
+
+### IPFS / CAR Format
+
+[IPFS](https://docs.ipfs.tech/) uses Content Addressable aRchives (CAR) for
+storing and transferring content-addressed data.
+
+**Architecture:**
+- CARv1/v2 format for bundling IPLD blocks
+- UnixFS (dag-pb/protobuf) for file/directory representation
+- CIDs (Content Identifiers) with multicodec/multihash flexibility
+
+**Pros:**
+- Well-specified, stable format
+- Large ecosystem and tooling
+- CARv2 adds index for random access
+- Flexible hash algorithm selection via multihash
+
+**Cons:**
+- **Tied to IPFS/IPLD ecosystem**. CIDs, dag-pb, and UnixFS add conceptual
+  overhead if not using the full IPFS stack.
+- **Protobuf-based**. More complex parsing than our flat binary format.
+- **Designed for P2P distribution**, not CDN/HTTP serving.
+
+**Verdict:** Overkill for our use case; brings ecosystem baggage we don't need.
+
+### Hybrid Approach Considered
+
+We considered using desync's chunk store infrastructure (the `Store` interface
+for local/HTTP/S3 backends) while keeping our TSM manifest format:
+
+```
+filesystem → TSM (our format, with hardlinks) → desync chunk store
+```
+
+**Verdict:** This would inherit desync's per-chunk HTTP model, negating our
+pipelined byte-range performance advantage. Not worth the trade-off.
+
+### Summary Table
+
+| Feature | TSM+TSC | casync/desync | Lore | IPFS/CAR |
+|---------|---------|---------------|------|----------|
+| Hardlink support | ✅ Yes | ❌ No | ✅ Yes | ✅ Yes |
+| Pure Go | ✅ Yes | ✅ Yes | ❌ FFI | ✅ Yes |
+| HTTP efficiency | ✅ Pipelined ranges | ❌ 1 req/chunk | ? | ❌ Block-based |
+| Hash algorithm | SHA-256 | SHA512/256 | BLAKE3 | Configurable |
+| Chunking | bupsplit | buzhash | FastCDC | Fixed/Rabin |
+| Maturity | Internal | Production | New | Production |
+
+### Future Considerations
+
+While we're keeping TSM+TSC for now, we could adopt specific improvements:
+
+1. **BLAKE3 hashing** - Swap SHA-256 for BLAKE3 (same 32-byte output, ~3-5x faster)
+2. **FastCDC chunking** - Replace bupsplit with FastCDC for better performance
+3. **Larger chunk sizes** - Move from 8KB avg to 64KB avg to reduce chunk count
+4. **Range coalescing** - Merge consecutive chunk ranges into single HTTP requests
+
+These changes would be internal optimizations requiring a format version bump
+(TSM v3) but wouldn't require adopting an external system's architecture.
