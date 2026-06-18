@@ -1979,16 +1979,26 @@ type CreateRequest struct {
 
 // parseFrameSpec parses a frame spec string "rootfs:home:work" into components.
 // Returns rootfs, home, work snap IDs.
+// The string "nil" is treated as empty (allows explicit empty components in frame specs).
 func parseFrameSpec(spec string) (rootfs, home, work string) {
 	parts := strings.Split(spec, ":")
 	if len(parts) >= 1 {
 		rootfs = parts[0]
+		if rootfs == "nil" {
+			rootfs = ""
+		}
 	}
 	if len(parts) >= 2 {
 		home = parts[1]
+		if home == "nil" {
+			home = ""
+		}
 	}
 	if len(parts) >= 3 {
 		work = parts[2]
+		if work == "nil" {
+			work = ""
+		}
 	}
 	return
 }
@@ -2830,7 +2840,16 @@ func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string
 	}
 
 	// Return frame spec format: rootfs:home:work
-	return fmt.Sprintf("%s:%s:%s", rootfsID, homeID, workID), nil
+	// Use "nil" for empty components to avoid ambiguity with colons
+	homeStr := homeID
+	if homeStr == "" {
+		homeStr = "nil"
+	}
+	workStr := workID
+	if workStr == "" {
+		workStr = "nil"
+	}
+	return fmt.Sprintf("%s:%s:%s", rootfsID, homeStr, workStr), nil
 }
 
 // createSnapshotWithFidx creates a read-only snapshot in snapshots-dir and generates

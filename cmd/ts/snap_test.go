@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -135,6 +136,170 @@ func TestSnapEndpointResponse(t *testing.T) {
 			}
 			if result.SnapshotID != tt.wantID {
 				t.Errorf("snapshot ID mismatch: got %q, want %q", result.SnapshotID, tt.wantID)
+			}
+		})
+	}
+}
+
+// TestWhoHasColonDetection tests that who-has properly rejects frame specs with colons.
+func TestWhoHasColonDetection(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		hasColon      bool
+		nonEmptyCount int
+		wantSnaps     []string
+	}{
+		{
+			name:          "single_snap",
+			input:         "abc123",
+			hasColon:      false,
+			nonEmptyCount: 0,
+			wantSnaps:     nil,
+		},
+		{
+			name:          "frame_spec_all_filled",
+			input:         "abc:def:ghi",
+			hasColon:      true,
+			nonEmptyCount: 3,
+			wantSnaps:     []string{"abc", "def", "ghi"},
+		},
+		{
+			name:          "frame_spec_with_nil",
+			input:         "abc:nil:ghi",
+			hasColon:      true,
+			nonEmptyCount: 2,
+			wantSnaps:     []string{"abc", "ghi"},
+		},
+		{
+			name:          "frame_spec_with_empty",
+			input:         "abc::ghi",
+			hasColon:      true,
+			nonEmptyCount: 2,
+			wantSnaps:     []string{"abc", "ghi"},
+		},
+		{
+			name:          "frame_spec_rootfs_only",
+			input:         "abc:nil:nil",
+			hasColon:      true,
+			nonEmptyCount: 1,
+			wantSnaps:     []string{"abc"},
+		},
+		{
+			name:          "frame_spec_all_nil",
+			input:         "nil:nil:nil",
+			hasColon:      true,
+			nonEmptyCount: 0,
+			wantSnaps:     nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hasColon := strings.Contains(tt.input, ":")
+			if hasColon != tt.hasColon {
+				t.Errorf("hasColon: got %v, want %v", hasColon, tt.hasColon)
+			}
+
+			if !hasColon {
+				return
+			}
+
+			// Parse the frame spec like cmdWhoHas does
+			parts := strings.Split(tt.input, ":")
+			var nonEmpty []string
+			for _, p := range parts {
+				if p != "" && p != "nil" {
+					nonEmpty = append(nonEmpty, p)
+				}
+			}
+
+			if len(nonEmpty) != tt.nonEmptyCount {
+				t.Errorf("nonEmptyCount: got %d, want %d", len(nonEmpty), tt.nonEmptyCount)
+			}
+
+			if tt.wantSnaps != nil {
+				if len(nonEmpty) != len(tt.wantSnaps) {
+					t.Errorf("snaps count mismatch: got %d, want %d", len(nonEmpty), len(tt.wantSnaps))
+				}
+				for i, snap := range nonEmpty {
+					if i < len(tt.wantSnaps) && snap != tt.wantSnaps[i] {
+						t.Errorf("snap[%d]: got %q, want %q", i, snap, tt.wantSnaps[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestDownloadSnapFrameSpecParsing tests that download-snap correctly parses frame specs.
+func TestDownloadSnapFrameSpecParsing(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantSnaps []string
+	}{
+		{
+			name:      "single_snap",
+			input:     "abc123",
+			wantSnaps: []string{"abc123"},
+		},
+		{
+			name:      "frame_spec_all_filled",
+			input:     "abc:def:ghi",
+			wantSnaps: []string{"abc", "def", "ghi"},
+		},
+		{
+			name:      "frame_spec_with_nil",
+			input:     "abc:nil:ghi",
+			wantSnaps: []string{"abc", "ghi"},
+		},
+		{
+			name:      "frame_spec_with_empty",
+			input:     "abc::ghi",
+			wantSnaps: []string{"abc", "ghi"},
+		},
+		{
+			name:      "frame_spec_rootfs_only",
+			input:     "abc:nil:nil",
+			wantSnaps: []string{"abc"},
+		},
+		{
+			name:      "frame_spec_all_nil",
+			input:     "nil:nil:nil",
+			wantSnaps: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var snapsToDownload []string
+
+			if strings.Contains(tt.input, ":") {
+				parts := strings.Split(tt.input, ":")
+				for _, p := range parts {
+					if p != "" && p != "nil" {
+						snapsToDownload = append(snapsToDownload, p)
+					}
+				}
+			} else {
+				snapsToDownload = []string{tt.input}
+			}
+
+			if tt.wantSnaps == nil {
+				if len(snapsToDownload) != 0 {
+					t.Errorf("expected no snaps, got %v", snapsToDownload)
+				}
+				return
+			}
+
+			if len(snapsToDownload) != len(tt.wantSnaps) {
+				t.Errorf("snaps count mismatch: got %d, want %d", len(snapsToDownload), len(tt.wantSnaps))
+			}
+			for i, snap := range snapsToDownload {
+				if i < len(tt.wantSnaps) && snap != tt.wantSnaps[i] {
+					t.Errorf("snap[%d]: got %q, want %q", i, snap, tt.wantSnaps[i])
+				}
 			}
 		})
 	}

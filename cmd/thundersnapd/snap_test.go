@@ -291,3 +291,123 @@ func TestFullSnapProtocol(t *testing.T) {
 		t.Errorf("client: SnapshotID: got %q, want %q", result.SnapshotID, "test123")
 	}
 }
+
+// TestParseFrameSpec tests the parseFrameSpec function with various inputs.
+func TestParseFrameSpec(t *testing.T) {
+	tests := []struct {
+		name       string
+		spec       string
+		wantRootfs string
+		wantHome   string
+		wantWork   string
+	}{
+		{
+			name:       "single_snap",
+			spec:       "abc123",
+			wantRootfs: "abc123",
+			wantHome:   "",
+			wantWork:   "",
+		},
+		{
+			name:       "two_components",
+			spec:       "abc:def",
+			wantRootfs: "abc",
+			wantHome:   "def",
+			wantWork:   "",
+		},
+		{
+			name:       "three_components",
+			spec:       "abc:def:ghi",
+			wantRootfs: "abc",
+			wantHome:   "def",
+			wantWork:   "ghi",
+		},
+		{
+			name:       "empty_home",
+			spec:       "abc::ghi",
+			wantRootfs: "abc",
+			wantHome:   "",
+			wantWork:   "ghi",
+		},
+		{
+			name:       "nil_home",
+			spec:       "abc:nil:ghi",
+			wantRootfs: "abc",
+			wantHome:   "",
+			wantWork:   "ghi",
+		},
+		{
+			name:       "nil_work",
+			spec:       "abc:def:nil",
+			wantRootfs: "abc",
+			wantHome:   "def",
+			wantWork:   "",
+		},
+		{
+			name:       "both_nil",
+			spec:       "abc:nil:nil",
+			wantRootfs: "abc",
+			wantHome:   "",
+			wantWork:   "",
+		},
+		{
+			name:       "all_nil",
+			spec:       "nil:nil:nil",
+			wantRootfs: "",
+			wantHome:   "",
+			wantWork:   "",
+		},
+		{
+			name:       "nil_rootfs",
+			spec:       "nil:def:ghi",
+			wantRootfs: "",
+			wantHome:   "def",
+			wantWork:   "ghi",
+		},
+		{
+			name:       "rootfs_with_empty_suffix",
+			spec:       "abc::",
+			wantRootfs: "abc",
+			wantHome:   "",
+			wantWork:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotRootfs, gotHome, gotWork := parseFrameSpec(tt.spec)
+			if gotRootfs != tt.wantRootfs {
+				t.Errorf("rootfs: got %q, want %q", gotRootfs, tt.wantRootfs)
+			}
+			if gotHome != tt.wantHome {
+				t.Errorf("home: got %q, want %q", gotHome, tt.wantHome)
+			}
+			if gotWork != tt.wantWork {
+				t.Errorf("work: got %q, want %q", gotWork, tt.wantWork)
+			}
+		})
+	}
+}
+
+// TestIsFrameSpec tests the isFrameSpec function.
+func TestIsFrameSpec(t *testing.T) {
+	tests := []struct {
+		spec string
+		want bool
+	}{
+		{"abc123", false},
+		{"abc:def", true},
+		{"abc:def:ghi", true},
+		{"abc::", true},
+		{"abc:nil:nil", true},
+		{":", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.spec, func(t *testing.T) {
+			if got := isFrameSpec(tt.spec); got != tt.want {
+				t.Errorf("isFrameSpec(%q) = %v, want %v", tt.spec, got, tt.want)
+			}
+		})
+	}
+}

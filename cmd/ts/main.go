@@ -996,6 +996,28 @@ func cmdWhoHas(args []string) {
 
 	snapshotID := opts.Arg(0)
 
+	// Detect frame specs (colon-separated) and give helpful error
+	if strings.Contains(snapshotID, ":") {
+		parts := strings.Split(snapshotID, ":")
+		var nonEmpty []string
+		for _, p := range parts {
+			if p != "" && p != "nil" {
+				nonEmpty = append(nonEmpty, p)
+			}
+		}
+		fmt.Fprintln(os.Stderr, "error: who-has can only query one snap at a time")
+		fmt.Fprintln(os.Stderr, "")
+		if len(nonEmpty) == 0 {
+			fmt.Fprintln(os.Stderr, "The frame spec contains no non-empty snaps.")
+		} else {
+			fmt.Fprintf(os.Stderr, "Try querying each snap separately (%d commands):\n", len(nonEmpty))
+			for _, snap := range nonEmpty {
+				fmt.Fprintf(os.Stderr, "  ts who-has %s\n", snap)
+			}
+		}
+		os.Exit(1)
+	}
+
 	peers, err := doWhoHas(*sockPath, snapshotID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -1314,6 +1336,51 @@ func cmdDownloadSnap(args []string) {
 	}
 
 	snapshotID := opts.Arg(0)
+
+	// Handle frame specs (colon-separated) by downloading all non-empty snaps
+	if strings.Contains(snapshotID, ":") {
+		parts := strings.Split(snapshotID, ":")
+		var snapsToDownload []string
+		for _, p := range parts {
+			if p != "" && p != "nil" {
+				snapsToDownload = append(snapsToDownload, p)
+			}
+		}
+
+		if len(snapsToDownload) == 0 {
+			// All empty - nothing to download
+			return
+		}
+
+		// Download all snaps in parallel
+		type downloadResult struct {
+			snap string
+			err  error
+		}
+		results := make(chan downloadResult, len(snapsToDownload))
+
+		for _, snap := range snapsToDownload {
+			go func(s string) {
+				err := doDownloadSnap(*sockPath, s)
+				results <- downloadResult{snap: s, err: err}
+			}(snap)
+		}
+
+		// Collect results
+		var failed []string
+		for range snapsToDownload {
+			r := <-results
+			if r.err != nil {
+				fmt.Fprintf(os.Stderr, "error downloading %s: %v\n", r.snap, r.err)
+				failed = append(failed, r.snap)
+			}
+		}
+
+		if len(failed) > 0 {
+			os.Exit(1)
+		}
+		return
+	}
 
 	if err := doDownloadSnap(*sockPath, snapshotID); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
