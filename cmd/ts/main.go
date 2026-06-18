@@ -956,6 +956,11 @@ func doCreate(sockPath, frameName, snapshotID, isolation string) error {
 			}
 		} else if event.Type == "result" {
 			lastEvent = event
+		} else if event.Type == "" && event.Status != "" {
+			// Non-streaming error response (e.g., frame already exists)
+			// Convert to a result event for consistent handling
+			lastEvent = event
+			lastEvent.Type = "result"
 		}
 	}
 
