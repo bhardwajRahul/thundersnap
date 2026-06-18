@@ -45,10 +45,14 @@ type Indexer struct {
 
 // NewIndexer creates a new filesystem indexer
 func NewIndexer(opts IndexerOptions) *Indexer {
+	tsm := NewTSMWriter()
+	// Zero the creation time for reproducible output. The TSM SHA should
+	// depend only on content, not when the indexing happened.
+	tsm.SetCreationTime(time.Time{})
 	return &Indexer{
 		opts:      opts,
 		tsc:       NewTSCWriter(),
-		tsm:       NewTSMWriter(),
+		tsm:       tsm,
 		hardlinks: make(map[uint64]uint32),
 	}
 }
@@ -171,6 +175,14 @@ func (idx *Indexer) processEntry(path, relPath string, info os.FileInfo, entryIn
 		Mtime: stat.Mtim.Nano(),
 		Ctime: stat.Ctim.Nano(),
 		Atime: stat.Atim.Nano(),
+	}
+
+	// Zero out timestamps on the root entry so that two trees with identical
+	// contents produce identical hashes regardless of when they were created.
+	if relPath == "" {
+		entry.Mtime = 0
+		entry.Ctime = 0
+		entry.Atime = 0
 	}
 
 	mode := info.Mode()

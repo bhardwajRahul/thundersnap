@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -867,6 +868,73 @@ func TestChunkRefTableRoundtrip(t *testing.T) {
 					entry.Path, i, shas[i], expectedSHAs[i])
 			}
 		}
+	}
+}
+
+func TestIndexerRootTimestampsZeroed(t *testing.T) {
+	// Test that the root entry has zeroed timestamps. This ensures that
+	// two empty directories produce identical hashes regardless of when
+	// they were created (e.g., /home and /work subvolumes).
+	tmpDir := t.TempDir()
+
+	// Create two empty directories
+	dir1 := filepath.Join(tmpDir, "dir1")
+	dir2 := filepath.Join(tmpDir, "dir2")
+
+	if err := os.MkdirAll(dir1, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Sleep briefly to ensure different timestamps
+	time.Sleep(10 * time.Millisecond)
+	if err := os.MkdirAll(dir2, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Index both directories
+	out1 := filepath.Join(tmpDir, "out1")
+	out2 := filepath.Join(tmpDir, "out2")
+
+	if err := Create(dir1, out1, IndexerOptions{}); err != nil {
+		t.Fatalf("Index dir1 failed: %v", err)
+	}
+	if err := Create(dir2, out2, IndexerOptions{}); err != nil {
+		t.Fatalf("Index dir2 failed: %v", err)
+	}
+
+	// Read both TSMs
+	tsm1, err := ReadTSM(out1 + ".tsm")
+	if err != nil {
+		t.Fatalf("ReadTSM dir1 failed: %v", err)
+	}
+	tsm2, err := ReadTSM(out2 + ".tsm")
+	if err != nil {
+		t.Fatalf("ReadTSM dir2 failed: %v", err)
+	}
+
+	// Verify the root entry has zeroed timestamps
+	root1, found := tsm1.LookupPath("")
+	if !found {
+		t.Fatal("root entry not found in dir1 TSM")
+	}
+	if root1.Mtime != 0 || root1.Ctime != 0 || root1.Atime != 0 {
+		t.Errorf("root entry should have zeroed timestamps, got mtime=%d ctime=%d atime=%d",
+			root1.Mtime, root1.Ctime, root1.Atime)
+	}
+
+	root2, found := tsm2.LookupPath("")
+	if !found {
+		t.Fatal("root entry not found in dir2 TSM")
+	}
+	if root2.Mtime != 0 || root2.Ctime != 0 || root2.Atime != 0 {
+		t.Errorf("root entry should have zeroed timestamps, got mtime=%d ctime=%d atime=%d",
+			root2.Mtime, root2.Ctime, root2.Atime)
+	}
+
+	// Two empty directories should produce identical TSM hashes since root
+	// timestamps are zeroed
+	if tsm1.SHA256 != tsm2.SHA256 {
+		t.Errorf("TSM SHA256 mismatch: two empty directories should have identical hashes\n"+
+			"dir1: %x\ndir2: %x", tsm1.SHA256, tsm2.SHA256)
 	}
 }
 
