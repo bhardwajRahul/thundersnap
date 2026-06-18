@@ -1707,6 +1707,8 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux.HandleFunc("/snap", cs.handleSnap)
 	mux.HandleFunc("/create", cs.handleCreate)
 	mux.HandleFunc("/taint", cs.handleTaint)
+	mux.HandleFunc("/delete-snap", handleDeleteSnap)
+	mux.HandleFunc("/delete-frame", cs.handleDeleteFrame)
 	mux.HandleFunc("/download-docker", handleDownloadDocker)
 	mux.HandleFunc("/download-snap", handleDownloadSnap)
 	mux.HandleFunc("/who-has", handleWhoHas)
@@ -2164,6 +2166,249 @@ func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(TaintResponse{
 		Status: "ok",
 		Taints: frameMeta.Taints,
+	})
+}
+
+// DeleteSnapRequest is the request body for /delete-snap
+type DeleteSnapRequest struct {
+	SnapshotID string `json:"snapshot_id"`
+}
+
+// DeleteSnapResponse is the response from /delete-snap
+type DeleteSnapResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+// handleDeleteSnap handles POST /delete-snap - delete a snapshot
+// When deleting a snap that has children, updates the children to point
+// to the deleted snap's parent, maintaining the parent chain integrity.
+func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req DeleteSnapRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.SnapshotID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(DeleteSnapResponse{
+			Status:  "error",
+			Message: "snapshot_id is required",
+		})
+		return
+	}
+
+	// Check that the snapshot exists
+	snapPath := filepath.Join(*flagSnapshotsDir, req.SnapshotID)
+	if _, err := os.Stat(snapPath); os.IsNotExist(err) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(DeleteSnapResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("snapshot %q not found", req.SnapshotID),
+		})
+		return
+	}
+
+	// Read the snap's metadata to get its parent
+	snapMeta, _ := readSnapMeta(*flagSnapshotsDir, req.SnapshotID)
+	var deletedParent string
+	if snapMeta != nil {
+		deletedParent = snapMeta.Parent
+	}
+
+	// Find all snaps that have this snap as their parent and update them
+	if err := relinkSnapChildren(*flagSnapshotsDir, req.SnapshotID, deletedParent); err != nil {
+		log.Printf("Warning: failed to relink children of %s: %v", req.SnapshotID, err)
+	}
+
+	// Delete the snapshot directory (btrfs subvolume)
+	cmd := exec.Command("btrfs", "subvolume", "delete", snapPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(DeleteSnapResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("btrfs subvolume delete failed: %v\noutput: %s", err, string(output)),
+		})
+		return
+	}
+
+	// Delete associated files
+	os.Remove(snapPath + ".jsonc")  // metadata
+	os.Remove(snapPath + ".stamp")  // stamp file
+	os.Remove(snapPath + ".fidx")   // fidx
+	os.Remove(snapPath + ".fidx.fidx") // fidx of fidx
+	os.Remove(snapPath + ".tsm")    // tsm manifest
+	os.Remove(snapPath + ".tsc")    // tsc manifest
+
+	log.Printf("Deleted snapshot %s", req.SnapshotID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(DeleteSnapResponse{
+		Status: "ok",
+	})
+}
+
+// relinkSnapChildren finds all snaps that have oldParent as their parent
+// and updates them to point to newParent instead.
+func relinkSnapChildren(snapshotsDir, oldParent, newParent string) error {
+	entries, err := os.ReadDir(snapshotsDir)
+	if err != nil {
+		return fmt.Errorf("read snapshots dir: %w", err)
+	}
+
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".jsonc") {
+			continue
+		}
+
+		snapID := strings.TrimSuffix(entry.Name(), ".jsonc")
+		if snapID == oldParent {
+			continue // Skip the snap being deleted
+		}
+
+		meta, err := readSnapMeta(snapshotsDir, snapID)
+		if err != nil || meta == nil {
+			continue
+		}
+
+		if meta.Parent == oldParent {
+			meta.Parent = newParent
+			if err := writeSnapMeta(snapshotsDir, snapID, meta); err != nil {
+				log.Printf("Warning: failed to update parent for snap %s: %v", snapID, err)
+			} else {
+				log.Printf("Relinked snap %s: parent changed from %s to %s", snapID, oldParent, newParent)
+			}
+		}
+	}
+
+	return nil
+}
+
+// DeleteFrameRequest is the request body for /delete-frame
+type DeleteFrameRequest struct {
+	FrameName string `json:"frame_name"`
+}
+
+// DeleteFrameResponse is the response from /delete-frame
+type DeleteFrameResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+// handleDeleteFrame handles POST /delete-frame - delete a frame
+func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req DeleteFrameRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.FrameName == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(DeleteFrameResponse{
+			Status:  "error",
+			Message: "frame_name is required",
+		})
+		return
+	}
+
+	// Extract tailscale user from rootFS path: /fs-dir/<tailscale-user>/<frame>
+	rootFSRel, _ := filepath.Rel(*flagFsDir, c.rootFS)
+	parts := strings.Split(rootFSRel, string(filepath.Separator))
+	if len(parts) < 2 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(DeleteFrameResponse{
+			Status:  "error",
+			Message: "cannot determine tailscale user from rootFS path",
+		})
+		return
+	}
+	safeTailscaleUser := parts[0]
+
+	// Sanitize frame name for filesystem path
+	safeFrameName := sanitizeForPath(req.FrameName)
+
+	// Build the target path
+	framePath := filepath.Join(*flagFsDir, safeTailscaleUser, safeFrameName)
+
+	// Check if frame exists
+	if _, err := os.Stat(framePath); os.IsNotExist(err) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(DeleteFrameResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("frame %q not found", req.FrameName),
+		})
+		return
+	}
+
+	// Prevent deleting the current frame
+	if framePath == c.rootFS {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(DeleteFrameResponse{
+			Status:  "error",
+			Message: "cannot delete the currently active frame",
+		})
+		return
+	}
+
+	// Delete nested subvolumes first (home and work) if they exist
+	homePath := filepath.Join(framePath, "home")
+	workPath := filepath.Join(framePath, "work")
+
+	if isSubvolume(homePath) {
+		cmd := exec.Command("btrfs", "subvolume", "delete", homePath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: failed to delete home subvolume: %v\noutput: %s", err, string(output))
+		}
+	}
+
+	if isSubvolume(workPath) {
+		cmd := exec.Command("btrfs", "subvolume", "delete", workPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: failed to delete work subvolume: %v\noutput: %s", err, string(output))
+		}
+	}
+
+	// Delete the frame directory (btrfs subvolume)
+	cmd := exec.Command("btrfs", "subvolume", "delete", framePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(DeleteFrameResponse{
+			Status:  "error",
+			Message: fmt.Sprintf("btrfs subvolume delete failed: %v\noutput: %s", err, string(output)),
+		})
+		return
+	}
+
+	// Delete the frame metadata file
+	os.Remove(framePath + ".jsonc")
+
+	log.Printf("Deleted frame %s", framePath)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(DeleteFrameResponse{
+		Status: "ok",
 	})
 }
 

@@ -264,11 +264,27 @@ func cmdFidx(args []string) {
 func cmdSnap(args []string) {
 	opts := getopt.New()
 	opts.SetProgram("ts snap")
+	deleteFlag := opts.BoolLong("delete", 'd', "delete a snapshot")
 	// Parse expects first element to be program name (like os.Args)
 	opts.Parse(append([]string{"ts snap"}, args...))
 
+	if *deleteFlag {
+		if opts.NArgs() != 1 {
+			fmt.Fprintln(os.Stderr, "error: --delete requires exactly one snapshot ID argument")
+			fmt.Fprintln(os.Stderr, "usage: ts snap --delete <snapshot-id>")
+			os.Exit(1)
+		}
+		snapshotID := opts.Arg(0)
+		if err := doDeleteSnap(*sockPath, snapshotID); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Deleted snapshot %s\n", snapshotID)
+		return
+	}
+
 	if opts.NArgs() > 0 {
-		fmt.Fprintln(os.Stderr, "error: snap takes no arguments")
+		fmt.Fprintln(os.Stderr, "error: snap takes no arguments (use --delete to delete a snapshot)")
 		os.Exit(1)
 	}
 
@@ -391,6 +407,50 @@ func doSnap(sockPath string) (string, error) {
 	}
 
 	return lastEvent.SnapshotID, nil
+}
+
+// DeleteSnapRequest is the request body for /delete-snap
+type DeleteSnapRequest struct {
+	SnapshotID string `json:"snapshot_id"`
+}
+
+// DeleteSnapResponse is the response from /delete-snap
+type DeleteSnapResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+func doDeleteSnap(sockPath, snapshotID string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	req := DeleteSnapRequest{SnapshotID: snapshotID}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := client.Post("http://localhost/delete-snap", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result DeleteSnapResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("%s", result.Message)
+	}
+
+	return nil
 }
 
 func cmdBupdate(args []string) {
@@ -826,13 +886,30 @@ func cmdFrame(args []string) {
 	opts.SetProgram("ts frame")
 	opts.SetParameters("<frame-name> <snapshot-spec>")
 	isolation := opts.StringLong("isolation", 0, "", "isolation level: vm, container, none")
+	deleteFlag := opts.BoolLong("delete", 'd', "delete a frame")
 	// Parse expects first element to be program name (like os.Args)
 	opts.Parse(append([]string{"ts frame"}, args...))
+
+	if *deleteFlag {
+		if opts.NArgs() != 1 {
+			fmt.Fprintln(os.Stderr, "error: --delete requires exactly one frame name argument")
+			fmt.Fprintln(os.Stderr, "usage: ts frame --delete <frame-name>")
+			os.Exit(1)
+		}
+		frameName := opts.Arg(0)
+		if err := doDeleteFrame(*sockPath, frameName); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Deleted frame %s\n", frameName)
+		return
+	}
 
 	if opts.NArgs() != 2 {
 		fmt.Fprintln(os.Stderr, "error: frame requires exactly two arguments")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "usage: ts frame [--isolation=<level>] <frame-name> <snapshot-spec>")
+		fmt.Fprintln(os.Stderr, "       ts frame --delete <frame-name>")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "snapshot-spec can be:")
 		fmt.Fprintln(os.Stderr, "  <snapshot-id>                    single snapshot (legacy)")
@@ -843,6 +920,7 @@ func cmdFrame(args []string) {
 		fmt.Fprintln(os.Stderr, "  ts frame dev abc123             single snapshot")
 		fmt.Fprintln(os.Stderr, "  ts frame dev abc123::           rootfs only, empty home/work")
 		fmt.Fprintln(os.Stderr, "  ts frame dev abc123:def456:     rootfs + home, empty work")
+		fmt.Fprintln(os.Stderr, "  ts frame --delete dev           delete a frame")
 		os.Exit(1)
 	}
 
@@ -983,6 +1061,50 @@ func doCreate(sockPath, frameName, snapshotID, isolation string) error {
 	}
 
 	fmt.Printf("Created frame at %s\n", lastEvent.Path)
+	return nil
+}
+
+// DeleteFrameRequest is the request body for /delete-frame
+type DeleteFrameRequest struct {
+	FrameName string `json:"frame_name"`
+}
+
+// DeleteFrameResponse is the response from /delete-frame
+type DeleteFrameResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+func doDeleteFrame(sockPath, frameName string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	req := DeleteFrameRequest{FrameName: frameName}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := client.Post("http://localhost/delete-frame", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result DeleteFrameResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("%s", result.Message)
+	}
+
 	return nil
 }
 

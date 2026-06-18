@@ -232,6 +232,263 @@ func TestWhoHasColonDetection(t *testing.T) {
 	}
 }
 
+// TestDeleteSnapRequestEncoding verifies that DeleteSnapRequest JSON encoding/decoding
+// works correctly between client and server.
+func TestDeleteSnapRequestEncoding(t *testing.T) {
+	tests := []struct {
+		name    string
+		request DeleteSnapRequest
+	}{
+		{
+			name:    "simple_id",
+			request: DeleteSnapRequest{SnapshotID: "abc123def456"},
+		},
+		{
+			name:    "sha256_id",
+			request: DeleteSnapRequest{SnapshotID: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Encode
+			data, err := json.Marshal(tt.request)
+			if err != nil {
+				t.Fatalf("failed to marshal: %v", err)
+			}
+
+			// Decode
+			var decoded DeleteSnapRequest
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatalf("failed to unmarshal: %v", err)
+			}
+
+			// Verify
+			if decoded.SnapshotID != tt.request.SnapshotID {
+				t.Errorf("SnapshotID mismatch: got %q, want %q", decoded.SnapshotID, tt.request.SnapshotID)
+			}
+		})
+	}
+}
+
+// TestDeleteSnapResponseEncoding verifies that DeleteSnapResponse JSON encoding/decoding
+// works correctly between client and server.
+func TestDeleteSnapResponseEncoding(t *testing.T) {
+	tests := []struct {
+		name     string
+		response DeleteSnapResponse
+	}{
+		{
+			name: "success",
+			response: DeleteSnapResponse{
+				Status: "ok",
+			},
+		},
+		{
+			name: "error",
+			response: DeleteSnapResponse{
+				Status:  "error",
+				Message: "snapshot not found",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Encode
+			data, err := json.Marshal(tt.response)
+			if err != nil {
+				t.Fatalf("failed to marshal: %v", err)
+			}
+
+			// Decode
+			var decoded DeleteSnapResponse
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatalf("failed to unmarshal: %v", err)
+			}
+
+			// Verify
+			if decoded.Status != tt.response.Status {
+				t.Errorf("Status mismatch: got %q, want %q", decoded.Status, tt.response.Status)
+			}
+			if decoded.Message != tt.response.Message {
+				t.Errorf("Message mismatch: got %q, want %q", decoded.Message, tt.response.Message)
+			}
+		})
+	}
+}
+
+// TestDeleteFrameRequestEncoding verifies that DeleteFrameRequest JSON encoding/decoding
+// works correctly between client and server.
+func TestDeleteFrameRequestEncoding(t *testing.T) {
+	tests := []struct {
+		name    string
+		request DeleteFrameRequest
+	}{
+		{
+			name:    "simple_name",
+			request: DeleteFrameRequest{FrameName: "dev"},
+		},
+		{
+			name:    "complex_name",
+			request: DeleteFrameRequest{FrameName: "my-test-frame-123"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Encode
+			data, err := json.Marshal(tt.request)
+			if err != nil {
+				t.Fatalf("failed to marshal: %v", err)
+			}
+
+			// Decode
+			var decoded DeleteFrameRequest
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatalf("failed to unmarshal: %v", err)
+			}
+
+			// Verify
+			if decoded.FrameName != tt.request.FrameName {
+				t.Errorf("FrameName mismatch: got %q, want %q", decoded.FrameName, tt.request.FrameName)
+			}
+		})
+	}
+}
+
+// TestDeleteFrameResponseEncoding verifies that DeleteFrameResponse JSON encoding/decoding
+// works correctly between client and server.
+func TestDeleteFrameResponseEncoding(t *testing.T) {
+	tests := []struct {
+		name     string
+		response DeleteFrameResponse
+	}{
+		{
+			name: "success",
+			response: DeleteFrameResponse{
+				Status: "ok",
+			},
+		},
+		{
+			name: "error_not_found",
+			response: DeleteFrameResponse{
+				Status:  "error",
+				Message: "frame not found",
+			},
+		},
+		{
+			name: "error_active_frame",
+			response: DeleteFrameResponse{
+				Status:  "error",
+				Message: "cannot delete the currently active frame",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Encode
+			data, err := json.Marshal(tt.response)
+			if err != nil {
+				t.Fatalf("failed to marshal: %v", err)
+			}
+
+			// Decode
+			var decoded DeleteFrameResponse
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatalf("failed to unmarshal: %v", err)
+			}
+
+			// Verify
+			if decoded.Status != tt.response.Status {
+				t.Errorf("Status mismatch: got %q, want %q", decoded.Status, tt.response.Status)
+			}
+			if decoded.Message != tt.response.Message {
+				t.Errorf("Message mismatch: got %q, want %q", decoded.Message, tt.response.Message)
+			}
+		})
+	}
+}
+
+// TestDeleteSnapEndpointResponse simulates the server response and verifies the client
+// can correctly parse it.
+func TestDeleteSnapEndpointResponse(t *testing.T) {
+	tests := []struct {
+		name           string
+		serverResponse DeleteSnapResponse
+		statusCode     int
+		wantErr        bool
+	}{
+		{
+			name: "success",
+			serverResponse: DeleteSnapResponse{
+				Status: "ok",
+			},
+			statusCode: http.StatusOK,
+			wantErr:    false,
+		},
+		{
+			name: "not_found",
+			serverResponse: DeleteSnapResponse{
+				Status:  "error",
+				Message: "snapshot not found",
+			},
+			statusCode: http.StatusNotFound,
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create test server
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.statusCode)
+				json.NewEncoder(w).Encode(tt.serverResponse)
+			}))
+			defer server.Close()
+
+			// Make request
+			reqBody := DeleteSnapRequest{SnapshotID: "test-snap"}
+			body, _ := json.Marshal(reqBody)
+			resp, err := http.Post(server.URL+"/delete-snap", "application/json", strings.NewReader(string(body)))
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			// Parse response like the client does
+			var result DeleteSnapResponse
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+
+			// Check status code
+			if resp.StatusCode != tt.statusCode {
+				t.Errorf("status code mismatch: got %d, want %d", resp.StatusCode, tt.statusCode)
+			}
+
+			// Check error case
+			if tt.wantErr {
+				if result.Status == "ok" {
+					t.Error("expected error status, got ok")
+				}
+				return
+			}
+
+			// Check success case
+			if result.Status != "ok" {
+				t.Errorf("expected ok status, got %q", result.Status)
+			}
+		})
+	}
+}
+
 // TestDownloadSnapFrameSpecParsing tests that download-snap correctly parses frame specs.
 func TestDownloadSnapFrameSpecParsing(t *testing.T) {
 	tests := []struct {

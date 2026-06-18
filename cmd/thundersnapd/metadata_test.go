@@ -323,3 +323,144 @@ func TestHujsonParsing(t *testing.T) {
 		t.Errorf("len(Taints) = %d, want 2", len(got.Taints))
 	}
 }
+
+func TestRelinkSnapChildren(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a parent chain: grandparent -> parent -> child1, child2
+	// When we delete "parent", child1 and child2 should point to grandparent
+	grandparentID := "grandparent-snap"
+	parentID := "parent-snap"
+	child1ID := "child1-snap"
+	child2ID := "child2-snap"
+	unrelatedID := "unrelated-snap"
+
+	// Write snap metadata
+	grandparentMeta := &SnapMeta{Parent: ""}
+	parentMeta := &SnapMeta{Parent: grandparentID}
+	child1Meta := &SnapMeta{Parent: parentID}
+	child2Meta := &SnapMeta{Parent: parentID}
+	unrelatedMeta := &SnapMeta{Parent: "some-other-parent"}
+
+	if err := writeSnapMeta(tmpDir, grandparentID, grandparentMeta); err != nil {
+		t.Fatalf("write grandparent meta: %v", err)
+	}
+	if err := writeSnapMeta(tmpDir, parentID, parentMeta); err != nil {
+		t.Fatalf("write parent meta: %v", err)
+	}
+	if err := writeSnapMeta(tmpDir, child1ID, child1Meta); err != nil {
+		t.Fatalf("write child1 meta: %v", err)
+	}
+	if err := writeSnapMeta(tmpDir, child2ID, child2Meta); err != nil {
+		t.Fatalf("write child2 meta: %v", err)
+	}
+	if err := writeSnapMeta(tmpDir, unrelatedID, unrelatedMeta); err != nil {
+		t.Fatalf("write unrelated meta: %v", err)
+	}
+
+	// Relink children when deleting parent
+	if err := relinkSnapChildren(tmpDir, parentID, grandparentID); err != nil {
+		t.Fatalf("relinkSnapChildren: %v", err)
+	}
+
+	// Verify child1 now points to grandparent
+	child1After, err := readSnapMeta(tmpDir, child1ID)
+	if err != nil {
+		t.Fatalf("read child1 after: %v", err)
+	}
+	if child1After.Parent != grandparentID {
+		t.Errorf("child1.Parent = %q, want %q", child1After.Parent, grandparentID)
+	}
+
+	// Verify child2 now points to grandparent
+	child2After, err := readSnapMeta(tmpDir, child2ID)
+	if err != nil {
+		t.Fatalf("read child2 after: %v", err)
+	}
+	if child2After.Parent != grandparentID {
+		t.Errorf("child2.Parent = %q, want %q", child2After.Parent, grandparentID)
+	}
+
+	// Verify unrelated snap is unchanged
+	unrelatedAfter, err := readSnapMeta(tmpDir, unrelatedID)
+	if err != nil {
+		t.Fatalf("read unrelated after: %v", err)
+	}
+	if unrelatedAfter.Parent != "some-other-parent" {
+		t.Errorf("unrelated.Parent = %q, want %q", unrelatedAfter.Parent, "some-other-parent")
+	}
+
+	// Verify grandparent is unchanged
+	grandparentAfter, err := readSnapMeta(tmpDir, grandparentID)
+	if err != nil {
+		t.Fatalf("read grandparent after: %v", err)
+	}
+	if grandparentAfter.Parent != "" {
+		t.Errorf("grandparent.Parent = %q, want empty", grandparentAfter.Parent)
+	}
+}
+
+func TestRelinkSnapChildrenToEmptyParent(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a chain: root (no parent) -> child
+	// When we delete root, child should have empty parent
+	rootID := "root-snap"
+	childID := "child-snap"
+
+	rootMeta := &SnapMeta{Parent: ""}
+	childMeta := &SnapMeta{Parent: rootID}
+
+	if err := writeSnapMeta(tmpDir, rootID, rootMeta); err != nil {
+		t.Fatalf("write root meta: %v", err)
+	}
+	if err := writeSnapMeta(tmpDir, childID, childMeta); err != nil {
+		t.Fatalf("write child meta: %v", err)
+	}
+
+	// Relink children when deleting root (no parent to inherit)
+	if err := relinkSnapChildren(tmpDir, rootID, ""); err != nil {
+		t.Fatalf("relinkSnapChildren: %v", err)
+	}
+
+	// Verify child now has empty parent
+	childAfter, err := readSnapMeta(tmpDir, childID)
+	if err != nil {
+		t.Fatalf("read child after: %v", err)
+	}
+	if childAfter.Parent != "" {
+		t.Errorf("child.Parent = %q, want empty", childAfter.Parent)
+	}
+}
+
+func TestRelinkSnapChildrenPreservesTaints(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// When relinking, child's taints should be preserved
+	parentID := "parent-snap"
+	childID := "child-snap"
+
+	parentMeta := &SnapMeta{Parent: "grandparent", Taints: []string{"taint-a"}}
+	childMeta := &SnapMeta{Parent: parentID, Taints: []string{"taint-b", "taint-c"}}
+
+	if err := writeSnapMeta(tmpDir, parentID, parentMeta); err != nil {
+		t.Fatalf("write parent meta: %v", err)
+	}
+	if err := writeSnapMeta(tmpDir, childID, childMeta); err != nil {
+		t.Fatalf("write child meta: %v", err)
+	}
+
+	// Relink
+	if err := relinkSnapChildren(tmpDir, parentID, "grandparent"); err != nil {
+		t.Fatalf("relinkSnapChildren: %v", err)
+	}
+
+	// Verify child's taints are preserved
+	childAfter, err := readSnapMeta(tmpDir, childID)
+	if err != nil {
+		t.Fatalf("read child after: %v", err)
+	}
+	if !reflect.DeepEqual(childAfter.Taints, []string{"taint-b", "taint-c"}) {
+		t.Errorf("child.Taints = %v, want [taint-b, taint-c]", childAfter.Taints)
+	}
+}
