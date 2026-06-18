@@ -1201,6 +1201,16 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		log.Printf("Warning: strip-uids on %s: %v", rootFS, err)
 	}
 
+	// Ensure resolv.conf exists for DNS resolution inside the frame
+	if err := ensureResolvConf(rootFS); err != nil {
+		log.Printf("Warning: ensure resolv.conf on %s: %v", rootFS, err)
+	}
+
+	// Ensure /tmp has correct permissions (1777 with sticky bit)
+	if err := ensureTmpDir(rootFS); err != nil {
+		log.Printf("Warning: ensure /tmp on %s: %v", rootFS, err)
+	}
+
 	return nil
 }
 
@@ -1313,6 +1323,16 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 		log.Printf("Warning: strip-uids on %s: %v", rootFS, err)
 	}
 
+	// Step 8: Ensure resolv.conf exists for DNS resolution inside the frame
+	if err := ensureResolvConf(rootFS); err != nil {
+		log.Printf("Warning: ensure resolv.conf on %s: %v", rootFS, err)
+	}
+
+	// Step 9: Ensure /tmp has correct permissions (1777 with sticky bit)
+	if err := ensureTmpDir(rootFS); err != nil {
+		log.Printf("Warning: ensure /tmp on %s: %v", rootFS, err)
+	}
+
 	log.Printf("Created frame %s with rootfs:%s home:%s work:%s taints:%v",
 		rootFS, meta.Rootfs, meta.Home, meta.Work, meta.Taints)
 	return nil
@@ -1323,6 +1343,70 @@ func isSubvolume(path string) bool {
 	cmd := exec.Command("btrfs", "subvolume", "show", path)
 	err := cmd.Run()
 	return err == nil
+}
+
+// ensureResolvConf copies the host's /etc/resolv.conf into the frame if
+// the frame doesn't already have one. If there's an existing resolv.conf,
+// it's backed up to resolv.conf.orig (but only if .orig doesn't exist).
+func ensureResolvConf(rootFS string) error {
+	frameResolvConf := filepath.Join(rootFS, "etc", "resolv.conf")
+	frameResolvConfOrig := frameResolvConf + ".orig"
+	hostResolvConf := "/etc/resolv.conf"
+
+	// Read the host's resolv.conf
+	hostData, err := os.ReadFile(hostResolvConf)
+	if err != nil {
+		return fmt.Errorf("reading host resolv.conf: %w", err)
+	}
+
+	// Check if frame already has a resolv.conf
+	frameData, err := os.ReadFile(frameResolvConf)
+	if err == nil {
+		// Frame has an existing resolv.conf - check if it matches host
+		if string(frameData) == string(hostData) {
+			// Already matches, nothing to do
+			return nil
+		}
+		// Different content - back up to .orig if .orig doesn't exist
+		if _, err := os.Stat(frameResolvConfOrig); os.IsNotExist(err) {
+			if err := os.WriteFile(frameResolvConfOrig, frameData, 0644); err != nil {
+				log.Printf("Warning: failed to backup resolv.conf to %s: %v", frameResolvConfOrig, err)
+			}
+		}
+	}
+
+	// Ensure /etc directory exists
+	etcDir := filepath.Join(rootFS, "etc")
+	if err := os.MkdirAll(etcDir, 0755); err != nil {
+		return fmt.Errorf("creating /etc directory: %w", err)
+	}
+
+	// Write the host's resolv.conf to the frame
+	if err := os.WriteFile(frameResolvConf, hostData, 0644); err != nil {
+		return fmt.Errorf("writing resolv.conf: %w", err)
+	}
+
+	return nil
+}
+
+// ensureTmpDir ensures /tmp exists with the correct permissions (1777 with sticky bit).
+// Docker images sometimes have /tmp with wrong permissions, which breaks apt-get and
+// other tools that need to create temp files.
+func ensureTmpDir(rootFS string) error {
+	tmpDir := filepath.Join(rootFS, "tmp")
+
+	// Create /tmp if it doesn't exist
+	if err := os.MkdirAll(tmpDir, 0777); err != nil {
+		return fmt.Errorf("creating /tmp: %w", err)
+	}
+
+	// Set correct permissions: 1777 (sticky bit + world writable)
+	// The sticky bit (01000) ensures users can only delete their own files
+	if err := os.Chmod(tmpDir, 01777); err != nil {
+		return fmt.Errorf("chmod /tmp: %w", err)
+	}
+
+	return nil
 }
 
 // copyTsBinary copies the ts binary into the container's /bin using btrfs reflink (COW copy).
@@ -2228,6 +2312,16 @@ func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) er
 	// it on an already-stripped tree leaves it unchanged.
 	if err := tsm.StripRootfs(framePath, tsm.StripOptions{ChownFiles: true}); err != nil {
 		log.Printf("Warning: strip-uids on %s: %v", framePath, err)
+	}
+
+	// Ensure resolv.conf exists for DNS resolution inside the frame
+	if err := ensureResolvConf(framePath); err != nil {
+		log.Printf("Warning: ensure resolv.conf on %s: %v", framePath, err)
+	}
+
+	// Ensure /tmp has correct permissions (1777 with sticky bit)
+	if err := ensureTmpDir(framePath); err != nil {
+		log.Printf("Warning: ensure /tmp on %s: %v", framePath, err)
 	}
 
 	return nil
