@@ -12,7 +12,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -409,6 +411,14 @@ func flattenDockerTarball(tarPath, destDir string, progress io.Writer) error {
 	return nil
 }
 
+// dirTimeInfo holds directory path and mtime for deferred timestamp setting.
+// We can't set directory mtimes until after all their contents are extracted,
+// because extracting files inside updates the directory mtime.
+type dirTimeInfo struct {
+	path  string
+	mtime time.Time
+}
+
 // extractLayer extracts a layer tarball to the destination, handling whiteouts.
 // The layer may be gzip-compressed (as produced by go-containerregistry's tarball.Write).
 func extractLayer(layerPath, destDir string) error {
@@ -438,6 +448,11 @@ func extractLayer(layerPath, destDir string) error {
 	}
 
 	tr := tar.NewReader(r)
+
+	// Collect directories so we can set their timestamps after extraction.
+	// Directory mtimes get updated when files are extracted inside them,
+	// so we need to set them at the end.
+	var dirs []dirTimeInfo
 
 	for {
 		hdr, err := tr.Next()
@@ -477,6 +492,14 @@ func extractLayer(layerPath, destDir string) error {
 			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
 				return err
 			}
+			// MkdirAll doesn't update mode if dir already exists (e.g., created
+			// by extracting a file inside it first), so explicitly set the mode.
+			// This is important for directories like /tmp that need 1777.
+			if err := os.Chmod(target, os.FileMode(hdr.Mode)); err != nil {
+				return err
+			}
+			// Defer setting directory timestamps until after all contents are extracted
+			dirs = append(dirs, dirTimeInfo{path: target, mtime: hdr.ModTime})
 		case tar.TypeReg:
 			// Ensure parent directory exists
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
@@ -484,20 +507,23 @@ func extractLayer(layerPath, destDir string) error {
 			}
 			// Remove existing file if any
 			os.Remove(target)
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+			outf, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
 			if err != nil {
 				return err
 			}
-			_, err = io.Copy(f, tr)
-			f.Close()
+			_, err = io.Copy(outf, tr)
+			outf.Close()
 			if err != nil {
 				return err
 			}
+			// Preserve mtime from the tar header for reproducible snapshots
+			os.Chtimes(target, hdr.ModTime, hdr.ModTime)
 		case tar.TypeSymlink:
 			os.Remove(target)
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
 				return err
 			}
+			// Note: can't set mtime on symlinks portably, Lchtimes is Linux-only
 		case tar.TypeLink:
 			// Hard link
 			linkTarget := filepath.Join(destDir, hdr.Linkname)
@@ -530,6 +556,15 @@ func extractLayer(layerPath, destDir string) error {
 
 		// Set ownership (best effort, may need root)
 		os.Lchown(target, hdr.Uid, hdr.Gid)
+	}
+
+	// Set directory timestamps in reverse order (deepest first) so that
+	// setting a child directory's mtime doesn't update the parent's mtime.
+	sort.Slice(dirs, func(i, j int) bool {
+		return len(dirs[i].path) > len(dirs[j].path)
+	})
+	for _, d := range dirs {
+		os.Chtimes(d.path, d.mtime, d.mtime)
 	}
 
 	return nil
