@@ -638,6 +638,59 @@ func setWinsize(f *os.File, w, h int) {
 		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0})))
 }
 
+// containerOOMScore is the OOM score adjustment applied to container processes.
+// Higher values make processes more likely to be killed by the OOM killer.
+// Range is -1000 to +1000; default is 0. We use +500 to make containers much more
+// likely to be killed than the host OS or thundersnapd itself during memory pressure.
+const containerOOMScore = 500
+
+// setProcessOOMScore sets the OOM score adjustment for a process.
+// Higher scores make the process more likely to be killed during memory pressure.
+// Errors are logged but not fatal since OOM adjustment is best-effort.
+func setProcessOOMScore(pid int, score int) {
+	path := fmt.Sprintf("/proc/%d/oom_score_adj", pid)
+	if err := os.WriteFile(path, []byte(strconv.Itoa(score)), 0644); err != nil {
+		log.Printf("warning: failed to set OOM score for pid %d: %v", pid, err)
+	}
+}
+
+// setupContainerCgroup creates a cgroup for the container process and enables
+// memory.oom.group so that when OOM kills one process, it kills the entire container.
+// This prevents orphaned processes from a half-killed container.
+// Errors are logged but not fatal since cgroup setup is best-effort.
+func setupContainerCgroup(pid int, cgroupName string) {
+	// Use cgroup v2 unified hierarchy
+	cgroupPath := filepath.Join("/sys/fs/cgroup", cgroupName)
+
+	// Create cgroup directory
+	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
+		log.Printf("warning: failed to create cgroup %s: %v", cgroupPath, err)
+		return
+	}
+
+	// Enable memory.oom.group=1 so OOM kills the entire cgroup
+	oomGroupPath := filepath.Join(cgroupPath, "memory.oom.group")
+	if err := os.WriteFile(oomGroupPath, []byte("1"), 0644); err != nil {
+		// This might fail if memory controller isn't enabled, which is fine
+		log.Printf("warning: failed to set memory.oom.group for %s: %v", cgroupName, err)
+	}
+
+	// Move the process into the cgroup
+	procsPath := filepath.Join(cgroupPath, "cgroup.procs")
+	if err := os.WriteFile(procsPath, []byte(strconv.Itoa(pid)), 0644); err != nil {
+		log.Printf("warning: failed to add pid %d to cgroup %s: %v", pid, cgroupName, err)
+		return
+	}
+}
+
+// configureContainerOOM sets up OOM handling for a container process.
+// It adjusts OOM score to prioritize killing containers over host services,
+// and sets up a cgroup with memory.oom.group=1 to kill all container processes together.
+func configureContainerOOM(pid int, cgroupName string) {
+	setProcessOOMScore(pid, containerOOMScore)
+	setupContainerCgroup(pid, cgroupName)
+}
+
 // sanitizeForPath replaces characters that are unsafe for filesystem paths.
 func sanitizeForPath(s string) string {
 	// Replace / and null bytes, and collapse multiple replacements
@@ -789,6 +842,9 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
 	}
 
+	// Build cgroup name for this container (used for OOM group killing)
+	cgroupName := fmt.Sprintf("thundersnap/%s/%s", safeTailscaleUser, safeSSHUser)
+
 	if isPty {
 		cmd.Env = append(cmd.Env, "TERM="+ptyReq.Term)
 		ptmx, err := pty.Start(cmd)
@@ -796,6 +852,10 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 			return fmt.Errorf("start shell: %w", err)
 		}
 		defer ptmx.Close()
+
+		// Configure OOM handling: raise OOM score so containers die before host,
+		// and set up cgroup so entire container is killed together on OOM
+		configureContainerOOM(cmd.Process.Pid, cgroupName)
 
 		// Handle window size changes
 		go func() {
@@ -826,6 +886,10 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("start command: %w", err)
 		}
+
+		// Configure OOM handling: raise OOM score so containers die before host,
+		// and set up cgroup so entire container is killed together on OOM
+		configureContainerOOM(cmd.Process.Pid, cgroupName)
 
 		// Copy stdin from SSH session to command in background
 		go func() {
@@ -906,6 +970,12 @@ func runSFTPSession(s ssh.Session, rootFS, targetUser string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start sftp-server: %w", err)
 	}
+
+	// Configure OOM handling: raise OOM score so containers die before host,
+	// and set up cgroup so entire container is killed together on OOM.
+	// Derive cgroup name from rootFS path (e.g., /fs/user/container -> thundersnap/user/container)
+	cgroupName := "thundersnap/" + filepath.Base(filepath.Dir(rootFS)) + "/" + filepath.Base(rootFS)
+	configureContainerOOM(cmd.Process.Pid, cgroupName)
 
 	// Copy stdin from SSH session to sftp-server
 	go func() {
