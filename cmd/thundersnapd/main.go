@@ -42,6 +42,14 @@ import (
 	"tailscale.com/tsnet"
 )
 
+func init() {
+	// Configure tsnet to cache and reuse the netmap, which allows the server
+	// to start serving requests faster when reconnecting after being offline.
+	// These must be set before any tsnet.Server.Up() calls.
+	os.Setenv("TS_FORCE_CACHE_NETMAP", "1")
+	os.Setenv("TS_USE_CACHED_NETMAP", "1")
+}
+
 var (
 	flagFsDir        *string
 	flagSnapshotsDir *string
