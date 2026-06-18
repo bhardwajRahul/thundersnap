@@ -126,7 +126,7 @@ func attachWorkspace(user, workspace string, controlMode bool) {
         // Create window running shell inside container
         exec.Command("tmux", "-S", sess.sock,
             "new-window", "-n", workspace,
-            "/usr/sbin/ts", "drop-caps-and-run",
+            "/usr/bin/ts", "drop-caps-and-run",
             "--chroot="+rootFS, "--", "su", "-", runAsUser,
         ).Run()
     }

@@ -699,7 +699,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		return fmt.Errorf("create /proc directory: %w", err)
 	}
 
-	// Copy ts binary into container's /sbin using btrfs reflink
+	// Copy ts binary into container's /bin using btrfs reflink
 	if err := copyTsBinary(rootFS); err != nil {
 		return fmt.Errorf("copy ts binary: %w", err)
 	}
@@ -741,7 +741,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	if err != nil {
 		return fmt.Errorf("get absolute path for rootFS: %w", err)
 	}
-	tsBinary := filepath.Join(absRootFS, "sbin", "ts")
+	tsBinary := filepath.Join(absRootFS, "bin", "ts")
 	tsArgs := []string{"--chroot=" + absRootFS}
 
 	// Set hostname and domainname in the new UTS namespace based on tsnet FQDN.
@@ -854,7 +854,7 @@ func runSFTPSession(s ssh.Session, rootFS, targetUser string) error {
 	if err != nil {
 		return fmt.Errorf("get absolute path for rootFS: %w", err)
 	}
-	tsBinary := filepath.Join(absRootFS, "sbin", "ts")
+	tsBinary := filepath.Join(absRootFS, "bin", "ts")
 	tsArgs := []string{"--chroot=" + absRootFS}
 
 	// Find sftp-server - it's typically in /usr/lib/openssh/ or /usr/libexec/
@@ -1317,9 +1317,11 @@ func isSubvolume(path string) bool {
 	return err == nil
 }
 
-// copyTsBinary copies the ts binary into the container's /sbin using btrfs reflink (COW copy).
+// copyTsBinary copies the ts binary into the container's /bin using btrfs reflink (COW copy).
 func copyTsBinary(rootFS string) error {
-	return copyBinaryToRootFS(rootFS, "ts", "sbin/ts")
+	// Remove legacy /sbin/ts if present (we moved to /bin/ts for PATH sanity).
+	os.Remove(filepath.Join(rootFS, "sbin", "ts"))
+	return copyBinaryToRootFS(rootFS, "ts", "bin/ts")
 }
 
 // copyVshdBinary copies the vshd binary into the VM's /sbin using btrfs reflink (COW copy).

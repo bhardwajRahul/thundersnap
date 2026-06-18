@@ -13,7 +13,7 @@ package main
 //   3. createSnapshot from the live frame produces .tsm and .tsc
 //      files in snapshots-dir alongside .fidx/.fidx.fidx/.stamp.
 //   4. createFrameFromSnapshot from that newly-created snapshot
-//      produces a usable frame with a /sbin/ts binary.
+//      produces a usable frame with a /bin/ts binary.
 //   5. The ts binary inside the frame is executable.
 //
 // The test requires root + btrfs. It skips otherwise.
@@ -52,7 +52,7 @@ func requireBtrfsRoot(t *testing.T, dir string) {
 }
 
 // makeSeedRootFS populates a directory with a minimal "snapshot 1" tree:
-// /etc/passwd, /etc/group, /home/<user>, /sbin, /usr/bin, /usr/sbin/ts (a
+// /etc/passwd, /etc/group, /home/<user>, /bin, /usr/bin, /usr/bin/ts (a
 // tiny shim), plus a couple of files owned by non-root UIDs to verify
 // strip-uids actually rewrites ownership.
 func makeSeedRootFS(t *testing.T, dir string) {
@@ -73,7 +73,7 @@ func makeSeedRootFS(t *testing.T, dir string) {
 	}
 	mk("etc", 0755)
 	mk("home/ubuntu", 0755)
-	mk("sbin", 0755)
+	mk("bin", 0755)
 	mk("usr/bin", 0755)
 	mk("var/lib/postgresql", 0755)
 	mk("proc", 0555)
@@ -103,7 +103,7 @@ func makeSeedRootFS(t *testing.T, dir string) {
 	}
 
 	// A tiny "ts" shim used by copyTsBinary. It just needs to exist.
-	wf("sbin/ts.seed", "#!/bin/sh\necho ts-seed\n", 0755)
+	wf("bin/ts.seed", "#!/bin/sh\necho ts-seed\n", 0755)
 }
 
 // btrfsSubvol creates a new subvolume at path. Fails the test on error.
