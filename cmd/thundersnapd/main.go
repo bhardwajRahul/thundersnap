@@ -2509,16 +2509,154 @@ func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*b
 		}
 	}
 
-	// Download the snapshot
+	// Download the snapshot with btrfs-aware callbacks
 	opts := bupdate.DownloadSnapshotOptions{
 		SnapshotID:     snapshotID,
 		SnapshotsDir:   *flagSnapshotsDir,
 		Peers:          peers,
 		ProgressWriter: progressWriter,
 		IsTTY:          isTTY,
+
+		// Create the target directory as a btrfs subvolume.
+		// If parentStamp refers to an existing local snap (or one of its ancestors),
+		// clone from that to speed up the download by reusing unchanged files.
+		CreateTargetDir: func(path, parentStamp string) error {
+			return createDownloadTargetDir(path, parentStamp, progressWriter)
+		},
+
+		// Clean up using btrfs subvolume delete since we created a subvolume
+		CleanupTargetDir: func(path string) {
+			exec.Command("btrfs", "subvolume", "delete", path).Run()
+		},
+
+		// Delete files that exist in the cloned parent but not in the new snapshot
+		PrepareForFiles: func(targetDir string, fileList []string) error {
+			return prepareDownloadDir(targetDir, fileList, progressWriter)
+		},
 	}
 
 	return bupdate.DownloadSnapshot(opts)
+}
+
+// createDownloadTargetDir creates a btrfs subvolume for downloading a snapshot.
+// If parentStamp (or one of its historical parents) exists locally as a subvolume,
+// we clone from it instead of creating an empty subvolume - this allows unchanged
+// files to be skipped during download.
+func createDownloadTargetDir(path, parentStamp string, progress io.Writer) error {
+	// Walk the parent chain to find a local ancestor we can clone from
+	localAncestor := findLocalAncestor(parentStamp)
+
+	if localAncestor != "" {
+		// Clone from the local ancestor
+		if progress != nil {
+			fmt.Fprintf(progress, "Cloning from local ancestor %s...\n", filepath.Base(localAncestor))
+		}
+		cmd := exec.Command("btrfs", "subvolume", "snapshot", localAncestor, path)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("btrfs subvolume snapshot from %s to %s: %w\noutput: %s",
+				localAncestor, path, err, output)
+		}
+		return nil
+	}
+
+	// No local ancestor found, create a fresh subvolume
+	cmd := exec.Command("btrfs", "subvolume", "create", path)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("btrfs subvolume create %s: %w\noutput: %s", path, err, output)
+	}
+	return nil
+}
+
+// findLocalAncestor walks the parent chain starting from stampID and returns
+// the path to the first snapshot that exists locally as a btrfs subvolume.
+// Returns empty string if no local ancestor is found.
+func findLocalAncestor(stampID string) string {
+	// Limit the search depth to avoid infinite loops from circular references
+	const maxDepth = 100
+
+	currentID := stampID
+	for i := 0; i < maxDepth && currentID != "" && currentID != "1"; i++ {
+		snapPath := filepath.Join(*flagSnapshotsDir, currentID)
+
+		// Check if this snapshot exists locally and is a btrfs subvolume
+		if _, err := os.Stat(snapPath); err == nil {
+			if isSubvolume(snapPath) {
+				return snapPath
+			}
+			// Exists but not a subvolume - check its parent instead
+		}
+
+		// Look up this snapshot's parent from its stamp file
+		currentID = readStampFile(snapPath)
+	}
+
+	// Also check if the base "1" snapshot exists (common ancestor for all)
+	basePath := filepath.Join(*flagSnapshotsDir, "1")
+	if _, err := os.Stat(basePath); err == nil && isSubvolume(basePath) {
+		return basePath
+	}
+
+	return ""
+}
+
+// prepareDownloadDir removes files from targetDir that are not in fileList.
+// This is used when we've cloned from a parent snapshot and need to delete
+// files that were removed in the new snapshot.
+func prepareDownloadDir(targetDir string, fileList []string, progress io.Writer) error {
+	// Build a set of files that should exist
+	shouldExist := make(map[string]bool)
+	for _, f := range fileList {
+		shouldExist[f] = true
+		// Also mark parent directories as "should exist" to avoid deleting them
+		dir := filepath.Dir(f)
+		for dir != "." && dir != "/" {
+			shouldExist[dir] = true
+			dir = filepath.Dir(dir)
+		}
+	}
+
+	// Walk the directory and find files to delete
+	var toDelete []string
+	err := filepath.Walk(targetDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == targetDir {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(targetDir, path)
+		if err != nil {
+			return err
+		}
+
+		if !shouldExist[relPath] {
+			toDelete = append(toDelete, path)
+			if info.IsDir() {
+				return filepath.SkipDir // Don't recurse into directories we'll delete
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("scanning directory: %w", err)
+	}
+
+	// Delete files/dirs that shouldn't exist (in reverse order to handle nested dirs)
+	for i := len(toDelete) - 1; i >= 0; i-- {
+		path := toDelete[i]
+		if err := os.RemoveAll(path); err != nil {
+			log.Printf("Warning: failed to remove %s: %v", path, err)
+		}
+	}
+
+	if len(toDelete) > 0 && progress != nil {
+		fmt.Fprintf(progress, "Removed %d files/dirs not in new snapshot\n", len(toDelete))
+	}
+
+	return nil
 }
 
 // createSnapshot creates a read-only snapshot of the given rootFS in snapshots-dir.

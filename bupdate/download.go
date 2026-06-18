@@ -22,6 +22,22 @@ type DownloadSnapshotOptions struct {
 	ProgressWriter io.Writer
 	// IsTTY indicates whether to format progress for a terminal
 	IsTTY bool
+
+	// CreateTargetDir is called to create the target directory for the snapshot.
+	// parentStamp is the parent snapshot ID from the stamp file (may be empty).
+	// If nil, os.MkdirAll is used.
+	CreateTargetDir func(path, parentStamp string) error
+
+	// CleanupTargetDir is called to clean up the target directory on error.
+	// If nil, os.RemoveAll is used.
+	CleanupTargetDir func(path string)
+
+	// PrepareForFiles is called after the target dir is created but before
+	// downloading files. fileList contains all files that will be in the snapshot.
+	// This can be used to delete files that exist in a cloned parent but are
+	// not present in the new snapshot.
+	// If nil, no preparation is done.
+	PrepareForFiles func(targetDir string, fileList []string) error
 }
 
 // DownloadSnapshotResult contains the result of downloading a snapshot.
@@ -86,41 +102,33 @@ func DownloadSnapshot(opts DownloadSnapshotOptions) (*DownloadSnapshotResult, er
 	finalFidxFidxPath := snapshotPath + ".fidx.fidx"
 	finalStampPath := snapshotPath + ".stamp"
 
+	// Determine cleanup functions (use callbacks if provided)
+	cleanupDir := opts.CleanupTargetDir
+	if cleanupDir == nil {
+		cleanupDir = func(path string) { os.RemoveAll(path) }
+	}
+
 	// Clean up temp files on error
 	cleanup := func() {
-		os.RemoveAll(tmpSnapshotDir)
+		cleanupDir(tmpSnapshotDir)
 		os.Remove(tmpFidxPath)
 		os.Remove(tmpFidxFidxPath)
 		os.Remove(tmpStampPath)
 	}
 
-	// Create temp snapshot directory
-	if err := os.MkdirAll(tmpSnapshotDir, 0755); err != nil {
-		return nil, fmt.Errorf("creating temp snapshot dir: %w", err)
-	}
-
-	// Step 1: Download the stamp file
+	// Step 1: Download the stamp file first (we need parent info before creating dir)
 	stampURL := baseURL + "/bupdate/" + opts.SnapshotID + ".stamp"
 	stampData, err := FetchFullFile(stampURL)
 	if err != nil {
-		cleanup()
 		return nil, fmt.Errorf("downloading stamp file: %w", err)
 	}
-	if err := os.WriteFile(tmpStampPath, stampData, 0644); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("writing stamp file: %w", err)
-	}
+	parentStamp := strings.TrimSpace(string(stampData))
 
 	// Step 2: Download the fidx.fidx (for bootstrapping fidx download)
 	fidxFidxURL := baseURL + "/bupdate/" + opts.SnapshotID + ".fidx.fidx"
 	fidxFidxData, err := FetchFullFile(fidxFidxURL)
 	if err != nil {
-		cleanup()
 		return nil, fmt.Errorf("downloading fidx.fidx: %w", err)
-	}
-	if err := os.WriteFile(tmpFidxFidxPath, fidxFidxData, 0644); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("writing fidx.fidx: %w", err)
 	}
 
 	// Step 3: Download the main fidx using bupdate
@@ -132,34 +140,72 @@ func DownloadSnapshot(opts DownloadSnapshotOptions) (*DownloadSnapshotResult, er
 	// Load the fidx.fidx to get the structure
 	fidxFidx, err := ParseFidxData(tmpFidxFidxPath, fidxFidxData)
 	if err != nil {
-		cleanup()
 		return nil, fmt.Errorf("parsing fidx.fidx: %w", err)
+	}
+
+	// We need to write fidx.fidx temporarily to parse it for chunk locations
+	if err := os.WriteFile(tmpFidxFidxPath, fidxFidxData, 0644); err != nil {
+		return nil, fmt.Errorf("writing fidx.fidx: %w", err)
 	}
 
 	// Download fidx using range requests
 	if err := downloadFileWithFidx(tmpFidxPath, fidxURL, fidxFidx, opts.SnapshotsDir, opts.ProgressWriter); err != nil {
-		cleanup()
+		os.Remove(tmpFidxFidxPath)
 		return nil, fmt.Errorf("downloading fidx: %w", err)
 	}
 
-	// Step 4: Load the main fidx and download all files
+	// Step 4: Load the main fidx to get the file list
 	mainFidx, err := LoadFidx(tmpFidxPath)
 	if err != nil {
-		cleanup()
+		os.Remove(tmpFidxPath)
+		os.Remove(tmpFidxFidxPath)
 		return nil, fmt.Errorf("loading fidx: %w", err)
+	}
+
+	// Step 5: Create the target directory (may clone from parent if callback provided)
+	if opts.CreateTargetDir != nil {
+		if err := opts.CreateTargetDir(tmpSnapshotDir, parentStamp); err != nil {
+			os.Remove(tmpFidxPath)
+			os.Remove(tmpFidxFidxPath)
+			return nil, fmt.Errorf("creating target dir: %w", err)
+		}
+	} else {
+		if err := os.MkdirAll(tmpSnapshotDir, 0755); err != nil {
+			os.Remove(tmpFidxPath)
+			os.Remove(tmpFidxFidxPath)
+			return nil, fmt.Errorf("creating temp snapshot dir: %w", err)
+		}
+	}
+
+	// Step 6: Prepare for files (e.g., delete files not in the manifest if cloned from parent)
+	if opts.PrepareForFiles != nil {
+		fileList := make([]string, len(mainFidx.Files))
+		for i, f := range mainFidx.Files {
+			fileList[i] = f.Filename
+		}
+		if err := opts.PrepareForFiles(tmpSnapshotDir, fileList); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("preparing for files: %w", err)
+		}
 	}
 
 	if opts.ProgressWriter != nil {
 		fmt.Fprintf(opts.ProgressWriter, "Downloading %d files...\n", len(mainFidx.Files))
 	}
 
-	// Download all files in the snapshot
+	// Step 7: Download all files in the snapshot
 	if err := downloadMFIDX(tmpSnapshotDir, baseURL, mainFidx, opts.SnapshotID, opts.SnapshotsDir, opts.ProgressWriter); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("downloading snapshot files: %w", err)
 	}
 
-	// Step 5: Rename all temp files to final locations
+	// Write stamp file
+	if err := os.WriteFile(tmpStampPath, stampData, 0644); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("writing stamp file: %w", err)
+	}
+
+	// Step 8: Rename all temp files to final locations
 	if err := os.Rename(tmpSnapshotDir, snapshotPath); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("renaming snapshot dir: %w", err)

@@ -346,3 +346,268 @@ func TestE2ESnapshotCloneStripUIDs(t *testing.T) {
 		t.Errorf("bad TSM magic in %s", tsmPath)
 	}
 }
+
+// TestDownloadTargetDirCreation tests the btrfs-aware download callbacks:
+// - createDownloadTargetDir: creates subvolumes, clones from local ancestors
+// - prepareDownloadDir: removes files not in the target manifest
+// - findLocalAncestor: walks parent chain to find closest local snapshot
+func TestDownloadTargetDirCreation(t *testing.T) {
+	_, snapsDir, libexecDir, cleanup := setupTestEnv(t)
+	defer cleanup()
+	// We only need snapsDir for this test
+	setFlagsForTest(t.TempDir(), snapsDir, libexecDir)
+	defer resetFlagsForTest()
+
+	// Test 1a: createDownloadTargetDir falls back to base "1" when no direct ancestor exists
+	t.Run("fallback_to_base_snapshot", func(t *testing.T) {
+		target := filepath.Join(snapsDir, "fresh-test")
+		defer btrfsDelete(target)
+
+		err := createDownloadTargetDir(target, "nonexistent-parent", nil)
+		if err != nil {
+			t.Fatalf("createDownloadTargetDir failed: %v", err)
+		}
+
+		// Verify it's a subvolume
+		if !isSubvolume(target) {
+			t.Error("created path is not a btrfs subvolume")
+		}
+
+		// Verify it cloned from "1" (should have /etc/passwd from makeSeedRootFS)
+		if _, err := os.Stat(filepath.Join(target, "etc/passwd")); err != nil {
+			t.Errorf("should have cloned from base '1' and have etc/passwd: %v", err)
+		}
+	})
+
+	// Test 1b: createDownloadTargetDir creates empty subvolume when no base "1" exists
+	t.Run("fresh_subvolume_no_base", func(t *testing.T) {
+		// Create a temporary snapsDir without a "1" base snapshot
+		tmpSnapsDir := filepath.Join(t.TempDir(), "empty-snaps")
+		requireBtrfsRoot(t, tmpSnapsDir)
+		os.MkdirAll(tmpSnapsDir, 0755)
+
+		// Point flagSnapshotsDir to our empty dir temporarily
+		oldSnapsDir := *flagSnapshotsDir
+		*flagSnapshotsDir = tmpSnapsDir
+		defer func() { *flagSnapshotsDir = oldSnapsDir }()
+
+		target := filepath.Join(tmpSnapsDir, "truly-fresh")
+		defer btrfsDelete(target)
+
+		err := createDownloadTargetDir(target, "nonexistent-parent", nil)
+		if err != nil {
+			t.Fatalf("createDownloadTargetDir failed: %v", err)
+		}
+
+		// Verify it's a subvolume
+		if !isSubvolume(target) {
+			t.Error("created path is not a btrfs subvolume")
+		}
+
+		// Verify it's empty (no base to clone from)
+		entries, _ := os.ReadDir(target)
+		if len(entries) != 0 {
+			t.Errorf("fresh subvolume should be empty, got %d entries", len(entries))
+		}
+	})
+
+	// Test 2: createDownloadTargetDir with local ancestor clones from it
+	t.Run("clone_from_ancestor", func(t *testing.T) {
+		// Create a "parent" snapshot with some files
+		parentID := "parent-snap-abc"
+		parentPath := filepath.Join(snapsDir, parentID)
+		btrfsSubvol(t, parentPath)
+		defer btrfsDelete(parentPath)
+
+		// Add files to parent
+		os.MkdirAll(filepath.Join(parentPath, "etc"), 0755)
+		os.WriteFile(filepath.Join(parentPath, "etc/passwd"), []byte("root:x:0:0:root:/root:/bin/bash\n"), 0644)
+		os.WriteFile(filepath.Join(parentPath, "etc/hostname"), []byte("parent-host\n"), 0644)
+		os.MkdirAll(filepath.Join(parentPath, "home/user"), 0755)
+		os.WriteFile(filepath.Join(parentPath, "home/user/file.txt"), []byte("user file content\n"), 0644)
+
+		// Create stamp file for parent
+		os.WriteFile(parentPath+".stamp", []byte("1\n"), 0644)
+
+		// Create target by cloning from parent
+		target := filepath.Join(snapsDir, "child-snap-xyz")
+		defer btrfsDelete(target)
+
+		err := createDownloadTargetDir(target, parentID, nil)
+		if err != nil {
+			t.Fatalf("createDownloadTargetDir failed: %v", err)
+		}
+
+		// Verify it's a subvolume
+		if !isSubvolume(target) {
+			t.Error("created path is not a btrfs subvolume")
+		}
+
+		// Verify files were cloned
+		if data, err := os.ReadFile(filepath.Join(target, "etc/hostname")); err != nil {
+			t.Errorf("cloned file missing: %v", err)
+		} else if string(data) != "parent-host\n" {
+			t.Errorf("cloned file content wrong: %q", data)
+		}
+
+		if data, err := os.ReadFile(filepath.Join(target, "home/user/file.txt")); err != nil {
+			t.Errorf("cloned nested file missing: %v", err)
+		} else if string(data) != "user file content\n" {
+			t.Errorf("cloned nested file content wrong: %q", data)
+		}
+	})
+
+	// Test 3: findLocalAncestor walks the parent chain
+	t.Run("find_ancestor_chain", func(t *testing.T) {
+		// Create a chain: grandparent -> parent -> (target, not created yet)
+		grandparentID := "grandparent-111"
+		parentID := "parent-222"
+
+		grandparentPath := filepath.Join(snapsDir, grandparentID)
+		parentPath := filepath.Join(snapsDir, parentID)
+
+		btrfsSubvol(t, grandparentPath)
+		defer btrfsDelete(grandparentPath)
+		os.WriteFile(grandparentPath+".stamp", []byte("1\n"), 0644)
+
+		btrfsSubvol(t, parentPath)
+		defer btrfsDelete(parentPath)
+		os.WriteFile(parentPath+".stamp", []byte(grandparentID+"\n"), 0644)
+
+		// findLocalAncestor with parent as stamp should find parent
+		found := findLocalAncestor(parentID)
+		if found != parentPath {
+			t.Errorf("expected to find %s, got %s", parentPath, found)
+		}
+
+		// Now delete parent and try again - should find grandparent
+		btrfsDelete(parentPath)
+		found = findLocalAncestor(parentID)
+		if found != grandparentPath {
+			t.Errorf("expected to find grandparent %s, got %s", grandparentPath, found)
+		}
+	})
+
+	// Test 4: prepareDownloadDir removes files not in manifest
+	t.Run("prepare_removes_extra_files", func(t *testing.T) {
+		// Create a subvolume with files
+		target := filepath.Join(snapsDir, "prepare-test")
+		btrfsSubvol(t, target)
+		defer btrfsDelete(target)
+
+		// Add files - some will be in manifest, some won't
+		os.MkdirAll(filepath.Join(target, "etc"), 0755)
+		os.MkdirAll(filepath.Join(target, "var/log"), 0755)
+		os.MkdirAll(filepath.Join(target, "tmp/cache"), 0755)
+		os.WriteFile(filepath.Join(target, "etc/passwd"), []byte("root:x:0:0::\n"), 0644)
+		os.WriteFile(filepath.Join(target, "etc/hostname"), []byte("old-hostname\n"), 0644)
+		os.WriteFile(filepath.Join(target, "var/log/old.log"), []byte("old log\n"), 0644)
+		os.WriteFile(filepath.Join(target, "tmp/cache/junk.bin"), []byte("junk\n"), 0644)
+
+		// New snapshot only has etc/passwd and etc/group
+		newFileList := []string{
+			"etc/passwd",
+			"etc/group",
+		}
+
+		err := prepareDownloadDir(target, newFileList, nil)
+		if err != nil {
+			t.Fatalf("prepareDownloadDir failed: %v", err)
+		}
+
+		// etc/passwd should still exist (in manifest)
+		if _, err := os.Stat(filepath.Join(target, "etc/passwd")); err != nil {
+			t.Error("etc/passwd should still exist")
+		}
+
+		// etc/hostname should be deleted (not in manifest)
+		if _, err := os.Stat(filepath.Join(target, "etc/hostname")); !os.IsNotExist(err) {
+			t.Error("etc/hostname should have been deleted")
+		}
+
+		// var/log directory and its contents should be deleted
+		if _, err := os.Stat(filepath.Join(target, "var")); !os.IsNotExist(err) {
+			t.Error("var directory should have been deleted")
+		}
+
+		// tmp directory and its contents should be deleted
+		if _, err := os.Stat(filepath.Join(target, "tmp")); !os.IsNotExist(err) {
+			t.Error("tmp directory should have been deleted")
+		}
+	})
+
+	// Test 5: Full flow - clone from parent, remove deleted files, keep modified files
+	t.Run("full_clone_and_prepare", func(t *testing.T) {
+		// Create parent snapshot
+		parentID := "parent-full-test"
+		parentPath := filepath.Join(snapsDir, parentID)
+		btrfsSubvol(t, parentPath)
+		defer btrfsDelete(parentPath)
+		os.WriteFile(parentPath+".stamp", []byte("1\n"), 0644)
+
+		// Parent has: etc/passwd, etc/hostname, var/log/app.log, home/user/doc.txt
+		os.MkdirAll(filepath.Join(parentPath, "etc"), 0755)
+		os.MkdirAll(filepath.Join(parentPath, "var/log"), 0755)
+		os.MkdirAll(filepath.Join(parentPath, "home/user"), 0755)
+		os.WriteFile(filepath.Join(parentPath, "etc/passwd"), []byte("old passwd\n"), 0644)
+		os.WriteFile(filepath.Join(parentPath, "etc/hostname"), []byte("old hostname\n"), 0644)
+		os.WriteFile(filepath.Join(parentPath, "var/log/app.log"), []byte("old logs\n"), 0644)
+		os.WriteFile(filepath.Join(parentPath, "home/user/doc.txt"), []byte("original doc\n"), 0644)
+
+		// New snapshot has: etc/passwd (modified), etc/hostname (same), home/user/new.txt (new)
+		// Deleted: var/log/app.log, home/user/doc.txt
+		target := filepath.Join(snapsDir, "child-full-test")
+		defer btrfsDelete(target)
+
+		// Step 1: Clone from parent
+		err := createDownloadTargetDir(target, parentID, nil)
+		if err != nil {
+			t.Fatalf("createDownloadTargetDir failed: %v", err)
+		}
+
+		// Step 2: Prepare for new file list (removes deleted files)
+		newFileList := []string{
+			"etc/passwd",
+			"etc/hostname",
+			"home/user/new.txt",
+		}
+		err = prepareDownloadDir(target, newFileList, nil)
+		if err != nil {
+			t.Fatalf("prepareDownloadDir failed: %v", err)
+		}
+
+		// Verify deleted files are gone
+		if _, err := os.Stat(filepath.Join(target, "var/log/app.log")); !os.IsNotExist(err) {
+			t.Error("var/log/app.log should have been deleted")
+		}
+		if _, err := os.Stat(filepath.Join(target, "home/user/doc.txt")); !os.IsNotExist(err) {
+			t.Error("home/user/doc.txt should have been deleted")
+		}
+
+		// Verify kept files still exist (with old content for now - download would update them)
+		if data, err := os.ReadFile(filepath.Join(target, "etc/passwd")); err != nil {
+			t.Errorf("etc/passwd should still exist: %v", err)
+		} else if string(data) != "old passwd\n" {
+			t.Errorf("etc/passwd content unexpected: %q", data)
+		}
+
+		if data, err := os.ReadFile(filepath.Join(target, "etc/hostname")); err != nil {
+			t.Errorf("etc/hostname should still exist: %v", err)
+		} else if string(data) != "old hostname\n" {
+			t.Errorf("etc/hostname content unexpected: %q", data)
+		}
+
+		// Step 3: Simulate download updating/creating files
+		os.WriteFile(filepath.Join(target, "etc/passwd"), []byte("new passwd\n"), 0644)
+		os.MkdirAll(filepath.Join(target, "home/user"), 0755)
+		os.WriteFile(filepath.Join(target, "home/user/new.txt"), []byte("new file\n"), 0644)
+
+		// Final verification
+		if data, _ := os.ReadFile(filepath.Join(target, "etc/passwd")); string(data) != "new passwd\n" {
+			t.Errorf("etc/passwd should have new content: %q", data)
+		}
+		if data, _ := os.ReadFile(filepath.Join(target, "home/user/new.txt")); string(data) != "new file\n" {
+			t.Errorf("new file should exist: %q", data)
+		}
+	})
+}
