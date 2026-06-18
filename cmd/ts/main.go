@@ -47,11 +47,11 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  bupdate        download and reconstruct files from mesh peers")
 	fmt.Fprintln(os.Stderr, "  fidx           create a file index (.fidx) for a file or directory")
 	fmt.Fprintln(os.Stderr, "  snap           create a snapshot of the current container/VM")
-	fmt.Fprintln(os.Stderr, "  frame          create a new frame from a snapshot")
+	fmt.Fprintln(os.Stderr, "  frame          create a new frame from root:home:work snaps")
 	fmt.Fprintln(os.Stderr, "  taint          add a taint to the current frame")
-	fmt.Fprintln(os.Stderr, "  download-docker download a Docker image as a snapshot")
-	fmt.Fprintln(os.Stderr, "  who-has        query peers to find which ones have a snapshot")
-	fmt.Fprintln(os.Stderr, "  download-snap  download a snapshot from mesh peers")
+	fmt.Fprintln(os.Stderr, "  download-docker download a Docker image as a snap")
+	fmt.Fprintln(os.Stderr, "  who-has        query peers to find which ones have a snap")
+	fmt.Fprintln(os.Stderr, "  download-snap  download a snap from mesh peers")
 	os.Exit(1)
 }
 
