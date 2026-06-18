@@ -3,6 +3,7 @@ package main
 
 import (
 	"archive/tar"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -409,6 +410,7 @@ func flattenDockerTarball(tarPath, destDir string, progress io.Writer) error {
 }
 
 // extractLayer extracts a layer tarball to the destination, handling whiteouts.
+// The layer may be gzip-compressed (as produced by go-containerregistry's tarball.Write).
 func extractLayer(layerPath, destDir string) error {
 	f, err := os.Open(layerPath)
 	if err != nil {
@@ -416,7 +418,26 @@ func extractLayer(layerPath, destDir string) error {
 	}
 	defer f.Close()
 
-	tr := tar.NewReader(f)
+	// Check for gzip magic bytes (1f 8b)
+	var magic [2]byte
+	if _, err := io.ReadFull(f, magic[:]); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return err
+	}
+
+	var r io.Reader = f
+	if magic[0] == 0x1f && magic[1] == 0x8b {
+		gr, err := gzip.NewReader(f)
+		if err != nil {
+			return fmt.Errorf("gzip reader: %w", err)
+		}
+		defer gr.Close()
+		r = gr
+	}
+
+	tr := tar.NewReader(r)
 
 	for {
 		hdr, err := tr.Next()
