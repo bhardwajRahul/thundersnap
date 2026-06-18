@@ -229,6 +229,39 @@ func StripRootfs(rootfs string, opts StripOptions) error {
 			return fmt.Errorf("chown rootfs: %w", err)
 		}
 	}
+	// Configure passwordless sudo for the shared UID user so they can
+	// run apt-get, systemctl, etc. without a password prompt.
+	if err := EnsureSudoers(rootfs); err != nil {
+		// Non-fatal: some minimal containers don't have sudo
+		// Log would be nice but we don't have a logger here
+	}
+	return nil
+}
+
+// EnsureSudoers creates a sudoers.d drop-in file that grants passwordless
+// sudo to the "user" account (the shared UID account). This is necessary
+// because containers typically need root access for package management,
+// service control, etc.
+//
+// Returns nil if /etc/sudoers.d doesn't exist (container has no sudo).
+func EnsureSudoers(rootfs string) error {
+	sudoersDir := filepath.Join(rootfs, "etc", "sudoers.d")
+	if _, err := os.Stat(sudoersDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // No sudo installed, skip
+		}
+		return err
+	}
+
+	// Create a drop-in file for the user account
+	dropinPath := filepath.Join(sudoersDir, "thundersnap-user")
+	content := "# Thundersnap: allow the shared UID user passwordless sudo\nuser ALL=(ALL) NOPASSWD: ALL\n"
+
+	// sudoers files must be mode 0440 and owned by root
+	if err := os.WriteFile(dropinPath, []byte(content), 0440); err != nil {
+		return fmt.Errorf("write sudoers drop-in: %w", err)
+	}
+
 	return nil
 }
 
