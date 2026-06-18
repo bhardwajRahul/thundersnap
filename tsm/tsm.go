@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 	"sort"
 	"time"
@@ -171,6 +170,18 @@ func encodeEntry(entry *TSMEntry) []byte {
 	return buf
 }
 
+// encodeEntryForHash encodes an entry for hash computation, zeroing ctime and atime.
+// These fields are stored in the TSM for change detection, but excluded from the
+// hash because they cannot be preserved during replication (ctime is kernel-controlled,
+// atime changes on read). This allows identical content to produce identical snap IDs.
+func encodeEntryForHash(entry *TSMEntry) []byte {
+	// Make a copy with zeroed ctime/atime
+	hashEntry := *entry
+	hashEntry.Ctime = 0
+	hashEntry.Atime = 0
+	return encodeEntry(&hashEntry)
+}
+
 // Write writes the TSM file with a reference to the TSC file.
 // The indexMap maps original TSC indices to sorted TSC indices.
 func (w *TSMWriter) Write(path string, tscSHA [32]byte, indexMap []uint32) ([32]byte, error) {
@@ -208,9 +219,8 @@ func (w *TSMWriter) Write(path string, tscSHA [32]byte, indexMap []uint32) ([32]
 
 	bufw := bufio.NewWriter(f)
 	hash := sha256.New()
-	mw := io.MultiWriter(bufw, hash)
 
-	// Write header
+	// Write header to both file and hash
 	header := make([]byte, TSMHeaderSize)
 	copy(header[0:4], TSMMagic)
 	binary.BigEndian.PutUint32(header[4:8], w.flags)
@@ -221,26 +231,32 @@ func (w *TSMWriter) Write(path string, tscSHA [32]byte, indexMap []uint32) ([32]
 	copy(header[40:48], w.fsUUID[:])
 	// Remaining 16 bytes are reserved (zero)
 
-	if _, err := mw.Write(header); err != nil {
+	if _, err := bufw.Write(header); err != nil {
 		return [32]byte{}, err
 	}
+	hash.Write(header)
 
 	// Write entries (sorted by path)
+	// File gets full entry data (with ctime/atime for change detection).
+	// Hash gets entry data with ctime/atime zeroed (for reproducible snap IDs).
 	for i := range w.entries {
 		entryData := encodeEntry(&w.entries[i])
-		if _, err := mw.Write(entryData); err != nil {
+		if _, err := bufw.Write(entryData); err != nil {
 			return [32]byte{}, err
 		}
+		hashData := encodeEntryForHash(&w.entries[i])
+		hash.Write(hashData)
 	}
 
-	// Write chunk reference table
+	// Write chunk reference table to both file and hash
 	// Each entry is a uint32 index into the TSC file
 	refBuf := make([]byte, 4)
 	for _, ref := range chunkRefTable {
 		binary.BigEndian.PutUint32(refBuf, ref)
-		if _, err := mw.Write(refBuf); err != nil {
+		if _, err := bufw.Write(refBuf); err != nil {
 			return [32]byte{}, err
 		}
+		hash.Write(refBuf)
 	}
 
 	// Compute file SHA and write footer
@@ -304,17 +320,7 @@ func ParseTSM(data []byte) (*TSMReader, error) {
 	footer := data[len(data)-TSMFooterSize:]
 	contentData := data[:len(data)-TSMFooterSize]
 
-	// Verify checksum
-	h := sha256.New()
-	h.Write(contentData)
-	computedSHA := h.Sum(nil)
-
-	if !bytes.Equal(computedSHA, footer[0:32]) {
-		return nil, fmt.Errorf("tsm checksum mismatch")
-	}
-
 	reader := &TSMReader{}
-	copy(reader.SHA256[:], computedSHA)
 	copy(reader.TSCSHA[:], footer[32:64])
 
 	// Parse header
@@ -362,6 +368,27 @@ func ParseTSM(data []byte) (*TSMReader, error) {
 		reader.ChunkRefTable[i] = binary.BigEndian.Uint32(data[offset : offset+4])
 		offset += 4
 	}
+
+	// Verify checksum by recomputing with ctime/atime zeroed (same as writer).
+	// The file stores real ctime/atime for change detection, but the checksum
+	// excludes them for reproducibility.
+	h := sha256.New()
+	h.Write(data[:TSMHeaderSize]) // Header is the same
+	for i := range reader.Entries {
+		h.Write(encodeEntryForHash(&reader.Entries[i]))
+	}
+	// Chunk ref table
+	refBuf := make([]byte, 4)
+	for _, ref := range reader.ChunkRefTable {
+		binary.BigEndian.PutUint32(refBuf, ref)
+		h.Write(refBuf)
+	}
+	computedSHA := h.Sum(nil)
+
+	if !bytes.Equal(computedSHA, footer[0:32]) {
+		return nil, fmt.Errorf("tsm checksum mismatch")
+	}
+	copy(reader.SHA256[:], computedSHA)
 
 	// Populate ChunkRefs on each entry from the chunk ref table
 	for i := range reader.Entries {

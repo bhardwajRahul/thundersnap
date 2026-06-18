@@ -20,6 +20,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	"golang.org/x/sys/unix"
 )
 
 // DownloadDockerRequest is the request body for /download-docker
@@ -523,7 +524,8 @@ func extractLayer(layerPath, destDir string) error {
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
 				return err
 			}
-			// Note: can't set mtime on symlinks portably, Lchtimes is Linux-only
+			// Preserve mtime on symlinks using Lutimes (Linux-specific)
+			setSymlinkTimes(target, hdr.ModTime)
 		case tar.TypeLink:
 			// Hard link
 			linkTarget := filepath.Join(destDir, hdr.Linkname)
@@ -568,4 +570,18 @@ func extractLayer(layerPath, destDir string) error {
 	}
 
 	return nil
+}
+
+// setSymlinkTimes sets the mtime on a symlink using Lutimes.
+// This is Linux-specific but necessary for reproducible Docker image extraction.
+func setSymlinkTimes(path string, mtime time.Time) {
+	// Convert time.Time to unix.Timeval
+	sec := mtime.Unix()
+	usec := mtime.Nanosecond() / 1000 // Lutimes uses microseconds
+	tv := []unix.Timeval{
+		{Sec: sec, Usec: int64(usec)}, // atime
+		{Sec: sec, Usec: int64(usec)}, // mtime
+	}
+	// Ignore errors - this is best effort for reproducibility
+	unix.Lutimes(path, tv)
 }

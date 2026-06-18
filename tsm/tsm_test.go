@@ -938,6 +938,133 @@ func TestIndexerRootTimestampsZeroed(t *testing.T) {
 	}
 }
 
+// TestIndexerCtimeAtimeStored verifies that ctime and atime are stored in TSM
+// entries (for change detection), but the TSM hash excludes them (for reproducibility).
+func TestIndexerCtimeAtimeStored(t *testing.T) {
+	tmpDir := t.TempDir()
+	testDir := filepath.Join(tmpDir, "testroot")
+	if err := os.MkdirAll(testDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a directory with some files
+	subdir := filepath.Join(testDir, "subdir")
+	if err := os.MkdirAll(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(testDir, "file.txt"), []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "nested.txt"), []byte("nested"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("file.txt", filepath.Join(testDir, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Index the directory
+	outBase := filepath.Join(tmpDir, "out")
+	if err := Create(testDir, outBase, IndexerOptions{}); err != nil {
+		t.Fatalf("Index failed: %v", err)
+	}
+
+	// Read the TSM
+	tsm, err := ReadTSM(outBase + ".tsm")
+	if err != nil {
+		t.Fatalf("ReadTSM failed: %v", err)
+	}
+
+	// Verify non-root entries have non-zero ctime (stored for change detection)
+	// Root entry should have zeroed timestamps
+	for _, entry := range tsm.Entries {
+		if entry.Path == "" {
+			// Root entry should have zeroed timestamps
+			if entry.Ctime != 0 || entry.Atime != 0 || entry.Mtime != 0 {
+				t.Errorf("root entry should have zeroed timestamps, got mtime=%d ctime=%d atime=%d",
+					entry.Mtime, entry.Ctime, entry.Atime)
+			}
+		} else {
+			// Non-root entries should have real ctime/atime (for change detection)
+			if entry.Ctime == 0 {
+				t.Errorf("entry %q has zero ctime, expected non-zero (stored for change detection)", entry.Path)
+			}
+		}
+	}
+}
+
+// TestIndexerReproducibility verifies that indexing the same directory content
+// at different times produces identical TSM files. This specifically tests
+// that non-reproducible timestamps (ctime, atime) don't affect the hash.
+func TestIndexerReproducibility(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create two directories with identical content at different times
+	dir1 := filepath.Join(tmpDir, "dir1")
+	dir2 := filepath.Join(tmpDir, "dir2")
+
+	createTestDir := func(root string) {
+		os.MkdirAll(filepath.Join(root, "subdir"), 0755)
+		os.WriteFile(filepath.Join(root, "file.txt"), []byte("content"), 0644)
+		os.WriteFile(filepath.Join(root, "subdir", "nested.txt"), []byte("nested"), 0644)
+		os.Symlink("file.txt", filepath.Join(root, "link"))
+	}
+
+	createTestDir(dir1)
+	// Sleep to ensure different ctime/atime on the filesystem
+	time.Sleep(50 * time.Millisecond)
+	createTestDir(dir2)
+
+	// Set identical mtimes (the one timestamp we DO preserve)
+	// Note: os.Chtimes follows symlinks, so we need unix.Lutimes for symlinks
+	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	setMtimeRecursive := func(root string) {
+		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				// Use Lutimes for symlinks (Chtimes follows symlinks)
+				tv := []unix.Timeval{
+					{Sec: fixedTime.Unix(), Usec: 0},
+					{Sec: fixedTime.Unix(), Usec: 0},
+				}
+				unix.Lutimes(path, tv)
+			} else {
+				os.Chtimes(path, fixedTime, fixedTime)
+			}
+			return nil
+		})
+	}
+	setMtimeRecursive(dir1)
+	setMtimeRecursive(dir2)
+
+	// Index both
+	out1 := filepath.Join(tmpDir, "out1")
+	out2 := filepath.Join(tmpDir, "out2")
+	if err := Create(dir1, out1, IndexerOptions{}); err != nil {
+		t.Fatalf("Index dir1 failed: %v", err)
+	}
+	if err := Create(dir2, out2, IndexerOptions{}); err != nil {
+		t.Fatalf("Index dir2 failed: %v", err)
+	}
+
+	// Read both TSMs
+	tsm1, err := ReadTSM(out1 + ".tsm")
+	if err != nil {
+		t.Fatalf("ReadTSM dir1 failed: %v", err)
+	}
+	tsm2, err := ReadTSM(out2 + ".tsm")
+	if err != nil {
+		t.Fatalf("ReadTSM dir2 failed: %v", err)
+	}
+
+	// The TSM files should have identical hashes
+	if tsm1.SHA256 != tsm2.SHA256 {
+		t.Errorf("TSM SHA256 mismatch: identical content should produce identical hashes\n"+
+			"dir1: %x\ndir2: %x", tsm1.SHA256, tsm2.SHA256)
+	}
+}
+
 func TestChunkRefTableWithDedup(t *testing.T) {
 	// Test that deduplicated chunks (same content in different files)
 	// correctly reference the same TSC entry.

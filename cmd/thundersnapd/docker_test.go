@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -796,4 +797,193 @@ func addTarEntry(tw *tar.Writer, name string, content []byte, mode int64) error 
 	}
 	_, err := tw.Write(content)
 	return err
+}
+
+// TestExtractLayerTimestampPreservation tests that timestamps from tar headers
+// are preserved during extraction for all entry types (files, directories, symlinks).
+// This is essential for reproducible Docker image extraction.
+func TestExtractLayerTimestampPreservation(t *testing.T) {
+	tmpDir := t.TempDir()
+	layerPath := filepath.Join(tmpDir, "layer.tar")
+	destDir := filepath.Join(tmpDir, "extracted")
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a fixed timestamp for testing (2024-01-15 12:34:56 UTC)
+	fixedTime := time.Date(2024, 1, 15, 12, 34, 56, 0, time.UTC)
+
+	// Build layer with specific timestamps
+	f, err := os.Create(layerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tw := tar.NewWriter(f)
+
+	// Directory with fixed mtime
+	tw.WriteHeader(&tar.Header{
+		Name:     "etc/",
+		Mode:     0755,
+		Typeflag: tar.TypeDir,
+		ModTime:  fixedTime,
+	})
+
+	// Regular file with fixed mtime
+	content := []byte("test content\n")
+	tw.WriteHeader(&tar.Header{
+		Name:    "etc/test.txt",
+		Mode:    0644,
+		Size:    int64(len(content)),
+		ModTime: fixedTime,
+	})
+	tw.Write(content)
+
+	// Symlink with fixed mtime
+	tw.WriteHeader(&tar.Header{
+		Name:     "etc/link",
+		Mode:     0777,
+		Typeflag: tar.TypeSymlink,
+		Linkname: "test.txt",
+		ModTime:  fixedTime,
+	})
+
+	tw.Close()
+	f.Close()
+
+	// Extract the layer
+	if err := extractLayer(layerPath, destDir); err != nil {
+		t.Fatalf("extractLayer: %v", err)
+	}
+
+	// Verify timestamps for all entry types
+	checks := []struct {
+		path      string
+		isSymlink bool
+	}{
+		{"etc", false},
+		{"etc/test.txt", false},
+		{"etc/link", true},
+	}
+
+	for _, c := range checks {
+		p := filepath.Join(destDir, c.path)
+		var info os.FileInfo
+		var err error
+		if c.isSymlink {
+			info, err = os.Lstat(p)
+		} else {
+			info, err = os.Stat(p)
+		}
+		if err != nil {
+			t.Errorf("stat %s: %v", c.path, err)
+			continue
+		}
+
+		mtime := info.ModTime()
+		// Allow 1 second tolerance since tar only has second precision
+		diff := mtime.Sub(fixedTime)
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > time.Second {
+			t.Errorf("%s: mtime = %v, want ~%v (diff=%v)", c.path, mtime, fixedTime, diff)
+		}
+	}
+}
+
+// TestExtractLayerTimestampPreservationSymlinks specifically tests symlink
+// timestamp preservation, which was previously broken. This test will fail
+// if symlink mtimes are not set (they'll have the extraction time instead).
+func TestExtractLayerTimestampPreservationSymlinks(t *testing.T) {
+	tmpDir := t.TempDir()
+	layerPath := filepath.Join(tmpDir, "layer.tar")
+	destDir := filepath.Join(tmpDir, "extracted")
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a timestamp that's clearly in the past (not near current time)
+	pastTime := time.Date(2020, 6, 15, 10, 30, 0, 0, time.UTC)
+	now := time.Now()
+
+	// Build layer with symlinks
+	f, err := os.Create(layerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tw := tar.NewWriter(f)
+
+	// Directory
+	tw.WriteHeader(&tar.Header{
+		Name:     "usr/",
+		Mode:     0755,
+		Typeflag: tar.TypeDir,
+		ModTime:  pastTime,
+	})
+	tw.WriteHeader(&tar.Header{
+		Name:     "usr/bin/",
+		Mode:     0755,
+		Typeflag: tar.TypeDir,
+		ModTime:  pastTime,
+	})
+
+	// Target file
+	content := []byte("binary content")
+	tw.WriteHeader(&tar.Header{
+		Name:    "usr/bin/python3",
+		Mode:    0755,
+		Size:    int64(len(content)),
+		ModTime: pastTime,
+	})
+	tw.Write(content)
+
+	// Symlink (this is the critical test case)
+	tw.WriteHeader(&tar.Header{
+		Name:     "usr/bin/python",
+		Mode:     0777,
+		Typeflag: tar.TypeSymlink,
+		Linkname: "python3",
+		ModTime:  pastTime,
+	})
+
+	tw.Close()
+	f.Close()
+
+	// Extract the layer
+	if err := extractLayer(layerPath, destDir); err != nil {
+		t.Fatalf("extractLayer: %v", err)
+	}
+
+	// Check symlink timestamp specifically
+	symlinkPath := filepath.Join(destDir, "usr/bin/python")
+	info, err := os.Lstat(symlinkPath)
+	if err != nil {
+		t.Fatalf("lstat symlink: %v", err)
+	}
+
+	symlinkMtime := info.ModTime()
+
+	// The symlink mtime should be close to pastTime, not close to now
+	diffFromPast := symlinkMtime.Sub(pastTime)
+	if diffFromPast < 0 {
+		diffFromPast = -diffFromPast
+	}
+	diffFromNow := now.Sub(symlinkMtime)
+	if diffFromNow < 0 {
+		diffFromNow = -diffFromNow
+	}
+
+	// If symlink mtime is closer to now than to pastTime, the timestamp wasn't preserved
+	if diffFromNow < diffFromPast {
+		t.Errorf("symlink mtime not preserved: got %v (diff from past: %v, diff from now: %v)",
+			symlinkMtime, diffFromPast, diffFromNow)
+		t.Errorf("expected mtime close to %v, but got time close to extraction time", pastTime)
+	}
+
+	// Also verify the mtime is within 1 second of pastTime (tar has second precision)
+	if diffFromPast > time.Second {
+		t.Errorf("symlink mtime = %v, want ~%v (diff=%v)", symlinkMtime, pastTime, diffFromPast)
+	}
 }
