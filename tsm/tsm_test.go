@@ -1222,3 +1222,50 @@ func TestIndexerLargeFileChunkRefs(t *testing.T) {
 		t.Errorf("total chunk size %d != file size %d", totalSize, len(data))
 	}
 }
+
+// TestEmptyDirectoryHashDeterministic verifies that two empty directories with the same
+// attributes produce identical TSM hashes. This is important because the TSM indexer
+// zeros root entry timestamps, making empty directories produce identical hashes
+// regardless of creation time.
+func TestEmptyDirectoryHashDeterministic(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create two empty directories
+	emptyDir1 := filepath.Join(tmpDir, "empty1")
+	emptyDir2 := filepath.Join(tmpDir, "empty2")
+	if err := os.MkdirAll(emptyDir1, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(emptyDir2, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Index both
+	outPath1 := filepath.Join(tmpDir, "out1")
+	outPath2 := filepath.Join(tmpDir, "out2")
+	if err := Create(emptyDir1, outPath1, IndexerOptions{}); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if err := Create(emptyDir2, outPath2, IndexerOptions{}); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Read both TSMs
+	tsmReader1, err := ReadTSM(outPath1 + ".tsm")
+	if err != nil {
+		t.Fatalf("ReadTSM failed: %v", err)
+	}
+	tsmReader2, err := ReadTSM(outPath2 + ".tsm")
+	if err != nil {
+		t.Fatalf("ReadTSM failed: %v", err)
+	}
+
+	// Verify they have identical hashes
+	if tsmReader1.SHA256 != tsmReader2.SHA256 {
+		t.Errorf("Two empty directories should have identical hashes:\n  dir1: %x\n  dir2: %x",
+			tsmReader1.SHA256, tsmReader2.SHA256)
+	}
+
+	// Log the hash for reference
+	t.Logf("Empty directory hash (UID=%d): %x", os.Getuid(), tsmReader1.SHA256)
+}

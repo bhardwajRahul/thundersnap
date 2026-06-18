@@ -1827,7 +1827,11 @@ func setupDev() {
 		path := "/dev/" + dev.name
 		devNum := unix.Mkdev(dev.major, dev.minor)
 		// Ignore errors - we're best-effort here
-		unix.Mknod(path, dev.mode, int(devNum))
+		if err := unix.Mknod(path, dev.mode, int(devNum)); err == nil {
+			// Mknod doesn't respect mode bits for permissions (affected by umask),
+			// so explicitly set the permissions after creating the device.
+			unix.Chmod(path, dev.mode&0777)
+		}
 	}
 
 	// Create symlinks for stdin/stdout/stderr
