@@ -215,7 +215,9 @@ func createMFIDX(paths []string, outPath string, opts IndexerOptions) error {
 		var err error
 		refMap, _, err = LoadRefMFIDX(opts.RefPath)
 		if err != nil {
-			return fmt.Errorf("loading reference mfidx: %w", err)
+			// If the reference isn't a valid mfidx (e.g., empty directory
+			// snapshot), continue without a reference rather than failing.
+			refMap = nil
 		}
 	}
 
