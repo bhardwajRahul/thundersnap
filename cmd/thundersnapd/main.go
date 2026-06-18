@@ -1470,6 +1470,10 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 			return fmt.Errorf("btrfs subvolume create home at %s failed: %w\noutput: %s",
 				homePath, err, string(output))
 		}
+		// Set ownership to shared UID 1000
+		if err := os.Chown(homePath, 1000, 1000); err != nil {
+			log.Printf("Warning: failed to chown home directory: %v", err)
+		}
 	}
 
 	// Step 3: Create or clone work subvolume
@@ -1500,6 +1504,10 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 		if err != nil {
 			return fmt.Errorf("btrfs subvolume create work at %s failed: %w\noutput: %s",
 				workPath, err, string(output))
+		}
+		// Set ownership to shared UID 1000
+		if err := os.Chown(workPath, 1000, 1000); err != nil {
+			log.Printf("Warning: failed to chown work directory: %v", err)
 		}
 	}
 
