@@ -1892,6 +1892,14 @@ func cmdDropCapsAndRun(args []string) {
 		_ = err
 	}
 
+	// Set up /dev like Docker/containerd do:
+	// - tmpfs at /dev
+	// - Essential device nodes (null, zero, full, random, urandom, tty)
+	// - Symlinks for stdin/stdout/stderr and /dev/fd
+	// - /dev/pts for pseudoterminals
+	// - /dev/shm for shared memory
+	setupDev()
+
 	// Set hostname if provided
 	if hostname != "" {
 		if err := unix.Sethostname([]byte(hostname)); err != nil {
@@ -1939,6 +1947,67 @@ func cmdDropCapsAndRun(args []string) {
 		fmt.Fprintf(os.Stderr, "error: exec %s: %v\n", cmdArgs[0], err)
 		os.Exit(1)
 	}
+}
+
+// setupDev creates a minimal /dev filesystem like Docker/containerd.
+// This creates a tmpfs at /dev with essential device nodes, symlinks,
+// /dev/pts for pseudoterminals, and /dev/shm for shared memory.
+func setupDev() {
+	// Mount tmpfs at /dev
+	if err := unix.Mount("tmpfs", "/dev", "tmpfs", unix.MS_NOSUID|unix.MS_STRICTATIME, "mode=755,size=65536k"); err != nil {
+		// /dev might not exist or we might not have permissions
+		return
+	}
+
+	// Create essential device nodes
+	// Format: name, mode, major, minor
+	devices := []struct {
+		name  string
+		mode  uint32
+		major uint32
+		minor uint32
+	}{
+		{"null", unix.S_IFCHR | 0666, 1, 3},
+		{"zero", unix.S_IFCHR | 0666, 1, 5},
+		{"full", unix.S_IFCHR | 0666, 1, 7},
+		{"random", unix.S_IFCHR | 0666, 1, 8},
+		{"urandom", unix.S_IFCHR | 0666, 1, 9},
+		{"tty", unix.S_IFCHR | 0666, 5, 0},
+	}
+
+	for _, dev := range devices {
+		path := "/dev/" + dev.name
+		devNum := unix.Mkdev(dev.major, dev.minor)
+		// Ignore errors - we're best-effort here
+		if err := unix.Mknod(path, dev.mode, int(devNum)); err == nil {
+			// Mknod doesn't respect mode bits for permissions (affected by umask),
+			// so explicitly set the permissions after creating the device.
+			unix.Chmod(path, dev.mode&0777)
+		}
+	}
+
+	// Create symlinks for stdin/stdout/stderr
+	os.Symlink("/proc/self/fd/0", "/dev/stdin")
+	os.Symlink("/proc/self/fd/1", "/dev/stdout")
+	os.Symlink("/proc/self/fd/2", "/dev/stderr")
+
+	// Create /dev/fd -> /proc/self/fd
+	os.Symlink("/proc/self/fd", "/dev/fd")
+
+	// Create /dev/pts directory and mount devpts
+	os.MkdirAll("/dev/pts", 0755)
+	unix.Mount("devpts", "/dev/pts", "devpts", unix.MS_NOSUID|unix.MS_NOEXEC, "newinstance,ptmxmode=0666,mode=620")
+
+	// Create /dev/ptmx symlink to /dev/pts/ptmx for the newinstance mount
+	os.Symlink("pts/ptmx", "/dev/ptmx")
+
+	// Create /dev/shm for shared memory
+	os.MkdirAll("/dev/shm", 1777)
+	unix.Mount("tmpfs", "/dev/shm", "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "mode=1777,size=65536k")
+
+	// Create /dev/mqueue for POSIX message queues (optional but some programs expect it)
+	os.MkdirAll("/dev/mqueue", 0755)
+	unix.Mount("mqueue", "/dev/mqueue", "mqueue", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "")
 }
 
 // findExecutable looks up the executable path, searching PATH if necessary.

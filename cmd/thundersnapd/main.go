@@ -1501,9 +1501,9 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 			return fmt.Errorf("btrfs subvolume create home at %s failed: %w\noutput: %s",
 				homePath, err, string(output))
 		}
-		// Set ownership to shared UID 1000
+		// Chown to user 1000 (the standard container user)
 		if err := os.Chown(homePath, 1000, 1000); err != nil {
-			log.Printf("Warning: failed to chown home directory: %v", err)
+			log.Printf("Warning: failed to chown home subvolume: %v", err)
 		}
 	}
 
@@ -1536,9 +1536,9 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 			return fmt.Errorf("btrfs subvolume create work at %s failed: %w\noutput: %s",
 				workPath, err, string(output))
 		}
-		// Set ownership to shared UID 1000
+		// Chown to user 1000 (the standard container user)
 		if err := os.Chown(workPath, 1000, 1000); err != nil {
-			log.Printf("Warning: failed to chown work directory: %v", err)
+			log.Printf("Warning: failed to chown work subvolume: %v", err)
 		}
 	}
 
@@ -1584,6 +1584,15 @@ func isSubvolume(path string) bool {
 	cmd := exec.Command("btrfs", "subvolume", "show", path)
 	err := cmd.Run()
 	return err == nil
+}
+
+// isDirEmpty returns true if the directory contains no files (ignoring . and ..).
+func isDirEmpty(path string) bool {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return true // treat errors as empty
+	}
+	return len(entries) == 0
 }
 
 // ensureResolvConf copies the host's /etc/resolv.conf into the frame if
@@ -3452,9 +3461,9 @@ func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string
 		return rootfsID, nil
 	}
 
-	// Snapshot home if it's a subvolume
+	// Snapshot home if it's a subvolume and not empty
 	homeID := ""
-	if hasHomeSubvol {
+	if hasHomeSubvol && !isDirEmpty(homePath) {
 		homeParent := ""
 		if frameMeta != nil && frameMeta.Home != "" {
 			homeParent = frameMeta.Home
@@ -3465,9 +3474,9 @@ func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string
 		}
 	}
 
-	// Snapshot work if it's a subvolume
+	// Snapshot work if it's a subvolume and not empty
 	workID := ""
-	if hasWorkSubvol {
+	if hasWorkSubvol && !isDirEmpty(workPath) {
 		workParent := ""
 		if frameMeta != nil && frameMeta.Work != "" {
 			workParent = frameMeta.Work
