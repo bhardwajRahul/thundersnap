@@ -187,6 +187,7 @@ func copyFile(src, dst string) error {
 
 // createBaseSnapshot creates a minimal base snapshot "1" with test files.
 // This mimics what downloading a Docker image would produce.
+// It uses the programmatic test fixture generator for reproducible results.
 func (e *testEnv) createBaseSnapshot() string {
 	e.t.Helper()
 
@@ -198,64 +199,10 @@ func (e *testEnv) createBaseSnapshot() string {
 		e.t.Fatalf("btrfs subvolume create: %v\n%s", err, out)
 	}
 
-	// Populate with minimal filesystem
-	e.populateRootFS(snapPath)
+	// Use the fixture generator to create a comprehensive test filesystem
+	CreateTestContainer(e.t, snapPath, e.tsBinary)
 
 	return "1"
-}
-
-// populateRootFS creates a minimal Linux root filesystem structure.
-func (e *testEnv) populateRootFS(dir string) {
-	e.t.Helper()
-
-	// Create directory structure
-	dirs := []string{
-		"bin", "etc", "home/user", "lib", "proc", "root", "sys",
-		"tmp", "usr/bin", "usr/lib", "var/log", "work",
-	}
-	for _, d := range dirs {
-		if err := os.MkdirAll(filepath.Join(dir, d), 0755); err != nil {
-			e.t.Fatalf("mkdir %s: %v", d, err)
-		}
-	}
-
-	// Create /etc/passwd and /etc/group
-	passwd := `root:x:0:0:root:/root:/bin/sh
-user:x:1000:1000:user:/home/user:/bin/sh
-daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
-`
-	group := `root:x:0:
-user:x:1000:
-daemon:x:1:
-`
-	if err := os.WriteFile(filepath.Join(dir, "etc/passwd"), []byte(passwd), 0644); err != nil {
-		e.t.Fatalf("write passwd: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "etc/group"), []byte(group), 0644); err != nil {
-		e.t.Fatalf("write group: %v", err)
-	}
-
-	// Set ownership on home and work directories
-	if err := os.Chown(filepath.Join(dir, "home/user"), 1000, 1000); err != nil {
-		e.t.Fatalf("chown home: %v", err)
-	}
-	if err := os.Chown(filepath.Join(dir, "work"), 1000, 1000); err != nil {
-		e.t.Fatalf("chown work: %v", err)
-	}
-
-	// Create a test file with non-root ownership
-	testFile := filepath.Join(dir, "home/user/.profile")
-	if err := os.WriteFile(testFile, []byte("# user profile\n"), 0644); err != nil {
-		e.t.Fatalf("write .profile: %v", err)
-	}
-	if err := os.Chown(testFile, 1000, 1000); err != nil {
-		e.t.Fatalf("chown .profile: %v", err)
-	}
-
-	// Copy ts binary to /bin/ts
-	if err := copyFile(e.tsBinary, filepath.Join(dir, "bin/ts")); err != nil {
-		e.t.Fatalf("copy ts to snapshot: %v", err)
-	}
 }
 
 // httpClient is an HTTP client that talks to a Unix socket.
