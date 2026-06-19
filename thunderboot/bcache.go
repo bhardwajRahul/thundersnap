@@ -12,11 +12,11 @@ import (
 // bcache superblock constants from Linux kernel / bcache-tools
 // See: https://github.com/koverstreet/bcache-tools/blob/master/bcache.h
 const (
-	SB_SECTOR            = 8    // superblock is at sector 8 (4096 bytes)
-	SB_START             = SB_SECTOR * 512
-	SB_LABEL_SIZE        = 32
-	SB_JOURNAL_BUCKETS   = 256
-	BDEV_DATA_START      = 16   // sectors - where actual data starts for backing devices
+	SB_SECTOR          = 8 // superblock is at sector 8 (4096 bytes)
+	SB_START           = SB_SECTOR * 512
+	SB_LABEL_SIZE      = 32
+	SB_JOURNAL_BUCKETS = 256
+	BDEV_DATA_START    = 16 // sectors - where actual data starts for backing devices
 
 	// Version constants
 	BCACHE_SB_VERSION_CDEV             = 0
@@ -51,24 +51,24 @@ var bcacheMagic = [16]byte{
 // cacheSB represents the bcache superblock structure.
 // This matches struct cache_sb from bcache.h.
 type cacheSB struct {
-	Csum      uint64
-	Offset    uint64     // sector where this sb was written
-	Version   uint64
-	Magic     [16]byte
-	UUID      [16]byte
-	SetUUID   [16]byte   // for cache devices: identifies the cache set
-	Label     [32]byte
-	Flags     uint64
-	Seq       uint64
-	Pad       [8]uint64
+	Csum    uint64
+	Offset  uint64 // sector where this sb was written
+	Version uint64
+	Magic   [16]byte
+	UUID    [16]byte
+	SetUUID [16]byte // for cache devices: identifies the cache set
+	Label   [32]byte
+	Flags   uint64
+	Seq     uint64
+	Pad     [8]uint64
 
 	// Union: cache device fields OR backing device fields
 	// For cache devices:
-	NBuckets    uint64
-	BlockSize   uint16   // sectors
-	BucketSize  uint16   // sectors
-	NrInSet     uint16
-	NrThisDev   uint16
+	NBuckets   uint64
+	BlockSize  uint16 // sectors
+	BucketSize uint16 // sectors
+	NrInSet    uint16
+	NrThisDev  uint16
 	// For backing devices, NBuckets becomes DataOffset
 
 	LastMount       uint32
