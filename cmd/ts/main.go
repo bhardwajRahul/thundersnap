@@ -105,6 +105,9 @@ func main() {
 	case "drop-caps-and-run":
 		// Hidden command - not listed in usage
 		cmdDropCapsAndRun(cmdArgs)
+	case "check-dev":
+		// Hidden command for e2e testing - outputs /dev state
+		cmdCheckDev()
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command: %s\n", cmd)
 		os.Exit(1)
@@ -2008,6 +2011,57 @@ func setupDev() {
 	// Create /dev/mqueue for POSIX message queues (optional but some programs expect it)
 	os.MkdirAll("/dev/mqueue", 0755)
 	unix.Mount("mqueue", "/dev/mqueue", "mqueue", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "")
+}
+
+// cmdCheckDev outputs the state of /dev for e2e testing.
+// Output format is one item per line:
+//
+//	DEV:<name>:<exists|missing>:<perms>
+//	LINK:<name>:<exists|missing>:<target>
+//	DIR:<name>:<exists|missing>
+//	DONE
+func cmdCheckDev() {
+	// Check device nodes
+	devices := []string{"null", "zero", "full", "random", "urandom", "tty"}
+	for _, dev := range devices {
+		path := "/dev/" + dev
+		info, err := os.Lstat(path)
+		if err != nil {
+			fmt.Printf("DEV:%s:missing:0\n", dev)
+			continue
+		}
+		if info.Mode()&os.ModeCharDevice == 0 {
+			fmt.Printf("DEV:%s:not-chardev:%o\n", dev, info.Mode().Perm())
+			continue
+		}
+		fmt.Printf("DEV:%s:exists:%o\n", dev, info.Mode().Perm())
+	}
+
+	// Check symlinks
+	links := []string{"stdin", "stdout", "stderr", "fd"}
+	for _, link := range links {
+		path := "/dev/" + link
+		target, err := os.Readlink(path)
+		if err != nil {
+			fmt.Printf("LINK:%s:missing:\n", link)
+			continue
+		}
+		fmt.Printf("LINK:%s:exists:%s\n", link, target)
+	}
+
+	// Check directories
+	dirs := []string{"pts", "shm", "mqueue"}
+	for _, dir := range dirs {
+		path := "/dev/" + dir
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			fmt.Printf("DIR:%s:missing\n", dir)
+			continue
+		}
+		fmt.Printf("DIR:%s:exists\n", dir)
+	}
+
+	fmt.Println("DONE")
 }
 
 // findExecutable looks up the executable path, searching PATH if necessary.

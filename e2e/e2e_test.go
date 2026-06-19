@@ -357,3 +357,129 @@ func TestE2EOwnership(t *testing.T) {
 		t.Errorf(".profile ownership: got %d:%d, want 1000:1000", stat.Uid, stat.Gid)
 	}
 }
+
+// TestE2EDevSetup verifies that ts drop-caps-and-run creates /dev correctly.
+// This tests the fix for device permission issues where Mknod wasn't respecting
+// mode bits due to umask - we now call Chmod after Mknod to ensure 0666 perms.
+func TestE2EDevSetup(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create a base snapshot and frame
+	baseSnap := env.createBaseSnapshot()
+	framePath := filepath.Join(env.fsDir, "testuser", "devtest")
+
+	// Create the frame directory structure
+	if err := os.MkdirAll(filepath.Dir(framePath), 0755); err != nil {
+		t.Fatalf("mkdir frame parent: %v", err)
+	}
+
+	// Clone snapshot to frame
+	cmd := exec.Command("btrfs", "subvolume", "snapshot",
+		filepath.Join(env.snapshotsDir, baseSnap), framePath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("btrfs snapshot: %v\n%s", err, out)
+	}
+
+	// Copy ts binary into the frame
+	tsDst := filepath.Join(framePath, "bin/ts")
+	if err := copyFile(env.tsBinary, tsDst); err != nil {
+		t.Fatalf("copy ts to frame: %v", err)
+	}
+
+	// Get absolute path for the frame (required for ts --chroot)
+	absFramePath, err := filepath.Abs(framePath)
+	if err != nil {
+		t.Fatalf("abs path: %v", err)
+	}
+
+	// Run ts drop-caps-and-run the same way thundersnapd does:
+	// The ts binary is run with CLONE_NEWPID, CLONE_NEWNS, CLONE_NEWUTS set
+	// via SysProcAttr.Cloneflags. ts then:
+	// 1. Makes all mounts private
+	// 2. Chroots into the container
+	// 3. Mounts /proc, /sys
+	// 4. Calls setupDev() to create /dev with device nodes
+	// 5. Execs the specified command
+	//
+	// We use the ts "check-dev" command which outputs /dev state in a parseable
+	// format, avoiding the need for a shell.
+	tsBinary := filepath.Join(absFramePath, "bin", "ts")
+	cmd = exec.Command(tsBinary, "drop-caps-and-run",
+		"--chroot="+absFramePath,
+		"--", "/bin/ts", "check-dev")
+	cmd.Dir = "/"
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Logf("ts drop-caps-and-run output: %s", output)
+		t.Fatalf("ts drop-caps-and-run error: %v", err)
+	}
+	// Parse results and verify
+	lines := strings.Split(string(output), "\n")
+	devicePerms := make(map[string]string)
+	linkTargets := make(map[string]string)
+	dirs := make(map[string]bool)
+
+	for _, line := range lines {
+		parts := strings.Split(line, ":")
+		if len(parts) < 3 {
+			continue
+		}
+		switch parts[0] {
+		case "DEV":
+			if parts[2] == "exists" && len(parts) >= 4 {
+				devicePerms[parts[1]] = parts[3]
+			}
+		case "LINK":
+			if parts[2] == "exists" && len(parts) >= 4 {
+				linkTargets[parts[1]] = parts[3]
+			}
+		case "DIR":
+			if parts[2] == "exists" {
+				dirs[parts[1]] = true
+			}
+		}
+	}
+
+	// Verify device permissions are 666 (the fix ensures this via Chmod after Mknod)
+	expectedDevices := []string{"null", "zero", "full", "random", "urandom", "tty"}
+	for _, dev := range expectedDevices {
+		perm, ok := devicePerms[dev]
+		if !ok {
+			t.Errorf("/dev/%s: not found", dev)
+			continue
+		}
+		if perm != "666" {
+			t.Errorf("/dev/%s: permissions = %s, want 666", dev, perm)
+		}
+	}
+
+	// Verify symlinks
+	expectedLinks := map[string]string{
+		"stdin":  "/proc/self/fd/0",
+		"stdout": "/proc/self/fd/1",
+		"stderr": "/proc/self/fd/2",
+		"fd":     "/proc/self/fd",
+	}
+	for link, expectedTarget := range expectedLinks {
+		target, ok := linkTargets[link]
+		if !ok {
+			t.Errorf("/dev/%s: symlink not found", link)
+			continue
+		}
+		if target != expectedTarget {
+			t.Errorf("/dev/%s: target = %q, want %q", link, target, expectedTarget)
+		}
+	}
+
+	// Verify directories
+	expectedDirs := []string{"pts", "shm", "mqueue"}
+	for _, dir := range expectedDirs {
+		if !dirs[dir] {
+			t.Errorf("/dev/%s: directory not found", dir)
+		}
+	}
+}
