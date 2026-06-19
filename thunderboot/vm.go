@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/creack/pty"
@@ -35,12 +36,17 @@ type VMConfig struct {
 	// This appears as /dev/vda in the guest.
 	CacheFile string
 	// BackingFile is the path to the host file used as the slow bcache backing device.
-	// This appears as /dev/vdb in the guest.
+	// This appears as /dev/vdb in the guest. Mutually exclusive with BackingNBD.
 	BackingFile string
 	// CacheSizeMB is the size of the cache file in megabytes.
 	CacheSizeMB int
 	// BackingSizeMB is the size of the backing file in megabytes.
+	// Only used when BackingNBD is empty.
 	BackingSizeMB int
+	// BackingNBD is the host:port of an NBD server to use as the backing device.
+	// When set, the guest connects to this NBD server instead of using a local file.
+	// Mutually exclusive with BackingFile/BackingSizeMB.
+	BackingNBD string
 	// MemoryMB is the VM memory size in megabytes. Default is 512.
 	MemoryMB int
 	// InitScript is an optional custom init script to run instead of the default.
@@ -72,6 +78,12 @@ func DefaultInitScript() string {
 	return `echo 'init: mounting essential filesystems'; mkdir -p /dev/pts /proc /sys; mount -t devpts devpts /dev/pts; mount -t proc proc /proc; mount -t sysfs sysfs /sys; echo 'init: configuring network'; ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; echo 'init: setting up bcache'; echo /dev/vdb > /sys/fs/bcache/register; sleep 1; echo /dev/vda > /sys/fs/bcache/register; sleep 1; ls -la /dev/bcache0 2>/dev/null && echo 'init: /dev/bcache0 exists' || echo 'init: /dev/bcache0 not found'; cat /sys/block/bcache0/bcache/state 2>/dev/null || true; echo 'init: starting vshd'; exec /sbin/vshd`
 }
 
+// NBDInitScript returns an init script that connects to an NBD server for the backing device.
+// The cache device is still /dev/vda, but the backing device comes from NBD on /dev/nbd0.
+func NBDInitScript(nbdHost, nbdPort string) string {
+	return fmt.Sprintf(`echo 'init: mounting essential filesystems'; mkdir -p /dev/pts /proc /sys; mount -t devpts devpts /dev/pts; mount -t proc proc /proc; mount -t sysfs sysfs /sys; echo 'init: configuring network'; ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; echo 'init: loading nbd module'; modprobe nbd; echo 'init: connecting to NBD server %s:%s'; nbd-client %s %s /dev/nbd0 -persist; echo 'init: setting up bcache with NBD backing'; echo /dev/nbd0 > /sys/fs/bcache/register; sleep 1; echo /dev/vda > /sys/fs/bcache/register; sleep 1; ls -la /dev/bcache0 2>/dev/null && echo 'init: /dev/bcache0 exists' || echo 'init: /dev/bcache0 not found'; cat /sys/block/bcache0/bcache/state 2>/dev/null || true; echo 'init: starting vshd'; exec /sbin/vshd`, nbdHost, nbdPort, nbdHost, nbdPort)
+}
+
 // StartVM starts a new thunderboot VM session with bcache-backed storage.
 func StartVM(cfg VMConfig) (*VMSession, error) {
 	if cfg.MemoryMB == 0 {
@@ -80,9 +92,11 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	if cfg.CacheSizeMB == 0 {
 		cfg.CacheSizeMB = 256
 	}
-	if cfg.BackingSizeMB == 0 {
+	if cfg.BackingSizeMB == 0 && cfg.BackingNBD == "" {
 		cfg.BackingSizeMB = 512
 	}
+
+	useNBD := cfg.BackingNBD != ""
 
 	// Create unique socket paths for this session
 	sessionID := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
@@ -90,35 +104,47 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	vsockSock := filepath.Join("/tmp", fmt.Sprintf("tb-vsock-%s.sock", sessionID))
 	passtSock := filepath.Join("/tmp", fmt.Sprintf("tb-passt-%s.sock", sessionID))
 
-	// Create cache and backing files if paths not provided
+	// Create cache file if path not provided
 	cacheFile := cfg.CacheFile
-	backingFile := cfg.BackingFile
 	if cacheFile == "" {
 		cacheFile = filepath.Join("/tmp", fmt.Sprintf("tb-cache-%s.img", sessionID))
 	}
-	if backingFile == "" {
-		backingFile = filepath.Join("/tmp", fmt.Sprintf("tb-backing-%s.img", sessionID))
-	}
 
-	// Create sparse files for cache and backing devices
+	// Create sparse file for cache device
 	if err := createSparseFile(cacheFile, int64(cfg.CacheSizeMB)*1024*1024); err != nil {
 		return nil, fmt.Errorf("create cache file: %w", err)
 	}
-	if err := createSparseFile(backingFile, int64(cfg.BackingSizeMB)*1024*1024); err != nil {
-		os.Remove(cacheFile)
-		return nil, fmt.Errorf("create backing file: %w", err)
-	}
 
-	// Format files with bcache metadata
+	// Format cache file with bcache metadata
 	if err := formatBcacheCache(cacheFile); err != nil {
 		os.Remove(cacheFile)
-		os.Remove(backingFile)
 		return nil, fmt.Errorf("format cache device: %w", err)
 	}
-	if err := formatBcacheBacking(backingFile); err != nil {
+
+	// Create backing file only if not using NBD
+	var backingFile string
+	if !useNBD {
+		backingFile = cfg.BackingFile
+		if backingFile == "" {
+			backingFile = filepath.Join("/tmp", fmt.Sprintf("tb-backing-%s.img", sessionID))
+		}
+		if err := createSparseFile(backingFile, int64(cfg.BackingSizeMB)*1024*1024); err != nil {
+			os.Remove(cacheFile)
+			return nil, fmt.Errorf("create backing file: %w", err)
+		}
+		if err := formatBcacheBacking(backingFile); err != nil {
+			os.Remove(cacheFile)
+			os.Remove(backingFile)
+			return nil, fmt.Errorf("format backing device: %w", err)
+		}
+	}
+
+	// Helper to clean up files on error
+	cleanupFiles := func() {
 		os.Remove(cacheFile)
-		os.Remove(backingFile)
-		return nil, fmt.Errorf("format backing device: %w", err)
+		if backingFile != "" {
+			os.Remove(backingFile)
+		}
 	}
 
 	// Start virtiofsd
@@ -130,8 +156,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	)
 	virtiofsdCmd.Stderr = os.Stderr
 	if err := virtiofsdCmd.Start(); err != nil {
-		os.Remove(cacheFile)
-		os.Remove(backingFile)
+		cleanupFiles()
 		return nil, fmt.Errorf("start virtiofsd: %w", err)
 	}
 
@@ -139,8 +164,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	if err := waitForSocket(virtiofsSock, 5*time.Second); err != nil {
 		virtiofsdCmd.Process.Kill()
 		virtiofsdCmd.Wait()
-		os.Remove(cacheFile)
-		os.Remove(backingFile)
+		cleanupFiles()
 		return nil, fmt.Errorf("virtiofsd socket: %w", err)
 	}
 	log.Printf("virtiofsd socket ready at %s", virtiofsSock)
@@ -161,8 +185,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		virtiofsdCmd.Process.Kill()
 		virtiofsdCmd.Wait()
 		os.Remove(virtiofsSock)
-		os.Remove(cacheFile)
-		os.Remove(backingFile)
+		cleanupFiles()
 		return nil, fmt.Errorf("start passt: %w", err)
 	}
 
@@ -172,8 +195,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		virtiofsdCmd.Process.Kill()
 		virtiofsdCmd.Wait()
 		os.Remove(virtiofsSock)
-		os.Remove(cacheFile)
-		os.Remove(backingFile)
+		cleanupFiles()
 		return nil, fmt.Errorf("passt socket: %w", err)
 	}
 	log.Printf("passt socket ready at %s", passtSock)
@@ -181,7 +203,16 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// Build init script
 	initScript := cfg.InitScript
 	if initScript == "" {
-		initScript = DefaultInitScript()
+		if useNBD {
+			// Parse host:port from BackingNBD
+			nbdHost, nbdPort, _ := strings.Cut(cfg.BackingNBD, ":")
+			if nbdPort == "" {
+				nbdPort = "10809" // default NBD port
+			}
+			initScript = NBDInitScript(nbdHost, nbdPort)
+		} else {
+			initScript = DefaultInitScript()
+		}
 	}
 
 	// Build kernel command line
@@ -197,7 +228,11 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// Start cloud-hypervisor with block devices
 	// Note: cloud-hypervisor v49+ requires multiple disk specs as separate values
 	// to a single --disk argument, not multiple --disk flags
-	log.Printf("Starting cloud-hypervisor with bcache devices")
+	if useNBD {
+		log.Printf("Starting cloud-hypervisor with NBD backing (%s)", cfg.BackingNBD)
+	} else {
+		log.Printf("Starting cloud-hypervisor with bcache devices")
+	}
 	chvArgs := []string{
 		"--kernel", kernelPath,
 		"--cpus", "boot=1",
@@ -205,14 +240,18 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		"--fs", fmt.Sprintf("tag=rootfs,socket=%s", virtiofsSock),
 		"--net", fmt.Sprintf("vhost_user=true,socket=%s,num_queues=2", passtSock),
 		"--disk",
-		fmt.Sprintf("path=%s", cacheFile),   // /dev/vda - cache
-		fmt.Sprintf("path=%s", backingFile), // /dev/vdb - backing
+		fmt.Sprintf("path=%s", cacheFile), // /dev/vda - cache
+	}
+	if !useNBD {
+		chvArgs = append(chvArgs, fmt.Sprintf("path=%s", backingFile)) // /dev/vdb - backing
+	}
+	chvArgs = append(chvArgs,
 		"--cmdline", cmdline,
 		"--serial", "tty",
 		"--console", "off",
 		"--pvpanic",
 		"--vsock", fmt.Sprintf("cid=3,socket=%s", vsockSock),
-	}
+	)
 	chvCmd := exec.Command(chvPath, chvArgs...)
 
 	session := &VMSession{

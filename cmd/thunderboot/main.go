@@ -46,7 +46,8 @@ func main() {
 	autoRootFS := getopt.BoolLong("auto-rootfs", 'a', "Create a minimal rootfs automatically")
 	vmDir := getopt.StringLong("vmdir", 'v', "", "Directory containing cloud-hypervisor and vmlinux")
 	cacheMB := getopt.IntLong("cache-mb", 'c', 256, "Size of bcache cache device in MB")
-	backingMB := getopt.IntLong("backing-mb", 'b', 512, "Size of bcache backing device in MB")
+	backingMB := getopt.IntLong("backing-mb", 'b', 0, "Size of bcache backing device in MB (mutually exclusive with --backing-nbd)")
+	backingNBD := getopt.StringLong("backing-nbd", 0, "", "NBD server host:port for backing device (mutually exclusive with --backing-mb)")
 	memoryMB := getopt.IntLong("memory-mb", 'm', 512, "VM memory size in MB")
 	noBcache := getopt.BoolLong("no-bcache", 'n', "Skip bcache setup, just boot with virtiofs")
 	help := getopt.BoolLong("help", 'h', "Show help")
@@ -93,6 +94,14 @@ func main() {
 		log.Fatal("Cannot use / as rootfs. virtiofsd cannot pivot_root when sharing /. Use -auto-rootfs or specify a different directory.")
 	}
 
+	// Validate backing device options
+	if *backingMB > 0 && *backingNBD != "" {
+		log.Fatal("Cannot specify both --backing-mb and --backing-nbd")
+	}
+	if *backingMB == 0 && *backingNBD == "" && !*noBcache {
+		*backingMB = 512 // default when neither specified
+	}
+
 	// Create auto rootfs if requested
 	var tempRootFS string
 	if *autoRootFS {
@@ -112,6 +121,7 @@ func main() {
 		VMDir:         *vmDir,
 		CacheSizeMB:   *cacheMB,
 		BackingSizeMB: *backingMB,
+		BackingNBD:    *backingNBD,
 		MemoryMB:      *memoryMB,
 	}
 
@@ -139,7 +149,12 @@ echo 'init: vshd exited, powering off'
 	log.Printf("Starting thunderboot VM...")
 	log.Printf("  RootFS: %s", cfg.RootFS)
 	log.Printf("  VMDir: %s", cfg.VMDir)
-	log.Printf("  Cache: %d MB, Backing: %d MB", cfg.CacheSizeMB, cfg.BackingSizeMB)
+	log.Printf("  Cache: %d MB", cfg.CacheSizeMB)
+	if cfg.BackingNBD != "" {
+		log.Printf("  Backing: NBD %s", cfg.BackingNBD)
+	} else {
+		log.Printf("  Backing: %d MB (local file)", cfg.BackingSizeMB)
+	}
 	log.Printf("  Memory: %d MB", cfg.MemoryMB)
 	if *noBcache {
 		log.Printf("  bcache: disabled")
