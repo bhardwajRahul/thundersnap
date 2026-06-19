@@ -47,7 +47,9 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  bupdate        download and reconstruct files from mesh peers")
 	fmt.Fprintln(os.Stderr, "  fidx           create a file index (.fidx) for a file or directory")
 	fmt.Fprintln(os.Stderr, "  snap           create a snapshot of the current container/VM")
+	fmt.Fprintln(os.Stderr, "  snaps          list all snapshots with sizes")
 	fmt.Fprintln(os.Stderr, "  frame          create a new frame from root:home:work snaps")
+	fmt.Fprintln(os.Stderr, "  frames         list all frames with status")
 	fmt.Fprintln(os.Stderr, "  taint          add a taint to the current frame")
 	fmt.Fprintln(os.Stderr, "  download-docker download a Docker image as a snap")
 	fmt.Fprintln(os.Stderr, "  who-has        query peers to find which ones have a snap")
@@ -86,8 +88,12 @@ func main() {
 		cmdFidx(cmdArgs)
 	case "snap":
 		cmdSnap(cmdArgs)
+	case "snaps":
+		cmdSnaps(cmdArgs)
 	case "frame":
 		cmdFrame(cmdArgs)
+	case "frames":
+		cmdFrames(cmdArgs)
 	case "taint":
 		cmdTaint(cmdArgs)
 	case "download-docker":
@@ -307,6 +313,24 @@ func cmdSnap(args []string) {
 	fmt.Println(snapshotID)
 }
 
+func cmdSnaps(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts snaps")
+	// Parse expects first element to be program name (like os.Args)
+	opts.Parse(append([]string{"ts snaps"}, args...))
+
+	if opts.NArgs() > 0 {
+		fmt.Fprintln(os.Stderr, "error: snaps takes no arguments")
+		fmt.Fprintln(os.Stderr, "usage: ts snaps    list all snapshots")
+		os.Exit(1)
+	}
+
+	if err := doListSnaps(*sockPath); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 // SnapResponse is the response from the /snap endpoint (non-streaming)
 type SnapResponse struct {
 	Status     string `json:"status"`
@@ -457,6 +481,57 @@ func doDeleteSnap(sockPath, snapshotID string) error {
 
 	if result.Status != "ok" {
 		return fmt.Errorf("%s", result.Message)
+	}
+
+	return nil
+}
+
+// ListSnapsResponse is the response from /list-snaps
+type ListSnapsResponse struct {
+	Status string     `json:"status"`
+	Snaps  []SnapInfo `json:"snaps,omitempty"`
+	Error  string     `json:"error,omitempty"`
+}
+
+// SnapInfo contains info about a single snapshot
+type SnapInfo struct {
+	ID   string `json:"id"`
+	Size uint64 `json:"size"` // Total size in bytes from TSM header
+}
+
+func doListSnaps(sockPath string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	resp, err := client.Get("http://localhost/list-snaps")
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result ListSnapsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("%s", result.Error)
+	}
+
+	// Sort by ID for consistent output
+	sort.Slice(result.Snaps, func(i, j int) bool {
+		return result.Snaps[i].ID < result.Snaps[j].ID
+	})
+
+	// Print in du-like format: size first, then ID
+	for _, snap := range result.Snaps {
+		sizeGB := float64(snap.Size) / (1024 * 1024 * 1024)
+		fmt.Printf("%8.3fG  %s\n", sizeGB, snap.ID)
 	}
 
 	return nil
@@ -942,6 +1017,24 @@ func cmdFrame(args []string) {
 	}
 }
 
+func cmdFrames(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts frames")
+	// Parse expects first element to be program name (like os.Args)
+	opts.Parse(append([]string{"ts frames"}, args...))
+
+	if opts.NArgs() > 0 {
+		fmt.Fprintln(os.Stderr, "error: frames takes no arguments")
+		fmt.Fprintln(os.Stderr, "usage: ts frames    list all frames")
+		os.Exit(1)
+	}
+
+	if err := doListFrames(*sockPath); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 // CreateRequest is the request body for /create
 type CreateRequest struct {
 	FrameName  string `json:"frame_name"`
@@ -1112,6 +1205,56 @@ func doDeleteFrame(sockPath, frameName string) error {
 
 	if result.Status != "ok" {
 		return fmt.Errorf("%s", result.Message)
+	}
+
+	return nil
+}
+
+// ListFramesResponse is the response from /list-frames
+type ListFramesResponse struct {
+	Status string      `json:"status"`
+	Frames []FrameInfo `json:"frames,omitempty"`
+	Error  string      `json:"error,omitempty"`
+}
+
+// FrameInfo contains info about a single frame
+type FrameInfo struct {
+	Name   string `json:"name"`
+	Status string `json:"status"` // "stopped" or "running"
+}
+
+func doListFrames(sockPath string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	resp, err := client.Get("http://localhost/list-frames")
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result ListFramesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("%s", result.Error)
+	}
+
+	// Sort by name for consistent output
+	sort.Slice(result.Frames, func(i, j int) bool {
+		return result.Frames[i].Name < result.Frames[j].Name
+	})
+
+	// Print with fixed-width status column
+	for _, frame := range result.Frames {
+		fmt.Printf("%-7s  %s\n", frame.Status, frame.Name)
 	}
 
 	return nil

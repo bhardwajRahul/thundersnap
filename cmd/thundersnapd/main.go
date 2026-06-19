@@ -89,6 +89,37 @@ var vmSessions = &vmSessionManager{
 	sessions: make(map[string]*managedVMSession),
 }
 
+// activeFrames tracks which frames have active control servers (and thus active sessions).
+// Key is the frame path (e.g., /fs/user/framename), value is the number of active sessions.
+var activeFrames = struct {
+	sync.Mutex
+	count map[string]int
+}{count: make(map[string]int)}
+
+// registerActiveFrame increments the active session count for a frame.
+func registerActiveFrame(framePath string) {
+	activeFrames.Lock()
+	activeFrames.count[framePath]++
+	activeFrames.Unlock()
+}
+
+// unregisterActiveFrame decrements the active session count for a frame.
+func unregisterActiveFrame(framePath string) {
+	activeFrames.Lock()
+	activeFrames.count[framePath]--
+	if activeFrames.count[framePath] <= 0 {
+		delete(activeFrames.count, framePath)
+	}
+	activeFrames.Unlock()
+}
+
+// getActiveFrameCount returns the number of active sessions for a frame.
+func getActiveFrameCount(framePath string) int {
+	activeFrames.Lock()
+	defer activeFrames.Unlock()
+	return activeFrames.count[framePath]
+}
+
 // getOrCreateVM returns an existing VM session or creates a new one.
 // The caller must call releaseVM when done.
 func (m *vmSessionManager) getOrCreateVM(tailscaleUser, vmUser, rootFS, vmDir string, controlHandler http.Handler) (*managedVMSession, error) {
@@ -1701,6 +1732,7 @@ func (c *controlServer) Close() error {
 	c.listener.Close()
 	<-c.done
 	os.Remove(c.sockPath)
+	unregisterActiveFrame(c.rootFS)
 	return nil
 }
 
@@ -1736,6 +1768,8 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux.HandleFunc("/taint", cs.handleTaint)
 	mux.HandleFunc("/delete-snap", handleDeleteSnap)
 	mux.HandleFunc("/delete-frame", cs.handleDeleteFrame)
+	mux.HandleFunc("/list-snaps", handleListSnaps)
+	mux.HandleFunc("/list-frames", handleListFrames)
 	mux.HandleFunc("/download-docker", handleDownloadDocker)
 	mux.HandleFunc("/download-snap", handleDownloadSnap)
 	mux.HandleFunc("/who-has", handleWhoHas)
@@ -1744,6 +1778,7 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 
 	go cs.serve()
 
+	registerActiveFrame(rootFS)
 	return cs, nil
 }
 
@@ -2436,6 +2471,147 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(DeleteFrameResponse{
 		Status: "ok",
+	})
+}
+
+// ListSnapsResponse is the response from /list-snaps
+type ListSnapsResponse struct {
+	Status string     `json:"status"`
+	Snaps  []SnapInfo `json:"snaps,omitempty"`
+	Error  string     `json:"error,omitempty"`
+}
+
+// SnapInfo contains info about a single snapshot
+type SnapInfo struct {
+	ID   string `json:"id"`
+	Size uint64 `json:"size"` // Total size in bytes from TSM header
+}
+
+// handleListSnaps handles GET /list-snaps - list all snapshots with sizes
+func handleListSnaps(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	entries, err := os.ReadDir(*flagSnapshotsDir)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ListSnapsResponse{
+			Status: "error",
+			Error:  fmt.Sprintf("read snapshots dir: %v", err),
+		})
+		return
+	}
+
+	var snaps []SnapInfo
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".tsm") {
+			continue
+		}
+
+		snapID := strings.TrimSuffix(entry.Name(), ".tsm")
+
+		// Read TSM to get size from header
+		tsmPath := filepath.Join(*flagSnapshotsDir, entry.Name())
+		tsmReader, err := tsm.ReadTSM(tsmPath)
+		if err != nil {
+			// If we can't read the TSM, skip this snap
+			log.Printf("Warning: failed to read TSM for %s: %v", snapID, err)
+			continue
+		}
+
+		snaps = append(snaps, SnapInfo{
+			ID:   snapID,
+			Size: tsmReader.Header.TotalSize,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ListSnapsResponse{
+		Status: "ok",
+		Snaps:  snaps,
+	})
+}
+
+// ListFramesResponse is the response from /list-frames
+type ListFramesResponse struct {
+	Status string      `json:"status"`
+	Frames []FrameInfo `json:"frames,omitempty"`
+	Error  string      `json:"error,omitempty"`
+}
+
+// FrameInfo contains info about a single frame
+type FrameInfo struct {
+	Name   string `json:"name"`
+	Status string `json:"status"` // "stopped" or number of processes
+}
+
+// handleListFrames handles GET /list-frames - list all frames with status
+func handleListFrames(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Walk the fs-dir to find all frames
+	// Structure: fs-dir/<user>/<frame-name>/ with <frame-name>.jsonc metadata
+	var frames []FrameInfo
+
+	userEntries, err := os.ReadDir(*flagFsDir)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ListFramesResponse{
+			Status: "error",
+			Error:  fmt.Sprintf("read fs dir: %v", err),
+		})
+		return
+	}
+
+	for _, userEntry := range userEntries {
+		if !userEntry.IsDir() {
+			continue
+		}
+		userName := userEntry.Name()
+		userDir := filepath.Join(*flagFsDir, userName)
+
+		frameEntries, err := os.ReadDir(userDir)
+		if err != nil {
+			continue
+		}
+
+		for _, frameEntry := range frameEntries {
+			if !frameEntry.IsDir() {
+				continue
+			}
+			frameName := frameEntry.Name()
+			framePath := filepath.Join(userDir, frameName)
+
+			// Check if metadata file exists to confirm it's a frame
+			if _, err := os.Stat(framePath + ".jsonc"); os.IsNotExist(err) {
+				continue
+			}
+
+			// Determine status based on active control servers
+			sessionCount := getActiveFrameCount(framePath)
+			status := "stopped"
+			if sessionCount > 0 {
+				status = fmt.Sprintf("%d", sessionCount)
+			}
+
+			frames = append(frames, FrameInfo{
+				Name:   frameName,
+				Status: status,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ListFramesResponse{
+		Status: "ok",
+		Frames: frames,
 	})
 }
 
