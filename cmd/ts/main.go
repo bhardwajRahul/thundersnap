@@ -1868,9 +1868,13 @@ func cmdDropCapsAndRun(args []string) {
 	// mount point. After CLONE_NEWNS, we have our own copy of the mount table
 	// but it still has "shared" propagation. Making it private here only
 	// affects our namespace, not the parent.
+	//
+	// In VM mode (running as init), this may fail because the root filesystem
+	// (virtiofs) doesn't support propagation changes. That's fine - VMs don't
+	// have mount propagation concerns anyway.
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to make mounts private: %v\n", err)
-		os.Exit(1)
+		// Only log, don't exit - this is expected to fail in VM mode
+		fmt.Fprintf(os.Stderr, "warning: failed to make mounts private: %v (ok in VM mode)\n", err)
 	}
 
 	// Chroot into the container rootfs if specified
@@ -1940,6 +1944,12 @@ func cmdDropCapsAndRun(args []string) {
 		}
 	}
 
+	// Ensure PATH is set - the kernel doesn't set it when starting init,
+	// and child processes (like vshd calling "su") need it.
+	if os.Getenv("PATH") == "" {
+		os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	}
+
 	// Find the executable in PATH
 	executable, err := findExecutable(cmdArgs[0])
 	if err != nil {
@@ -1958,6 +1968,24 @@ func cmdDropCapsAndRun(args []string) {
 // This creates a tmpfs at /dev with essential device nodes, symlinks,
 // /dev/pts for pseudoterminals, and /dev/shm for shared memory.
 func setupDev() {
+	// Check if /dev/vsock exists on devtmpfs before we mount over it.
+	// In VMs, /dev/vsock is a misc device that only works when backed by devtmpfs -
+	// creating it via mknod on a different filesystem doesn't work. We'll bind-mount
+	// it from devtmpfs after setting up our tmpfs.
+	//
+	// To preserve access to the original devtmpfs vsock, we mount devtmpfs at a
+	// temporary location first.
+	var vsockSource string
+	if _, err := os.Stat("/dev/vsock"); err == nil {
+		// vsock exists - mount devtmpfs at a temp location so we can bind-mount it later
+		os.MkdirAll("/tmp/.devtmpfs", 0755)
+		if err := unix.Mount("devtmpfs", "/tmp/.devtmpfs", "devtmpfs", 0, ""); err == nil {
+			if _, err := os.Stat("/tmp/.devtmpfs/vsock"); err == nil {
+				vsockSource = "/tmp/.devtmpfs/vsock"
+			}
+		}
+	}
+
 	// Mount tmpfs at /dev
 	if err := unix.Mount("tmpfs", "/dev", "tmpfs", unix.MS_NOSUID|unix.MS_STRICTATIME, "mode=755,size=65536k"); err != nil {
 		// /dev might not exist or we might not have permissions
@@ -1966,6 +1994,8 @@ func setupDev() {
 
 	// Create essential device nodes
 	// Format: name, mode, major, minor
+	// Note: vsock is NOT included here - it's a misc device that only works via
+	// devtmpfs, so we bind-mount it separately if it existed before.
 	devices := []struct {
 		name  string
 		mode  uint32
@@ -2013,6 +2043,20 @@ func setupDev() {
 	// Create /dev/mqueue for POSIX message queues (optional but some programs expect it)
 	os.MkdirAll("/dev/mqueue", 0755)
 	unix.Mount("mqueue", "/dev/mqueue", "mqueue", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "")
+
+	// Bind-mount /dev/vsock from devtmpfs if it was available.
+	// This is necessary because vsock is a misc device that only works via devtmpfs.
+	if vsockSource != "" {
+		// Create the mount point
+		f, err := os.OpenFile("/dev/vsock", os.O_CREATE|os.O_WRONLY, 0666)
+		if err == nil {
+			f.Close()
+			unix.Mount(vsockSource, "/dev/vsock", "", unix.MS_BIND, "")
+		}
+		// Clean up the temporary devtmpfs mount
+		unix.Unmount("/tmp/.devtmpfs", 0)
+		os.Remove("/tmp/.devtmpfs")
+	}
 }
 
 // cmdCheckDev outputs the state of /dev for e2e testing.
@@ -2023,8 +2067,8 @@ func setupDev() {
 //	DIR:<name>:<exists|missing>
 //	DONE
 func cmdCheckDev() {
-	// Check device nodes
-	devices := []string{"null", "zero", "full", "random", "urandom", "tty"}
+	// Check device nodes (vsock is optional - only works in VMs with vsock support)
+	devices := []string{"null", "zero", "full", "random", "urandom", "tty", "vsock"}
 	for _, dev := range devices {
 		path := "/dev/" + dev
 		info, err := os.Lstat(path)
@@ -2061,6 +2105,15 @@ func cmdCheckDev() {
 			continue
 		}
 		fmt.Printf("DIR:%s:exists\n", dir)
+	}
+
+	// List all entries in /dev for completeness checking
+	// This allows tests to verify that unwanted devtmpfs entries are not present
+	entries, err := os.ReadDir("/dev")
+	if err == nil {
+		for _, entry := range entries {
+			fmt.Printf("ENTRY:%s\n", entry.Name())
+		}
 	}
 
 	fmt.Println("DONE")

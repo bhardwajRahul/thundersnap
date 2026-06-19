@@ -3,6 +3,7 @@ package thundersnap
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -43,6 +44,7 @@ type VMSession struct {
 	vsockSock      string       // cloud-hypervisor vsock unix socket path
 	vsockListener  net.Listener // listener for control vsock connections (guest-to-host)
 	done           chan struct{}
+	panicked       chan struct{} // closed when guest kernel panic is detected
 	controlHandler http.Handler
 }
 
@@ -132,17 +134,38 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	kernelPath := filepath.Join(cfg.VMDir, "vmlinux")
 
 	// Build kernel command line
-	// The VM runs vshd in the foreground as init. When vshd exits (or is killed),
-	// we power off the VM cleanly using busybox poweroff.
-	// We must mount devpts for PTY support (required by vshd).
-	// The ts command inside the VM detects vsock via /dev/vsock and connects directly.
-	// We start vshd via "sh -l -c 'exec vshd'" to get a proper login environment (PATH, etc).
-	// We echo status messages to help debug boot issues.
-	cmdline := `console=ttyS0 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "echo 'init: mounting devpts'; mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; echo 'init: mounting proc'; mount -t proc proc /proc; echo 'init: configuring network'; ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; echo 'nameserver 8.8.8.8' > /etc/resolv.conf; echo 'init: starting vshd'; /bin/sh -l -c 'exec /sbin/vshd'; echo 'init: vshd exited, powering off'; /bin/busybox poweroff -f"`
+	// The VM uses /bin/sh as init, which runs a script that:
+	// 1. Calls "ts drop-caps-and-run" to set up /dev (consistent with container mode)
+	// 2. Configures networking (eth0 with static IP for passt)
+	// 3. Starts vshd in the foreground
+	// 4. Powers off the VM when vshd exits
+	//
+	// We use sh as init because kernel cmdline argument parsing is limited -
+	// it doesn't handle complex quoting well when passing args directly to init.
+	// The shell script approach is more reliable.
+	//
+	// panic=1 tells the kernel to reboot 1 second after a panic. Since there's
+	// no bootable device, cloud-hypervisor will exit when the VM reboots.
+	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
+
+	// Create pipe for event monitor - cloud-hypervisor writes events, we read them
+	eventReadPipe, eventWritePipe, err := os.Pipe()
+	if err != nil {
+		passtCmd.Process.Kill()
+		passtCmd.Wait()
+		virtiofsdCmd.Process.Kill()
+		virtiofsdCmd.Wait()
+		os.Remove(virtiofsSock)
+		os.Remove(passtSock)
+		return nil, fmt.Errorf("create event monitor pipe: %w", err)
+	}
 
 	// Start cloud-hypervisor
 	// --pvpanic enables the pvpanic device which allows the guest to signal panic to the host
+	// --event-monitor fd=N tells cloud-hypervisor to write JSON events to the pipe
+	// ExtraFiles[0] becomes fd 3 in the child process (after stdin=0, stdout=1, stderr=2)
 	log.Printf("Starting cloud-hypervisor")
+	const eventMonitorFd = 3
 	chvArgs := []string{
 		"--kernel", kernelPath,
 		"--cpus", "boot=1",
@@ -153,12 +176,15 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		"--serial", "tty",
 		"--console", "off",
 		"--pvpanic",
+		"--event-monitor", fmt.Sprintf("fd=%d", eventMonitorFd),
 	}
 	// Add vsock if we have a control handler
 	if cfg.ControlHandler != nil {
 		chvArgs = append(chvArgs, "--vsock", fmt.Sprintf("cid=3,socket=%s", vsockSock))
 	}
 	chvCmd := exec.Command(chvPath, chvArgs...)
+	// Pass the event write pipe to cloud-hypervisor as fd 3
+	chvCmd.ExtraFiles = []*os.File{eventWritePipe}
 
 	session := &VMSession{
 		virtiofsdCmd:   virtiofsdCmd,
@@ -167,6 +193,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		virtiofsSock:   virtiofsSock,
 		vsockSock:      vsockSock,
 		done:           make(chan struct{}),
+		panicked:       make(chan struct{}),
 		controlHandler: cfg.ControlHandler,
 	}
 
@@ -174,6 +201,8 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// Console output goes to our log system via a goroutine
 	ptmx, err := pty.Start(chvCmd)
 	if err != nil {
+		eventReadPipe.Close()
+		eventWritePipe.Close()
 		passtCmd.Process.Kill()
 		passtCmd.Wait()
 		virtiofsdCmd.Process.Kill()
@@ -184,10 +213,14 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	}
 	log.Printf("cloud-hypervisor started with PID %d", chvCmd.Process.Pid)
 
+	// Close write end of event pipe in parent - cloud-hypervisor has its own copy
+	eventWritePipe.Close()
+
 	// Monitor cloud-hypervisor in background
 	go func() {
 		chvCmd.Wait()
 		ptmx.Close()
+		eventReadPipe.Close()
 		log.Printf("cloud-hypervisor exited")
 		close(session.done)
 	}()
@@ -199,6 +232,9 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 			log.Printf("vm: %s", scanner.Text())
 		}
 	}()
+
+	// Monitor event stream for panic events
+	go session.monitorEvents(eventReadPipe)
 
 	// Start vsock listener if we have a control handler
 	// Cloud-hypervisor's vsock uses a naming convention: when guest connects to
@@ -231,6 +267,40 @@ func (s *VMSession) Wait() error {
 // Done returns a channel that is closed when the VM exits.
 func (s *VMSession) Done() <-chan struct{} {
 	return s.done
+}
+
+// Panicked returns a channel that is closed when a guest kernel panic is detected.
+func (s *VMSession) Panicked() <-chan struct{} {
+	return s.panicked
+}
+
+// chvEvent represents a cloud-hypervisor event from the event monitor stream.
+type chvEvent struct {
+	Source string `json:"source"`
+	Event  string `json:"event"`
+}
+
+// monitorEvents reads the cloud-hypervisor event stream and detects panics.
+// Cloud-hypervisor outputs pretty-printed JSON objects, so we use a JSON decoder
+// which handles multi-line JSON correctly.
+func (s *VMSession) monitorEvents(r io.Reader) {
+	decoder := json.NewDecoder(r)
+	for {
+		var event chvEvent
+		if err := decoder.Decode(&event); err != nil {
+			if err == io.EOF {
+				return
+			}
+			log.Printf("event-monitor: decode error: %v", err)
+			return
+		}
+		log.Printf("event-monitor: source=%s event=%s", event.Source, event.Event)
+		if event.Source == "guest" && event.Event == "panic" {
+			log.Printf("event-monitor: guest kernel panic detected!")
+			close(s.panicked)
+			return
+		}
+	}
 }
 
 // Close terminates the VM session and cleans up resources.

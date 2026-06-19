@@ -76,13 +76,14 @@ type vmSessionManager struct {
 
 // managedVMSession wraps a VM session with reference counting.
 type managedVMSession struct {
-	session    *thundersnap.VMSession
-	vsockPath  string
-	refCount   int
-	done       chan struct{} // closed when VM exits
-	rootFS     string
+	session       *thundersnap.VMSession
+	vsockPath     string
+	refCount      int
+	done          chan struct{} // closed when VM exits
+	panicked      <-chan struct{} // closed when guest kernel panic is detected
+	rootFS        string
 	tailscaleUser string
-	vmUser     string
+	vmUser        string
 }
 
 var vmSessions = &vmSessionManager{
@@ -160,6 +161,7 @@ func (m *vmSessionManager) getOrCreateVM(tailscaleUser, vmUser, rootFS, vmDir st
 		vsockPath:     session.VshSocketPath(),
 		refCount:      1,
 		done:          make(chan struct{}),
+		panicked:      session.Panicked(),
 		rootFS:        rootFS,
 		tailscaleUser: tailscaleUser,
 		vmUser:        vmUser,
@@ -1202,7 +1204,8 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser, targetUser string, logEr
 	defer vmSessions.releaseVM(safeTailscaleUser, safeVMUser)
 
 	// Connect to vshd in the VM via vsock
-	conn, err := connectToVshd(ms.vsockPath)
+	// Pass panic channel so we abort immediately if VM panics during connection
+	conn, err := connectToVshd(ms.vsockPath, ms.panicked)
 	if err != nil {
 		return fmt.Errorf("connect to vshd: %w", err)
 	}
@@ -1220,54 +1223,98 @@ func runVMSession(s ssh.Session, tailscaleUser, vmUser, targetUser string, logEr
 	}
 
 	// Proxy the SSH session to vshd
-	done := make(chan struct{})
+	copyDone := make(chan struct{}, 2) // buffered to avoid goroutine leak
+
+	log.Printf("SSH proxy: starting io.Copy goroutines, ms.panicked=%v", ms.panicked)
 
 	// SSH stdin -> vshd
 	go func() {
-		io.Copy(conn, s)
+		n, err := io.Copy(conn, s)
+		log.Printf("SSH proxy: stdin->vshd finished: %d bytes, err=%v", n, err)
 		// When SSH session closes, close our write side to vshd
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
+		copyDone <- struct{}{}
 	}()
 
 	// vshd -> SSH stdout
 	go func() {
-		io.Copy(s, conn)
-		close(done)
+		n, err := io.Copy(s, conn)
+		log.Printf("SSH proxy: vshd->stdout finished: %d bytes, err=%v", n, err)
+		copyDone <- struct{}{}
 	}()
+
+	log.Printf("SSH proxy: entering select, watching copyDone, ms.done, ms.panicked, s.Context().Done()")
 
 	// Wait for either:
 	// - vshd connection to close (shell exited normally)
 	// - VM to exit unexpectedly
+	// - VM kernel panic (disconnect immediately)
 	// - SSH session to be closed by client (e.g., ~. escape sequence)
 	select {
-	case <-done:
-		log.Printf("vshd connection closed")
+	case <-copyDone:
+		log.Printf("SSH proxy: select triggered by copyDone (vshd connection closed)")
 	case <-ms.done:
-		log.Printf("VM exited")
+		log.Printf("SSH proxy: select triggered by ms.done (VM exited)")
+	case <-ms.panicked:
+		log.Printf("SSH proxy: select triggered by ms.panicked (VM kernel panic)")
 	case <-s.Context().Done():
-		log.Printf("SSH session closed by client")
+		log.Printf("SSH proxy: select triggered by s.Context().Done() (SSH session closed by client)")
 	}
 
+	log.Printf("SSH proxy: closing conn to unblock goroutines")
+	// Close conn to unblock any io.Copy goroutines still running
+	conn.Close()
+
+	// Wait briefly for goroutines to finish, but don't block forever
+	log.Printf("SSH proxy: waiting for goroutines to finish")
+	timeout := time.After(100 * time.Millisecond)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-copyDone:
+			log.Printf("SSH proxy: goroutine %d finished", i+1)
+		case <-timeout:
+			log.Printf("SSH proxy: Warning: io.Copy goroutine did not finish promptly")
+			goto done
+		}
+	}
+done:
+
+	log.Printf("SSH proxy: calling s.Exit(0)")
 	s.Exit(0)
+	log.Printf("SSH proxy: returning")
 	return nil
 }
 
 // connectToVshd connects to vshd in a VM via the vsock socket.
 // It performs the cloud-hypervisor vsock CONNECT handshake and retries
 // until vshd is ready (up to 10 seconds).
-func connectToVshd(vsockPath string) (net.Conn, error) {
+// If the panicked channel is closed, it aborts immediately.
+func connectToVshd(vsockPath string, panicked <-chan struct{}) (net.Conn, error) {
 	var lastErr error
 
 	// Retry the full connection + handshake for up to 10 seconds while vshd starts up
 	for i := 0; i < 100; i++ {
+		// Check if VM panicked before each attempt
+		select {
+		case <-panicked:
+			return nil, fmt.Errorf("VM kernel panic detected")
+		default:
+		}
+
 		conn, err := tryConnectToVshd(vsockPath)
 		if err == nil {
 			return conn, nil
 		}
 		lastErr = err
-		time.Sleep(100 * time.Millisecond)
+
+		// Wait 100ms, but abort immediately if VM panics
+		select {
+		case <-panicked:
+			return nil, fmt.Errorf("VM kernel panic detected")
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 
 	return nil, lastErr

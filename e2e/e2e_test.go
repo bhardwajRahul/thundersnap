@@ -22,9 +22,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // testEnv holds paths and resources for a test environment.
@@ -358,10 +360,145 @@ func TestE2EOwnership(t *testing.T) {
 	}
 }
 
-// TestE2EDevSetup verifies that ts drop-caps-and-run creates /dev correctly.
+// devCheckResult holds parsed output from "ts check-dev".
+type devCheckResult struct {
+	devicePerms map[string]string // device name -> octal perms
+	linkTargets map[string]string // symlink name -> target
+	dirs        map[string]bool   // directory name -> exists
+	allEntries  []string          // all entries in /dev
+}
+
+// parseDevCheckOutput parses the output of "ts check-dev".
+func parseDevCheckOutput(output string) devCheckResult {
+	result := devCheckResult{
+		devicePerms: make(map[string]string),
+		linkTargets: make(map[string]string),
+		dirs:        make(map[string]bool),
+	}
+
+	for _, line := range strings.Split(output, "\n") {
+		parts := strings.Split(line, ":")
+		if len(parts) < 2 {
+			continue
+		}
+		switch parts[0] {
+		case "DEV":
+			if len(parts) >= 4 && parts[2] == "exists" {
+				result.devicePerms[parts[1]] = parts[3]
+			}
+		case "LINK":
+			if len(parts) >= 4 && parts[2] == "exists" {
+				result.linkTargets[parts[1]] = parts[3]
+			}
+		case "DIR":
+			if len(parts) >= 3 && parts[2] == "exists" {
+				result.dirs[parts[1]] = true
+			}
+		case "ENTRY":
+			result.allEntries = append(result.allEntries, parts[1])
+		}
+	}
+
+	return result
+}
+
+// verifyDevSetup checks that /dev was set up correctly.
+func verifyDevSetup(t *testing.T, result devCheckResult) {
+	t.Helper()
+
+	// Verify device permissions are 666 (the fix ensures this via Chmod after Mknod)
+	expectedDevices := []string{"null", "zero", "full", "random", "urandom", "tty"}
+	for _, dev := range expectedDevices {
+		perm, ok := result.devicePerms[dev]
+		if !ok {
+			t.Errorf("/dev/%s: not found", dev)
+			continue
+		}
+		if perm != "666" {
+			t.Errorf("/dev/%s: permissions = %s, want 666", dev, perm)
+		}
+	}
+
+	// Verify symlinks
+	expectedLinks := map[string]string{
+		"stdin":  "/proc/self/fd/0",
+		"stdout": "/proc/self/fd/1",
+		"stderr": "/proc/self/fd/2",
+		"fd":     "/proc/self/fd",
+	}
+	for link, expectedTarget := range expectedLinks {
+		target, ok := result.linkTargets[link]
+		if !ok {
+			t.Errorf("/dev/%s: symlink not found", link)
+			continue
+		}
+		if target != expectedTarget {
+			t.Errorf("/dev/%s: target = %q, want %q", link, target, expectedTarget)
+		}
+	}
+
+	// Verify directories
+	expectedDirs := []string{"pts", "shm", "mqueue"}
+	for _, dir := range expectedDirs {
+		if !result.dirs[dir] {
+			t.Errorf("/dev/%s: directory not found", dir)
+		}
+	}
+
+	// Verify that devtmpfs-specific entries are NOT present
+	// These would indicate we're using the kernel's devtmpfs instead of our controlled tmpfs
+	devtmpfsEntries := []string{
+		"loop0", "loop1", "loop2", // loop devices
+		"sda", "sdb", "vda",       // disk devices
+		"dri",                     // GPU
+		"kvm",                     // KVM
+		"btrfs-control",          // btrfs
+		"autofs",                 // autofs
+		"console",                // console (we don't create this)
+		"kmsg",                   // kernel messages
+		"mem",                    // memory device
+	}
+
+	// Build set of allowed entries
+	allowedEntries := map[string]bool{
+		"null": true, "zero": true, "full": true,
+		"random": true, "urandom": true, "tty": true, "vsock": true,
+		"stdin": true, "stdout": true, "stderr": true, "fd": true,
+		"pts": true, "shm": true, "mqueue": true, "ptmx": true,
+	}
+
+	for _, entry := range devtmpfsEntries {
+		for _, actual := range result.allEntries {
+			if actual == entry {
+				t.Errorf("/dev/%s: found devtmpfs-specific entry that should not exist in controlled /dev", entry)
+			}
+		}
+	}
+
+	// Also warn about any unexpected entries (not necessarily an error, but useful for debugging)
+	for _, entry := range result.allEntries {
+		if !allowedEntries[entry] {
+			t.Logf("Note: unexpected /dev entry: %s", entry)
+		}
+	}
+}
+
+// TestE2EDevSetup verifies that /dev is created correctly in both container and VM modes.
 // This tests the fix for device permission issues where Mknod wasn't respecting
 // mode bits due to umask - we now call Chmod after Mknod to ensure 0666 perms.
 func TestE2EDevSetup(t *testing.T) {
+	t.Run("container", testDevSetupContainer)
+	t.Run("vm", testDevSetupVM)
+}
+
+// TestE2EVMPanicRecovery verifies that a kernel panic causes the VM to exit quickly.
+// This tests the panic=1 kernel parameter which reboots after 1 second.
+func TestE2EVMPanicRecovery(t *testing.T) {
+	testVMPanicRecovery(t)
+}
+
+// testDevSetupContainer tests /dev setup in container mode (chroot-based).
+func testDevSetupContainer(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Create a base snapshot and frame
@@ -417,69 +554,575 @@ func TestE2EDevSetup(t *testing.T) {
 		t.Logf("ts drop-caps-and-run output: %s", output)
 		t.Fatalf("ts drop-caps-and-run error: %v", err)
 	}
-	// Parse results and verify
-	lines := strings.Split(string(output), "\n")
-	devicePerms := make(map[string]string)
-	linkTargets := make(map[string]string)
-	dirs := make(map[string]bool)
 
-	for _, line := range lines {
-		parts := strings.Split(line, ":")
-		if len(parts) < 3 {
-			continue
-		}
-		switch parts[0] {
-		case "DEV":
-			if parts[2] == "exists" && len(parts) >= 4 {
-				devicePerms[parts[1]] = parts[3]
-			}
-		case "LINK":
-			if parts[2] == "exists" && len(parts) >= 4 {
-				linkTargets[parts[1]] = parts[3]
-			}
-		case "DIR":
-			if parts[2] == "exists" {
-				dirs[parts[1]] = true
+	result := parseDevCheckOutput(string(output))
+	verifyDevSetup(t, result)
+}
+
+// vmDir returns the path to VM binaries if available, or empty string if not.
+// Can be overridden with THUNDERSNAP_VM_DIR environment variable.
+func vmDir() string {
+	// Allow override via environment
+	if dir := os.Getenv("THUNDERSNAP_VM_DIR"); dir != "" {
+		chv := filepath.Join(dir, "cloud-hypervisor")
+		kernel := filepath.Join(dir, "vmlinux")
+		if _, err := os.Stat(chv); err == nil {
+			if _, err := os.Stat(kernel); err == nil {
+				return dir
 			}
 		}
 	}
 
-	// Verify device permissions are 666 (the fix ensures this via Chmod after Mknod)
-	expectedDevices := []string{"null", "zero", "full", "random", "urandom", "tty"}
-	for _, dev := range expectedDevices {
-		perm, ok := devicePerms[dev]
-		if !ok {
-			t.Errorf("/dev/%s: not found", dev)
-			continue
+	// Check common locations for cloud-hypervisor
+	candidates := []string{
+		"/usr/local/lib/thundersnap",
+		"/usr/lib/thundersnap",
+		"/opt/thundersnap",
+	}
+	for _, dir := range candidates {
+		chv := filepath.Join(dir, "cloud-hypervisor")
+		kernel := filepath.Join(dir, "vmlinux")
+		if _, err := os.Stat(chv); err == nil {
+			if _, err := os.Stat(kernel); err == nil {
+				return dir
+			}
 		}
-		if perm != "666" {
-			t.Errorf("/dev/%s: permissions = %s, want 666", dev, perm)
+	}
+	return ""
+}
+
+// requireVMDeps skips the test if VM dependencies are not available.
+func requireVMDeps(t *testing.T) string {
+	t.Helper()
+
+	dir := vmDir()
+	if dir == "" {
+		t.Skip("VM test requires cloud-hypervisor and vmlinux (not found in standard locations)")
+	}
+
+	// Also need virtiofsd and passt
+	if _, err := exec.LookPath("virtiofsd"); err != nil {
+		if _, err := os.Stat("/usr/libexec/virtiofsd"); err != nil {
+			t.Skip("VM test requires virtiofsd")
+		}
+	}
+	if _, err := exec.LookPath("passt"); err != nil {
+		t.Skip("VM test requires passt")
+	}
+
+	return dir
+}
+
+// testDevSetupVM tests /dev setup in VM mode.
+func testDevSetupVM(t *testing.T) {
+	env := newTestEnv(t)
+	vmDir := requireVMDeps(t)
+
+	// Create a base snapshot and frame for the VM
+	baseSnap := env.createBaseSnapshot()
+	framePath := filepath.Join(env.fsDir, "testuser", "vmdevtest")
+
+	// Create the frame directory structure
+	if err := os.MkdirAll(filepath.Dir(framePath), 0755); err != nil {
+		t.Fatalf("mkdir frame parent: %v", err)
+	}
+
+	// Clone snapshot to frame
+	cmd := exec.Command("btrfs", "subvolume", "snapshot",
+		filepath.Join(env.snapshotsDir, baseSnap), framePath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("btrfs snapshot: %v\n%s", err, out)
+	}
+
+	// Copy ts binary into the frame
+	tsDst := filepath.Join(framePath, "bin/ts")
+	if err := copyFile(env.tsBinary, tsDst); err != nil {
+		t.Fatalf("copy ts to frame: %v", err)
+	}
+
+	// Build vshd and copy it into the frame
+	vshdBinary := env.buildBinary("./cmd/vshd", "vshd")
+	vshdDst := filepath.Join(framePath, "sbin/vshd")
+	if err := os.MkdirAll(filepath.Dir(vshdDst), 0755); err != nil {
+		t.Fatalf("mkdir sbin: %v", err)
+	}
+	if err := copyFile(vshdBinary, vshdDst); err != nil {
+		t.Fatalf("copy vshd to frame: %v", err)
+	}
+
+	// We also need busybox for the init script (poweroff)
+	// For now, just create a minimal script that doesn't need busybox
+	// Actually, let's copy /bin/busybox if it exists
+	if busybox, err := exec.LookPath("busybox"); err == nil {
+		busyboxDst := filepath.Join(framePath, "bin/busybox")
+		if err := copyFile(busybox, busyboxDst); err != nil {
+			t.Logf("Warning: couldn't copy busybox: %v", err)
 		}
 	}
 
-	// Verify symlinks
-	expectedLinks := map[string]string{
-		"stdin":  "/proc/self/fd/0",
-		"stdout": "/proc/self/fd/1",
-		"stderr": "/proc/self/fd/2",
-		"fd":     "/proc/self/fd",
+	// Get absolute path for the frame
+	absFramePath, err := filepath.Abs(framePath)
+	if err != nil {
+		t.Fatalf("abs path: %v", err)
 	}
-	for link, expectedTarget := range expectedLinks {
-		target, ok := linkTargets[link]
-		if !ok {
-			t.Errorf("/dev/%s: symlink not found", link)
-			continue
+
+	// Start the VM
+	t.Logf("Starting VM with rootfs=%s vmdir=%s", absFramePath, vmDir)
+
+	// Import the thundersnap package to use StartVM
+	// For e2e tests, we'll use exec to run cloud-hypervisor directly
+	// to avoid import cycles. Actually, let's just import thundersnap.
+	//
+	// Since we can't easily import thundersnap from e2e without cycles,
+	// we'll start the VM components manually similar to what StartVM does.
+
+	// Create unique socket paths
+	sessionID := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
+	virtiofsSock := filepath.Join("/tmp", fmt.Sprintf("virtiofs-test-%s.sock", sessionID))
+	vsockSock := filepath.Join("/tmp", fmt.Sprintf("vsock-test-%s.sock", sessionID))
+	passtSock := filepath.Join("/tmp", fmt.Sprintf("passt-test-%s.sock", sessionID))
+
+	// Cleanup sockets on exit
+	defer os.Remove(virtiofsSock)
+	defer os.Remove(vsockSock)
+	defer os.Remove(passtSock)
+
+	// Start virtiofsd
+	virtiofsdPath := "/usr/libexec/virtiofsd"
+	if _, err := os.Stat(virtiofsdPath); err != nil {
+		virtiofsdPath, _ = exec.LookPath("virtiofsd")
+	}
+	virtiofsdCmd := exec.Command(virtiofsdPath,
+		"--socket-path="+virtiofsSock,
+		"--shared-dir="+absFramePath,
+		"--cache=always",
+	)
+	virtiofsdCmd.Stderr = os.Stderr
+	if err := virtiofsdCmd.Start(); err != nil {
+		t.Fatalf("start virtiofsd: %v", err)
+	}
+	defer virtiofsdCmd.Wait()
+	defer virtiofsdCmd.Process.Kill()
+
+	// Wait for virtiofsd socket
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(virtiofsSock); err == nil {
+			break
 		}
-		if target != expectedTarget {
-			t.Errorf("/dev/%s: target = %q, want %q", link, target, expectedTarget)
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Start passt
+	passtCmd := exec.Command("passt",
+		"--socket", passtSock,
+		"--vhost-user",
+		"--foreground",
+		"--quiet",
+		"-a", "10.0.2.15",
+		"-g", "10.0.2.2",
+		"-D", "none",
+	)
+	passtCmd.Stderr = os.Stderr
+	if err := passtCmd.Start(); err != nil {
+		t.Fatalf("start passt: %v", err)
+	}
+	defer passtCmd.Wait()
+	defer passtCmd.Process.Kill()
+
+	// Wait for passt socket
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(passtSock); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Start cloud-hypervisor
+	chvPath := filepath.Join(vmDir, "cloud-hypervisor")
+	kernelPath := filepath.Join(vmDir, "vmlinux")
+
+	// Build kernel command line - use sh as init, then call ts drop-caps-and-run
+	// for consistent /dev setup between container and VM modes.
+	// panic=1 ensures the VM reboots (and thus terminates) on kernel panic.
+	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
+
+	// Create pipe for event monitor to detect panics
+	eventReadPipe, eventWritePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create event pipe: %v", err)
+	}
+	defer eventReadPipe.Close()
+
+	chvCmd := exec.Command(chvPath,
+		"--kernel", kernelPath,
+		"--cpus", "boot=1",
+		"--memory", "size=512M,shared=on",
+		"--fs", fmt.Sprintf("tag=rootfs,socket=%s", virtiofsSock),
+		"--net", fmt.Sprintf("vhost_user=true,socket=%s,num_queues=2", passtSock),
+		"--cmdline", cmdline,
+		"--serial", "tty",
+		"--console", "off",
+		"--vsock", fmt.Sprintf("cid=3,socket=%s", vsockSock),
+		"--pvpanic",
+		"--event-monitor", "fd=3",
+	)
+	chvCmd.ExtraFiles = []*os.File{eventWritePipe}
+
+	// Start with PTY for serial console
+	chvPty, err := startWithPty(chvCmd)
+	if err != nil {
+		t.Fatalf("start cloud-hypervisor: %v", err)
+	}
+	defer chvCmd.Wait()         // Wait runs second (after Kill)
+	defer chvCmd.Process.Kill() // Kill runs first
+	defer chvPty.Close()
+
+	// Close write end in parent
+	eventWritePipe.Close()
+
+	// Monitor VM process exit
+	vmExited := make(chan error, 1)
+	go func() {
+		vmExited <- chvCmd.Wait()
+	}()
+
+	// Monitor for panic events
+	vmPanicked := make(chan struct{})
+	go monitorVMEvents(t, eventReadPipe, vmPanicked)
+
+	// Collect VM console output for debugging
+	vmLogs := &vmConsoleMonitor{}
+	go vmLogs.monitor(t, chvPty)
+
+	// Wait for vshd to be ready (vsock port socket to exist)
+	vshSockPath := fmt.Sprintf("%s_%d", vsockSock, 5222)
+	t.Logf("Waiting for vshd at %s", vshSockPath)
+	var vshReady bool
+	for i := 0; i < 50; i++ { // 5 seconds max
+		// Check if VM panicked
+		select {
+		case <-vmPanicked:
+			t.Fatalf("VM kernel panic detected!\n\nVM console output:\n%s", vmLogs.output())
+		case err := <-vmExited:
+			t.Fatalf("VM exited unexpectedly: %v\n\nVM console output:\n%s", err, vmLogs.output())
+		default:
+		}
+
+		if _, err := os.Stat(vshSockPath); err == nil {
+			vshReady = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !vshReady {
+		// Check one more time for panic/exit before reporting timeout
+		select {
+		case <-vmPanicked:
+			t.Fatalf("VM kernel panic detected!\n\nVM console output:\n%s", vmLogs.output())
+		case err := <-vmExited:
+			t.Fatalf("VM exited unexpectedly: %v\n\nVM console output:\n%s", err, vmLogs.output())
+		default:
+		}
+		t.Fatalf("vshd did not become ready (socket %s not created)\n\nVM console output:\n%s", vshSockPath, vmLogs.output())
+	}
+	t.Logf("vshd is ready")
+
+	// Connect to vshd and run "ts check-dev"
+	output, err := runVshCommand(vsockSock, "root", "/bin/ts", "check-dev")
+	if err != nil {
+		t.Fatalf("run ts check-dev in VM: %v", err)
+	}
+	t.Logf("VM /dev check output:\n%s", output)
+
+	result := parseDevCheckOutput(output)
+	verifyDevSetup(t, result)
+}
+
+// testVMPanicRecovery verifies that a kernel panic causes the VM to terminate quickly.
+func testVMPanicRecovery(t *testing.T) {
+	env := newTestEnv(t)
+	vmDir := requireVMDeps(t)
+
+	// Create a minimal frame - we just need ts binary
+	baseSnap := env.createBaseSnapshot()
+	framePath := filepath.Join(env.fsDir, "testuser", "panictest")
+
+	if err := os.MkdirAll(filepath.Dir(framePath), 0755); err != nil {
+		t.Fatalf("mkdir frame parent: %v", err)
+	}
+
+	cmd := exec.Command("btrfs", "subvolume", "snapshot",
+		filepath.Join(env.snapshotsDir, baseSnap), framePath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("btrfs snapshot: %v\n%s", err, out)
+	}
+
+	tsDst := filepath.Join(framePath, "bin/ts")
+	if err := copyFile(env.tsBinary, tsDst); err != nil {
+		t.Fatalf("copy ts to frame: %v", err)
+	}
+
+	absFramePath, err := filepath.Abs(framePath)
+	if err != nil {
+		t.Fatalf("abs path: %v", err)
+	}
+
+	// Create sockets
+	sessionID := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
+	virtiofsSock := filepath.Join("/tmp", fmt.Sprintf("virtiofs-panic-%s.sock", sessionID))
+	vsockSock := filepath.Join("/tmp", fmt.Sprintf("vsock-panic-%s.sock", sessionID))
+	passtSock := filepath.Join("/tmp", fmt.Sprintf("passt-panic-%s.sock", sessionID))
+
+	defer os.Remove(virtiofsSock)
+	defer os.Remove(vsockSock)
+	defer os.Remove(passtSock)
+
+	// Start virtiofsd
+	virtiofsdPath := "/usr/libexec/virtiofsd"
+	if _, err := os.Stat(virtiofsdPath); err != nil {
+		virtiofsdPath, _ = exec.LookPath("virtiofsd")
+	}
+	virtiofsdCmd := exec.Command(virtiofsdPath,
+		"--socket-path="+virtiofsSock,
+		"--shared-dir="+absFramePath,
+		"--cache=always",
+	)
+	virtiofsdCmd.Stderr = os.Stderr
+	if err := virtiofsdCmd.Start(); err != nil {
+		t.Fatalf("start virtiofsd: %v", err)
+	}
+	defer virtiofsdCmd.Wait()
+	defer virtiofsdCmd.Process.Kill()
+
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(virtiofsSock); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Start passt
+	passtCmd := exec.Command("passt",
+		"--socket", passtSock,
+		"--vhost-user",
+		"--foreground",
+		"--quiet",
+		"-a", "10.0.2.15",
+		"-g", "10.0.2.2",
+		"-D", "none",
+	)
+	passtCmd.Stderr = os.Stderr
+	if err := passtCmd.Start(); err != nil {
+		t.Fatalf("start passt: %v", err)
+	}
+	defer passtCmd.Wait()
+	defer passtCmd.Process.Kill()
+
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(passtSock); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Start VM with init that triggers a panic via sysrq
+	// The init script mounts /proc, enables sysrq, then triggers panic with 'c'
+	chvPath := filepath.Join(vmDir, "cloud-hypervisor")
+	kernelPath := filepath.Join(vmDir, "vmlinux")
+
+	// This init deliberately triggers a kernel panic
+	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "mount -t proc proc /proc; echo 1 > /proc/sys/kernel/sysrq; echo c > /proc/sysrq-trigger"`
+
+	// Create pipe for event monitor to detect panics
+	eventReadPipe, eventWritePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create event pipe: %v", err)
+	}
+	defer eventReadPipe.Close()
+
+	chvCmd := exec.Command(chvPath,
+		"--kernel", kernelPath,
+		"--cpus", "boot=1",
+		"--memory", "size=512M,shared=on",
+		"--fs", fmt.Sprintf("tag=rootfs,socket=%s", virtiofsSock),
+		"--net", fmt.Sprintf("vhost_user=true,socket=%s,num_queues=2", passtSock),
+		"--cmdline", cmdline,
+		"--serial", "tty",
+		"--console", "off",
+		"--pvpanic",
+		"--event-monitor", "fd=3",
+	)
+	chvCmd.ExtraFiles = []*os.File{eventWritePipe}
+
+	chvPty, err := startWithPty(chvCmd)
+	if err != nil {
+		t.Fatalf("start cloud-hypervisor: %v", err)
+	}
+	defer chvCmd.Wait()         // Wait runs second (after Kill)
+	defer chvCmd.Process.Kill() // Kill runs first
+	defer chvPty.Close()
+
+	// Close write end in parent
+	eventWritePipe.Close()
+
+	// Monitor for panic events
+	vmPanicked := make(chan struct{})
+	go monitorVMEvents(t, eventReadPipe, vmPanicked)
+
+	// Collect console output
+	vmLogs := &vmConsoleMonitor{}
+	go vmLogs.monitor(t, chvPty)
+
+	// Panic should be detected within 5 seconds via event monitor
+	select {
+	case <-vmPanicked:
+		t.Logf("Panic detected via event monitor as expected")
+		t.Logf("Console output:\n%s", vmLogs.output())
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Panic not detected within 5 seconds\n\nConsole output:\n%s", vmLogs.output())
+	}
+}
+
+// monitorVMEvents reads cloud-hypervisor event stream and closes panicked channel on panic.
+// Cloud-hypervisor outputs pretty-printed JSON objects, so we use a JSON decoder
+// which handles multi-line JSON correctly.
+func monitorVMEvents(t *testing.T, r io.Reader, panicked chan struct{}) {
+	type chvEvent struct {
+		Source string `json:"source"`
+		Event  string `json:"event"`
+	}
+
+	decoder := json.NewDecoder(r)
+	for {
+		var event chvEvent
+		if err := decoder.Decode(&event); err != nil {
+			if err == io.EOF {
+				return
+			}
+			t.Logf("event-monitor: decode error: %v", err)
+			return
+		}
+		t.Logf("event-monitor: source=%s event=%s", event.Source, event.Event)
+		if event.Source == "guest" && event.Event == "panic" {
+			t.Logf("event-monitor: guest kernel panic detected!")
+			close(panicked)
+			return
+		}
+	}
+}
+
+// vmConsoleMonitor captures VM console output for debugging.
+type vmConsoleMonitor struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+// monitor reads from the PTY and logs output.
+func (m *vmConsoleMonitor) monitor(t *testing.T, r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		t.Logf("vm: %s", line)
+
+		m.mu.Lock()
+		m.lines = append(m.lines, line)
+		m.mu.Unlock()
+	}
+}
+
+// output returns all captured console output as a string.
+func (m *vmConsoleMonitor) output() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return strings.Join(m.lines, "\n")
+}
+
+// startWithPty starts a command with a PTY and returns the PTY master.
+func startWithPty(cmd *exec.Cmd) (*os.File, error) {
+	ptmx, tty, err := openPty()
+	if err != nil {
+		return nil, err
+	}
+	defer tty.Close()
+
+	cmd.Stdin = tty
+	cmd.Stdout = tty
+	cmd.Stderr = tty
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:  true,
+		Setctty: true,
+	}
+
+	if err := cmd.Start(); err != nil {
+		ptmx.Close()
+		return nil, err
+	}
+
+	return ptmx, nil
+}
+
+// openPty opens a new PTY pair.
+func openPty() (ptmx, tty *os.File, err error) {
+	ptmx, err = os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Unlock the slave
+	var n int
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&n))); errno != 0 {
+		ptmx.Close()
+		return nil, nil, errno
+	}
+
+	// Get slave name
+	var ptsNum int
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&ptsNum))); errno != 0 {
+		ptmx.Close()
+		return nil, nil, errno
+	}
+
+	tty, err = os.OpenFile(fmt.Sprintf("/dev/pts/%d", ptsNum), os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		ptmx.Close()
+		return nil, nil, err
+	}
+
+	return ptmx, tty, nil
+}
+
+// runVshCommand connects to vshd via vsock and runs a command.
+func runVshCommand(vsockSock, user string, args ...string) (string, error) {
+	// Connect to cloud-hypervisor's vsock socket
+	vshSockPath := fmt.Sprintf("%s_%d", vsockSock, 5222)
+	conn, err := net.Dial("unix", vshSockPath)
+	if err != nil {
+		return "", fmt.Errorf("dial vsh socket: %w", err)
+	}
+	defer conn.Close()
+
+	// Set deadline for the whole operation
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	// Send vshd protocol:
+	// 1. target username (null-terminated)
+	// 2. arg count (null-terminated)
+	// 3. each arg (null-terminated)
+	if _, err := conn.Write([]byte(user + "\x00")); err != nil {
+		return "", fmt.Errorf("send user: %w", err)
+	}
+	if _, err := conn.Write([]byte(fmt.Sprintf("%d\x00", len(args)))); err != nil {
+		return "", fmt.Errorf("send arg count: %w", err)
+	}
+	for _, arg := range args {
+		if _, err := conn.Write([]byte(arg + "\x00")); err != nil {
+			return "", fmt.Errorf("send arg: %w", err)
 		}
 	}
 
-	// Verify directories
-	expectedDirs := []string{"pts", "shm", "mqueue"}
-	for _, dir := range expectedDirs {
-		if !dirs[dir] {
-			t.Errorf("/dev/%s: directory not found", dir)
-		}
-	}
+	// Read response
+	var buf bytes.Buffer
+	io.Copy(&buf, conn)
+
+	return buf.String(), nil
 }
