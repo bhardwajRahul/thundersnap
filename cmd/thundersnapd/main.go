@@ -1620,10 +1620,29 @@ func ensureTmpDir(rootFS string) error {
 }
 
 // copyTsBinary copies the ts binary into the container's /bin using btrfs reflink (COW copy).
+// If the container has no /bin/sh, it also creates a symlink /bin/sh -> ts so that
+// SSH commands work (ssh invokes /bin/sh -c "command"). The ts binary has a minimal
+// shell mode that handles this case.
 func copyTsBinary(rootFS string) error {
 	// Remove legacy /sbin/ts if present (we moved to /bin/ts for PATH sanity).
 	os.Remove(filepath.Join(rootFS, "sbin", "ts"))
-	return copyBinaryToRootFS(rootFS, "ts", "bin/ts")
+
+	if err := copyBinaryToRootFS(rootFS, "ts", "bin/ts"); err != nil {
+		return err
+	}
+
+	// If there's no shell, symlink /bin/sh -> ts so SSH command execution works.
+	// ts has a minimal shell mode that activates when invoked as "sh".
+	shPath := filepath.Join(rootFS, "bin", "sh")
+	if _, err := os.Lstat(shPath); os.IsNotExist(err) {
+		// No shell exists - create symlink to ts
+		if err := os.Symlink("ts", shPath); err != nil {
+			// Non-fatal: log but don't fail
+			log.Printf("Warning: failed to create /bin/sh symlink: %v", err)
+		}
+	}
+
+	return nil
 }
 
 // copyVshdBinary copies the vshd binary into the VM's /sbin using btrfs reflink (COW copy).

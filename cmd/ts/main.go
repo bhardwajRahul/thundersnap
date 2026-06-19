@@ -56,6 +56,15 @@ func usage() {
 }
 
 func main() {
+	// Check if we're being invoked as a shell (argv[0] is "sh" or "-sh")
+	// This happens when thundersnapd symlinks /bin/sh -> /bin/ts for
+	// containers that lack a shell.
+	base := filepath.Base(os.Args[0])
+	if base == "sh" || base == "-sh" {
+		runAsShell()
+		return
+	}
+
 	getopt.SetParameters("<command> [command-options]")
 	getopt.SetUsage(usage)
 	getopt.Parse()
@@ -1815,4 +1824,120 @@ func findExecutable(name string) (string, error) {
 	}
 
 	return "", fmt.Errorf("executable not found in PATH: %s", name)
+}
+
+// runAsShell implements a minimal shell mode for containers without /bin/sh.
+//
+// When ts is symlinked to /bin/sh, SSH commands like "ssh host cmd args" invoke:
+//   /bin/sh -c "cmd args"
+//
+// This function handles that by parsing the -c argument and executing the command.
+// It only supports single, non-interactive commands - no pipes, redirects, or
+// job control. This is sufficient for basic operations like "ssh host ts snap".
+func runAsShell() {
+	args := os.Args[1:]
+
+	// Handle common shell invocations:
+	// 1. "sh -c 'command args'" - run command
+	// 2. "sh script.sh" - not supported (we only do -c)
+	// 3. "sh" with no args - interactive shell (not supported)
+
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "ts: interactive shell mode not supported")
+		fmt.Fprintln(os.Stderr, "ts can only run single commands via: sh -c 'command'")
+		os.Exit(1)
+	}
+
+	// Parse flags - we only care about -c
+	var commandStr string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-c":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "ts: -c requires an argument")
+				os.Exit(1)
+			}
+			commandStr = args[i+1]
+			i++
+		case "-i", "-l", "--login":
+			// Interactive/login flags - ignore but continue
+		case "-e", "-x", "-v":
+			// Debug flags - ignore
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				// Unknown flag - ignore
+				continue
+			}
+			// Non-flag argument without -c means script file - not supported
+			fmt.Fprintf(os.Stderr, "ts: running script files not supported: %s\n", args[i])
+			os.Exit(1)
+		}
+	}
+
+	if commandStr == "" {
+		fmt.Fprintln(os.Stderr, "ts: no command specified (use -c 'command')")
+		os.Exit(1)
+	}
+
+	// Parse the command string into words.
+	// This is a simple tokenizer that handles quoted strings.
+	cmdArgs := parseShellCommand(commandStr)
+	if len(cmdArgs) == 0 {
+		os.Exit(0) // Empty command
+	}
+
+	// Find the executable
+	executable, err := findExecutable(cmdArgs[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ts: %v\n", err)
+		os.Exit(127) // Standard "command not found" exit code
+	}
+
+	// Exec the command, replacing this process
+	if err := syscall.Exec(executable, cmdArgs, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "ts: exec %s: %v\n", cmdArgs[0], err)
+		os.Exit(126) // Standard "cannot execute" exit code
+	}
+}
+
+// parseShellCommand tokenizes a shell command string into arguments.
+// It handles single and double quotes but does NOT handle:
+//   - Escape sequences (\n, \t, etc.) outside quotes
+//   - Variable expansion ($VAR)
+//   - Command substitution $(...)
+//   - Pipes, redirects, or other shell operators
+func parseShellCommand(cmd string) []string {
+	var args []string
+	var current strings.Builder
+	var inSingleQuote, inDoubleQuote bool
+
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+
+		switch {
+		case c == '\'' && !inDoubleQuote:
+			inSingleQuote = !inSingleQuote
+		case c == '"' && !inSingleQuote:
+			inDoubleQuote = !inDoubleQuote
+		case c == '\\' && inDoubleQuote && i+1 < len(cmd):
+			// In double quotes, backslash escapes the next character
+			i++
+			current.WriteByte(cmd[i])
+		case c == ' ' || c == '\t':
+			if inSingleQuote || inDoubleQuote {
+				current.WriteByte(c)
+			} else if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+		default:
+			current.WriteByte(c)
+		}
+	}
+
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+
+	return args
 }
