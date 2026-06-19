@@ -22,7 +22,7 @@ OUT ?= dist
 # Output directory for local binaries
 BIN ?= ./bin
 
-.PHONY: all test e2e not_e2e binaries ts vshd thundersnapd bupdate fidx slab \
+.PHONY: all test e2e not_e2e binaries ts vshd thundersnapd thunderboot \
         list build build-deb build-rpm build-tgz clean
 
 all: build
@@ -108,7 +108,7 @@ not_e2e: ts vshd thundersnapd
 	@./test-cleanup.sh $(E2E_TMPDIR)
 
 # Build all binaries for local development
-binaries: ts vshd thundersnapd
+binaries: ts vshd thundersnapd thunderboot
 
 # Binaries that need CGO_ENABLED=0 (run inside containers/VMs)
 ts:
@@ -125,6 +125,10 @@ vshd:
 thundersnapd:
 	@mkdir -p $(BIN)
 	CGO_ENABLED=0 go build -o $(BIN)/$@ ./cmd/$@
+
+thunderboot:
+	@mkdir -p $(BIN)
+	go build -o $(BIN)/$@ ./cmd/$@
 
 # List all available build targets
 list:
