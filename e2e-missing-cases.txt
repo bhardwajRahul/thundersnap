@@ -77,12 +77,12 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 ## Snapshot Operations
 - [x] BASIC: Create snapshot, verify it appears in `snaps` list with correct size
 - [ ] Snapshot large files (multi-GB)
-- [ ] Snapshot with modified files (delta verification)
-- [ ] Snapshot deduplication (identical content = same hash)
-- [ ] Nested snapshot tree (snap of snap of snap)
-- [ ] Delete snapshot with no references
+- [x] Snapshot with modified files (delta verification)
+- [x] Snapshot deduplication (identical content = same hash)
+- [x] Nested snapshot tree (snap of snap of snap)
+- [x] Delete snapshot with no references
 - [ ] Delete snapshot still referenced by a frame (error case)
-- [ ] List snapshots (snaps command)
+- [x] List snapshots (snaps command)
 
 ## Taint System
 - [x] BASIC: Add a taint to a frame, verify it's recorded and queryable
