@@ -127,7 +127,9 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [x] Setuid binary execution after snapshot restore
 - [x] Setgid binary execution
 - [x] Non-root file ownership preserved across snapshot/restore
-- [ ] UID stripping mode (/etc/passwd rewriting)
+- [x] UID stripping mode (/etc/passwd rewriting)
+- [x] Hardlinks to setuid binaries preserve setuid bit through snapshot/restore
+- [x] chown() clears setuid bit (documented kernel behavior)
 - [ ] Package installation with adduser
 
 ## VM Mode
@@ -153,10 +155,10 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 
 ## Protocol/Streaming
 - [x] BASIC: Verify streaming progress messages arrive incrementally (not buffered until end)
-- [ ] NDJSON streaming with partial line buffering
-- [ ] HTTP range request batching (verify 16-at-a-time)
-- [ ] vsock handshake timeout
-- [ ] Long-running operation progress updates
+- [x] NDJSON streaming with partial line buffering
+- [x] HTTP range request batching (verify 16-at-a-time)
+- [x] vsock handshake timeout
+- [x] Long-running operation progress updates
 
 ## Integration/Workflow Tests
 - [x] BASIC: Create frame, modify a file, snap, create new frame from snap, verify modification present
