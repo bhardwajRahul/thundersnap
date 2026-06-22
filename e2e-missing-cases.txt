@@ -217,19 +217,20 @@ fidx/mfidx format (SHA-1, 24-byte entries) with tsm/tsc (SHA-256, 40-byte entrie
 - [x] Integration/Workflow tests pass (proves end-to-end works)
 
 **Transition phases (do in order):**
-- [ ] Phase 1: Add TSC-based local deduplication (LoadLocalChunkMap in tsm package)
-- [ ] Phase 2: Implement TSM/TSC download path (tsm/download.go)
-- [ ] Phase 2b: HTTP serving of .tsm and .tsc files
-- [ ] Phase 2c: Update download-snap to use TSM/TSC path
-- [ ] Phase 2d: Test mesh download with TSM/TSC (run Mesh tests again)
-- [ ] Phase 3: Stop generating .fidx and .fidx.fidx in thundersnapd
-- [ ] Phase 3b: Remove `ts fidx` command (or repurpose to generate tsm/tsc)
-- [ ] Phase 4: Remove cmd/fidx and cmd/bupdate
-- [ ] Phase 4b: Remove fidx generation code from bupdate/indexer.go
+- [x] Phase 1: Add TSC-based local deduplication (LoadLocalChunkMap in tsm package)
+- [x] Phase 2: Implement TSM/TSC download path (tsm/download.go)
+- [x] Phase 2b: HTTP serving of .tsm and .tsc files (already works - bupdateFileServer serves all files)
+- [x] Phase 2c: Update download-snap to use TSM/TSC path (with fidx fallback)
+- [x] Phase 2d: Test mesh download with TSM/TSC (run Mesh tests again)
+- [x] Phase 3: Stop generating .fidx in thundersnapd (removed with bupdate deletion)
+- [x] Phase 3b: Remove `ts fidx` command (removed with bupdate deletion)
+- [x] Phase 4: Remove cmd/fidx and cmd/bupdate (done)
+- [x] Phase 4b: Remove fidx generation code from bupdate/indexer.go (done - entire bupdate/ deleted)
 - [ ] Phase 4c: Update README.md to remove fidx references
 
-**Keep for legacy compatibility:**
-- fidx parsing code (for reading old snapshots, at least temporarily)
+**Legacy compatibility note:**
+The fidx parsing code in bupdate/ has been removed. Old snapshots using fidx format
+will need to be re-created with the new TSM/TSC format.
 
 ---
 

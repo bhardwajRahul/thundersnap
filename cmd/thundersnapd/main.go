@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,7 +32,6 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
-	"github.com/tailscale/thundersnap/bupdate"
 	"github.com/tailscale/thundersnap/thundersnap"
 	"github.com/tailscale/thundersnap/tsm"
 	gossh "golang.org/x/crypto/ssh"
@@ -2363,8 +2363,6 @@ func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
 	// Delete associated files
 	os.Remove(snapPath + ".jsonc")  // metadata
 	os.Remove(snapPath + ".stamp")  // stamp file
-	os.Remove(snapPath + ".fidx")   // fidx
-	os.Remove(snapPath + ".fidx.fidx") // fidx of fidx
 	os.Remove(snapPath + ".tsm")    // tsm manifest
 	os.Remove(snapPath + ".tsc")    // tsc manifest
 
@@ -2859,36 +2857,7 @@ func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, framePath s
 		// Snapshot doesn't exist - try to download it
 		pw.writeProgress(fmt.Sprintf("Snapshot %s not found locally, downloading from mesh peers...", rootfsSnap))
 
-		if globalMeshState == nil {
-			pw.writeResult("error", "", fmt.Sprintf("snapshot %q not found locally and mesh not enabled", rootfsSnap))
-			return
-		}
-
-		meshPeers := globalMeshState.getPeers()
-		if len(meshPeers) == 0 {
-			pw.writeResult("error", "", fmt.Sprintf("snapshot %q not found locally and no mesh peers available", rootfsSnap))
-			return
-		}
-
-		// Convert to bupdate.PeerInfo
-		peers := make([]bupdate.PeerInfo, len(meshPeers))
-		for i, p := range meshPeers {
-			peers[i] = bupdate.PeerInfo{
-				URL:      p.URL,
-				Hostname: p.Hostname,
-			}
-		}
-
-		// Download the snapshot
-		opts := bupdate.DownloadSnapshotOptions{
-			SnapshotID:     rootfsSnap,
-			SnapshotsDir:   *flagSnapshotsDir,
-			Peers:          peers,
-			ProgressWriter: pw,
-			IsTTY:          isTTY,
-		}
-
-		result, err := bupdate.DownloadSnapshot(opts)
+		result, err := doDownloadSnap(rootfsSnap, pw, isTTY)
 		if err != nil {
 			log.Printf("create: auto-download of snapshot %s failed: %v", rootfsSnap, err)
 			pw.writeResult("error", "", fmt.Sprintf("failed to download snapshot: %v", err))
@@ -2898,7 +2867,7 @@ func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, framePath s
 		if result.AlreadyExists {
 			pw.writeProgress("Snapshot already present locally")
 		} else {
-			pw.writeProgress(fmt.Sprintf("Downloaded snapshot from %s", result.PeerHostname))
+			pw.writeProgress("Downloaded snapshot from mesh peer")
 		}
 	}
 
@@ -3126,17 +3095,17 @@ func handleWhoHas(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert to bupdate.PeerInfo
-	peers := make([]bupdate.PeerInfo, len(meshPeers))
+	// Convert to tsm.PeerInfo
+	peers := make([]tsm.PeerInfo, len(meshPeers))
 	for i, p := range meshPeers {
-		peers[i] = bupdate.PeerInfo{
+		peers[i] = tsm.PeerInfo{
 			URL:      p.URL,
 			Hostname: p.Hostname,
 		}
 	}
 
 	// Check all peers for the snapshot
-	results := bupdate.CheckPeersForSnapshot(peers, req.SnapshotID)
+	results := tsm.CheckPeersForSnapshot(peers, req.SnapshotID)
 
 	// Filter to peers that have the snapshot
 	var peersWithSnap []WhoHasPeerInfo
@@ -3289,12 +3258,12 @@ func (pw *downloadProgressWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-// doDownloadSnap performs the actual download operation
-func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*bupdate.DownloadSnapshotResult, error) {
+// doDownloadSnap performs the actual download operation using TSM/TSC format.
+func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*tsm.DownloadResult, error) {
 	// Check if snapshot already exists
 	snapshotPath := filepath.Join(*flagSnapshotsDir, snapshotID)
 	if _, err := os.Stat(snapshotPath); err == nil {
-		return &bupdate.DownloadSnapshotResult{
+		return &tsm.DownloadResult{
 			SnapshotPath:  snapshotPath,
 			AlreadyExists: true,
 		}, nil
@@ -3310,26 +3279,44 @@ func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*b
 		return nil, fmt.Errorf("no mesh peers available")
 	}
 
-	// Convert to bupdate.PeerInfo
-	peers := make([]bupdate.PeerInfo, len(meshPeers))
+	// Convert to tsm.PeerInfo
+	peers := make([]tsm.PeerInfo, len(meshPeers))
 	for i, p := range meshPeers {
-		peers[i] = bupdate.PeerInfo{
+		peers[i] = tsm.PeerInfo{
 			URL:      p.URL,
 			Hostname: p.Hostname,
 		}
 	}
 
-	// Download the snapshot with btrfs-aware callbacks
-	opts := bupdate.DownloadSnapshotOptions{
+	// Find a peer with the snapshot
+	results := tsm.CheckPeersForSnapshot(peers, snapshotID)
+	var peersWithSnap []tsm.PeerResult
+	for _, r := range results {
+		if r.HasSnap {
+			peersWithSnap = append(peersWithSnap, r)
+		}
+	}
+
+	if len(peersWithSnap) == 0 {
+		return nil, fmt.Errorf("no peer has snapshot %s", snapshotID)
+	}
+
+	// Sort by hostname for determinism, pick first
+	sort.Slice(peersWithSnap, func(i, j int) bool {
+		return peersWithSnap[i].Hostname < peersWithSnap[j].Hostname
+	})
+
+	peer := peersWithSnap[0]
+	baseURL := strings.TrimSuffix(peer.PeerURL, "/")
+
+	// Download using TSM/TSC format
+	opts := tsm.DownloadOptions{
 		SnapshotID:     snapshotID,
 		SnapshotsDir:   *flagSnapshotsDir,
-		Peers:          peers,
+		BaseURL:        baseURL,
 		ProgressWriter: progressWriter,
-		IsTTY:          isTTY,
 
 		// Create the target directory as a btrfs subvolume.
-		// If parentStamp refers to an existing local snap (or one of its ancestors),
-		// clone from that to speed up the download by reusing unchanged files.
 		CreateTargetDir: func(path, parentStamp string) error {
 			return createDownloadTargetDir(path, parentStamp, progressWriter)
 		},
@@ -3345,7 +3332,7 @@ func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*b
 		},
 	}
 
-	return bupdate.DownloadSnapshot(opts)
+	return tsm.Download(opts)
 }
 
 // createDownloadTargetDir creates a btrfs subvolume for downloading a snapshot.
@@ -3585,7 +3572,6 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 	}
 
 	tmpPath := filepath.Join(*flagSnapshotsDir, tmpID+".tmp")
-	tmpFidxPath := tmpPath + ".fidx"
 	tmpTSMPath := tmpPath + ".tsm"
 	tmpTSCPath := tmpPath + ".tsc"
 
@@ -3593,7 +3579,6 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 	cleanupTmp := func() {
 		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
 		os.Remove(tmpPath + ".stamp")
-		os.Remove(tmpFidxPath)
 		os.Remove(tmpTSMPath)
 		os.Remove(tmpTSCPath)
 	}
@@ -3611,29 +3596,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		return "", fmt.Errorf("write stamp file: %w", err)
 	}
 
-	// Step 2: Create mfidx for the snapshot
-	// Check if parent snapshot exists and has a fidx we can use as reference
-	var refPath string
-	if parentStampID != "" {
-		parentFidxPath := filepath.Join(*flagSnapshotsDir, parentStampID+".fidx")
-		if _, err := os.Stat(parentFidxPath); err == nil {
-			refPath = parentFidxPath
-		}
-	}
-
-	log.Printf("Creating fidx for snapshot (ref: %s)", refPath)
-	fidxOpts := bupdate.IndexerOptions{
-		RefPath:        refPath,
-		Progress:       false, // don't use stderr directly
-		ProgressWriter: progressWriter,
-		IsTTY:          isTTY,
-	}
-	if err := bupdate.CreateFidx(tmpPath, tmpFidxPath, fidxOpts); err != nil {
-		cleanupTmp()
-		return "", fmt.Errorf("create fidx: %w", err)
-	}
-
-	// Step 3: Create TSM/TSC manifests in tmp location
+	// Step 2: Create TSM/TSC manifests in tmp location
 	tsmOpts := tsm.IndexerOptions{
 		Progress:       false,
 		ProgressWriter: progressWriter,
@@ -3644,7 +3607,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		return "", fmt.Errorf("create tsm/tsc: %w", err)
 	}
 
-	// Step 4: Load TSM to get its SHA-256, which becomes the snapshot ID
+	// Step 3: Load TSM to get its SHA-256, which becomes the snapshot ID
 	tsmReader, err := tsm.ReadTSM(tmpTSMPath)
 	if err != nil {
 		cleanupTmp()
@@ -3653,8 +3616,6 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 	snapshotID := hex.EncodeToString(tsmReader.SHA256[:])
 
 	finalPath := filepath.Join(*flagSnapshotsDir, snapshotID)
-	finalFidxPath := finalPath + ".fidx"
-	finalFidxFidxPath := finalFidxPath + ".fidx"
 	finalTSMPath := finalPath + ".tsm"
 	finalTSCPath := finalPath + ".tsc"
 
@@ -3664,7 +3625,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		taints = getSnapTaints(*flagSnapshotsDir, parentStampID)
 	}
 
-	// Step 5: Check if a snapshot with this SHA-256 already exists
+	// Step 4: Check if a snapshot with this SHA-256 already exists
 	if _, err := os.Stat(finalPath); err == nil {
 		// Snapshot already exists! Perform taint intersection and discard the new one.
 		log.Printf("Snapshot %s already exists, checking taints", snapshotID)
@@ -3688,7 +3649,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		return snapshotID, nil
 	}
 
-	// Step 6: Rename all to final names (order matters for consistency)
+	// Step 5: Rename all to final names (order matters for consistency)
 	// First the directory, then stamp, then index files
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		cleanupTmp()
@@ -3697,9 +3658,6 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 	// Also rename the stamp file
 	os.Rename(tmpPath+".stamp", finalPath+".stamp")
 
-	if err := os.Rename(tmpFidxPath, finalFidxPath); err != nil {
-		log.Printf("Warning: failed to rename fidx: %v", err)
-	}
 	if err := os.Rename(tmpTSMPath, finalTSMPath); err != nil {
 		log.Printf("Warning: failed to rename tsm: %v", err)
 	}
@@ -3707,15 +3665,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		log.Printf("Warning: failed to rename tsc: %v", err)
 	}
 
-	// Step 7: Create fidx of the fidx (single file fidx)
-	fidxFidxOpts := bupdate.IndexerOptions{
-		Progress: false,
-	}
-	if err := bupdate.CreateSingleFidx(finalFidxPath, finalFidxFidxPath, fidxFidxOpts); err != nil {
-		log.Printf("Warning: failed to create fidx.fidx: %v", err)
-	}
-
-	// Step 8: Write snap.jsonc metadata
+	// Step 6: Write snap.jsonc metadata
 	snapMeta := &SnapMeta{
 		Parent: parentStampID,
 		Taints: taints,
@@ -3724,7 +3674,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		log.Printf("Warning: failed to write snap.jsonc for %s: %v", snapshotID, err)
 	}
 
-	log.Printf("Created snapshot %s (SHA-256) with fidx and tsm", snapshotID)
+	log.Printf("Created snapshot %s (SHA-256) with tsm/tsc", snapshotID)
 	return snapshotID, nil
 }
 

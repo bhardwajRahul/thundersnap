@@ -24,13 +24,12 @@ Tailscale identity. No SSH keys, no manual user provisioning — just
   `test` gets two independent filesystems; user `bob@example.com` SSHing
   as `dev` gets his own, separate `dev`.
 
-- **Content-addressable indexing and replication.** Thundersnap includes
-  `bupdate`, a content-defined chunking system inspired by
-  [bup](https://bup.github.io/). Filesystem contents are indexed into
-  `.fidx` / `.mfidx` files using a bupsplit rolling hash. Chunks are
-  SHA-256 addressed (git-blob format), enabling deduplication, incremental
-  snapshots, and efficient peer-to-peer transfer across a mesh of
-  thundersnap nodes.
+- **Content-addressable indexing and replication.** Thundersnap uses a
+  content-defined chunking system inspired by [bup](https://bup.github.io/).
+  Filesystem contents are indexed into `.tsm` (manifest) and `.tsc` (chunk
+  index) files using a bupsplit rolling hash. Chunks are SHA-256 addressed,
+  enabling deduplication, incremental snapshots, and efficient peer-to-peer
+  transfer across a mesh of thundersnap nodes.
 
 - **Tight Tailscale integration.** Thundersnap runs as a
   [tsnet](https://pkg.go.dev/tailscale.com/tsnet) application — it joins
@@ -148,8 +147,7 @@ Once inside a thundersnap workspace, use the `ts` tool:
 ```sh
 ts ping                              # health check
 ts snap                              # snapshot current workspace
-ts create newname <snapshot-id>      # fork a new workspace from a snapshot
-ts fidx /path/to/file                # generate content index
+ts frame newname <snapshot-id>       # fork a new workspace from a snapshot
 ts who-has <snapshot-id>             # find which mesh peers have a snapshot
 ts download-snap <snapshot-id>       # download a snapshot from the mesh
 ```
@@ -173,14 +171,14 @@ using content-defined chunking — only changed chunks are transferred.
 │  tsnet SSH server (:22) + mesh discovery (:7575)        │
 ├──────────────┬──────────────┬───────────────────────────┤
 │  Container   │   VM mode    │  Snapshot management      │
-│  namespaces  │ (cloud-hv +  │  (btrfs + fidx/bupdate    │
+│  namespaces  │ (cloud-hv +  │  (btrfs + TSM/TSC         │
 │  (chroot +   │  virtiofs +  │   content-addressed       │
 │  drop-caps)  │  passt)      │   chunking)               │
 ├──────────────┴──────────────┴───────────────────────────┤
 │                    btrfs filesystem                      │
 │  snapshots-dir/          fs-dir/<tailscale-user>/<name>/ │
 │    1/  (base)              (live workspaces)             │
-│    <fidx-hash>/                                         │
+│    <snap-hash>/                                         │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -189,11 +187,8 @@ using content-defined chunking — only changed chunks are transferred.
 | Binary | Description |
 |--------|-------------|
 | `thundersnapd` | Main daemon: tsnet SSH server, container/VM orchestration, mesh discovery, NFS export |
-| `ts` | In-container client: snapshots, workspace creation, mesh queries, capability dropping |
-| `tsm` | Generates `.tsm`/`.tsc` manifest and chunk index files (FIDX v2 format) |
-| `bupdate` | Reconstructs files from fidx indexes via local chunks or HTTP range requests |
-| `fidx` | Generates `.fidx`/`.mfidx` content-defined chunk indexes |
-| `slab` | Creates sequential slab files from chunk indexes (for CDN storage) |
+| `ts` | In-container client: snapshots, frame creation, mesh queries, capability dropping |
+| `tsm` | Generates `.tsm`/`.tsc` manifest and chunk index files for content-addressed storage |
 | `vshd` | Shell server that runs inside VMs, accepts vsock connections |
 | `vsh` | Client for connecting to vshd inside VMs via vsock |
 | `trivial-httpd` | Static file server with HTTP range support (for mesh chunk serving) |
