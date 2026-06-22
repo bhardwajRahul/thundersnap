@@ -214,16 +214,71 @@ func TestContainerDomainname(t *testing.T) {
 	}
 }
 
+// TestContainerMountPropagation tests that mount propagation is private
+// to ensure mounts in the container don't leak to the host.
+func TestContainerMountPropagation(t *testing.T) {
+	env := newTestEnv(t)
+
+	baseSnap := env.createBaseSnapshot()
+	framePath := filepath.Join(env.fsDir, "testuser", "mountproptest")
+	if err := os.MkdirAll(filepath.Dir(framePath), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	snapPath := filepath.Join(env.snapshotsDir, baseSnap)
+	cmd := exec.Command("btrfs", "subvolume", "snapshot", snapPath, framePath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("btrfs snapshot: %v\n%s", err, out)
+	}
+
+	tsDst := filepath.Join(framePath, "bin/ts")
+	if err := copyFile(env.tsBinary, tsDst); err != nil {
+		t.Fatalf("copy ts to frame: %v", err)
+	}
+
+	absFramePath, err := filepath.Abs(framePath)
+	if err != nil {
+		t.Fatalf("abs path: %v", err)
+	}
+
+	tsBinary := filepath.Join(absFramePath, "bin", "ts")
+	cmd = exec.Command(tsBinary, "drop-caps-and-run",
+		"--chroot="+absFramePath,
+		"--", "/bin/ts", "check-isolation")
+	cmd.Dir = "/"
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Logf("check-isolation output: %s", output)
+		t.Fatalf("check-isolation error: %v", err)
+	}
+
+	result := parseIsolationOutput(string(output))
+
+	// Verify mount propagation is private (not shared)
+	if result.mountPropagation == "" || result.mountPropagation == "error" {
+		t.Errorf("could not determine mount propagation, got %q", result.mountPropagation)
+	} else if result.mountPropagation != "private" {
+		t.Errorf("mount propagation: got %q, want %q", result.mountPropagation, "private")
+	} else {
+		t.Logf("Verified mount propagation is private")
+	}
+}
+
 // isolationCheckResult holds parsed output from "ts check-isolation".
 type isolationCheckResult struct {
-	hostname     string
-	domainname   string
-	isPID1       bool
-	pid          string
-	procMounted  bool
-	sysMounted   bool
-	capabilities map[string]string // cap name -> "has" or "dropped"
-	namespaces   map[string]string // ns name -> inode
+	hostname         string
+	domainname       string
+	isPID1           bool
+	pid              string
+	procMounted      bool
+	sysMounted       bool
+	capabilities     map[string]string // cap name -> "has" or "dropped"
+	namespaces       map[string]string // ns name -> inode
+	mountPropagation string            // "private", "shared", "slave", "unbindable"
 }
 
 // parseIsolationOutput parses the output of "ts check-isolation".
@@ -262,6 +317,8 @@ func parseIsolationOutput(output string) isolationCheckResult {
 			if len(parts) >= 3 {
 				result.namespaces[parts[1]] = parts[2]
 			}
+		case "MOUNT_PROPAGATION":
+			result.mountPropagation = parts[1]
 		}
 	}
 

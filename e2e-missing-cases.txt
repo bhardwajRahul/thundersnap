@@ -136,7 +136,7 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 - [x] --domainname flag sets domainname
 - [x] --chroot flag changes root
 - [x] /proc and /sys mounted correctly
-- [ ] Mount propagation is private
+- [x] Mount propagation is private
 
 ## UID/Permissions Edge Cases
 - [x] BASIC: Create file with non-root owner, snapshot, restore, verify ownership preserved

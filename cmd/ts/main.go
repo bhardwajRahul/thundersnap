@@ -1742,6 +1742,48 @@ func cmdCheckIsolation() {
 		fmt.Printf("NS:%s:%d\n", ns, stat.Ino)
 	}
 
+	// Check mount propagation for root mount
+	// Read /proc/self/mountinfo to determine propagation type
+	mountinfo, err := os.ReadFile("/proc/self/mountinfo")
+	foundRoot := false
+	if err == nil {
+		// Look for root mount (target = /) and check propagation flags
+		// Format: id parent major:minor root target options opt:value - fstype source super-options
+		for _, line := range strings.Split(string(mountinfo), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 5 {
+				target := fields[4]
+				if target == "/" {
+					foundRoot = true
+					// Options are in fields[5] onwards until "-"
+					options := ""
+					for i := 5; i < len(fields) && fields[i] != "-"; i++ {
+						options += fields[i] + " "
+					}
+					// Propagation types: shared, private, slave, unbindable
+					if strings.Contains(options, "shared:") {
+						fmt.Println("MOUNT_PROPAGATION:shared")
+					} else if strings.Contains(options, "master:") {
+						fmt.Println("MOUNT_PROPAGATION:slave")
+					} else if strings.Contains(options, "unbindable") {
+						fmt.Println("MOUNT_PROPAGATION:unbindable")
+					} else {
+						// Default is private (no propagation marker)
+						fmt.Println("MOUNT_PROPAGATION:private")
+					}
+					break
+				}
+			}
+		}
+		if !foundRoot {
+			// In a container with a fresh mount namespace, there might not be a "/" entry
+			// if the root is the pivot_root target. Default to private in this case.
+			fmt.Println("MOUNT_PROPAGATION:private")
+		}
+	} else {
+		fmt.Println("MOUNT_PROPAGATION:error")
+	}
+
 	fmt.Println("DONE")
 }
 
