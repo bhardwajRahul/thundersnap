@@ -64,13 +64,13 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 
 ## Frame Lifecycle
 - [x] BASIC: Create frame with rootfs-only spec, verify it exists in `frames` list, delete it
-- [ ] Create frame with rootfs-only spec (abc123::)
-- [ ] Create frame with rootfs+home spec (abc123:def456:)
-- [ ] Create frame with all three (rootfs:home:work)
-- [ ] Create frame from non-existent snapshot (error case)
-- [ ] List frames and verify output format
+- [x] Create frame with rootfs-only spec (abc123::)
+- [x] Create frame with rootfs+home spec (abc123:def456:)
+- [x] Create frame with all three (rootfs:home:work)
+- [x] Create frame from non-existent snapshot (error case)
+- [x] List frames and verify output format
 - [ ] Delete a running frame (should stop first or error)
-- [ ] Delete a stopped frame
+- [x] Delete a stopped frame
 - [ ] Frame restart behavior after stop
 - [ ] Multiple concurrent sessions to same frame
 
@@ -104,7 +104,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [ ] Peer discovery via mesh
 
 ## Docker Image Import
-- [ ] BASIC: Import a locally-constructed OCI tarball, verify resulting snapshot has expected files
+- [x] BASIC: Import a locally-constructed OCI tarball, verify resulting snapshot has expected files
 - [ ] download-docker basic image (e.g., alpine:latest)
 - [ ] download-docker with full registry path (docker.io/library/ubuntu:24.04)
 - [ ] download-docker caching (re-import same image is fast)
@@ -129,7 +129,7 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 - [ ] ~~Zero-block handling in fidx~~ (skip - being deprecated)
 
 ## Container Isolation (drop-caps-and-run)
-- [ ] BASIC: Run command in container, verify /proc mounted and dangerous caps dropped
+- [x] BASIC: Run command in container, verify /proc mounted and dangerous caps dropped
 - [ ] Namespace isolation (pid, net, mount, uts)
 - [ ] Capability dropping verification (NET_ADMIN, SYS_MODULE, etc. not available)
 - [ ] --hostname flag sets hostname
@@ -139,7 +139,7 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 - [ ] Mount propagation is private
 
 ## UID/Permissions Edge Cases
-- [ ] BASIC: Create file with non-root owner, snapshot, restore, verify ownership preserved
+- [x] BASIC: Create file with non-root owner, snapshot, restore, verify ownership preserved
 - [ ] Setuid binary execution after snapshot restore
 - [ ] Setgid binary execution
 - [ ] Non-root file ownership preserved across snapshot/restore
@@ -147,7 +147,7 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 - [ ] Package installation with adduser
 
 ## VM Mode
-- [ ] BASIC: Launch VM, run simple command via vshd, verify output, shut down cleanly
+- [x] BASIC: Launch VM, run simple command via vshd, verify output, shut down cleanly
 - [ ] VM launch success with sufficient memory
 - [ ] VM launch failure with insufficient memory (< 512MB)
 - [ ] virtiofs filesystem sharing works
@@ -158,7 +158,7 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 - [ ] VM panic recovery (already tested, but add timeout scenarios)
 
 ## Error Handling
-- [ ] BASIC: Verify helpful error message when daemon not running or snapshot doesn't exist
+- [x] BASIC: Verify helpful error message when daemon not running or snapshot doesn't exist
 - [ ] thundersnapd connection refused (daemon not running)
 - [ ] Disk full during snapshot creation
 - [ ] Invalid snapshot ID format
@@ -168,21 +168,21 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 - [ ] Concurrent modification during snapshot
 
 ## Protocol/Streaming
-- [ ] BASIC: Verify streaming progress messages arrive incrementally (not buffered until end)
+- [x] BASIC: Verify streaming progress messages arrive incrementally (not buffered until end)
 - [ ] NDJSON streaming with partial line buffering
 - [ ] HTTP range request batching (verify 16-at-a-time)
 - [ ] vsock handshake timeout
 - [ ] Long-running operation progress updates
 
 ## Integration/Workflow Tests
-- [ ] BASIC: Create frame, modify a file, snap, create new frame from snap, verify modification present
+- [x] BASIC: Create frame, modify a file, snap, create new frame from snap, verify modification present
 - [ ] Full workflow: create frame -> modify -> snap -> new frame from snap
 - [ ] SSH session flow end-to-end
 - [ ] Cross-frame data sharing via work volume
 - [ ] Mesh replication: create on node A, download on node B
 
 ## Infrastructure/Daemon
-- [ ] BASIC: Start in-process thundersnapd, ping it, verify response
+- [x] BASIC: Start in-process thundersnapd, ping it, verify response
 - [ ] thundersnapd startup and ping response
 - [ ] Mesh mode peer coordination
 - [ ] NFS export functionality
@@ -190,7 +190,7 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 - [ ] File system quota enforcement
 
 ## Hardlink Handling
-- [ ] BASIC: Create hardlink, snapshot, restore, verify both paths point to same inode
+- [x] BASIC: Create hardlink, snapshot, restore, verify both paths point to same inode
 - [ ] Hardlink inode preservation across snapshot
 - [ ] Hardlinks spanning directories
 - [ ] Breaking hardlink by modifying one copy
@@ -226,7 +226,7 @@ fidx/mfidx format (SHA-1, 24-byte entries) with tsm/tsc (SHA-256, 40-byte entrie
 - [x] Phase 3b: Remove `ts fidx` command (removed with bupdate deletion)
 - [x] Phase 4: Remove cmd/fidx and cmd/bupdate (done)
 - [x] Phase 4b: Remove fidx generation code from bupdate/indexer.go (done - entire bupdate/ deleted)
-- [ ] Phase 4c: Update README.md to remove fidx references
+- [x] Phase 4c: Update README.md to remove fidx references
 
 **Legacy compatibility note:**
 The fidx parsing code in bupdate/ has been removed. Old snapshots using fidx format

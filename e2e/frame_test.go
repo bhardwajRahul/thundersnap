@@ -653,6 +653,206 @@ func generateSnapshotID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// TestFrameWithHomeSpec tests creating a frame with rootfs+home spec.
+func TestFrameWithHomeSpec(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create base snapshot for rootfs
+	baseSnap := env.createBaseSnapshot()
+	t.Logf("Created base snapshot: %s", baseSnap)
+
+	// Create a home snapshot separately
+	homeSnapPath := filepath.Join(env.snapshotsDir, "home-snap")
+	cmd := exec.Command("btrfs", "subvolume", "create", homeSnapPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create home snap: %v\n%s", err, out)
+	}
+	// Add some content to home snapshot
+	homeUserDir := filepath.Join(homeSnapPath, "user")
+	if err := os.MkdirAll(homeUserDir, 0755); err != nil {
+		t.Fatalf("mkdir home/user: %v", err)
+	}
+	os.Chown(homeUserDir, 1000, 1000)
+	homeFile := filepath.Join(homeUserDir, "home-marker.txt")
+	if err := os.WriteFile(homeFile, []byte("from home snapshot\n"), 0644); err != nil {
+		t.Fatalf("write home marker: %v", err)
+	}
+	os.Chown(homeFile, 1000, 1000)
+
+	// Create frame with rootfs:home: spec
+	frameName := "homespectest"
+	frameSpec := baseSnap + ":home-snap:"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+	t.Logf("Created frame with home spec: %s", frameName)
+
+	// Verify the frame exists
+	listResp, err := client.getJSON("/list-frames")
+	if err != nil {
+		t.Fatalf("list frames: %v", err)
+	}
+	frames, _ := listResp["frames"].([]interface{})
+	found := false
+	for _, f := range frames {
+		fmap := f.(map[string]interface{})
+		if fmap["name"] == frameName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("frame %q not found in list", frameName)
+	}
+
+	// Verify home content exists in the frame
+	framePath := filepath.Join(env.fsDir, "testuser", frameName)
+	markerPath := filepath.Join(framePath, "home", "user", "home-marker.txt")
+	content, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read home marker: %v", err)
+	}
+	if string(content) != "from home snapshot\n" {
+		t.Errorf("home marker content: got %q, want 'from home snapshot\\n'", content)
+	}
+	t.Logf("Verified home content from snapshot present in frame")
+}
+
+// TestFrameWithAllThreeSpecs tests creating a frame with rootfs:home:work spec.
+func TestFrameWithAllThreeSpecs(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create base snapshot for rootfs
+	baseSnap := env.createBaseSnapshot()
+
+	// Create home snapshot
+	homeSnapPath := filepath.Join(env.snapshotsDir, "home-snap2")
+	cmd := exec.Command("btrfs", "subvolume", "create", homeSnapPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create home snap: %v\n%s", err, out)
+	}
+	homeUserDir := filepath.Join(homeSnapPath, "user")
+	os.MkdirAll(homeUserDir, 0755)
+	os.Chown(homeUserDir, 1000, 1000)
+	os.WriteFile(filepath.Join(homeUserDir, "home-marker.txt"), []byte("home\n"), 0644)
+
+	// Create work snapshot
+	workSnapPath := filepath.Join(env.snapshotsDir, "work-snap")
+	cmd = exec.Command("btrfs", "subvolume", "create", workSnapPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create work snap: %v\n%s", err, out)
+	}
+	os.Chown(workSnapPath, 1000, 1000)
+	os.WriteFile(filepath.Join(workSnapPath, "work-marker.txt"), []byte("work\n"), 0644)
+
+	// Create frame with rootfs:home:work spec
+	frameName := "fullspectest"
+	frameSpec := baseSnap + ":home-snap2:work-snap"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+	t.Logf("Created frame with full spec: %s", frameName)
+
+	// Verify home and work content
+	framePath := filepath.Join(env.fsDir, "testuser", frameName)
+
+	homeContent, err := os.ReadFile(filepath.Join(framePath, "home", "user", "home-marker.txt"))
+	if err != nil {
+		t.Fatalf("read home marker: %v", err)
+	}
+	if string(homeContent) != "home\n" {
+		t.Errorf("home content: got %q, want 'home\\n'", homeContent)
+	}
+
+	workContent, err := os.ReadFile(filepath.Join(framePath, "work", "work-marker.txt"))
+	if err != nil {
+		t.Fatalf("read work marker: %v", err)
+	}
+	if string(workContent) != "work\n" {
+		t.Errorf("work content: got %q, want 'work\\n'", workContent)
+	}
+
+	t.Log("Verified home and work content from snapshots present in frame")
+}
+
+// TestFrameFromNonExistentSnapshot tests error handling for creating a frame from non-existent snapshot.
+func TestFrameFromNonExistentSnapshot(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Try to create frame from a snapshot that doesn't exist
+	frameName := "badframe"
+	frameSpec := "nonexistent-snapshot-xyz123::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame request: %v", err)
+	}
+
+	// Should return an error status
+	status, ok := createResp["status"].(string)
+	if !ok {
+		t.Fatalf("response missing status: %v", createResp)
+	}
+	if status != "error" {
+		t.Errorf("expected error status for non-existent snapshot, got %q", status)
+	}
+
+	// Verify message mentions the issue
+	message, _ := createResp["message"].(string)
+	t.Logf("Got expected error: %s", message)
+
+	// Verify frame was not created
+	listResp, err := client.getJSON("/list-frames")
+	if err != nil {
+		t.Fatalf("list frames: %v", err)
+	}
+	frames, _ := listResp["frames"].([]interface{})
+	for _, f := range frames {
+		fmap := f.(map[string]interface{})
+		if fmap["name"] == frameName {
+			t.Fatalf("frame %q should not exist after failed creation", frameName)
+		}
+	}
+	t.Log("Verified frame was not created")
+}
+
 // getDirSize returns the size of a directory in bytes using du.
 // Returns 0 if the size cannot be determined.
 func getDirSize(path string) int64 {
