@@ -757,3 +757,163 @@ func TestListSnapsAndFrames(t *testing.T) {
 		}
 	})
 }
+
+// TestSelectTargetUserEnsuresUserInPasswd tests that selectTargetUser:
+//  1. Adds "user" to /etc/passwd if missing (with home=/home)
+//  2. Logs in as "user" if /home exists
+//  3. Falls back to root if /home doesn't exist
+func TestSelectTargetUserEnsuresUserInPasswd(t *testing.T) {
+	// These tests don't need btrfs, just basic filesystem operations
+	t.Run("adds user to passwd and logs in when /home exists", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootFS := filepath.Join(tmpDir, "rootfs")
+
+		// Create minimal rootfs: etc/passwd with just root, and /home directory
+		etcDir := filepath.Join(rootFS, "etc")
+		homeDir := filepath.Join(rootFS, "home")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(homeDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// passwd only has root - no "user" entry
+		passwd := "root::0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/bin/nologin\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Call selectTargetUser with empty targetUser (auto-detect)
+		result := selectTargetUser(rootFS, "")
+
+		// Should return "user" because:
+		// 1. "user" gets added to passwd with home=/home
+		// 2. /home exists
+		if result != "user" {
+			t.Errorf("expected 'user', got %q", result)
+		}
+
+		// Verify user was added to passwd
+		got, err := os.ReadFile(filepath.Join(etcDir, "passwd"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(got), "user:x:1000:1000:user:/home:") {
+			t.Errorf("user entry not added to passwd:\n%s", got)
+		}
+	})
+
+	t.Run("falls back to root when /home does not exist", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootFS := filepath.Join(tmpDir, "rootfs")
+
+		// Create minimal rootfs: etc/passwd with just root, NO /home directory
+		etcDir := filepath.Join(rootFS, "etc")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		passwd := "root::0:0:root:/root:/bin/bash\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		result := selectTargetUser(rootFS, "")
+
+		// Should return "root" because /home doesn't exist
+		if result != "root" {
+			t.Errorf("expected 'root', got %q", result)
+		}
+
+		// User should still have been added to passwd (for future use)
+		got, _ := os.ReadFile(filepath.Join(etcDir, "passwd"))
+		if !strings.Contains(string(got), "user:x:1000:1000:user:/home:") {
+			t.Errorf("user entry should still be added to passwd:\n%s", got)
+		}
+	})
+
+	t.Run("prefers ubuntu if /home/ubuntu exists", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootFS := filepath.Join(tmpDir, "rootfs")
+
+		etcDir := filepath.Join(rootFS, "etc")
+		homeUbuntu := filepath.Join(rootFS, "home", "ubuntu")
+		homeDir := filepath.Join(rootFS, "home")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(homeUbuntu, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		passwd := "root::0:0:root:/root:/bin/bash\nubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		result := selectTargetUser(rootFS, "")
+
+		// Should return "ubuntu" because /home/ubuntu exists (legacy behavior)
+		if result != "ubuntu" {
+			t.Errorf("expected 'ubuntu', got %q", result)
+		}
+
+		// user should NOT have been added (ubuntu wins first)
+		got, _ := os.ReadFile(filepath.Join(etcDir, "passwd"))
+		if strings.Contains(string(got), "user:x:1000:1000:user:/home:") {
+			t.Errorf("user entry should not be added when ubuntu exists:\n%s", got)
+		}
+
+		// Make sure /home also exists for completeness, but ubuntu takes precedence
+		_ = homeDir
+	})
+
+	t.Run("uses explicit targetUser when specified", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootFS := filepath.Join(tmpDir, "rootfs")
+
+		etcDir := filepath.Join(rootFS, "etc")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		passwd := "root::0:0:root:/root:/bin/bash\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Explicit targetUser should be used directly
+		result := selectTargetUser(rootFS, "postgres")
+		if result != "postgres" {
+			t.Errorf("expected 'postgres', got %q", result)
+		}
+	})
+
+	t.Run("respects existing user home from passwd", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootFS := filepath.Join(tmpDir, "rootfs")
+
+		etcDir := filepath.Join(rootFS, "etc")
+		// user already exists with custom home /home/myuser
+		customHome := filepath.Join(rootFS, "home", "myuser")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(customHome, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		passwd := "root::0:0:root:/root:/bin/bash\nuser:x:1000:1000:User:/home/myuser:/bin/bash\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		result := selectTargetUser(rootFS, "")
+
+		// Should return "user" because /home/myuser exists
+		if result != "user" {
+			t.Errorf("expected 'user', got %q", result)
+		}
+	})
+}

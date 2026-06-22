@@ -1073,19 +1073,38 @@ func stripDomain(s string) string {
 
 // selectTargetUser determines which Unix user to run as in a container/VM.
 // If targetUser is non-empty, it's used directly (caller specified it).
-// Otherwise, auto-detect by checking if /home/<user> exists for each candidate
-// in order: [ubuntu, user]. If none exist, fall back to root.
+// Otherwise, auto-detect:
+//  1. Check if "ubuntu" user's home exists -> use ubuntu
+//  2. Ensure "user" exists in /etc/passwd (add if missing, with home=/home)
+//  3. If user's home directory exists -> use user
+//  4. Fall back to root
 func selectTargetUser(rootFS, targetUser string) string {
 	if targetUser != "" {
 		return targetUser
 	}
-	// Auto-detect: check candidates in order
-	for _, candidate := range []string{"ubuntu", "user"} {
-		homeDir := filepath.Join(rootFS, "home", candidate)
-		if info, err := os.Stat(homeDir); err == nil && info.IsDir() {
-			return candidate
+
+	// First check for ubuntu user (legacy behavior)
+	ubuntuHome := filepath.Join(rootFS, "home", "ubuntu")
+	if info, err := os.Stat(ubuntuHome); err == nil && info.IsDir() {
+		return "ubuntu"
+	}
+
+	// Ensure "user" exists in /etc/passwd, adding it if necessary.
+	// This returns the home directory from passwd (e.g., "/home" for new entries).
+	userHome, err := tsm.EnsureUserInPasswd(rootFS)
+	if err != nil {
+		log.Printf("Warning: failed to ensure user in passwd: %v", err)
+	}
+
+	// If we have a home path, check if it exists in the rootfs
+	if userHome != "" {
+		// userHome is absolute (e.g., "/home"), join with rootFS
+		homePath := filepath.Join(rootFS, userHome)
+		if info, err := os.Stat(homePath); err == nil && info.IsDir() {
+			return "user"
 		}
 	}
+
 	return "root"
 }
 

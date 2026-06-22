@@ -265,6 +265,144 @@ func EnsureSudoers(rootfs string) error {
 	return nil
 }
 
+// PasswdEntry represents a single line from /etc/passwd.
+type PasswdEntry struct {
+	Username string
+	Password string // usually "x" meaning shadow
+	UID      uint32
+	GID      uint32
+	GECOS    string // comment/full name
+	Home     string
+	Shell    string
+}
+
+// ParsePasswdEntry parses a single colon-delimited passwd line.
+// Returns nil if the line is a comment, blank, or malformed.
+func ParsePasswdEntry(line string) *PasswdEntry {
+	if line == "" || strings.HasPrefix(line, "#") {
+		return nil
+	}
+	fields := strings.Split(line, ":")
+	if len(fields) < 7 {
+		return nil
+	}
+	uid, err := strconv.ParseUint(fields[2], 10, 32)
+	if err != nil {
+		return nil
+	}
+	gid, err := strconv.ParseUint(fields[3], 10, 32)
+	if err != nil {
+		return nil
+	}
+	return &PasswdEntry{
+		Username: fields[0],
+		Password: fields[1],
+		UID:      uint32(uid),
+		GID:      uint32(gid),
+		GECOS:    fields[4],
+		Home:     fields[5],
+		Shell:    fields[6],
+	}
+}
+
+// LookupPasswdUser reads /etc/passwd at rootfs and returns the entry for username.
+// Returns nil if the file doesn't exist or the user is not found.
+func LookupPasswdUser(rootfs, username string) *PasswdEntry {
+	path := filepath.Join(rootfs, "etc", "passwd")
+	in, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(in)))
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		entry := ParsePasswdEntry(scanner.Text())
+		if entry != nil && entry.Username == username {
+			return entry
+		}
+	}
+	return nil
+}
+
+// EnsureUserInPasswd ensures that a user named "user" exists in /etc/passwd.
+// If the user doesn't exist, it's added as the first entry after root with:
+//   - UID/GID: DefaultSharedUID/DefaultSharedGID (1000)
+//   - Home: /home
+//   - Shell: /bin/sh (or /bin/bash if available)
+//
+// Returns the home directory of the "user" account (from passwd, not filesystem).
+// Returns empty string if /etc/passwd doesn't exist.
+func EnsureUserInPasswd(rootfs string) (home string, err error) {
+	path := filepath.Join(rootfs, "etc", "passwd")
+	in, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	// Check if "user" already exists
+	var lines []string
+	var userExists bool
+	var userHome string
+	scanner := bufio.NewScanner(strings.NewReader(string(in)))
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		lines = append(lines, line)
+		entry := ParsePasswdEntry(line)
+		if entry != nil && entry.Username == "user" {
+			userExists = true
+			userHome = entry.Home
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("scan passwd: %w", err)
+	}
+
+	if userExists {
+		return userHome, nil
+	}
+
+	// User doesn't exist - add it after root (first non-root line position)
+	// Pick shell: prefer /bin/bash if it exists, otherwise /bin/sh
+	shell := "/bin/sh"
+	if _, err := os.Stat(filepath.Join(rootfs, "bin", "bash")); err == nil {
+		shell = "/bin/bash"
+	}
+
+	newEntry := fmt.Sprintf("user:x:%d:%d:user:/home:%s",
+		DefaultSharedUID, DefaultSharedGID, shell)
+
+	// Insert after root line
+	var out strings.Builder
+	inserted := false
+	for _, line := range lines {
+		out.WriteString(line)
+		out.WriteByte('\n')
+		// Insert after root entry (UID 0)
+		if !inserted {
+			entry := ParsePasswdEntry(line)
+			if entry != nil && entry.UID == 0 {
+				out.WriteString(newEntry)
+				out.WriteByte('\n')
+				inserted = true
+			}
+		}
+	}
+	// If we never found root (weird but possible), append at end
+	if !inserted {
+		out.WriteString(newEntry)
+		out.WriteByte('\n')
+	}
+
+	if err := atomicWriteFile(path, []byte(out.String()), 0644); err != nil {
+		return "", err
+	}
+	return "/home", nil
+}
+
 // atomicWriteFile writes data to path via a temp file + rename, preserving
 // the existing file's mode if it exists; otherwise uses defaultMode.
 func atomicWriteFile(path string, data []byte, defaultMode os.FileMode) error {

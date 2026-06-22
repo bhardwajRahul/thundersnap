@@ -18,20 +18,50 @@ import (
 
 // selectTargetUser determines which Unix user to run as.
 // If targetUser is non-empty, it's used directly (caller specified it).
-// Otherwise, auto-detect by checking if /home/<user> exists for each candidate
-// in order: [ubuntu, user]. If none exist, fall back to root.
+// Otherwise, auto-detect:
+//  1. Check if "ubuntu" user's home exists -> use ubuntu
+//  2. Look up "user" in /etc/passwd and check if their home exists -> use user
+//  3. Fall back to root
 func selectTargetUser(targetUser string) string {
 	if targetUser != "" {
 		return targetUser
 	}
-	// Auto-detect: check candidates in order
-	for _, candidate := range []string{"ubuntu", "user"} {
-		homeDir := "/home/" + candidate
-		if info, err := os.Stat(homeDir); err == nil && info.IsDir() {
-			return candidate
+
+	// First check for ubuntu user (legacy behavior)
+	if info, err := os.Stat("/home/ubuntu"); err == nil && info.IsDir() {
+		return "ubuntu"
+	}
+
+	// Look up "user" in /etc/passwd to find their home directory
+	userHome := lookupUserHome("user")
+	if userHome != "" {
+		if info, err := os.Stat(userHome); err == nil && info.IsDir() {
+			return "user"
 		}
 	}
+
 	return "root"
+}
+
+// lookupUserHome reads /etc/passwd and returns the home directory for username.
+// Returns empty string if the file doesn't exist or user is not found.
+func lookupUserHome(username string) string {
+	data, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		return ""
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) >= 6 && fields[0] == username {
+			return fields[5] // home directory field
+		}
+	}
+	return ""
 }
 
 const vsockPort = 5222
