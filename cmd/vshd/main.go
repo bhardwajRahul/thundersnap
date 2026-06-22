@@ -169,7 +169,8 @@ func runInteractiveShell(id uint64, conn *vsock.Conn, reader *bufio.Reader, runA
 }
 
 // runCommand executes a command as the specified user without PTY and exits when done.
-// For root, runs the command directly. For other users, uses "su <user> -c".
+// For root, runs the command directly. For other users, uses "su - <user> -c" for a
+// login shell that sets HOME and changes to the user's home directory.
 func runCommand(id uint64, conn *vsock.Conn, reader *bufio.Reader, runAsUser string, cmdArgs []string) {
 	var cmd *exec.Cmd
 
@@ -178,7 +179,8 @@ func runCommand(id uint64, conn *vsock.Conn, reader *bufio.Reader, runAsUser str
 		// This avoids the need for a dynamically-linked su binary in minimal containers.
 		cmd = exec.Command(cmdArgs[0], cmdArgs[1:]...)
 	} else {
-		// For non-root users, use su to switch users.
+		// For non-root users, use su - to switch users with a login shell.
+		// The login shell changes to the home directory, sets HOME, reads profile, etc.
 		// Build the command string with proper quoting for su -c
 		// We use single quotes and escape any single quotes in the arguments
 		quotedArgs := make([]string, len(cmdArgs))
@@ -186,7 +188,7 @@ func runCommand(id uint64, conn *vsock.Conn, reader *bufio.Reader, runAsUser str
 			quotedArgs[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
 		}
 		cmdStr := strings.Join(quotedArgs, " ")
-		cmd = exec.Command("su", runAsUser, "-c", cmdStr)
+		cmd = exec.Command("su", "-", runAsUser, "-c", cmdStr)
 	}
 	cmd.Env = os.Environ()
 
