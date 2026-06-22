@@ -5,6 +5,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,7 +14,7 @@ import (
 
 // TestDockerImportBasic tests importing a locally-constructed OCI tarball.
 // It constructs a minimal Docker-save-format tarball using pure Go (no external
-// downloads), imports it via the test control server's /download-docker endpoint,
+// downloads), imports it via the test control server's /import-docker-tarball endpoint,
 // and verifies the resulting snapshot contains the expected files.
 func TestDockerImportBasic(t *testing.T) {
 	env := newTestEnv(t)
@@ -257,14 +258,9 @@ func startDockerTestControlServer(t *testing.T, env *testEnv, sockPath string) *
 	return &dockerTestControlServer{testControlServer: base}
 }
 
-// Override handleConn to add Docker-specific endpoints
+// Close releases resources.
 func (s *dockerTestControlServer) Close() {
 	s.testControlServer.Close()
-}
-
-func init() {
-	// Register the import-docker-tarball handler in startTestControlServer
-	// by extending the mux. We do this via init() to add the handler.
 }
 
 // handleImportDockerTarball handles POST /import-docker-tarball
@@ -296,30 +292,7 @@ func (s *testControlServer) handleImportDockerTarball(w http.ResponseWriter, r *
 		return
 	}
 
-	// Create a temporary extraction directory
-	extractDir := filepath.Join(s.env.snapshotsDir, "docker-extract-temp")
-	if err := os.MkdirAll(extractDir, 0755); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "error",
-			"message": "create extract dir: " + err.Error(),
-		})
-		return
-	}
-	defer os.RemoveAll(extractDir)
-
-	// Extract the Docker tarball using our local implementation
-	// (This mimics what flattenDockerTarball does)
-	if err := extractDockerTarball(req.TarballPath, extractDir); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "error",
-			"message": "extract tarball: " + err.Error(),
-		})
-		return
-	}
-
-	// Generate a snapshot ID and create the snapshot
+	// Generate a snapshot ID
 	snapID, err := generateSnapshotID()
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -330,13 +303,24 @@ func (s *testControlServer) handleImportDockerTarball(w http.ResponseWriter, r *
 		return
 	}
 
-	// Move extracted content to snapshot location
+	// Create the snapshot directory directly
 	snapPath := filepath.Join(s.env.snapshotsDir, snapID)
-	if err := os.Rename(extractDir, snapPath); err != nil {
+	if err := os.MkdirAll(snapPath, 0755); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
 			"status":  "error",
-			"message": "create snapshot: " + err.Error(),
+			"message": "create snapshot dir: " + err.Error(),
+		})
+		return
+	}
+
+	// Extract the Docker tarball
+	if err := extractDockerTarball(req.TarballPath, snapPath); err != nil {
+		os.RemoveAll(snapPath)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "error",
+			"message": "extract tarball: " + err.Error(),
 		})
 		return
 	}
@@ -366,8 +350,11 @@ func extractDockerTarball(tarPath, destDir string) error {
 
 	for {
 		hdr, err := tr.Next()
-		if err != nil {
+		if err == io.EOF {
 			break
+		}
+		if err != nil {
+			return err
 		}
 
 		if hdr.Name == "manifest.json" {
@@ -395,24 +382,22 @@ func extractDockerTarball(tarPath, destDir string) error {
 
 	for {
 		hdr, err := tr.Next()
-		if err != nil {
+		if err == io.EOF {
 			break
+		}
+		if err != nil {
+			return err
 		}
 
 		for _, layerPath := range manifest[0].Layers {
 			if hdr.Name == layerPath {
-				data := make([]byte, hdr.Size)
-				if _, err := tr.Read(data); err != nil && err.Error() != "EOF" {
-					// Read might return less data if there's padding
+				// Read the entire layer content
+				data, err := io.ReadAll(tr)
+				if err != nil {
+					return err
 				}
-				// Read exact size
-				buf := bytes.NewBuffer(nil)
-				buf.Grow(int(hdr.Size))
-				_, _ = buf.ReadFrom(tr)
-				layers[layerPath] = buf.Bytes()
-				if len(layers[layerPath]) == 0 {
-					layers[layerPath] = data[:hdr.Size]
-				}
+				layers[layerPath] = data
+				break
 			}
 		}
 	}
@@ -438,8 +423,11 @@ func extractTarLayer(layerData []byte, destDir string) error {
 
 	for {
 		hdr, err := tr.Next()
-		if err != nil {
+		if err == io.EOF {
 			break
+		}
+		if err != nil {
+			return err
 		}
 
 		target := filepath.Join(destDir, hdr.Name)
@@ -457,13 +445,19 @@ func extractTarLayer(layerData []byte, destDir string) error {
 			if err != nil {
 				return err
 			}
-			buf := make([]byte, hdr.Size)
-			n, _ := tr.Read(buf)
-			outf.Write(buf[:n])
+			if _, err := io.Copy(outf, tr); err != nil {
+				outf.Close()
+				return err
+			}
 			outf.Close()
 		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
 			os.Remove(target)
-			os.Symlink(hdr.Linkname, target)
+			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				return err
+			}
 		}
 	}
 
