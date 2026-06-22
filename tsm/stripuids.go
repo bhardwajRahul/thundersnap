@@ -324,8 +324,9 @@ func LookupPasswdUser(rootfs, username string) *PasswdEntry {
 	return nil
 }
 
-// EnsureUserInPasswd ensures that a user named "user" exists in /etc/passwd.
-// If the user doesn't exist, it's added as the first entry after root with:
+// EnsureUserInPasswd ensures that a user named "user" exists in /etc/passwd
+// (and /etc/shadow if it exists). If the user doesn't exist, it's added as
+// the first entry after root with:
 //   - UID/GID: DefaultSharedUID/DefaultSharedGID (1000)
 //   - Home: /home
 //   - Shell: /bin/sh (or /bin/bash if available)
@@ -333,8 +334,8 @@ func LookupPasswdUser(rootfs, username string) *PasswdEntry {
 // Returns the home directory of the "user" account (from passwd, not filesystem).
 // Returns empty string if /etc/passwd doesn't exist.
 func EnsureUserInPasswd(rootfs string) (home string, err error) {
-	path := filepath.Join(rootfs, "etc", "passwd")
-	in, err := os.ReadFile(path)
+	passwdPath := filepath.Join(rootfs, "etc", "passwd")
+	in, err := os.ReadFile(passwdPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", nil
@@ -372,10 +373,10 @@ func EnsureUserInPasswd(rootfs string) (home string, err error) {
 		shell = "/bin/bash"
 	}
 
-	newEntry := fmt.Sprintf("user:x:%d:%d:user:/home:%s",
+	newPasswdEntry := fmt.Sprintf("user:x:%d:%d:user:/home:%s",
 		DefaultSharedUID, DefaultSharedGID, shell)
 
-	// Insert after root line
+	// Insert after root line in passwd
 	var out strings.Builder
 	inserted := false
 	for _, line := range lines {
@@ -385,7 +386,7 @@ func EnsureUserInPasswd(rootfs string) (home string, err error) {
 		if !inserted {
 			entry := ParsePasswdEntry(line)
 			if entry != nil && entry.UID == 0 {
-				out.WriteString(newEntry)
+				out.WriteString(newPasswdEntry)
 				out.WriteByte('\n')
 				inserted = true
 			}
@@ -393,14 +394,85 @@ func EnsureUserInPasswd(rootfs string) (home string, err error) {
 	}
 	// If we never found root (weird but possible), append at end
 	if !inserted {
-		out.WriteString(newEntry)
+		out.WriteString(newPasswdEntry)
 		out.WriteByte('\n')
 	}
 
-	if err := atomicWriteFile(path, []byte(out.String()), 0644); err != nil {
+	if err := atomicWriteFile(passwdPath, []byte(out.String()), 0644); err != nil {
 		return "", err
 	}
+
+	// Also add to /etc/shadow if it exists
+	if err := ensureUserInShadow(rootfs); err != nil {
+		return "", err
+	}
+
 	return "/home", nil
+}
+
+// ensureUserInShadow adds a "user" entry to /etc/shadow if the file exists
+// and doesn't already have a "user" entry. The entry uses "!" (locked password)
+// which allows login via su/sudo but not direct password auth.
+func ensureUserInShadow(rootfs string) error {
+	shadowPath := filepath.Join(rootfs, "etc", "shadow")
+	in, err := os.ReadFile(shadowPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // No shadow file, nothing to do
+		}
+		return err
+	}
+
+	// Check if "user" already exists in shadow
+	var lines []string
+	var userExists bool
+	scanner := bufio.NewScanner(strings.NewReader(string(in)))
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		lines = append(lines, line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			fields := strings.Split(line, ":")
+			if len(fields) > 0 && fields[0] == "user" {
+				userExists = true
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan shadow: %w", err)
+	}
+
+	if userExists {
+		return nil
+	}
+
+	// Shadow format: username:password:lastchanged:min:max:warn:inactive:expire:reserved
+	// "!" means locked (no password login, but su/sudo still work)
+	// Use 0 for lastchanged (days since epoch) - doesn't matter for locked accounts
+	newShadowEntry := "user:!:0:0:99999:7:::"
+
+	// Insert after root line
+	var out strings.Builder
+	inserted := false
+	for _, line := range lines {
+		out.WriteString(line)
+		out.WriteByte('\n')
+		if !inserted && line != "" && !strings.HasPrefix(line, "#") {
+			fields := strings.Split(line, ":")
+			if len(fields) > 0 && fields[0] == "root" {
+				out.WriteString(newShadowEntry)
+				out.WriteByte('\n')
+				inserted = true
+			}
+		}
+	}
+	if !inserted {
+		out.WriteString(newShadowEntry)
+		out.WriteByte('\n')
+	}
+
+	// Shadow files are mode 0640 (or 0600)
+	return atomicWriteFile(shadowPath, []byte(out.String()), 0640)
 }
 
 // atomicWriteFile writes data to path via a temp file + rename, preserving

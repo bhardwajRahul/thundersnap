@@ -392,4 +392,122 @@ func TestEnsureUserInPasswd(t *testing.T) {
 			t.Errorf("file changed between calls:\n1st: %s\n2nd: %s", first, second)
 		}
 	})
+
+	t.Run("adds user to shadow when shadow exists", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootfs := filepath.Join(tmpDir, "rootfs")
+		etcDir := filepath.Join(rootfs, "etc")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		passwd := "root::0:0:root:/root:/bin/bash\n"
+		shadow := "root:!:19000:0:99999:7:::\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(etcDir, "shadow"), []byte(shadow), 0640); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := EnsureUserInPasswd(rootfs)
+		if err != nil {
+			t.Fatalf("EnsureUserInPasswd: %v", err)
+		}
+
+		// Check passwd
+		gotPasswd, _ := os.ReadFile(filepath.Join(etcDir, "passwd"))
+		if !strings.Contains(string(gotPasswd), "user:x:1000:1000:user:/home:") {
+			t.Errorf("user not added to passwd:\n%s", gotPasswd)
+		}
+
+		// Check shadow
+		gotShadow, _ := os.ReadFile(filepath.Join(etcDir, "shadow"))
+		if !strings.Contains(string(gotShadow), "user:!:") {
+			t.Errorf("user not added to shadow:\n%s", gotShadow)
+		}
+
+		// Verify order in shadow: user should appear after root
+		shadowLines := strings.Split(strings.TrimSpace(string(gotShadow)), "\n")
+		var rootIdx, userIdx int = -1, -1
+		for i, line := range shadowLines {
+			if strings.HasPrefix(line, "root:") {
+				rootIdx = i
+			} else if strings.HasPrefix(line, "user:") {
+				userIdx = i
+			}
+		}
+		if rootIdx == -1 || userIdx == -1 {
+			t.Errorf("missing expected entries in shadow:\n%s", gotShadow)
+		}
+		if rootIdx >= userIdx {
+			t.Errorf("expected user after root in shadow, got indices root=%d, user=%d:\n%s",
+				rootIdx, userIdx, gotShadow)
+		}
+	})
+
+	t.Run("does not modify shadow when user already exists", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootfs := filepath.Join(tmpDir, "rootfs")
+		etcDir := filepath.Join(rootfs, "etc")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		passwd := "root::0:0:root:/root:/bin/bash\nuser:x:1000:1000:User:/home/user:/bin/bash\n"
+		shadow := "root:!:19000:0:99999:7:::\nuser:!:19000:0:99999:7:::\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(etcDir, "shadow"), []byte(shadow), 0640); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := EnsureUserInPasswd(rootfs)
+		if err != nil {
+			t.Fatalf("EnsureUserInPasswd: %v", err)
+		}
+
+		// Shadow should be unchanged
+		gotShadow, _ := os.ReadFile(filepath.Join(etcDir, "shadow"))
+		if string(gotShadow) != shadow {
+			t.Errorf("shadow was modified unexpectedly:\n%s", gotShadow)
+		}
+	})
+
+	t.Run("shadow idempotent", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootfs := filepath.Join(tmpDir, "rootfs")
+		etcDir := filepath.Join(rootfs, "etc")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		passwd := "root::0:0:root:/root:/bin/bash\n"
+		shadow := "root:!:19000:0:99999:7:::\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(etcDir, "shadow"), []byte(shadow), 0640); err != nil {
+			t.Fatal(err)
+		}
+
+		// First call
+		_, err := EnsureUserInPasswd(rootfs)
+		if err != nil {
+			t.Fatalf("first EnsureUserInPasswd: %v", err)
+		}
+		firstShadow, _ := os.ReadFile(filepath.Join(etcDir, "shadow"))
+
+		// Second call should not modify shadow
+		_, err = EnsureUserInPasswd(rootfs)
+		if err != nil {
+			t.Fatalf("second EnsureUserInPasswd: %v", err)
+		}
+		secondShadow, _ := os.ReadFile(filepath.Join(etcDir, "shadow"))
+
+		if string(firstShadow) != string(secondShadow) {
+			t.Errorf("shadow changed between calls:\n1st: %s\n2nd: %s", firstShadow, secondShadow)
+		}
+	})
 }
