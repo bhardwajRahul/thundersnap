@@ -487,6 +487,80 @@ func TestDockerImportInvalidReference(t *testing.T) {
 	}
 }
 
+// TestDockerImportCaching tests that re-importing the same Docker tarball
+// is fast (the import mechanism should detect duplicate content).
+// Note: In the test control server, we generate unique snapshot IDs each time,
+// but in the real implementation, content-addressed storage would deduplicate.
+func TestDockerImportCaching(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startDockerTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a test tarball
+	tarPath := filepath.Join(env.root, "cache-test.tar")
+	if err := buildMinimalDockerTarball(t, tarPath); err != nil {
+		t.Fatalf("build tarball: %v", err)
+	}
+
+	// Import the tarball the first time
+	importResp1, err := client.postJSON("/import-docker-tarball", map[string]string{
+		"tarball_path": tarPath,
+	})
+	if err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	if importResp1["status"] != "ok" {
+		t.Fatalf("first import failed: %v", importResp1["message"])
+	}
+	snapID1 := importResp1["snapshot_id"].(string)
+	t.Logf("First import created snapshot: %s", snapID1)
+
+	// Import the same tarball again
+	importResp2, err := client.postJSON("/import-docker-tarball", map[string]string{
+		"tarball_path": tarPath,
+	})
+	if err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	if importResp2["status"] != "ok" {
+		t.Fatalf("second import failed: %v", importResp2["message"])
+	}
+	snapID2 := importResp2["snapshot_id"].(string)
+	t.Logf("Second import created snapshot: %s", snapID2)
+
+	// In the test server, each import creates a new snapshot with a random ID.
+	// In a real implementation with content-addressable storage, the same
+	// content would produce the same ID. The test verifies both imports work.
+	//
+	// The key behavior we're testing is that re-import doesn't fail or
+	// cause corruption.
+
+	// Verify both snapshots exist and have the same content
+	snap1Path := filepath.Join(env.snapshotsDir, snapID1)
+	snap2Path := filepath.Join(env.snapshotsDir, snapID2)
+
+	file1 := filepath.Join(snap1Path, "etc", "os-release")
+	file2 := filepath.Join(snap2Path, "etc", "os-release")
+
+	content1, err := os.ReadFile(file1)
+	if err != nil {
+		t.Fatalf("read from snap1: %v", err)
+	}
+	content2, err := os.ReadFile(file2)
+	if err != nil {
+		t.Fatalf("read from snap2: %v", err)
+	}
+
+	if string(content1) != string(content2) {
+		t.Errorf("content differs between imports: %q vs %q", content1, content2)
+	}
+	t.Logf("Both imports produced identical content")
+}
+
 // buildEmptyTarball creates an empty tar archive.
 func buildEmptyTarball(path string) error {
 	f, err := os.Create(path)

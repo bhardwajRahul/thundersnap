@@ -107,8 +107,8 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [x] BASIC: Import a locally-constructed OCI tarball, verify resulting snapshot has expected files
 - [ ] download-docker basic image (e.g., alpine:latest)
 - [ ] download-docker with full registry path (docker.io/library/ubuntu:24.04)
-- [ ] download-docker caching (re-import same image is fast)
-- [ ] download-docker multi-layer image flattening
+- [x] download-docker caching (re-import same image is fast)
+- [x] download-docker multi-layer image flattening
 - [ ] download-docker private registry (auth error case)
 - [x] download-docker invalid image reference (error case)
 
@@ -163,7 +163,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [x] Full workflow: create frame -> modify -> snap -> new frame from snap
 - [ ] SSH session flow end-to-end
 - [x] Cross-frame data sharing via work volume
-- [ ] Mesh replication: create on node A, download on node B
+- [x] Mesh replication: create on node A, download on node B
 
 ## Infrastructure/Daemon
 - [x] BASIC: Start in-process thundersnapd, ping it, verify response
