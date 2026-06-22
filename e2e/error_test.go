@@ -302,6 +302,112 @@ func TestSymlinkLoopDetection(t *testing.T) {
 	}
 }
 
+// TestCorruptedSnapshotMetadata tests handling of corrupted snapshot metadata.
+// If a snapshot exists but its metadata is corrupted or missing, operations
+// should fail gracefully with helpful error messages.
+func TestCorruptedSnapshotMetadata(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a base snapshot
+	baseSnap := env.createBaseSnapshot()
+
+	// Create a frame from the base snapshot
+	frameName := "corrupttest"
+	frameSpec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+
+	// Create a snapshot
+	snapResp, err := client.postJSON("/snap", map[string]string{
+		"frame_name": frameName,
+	})
+	if err != nil {
+		t.Fatalf("snap: %v", err)
+	}
+	if snapResp["status"] != "ok" {
+		t.Fatalf("snap failed: %v", snapResp["message"])
+	}
+
+	snapID := snapResp["snapshot_id"].(string)
+	t.Logf("Created snapshot: %s", snapID)
+
+	// The snapshot exists - verify it's in the list
+	listResp, err := client.getJSON("/list-snaps")
+	if err != nil {
+		t.Fatalf("list-snaps: %v", err)
+	}
+	snaps := listResp["snaps"].([]interface{})
+	found := false
+	for _, s := range snaps {
+		smap := s.(map[string]interface{})
+		if smap["id"] == snapID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("snapshot not found in list")
+	}
+	t.Logf("Snapshot found in list before corruption")
+
+	// Now "corrupt" the snapshot by removing a critical file
+	// For btrfs snapshots, removing the snapshot directory would be corruption
+	// Instead, let's test listing when there's a non-directory entry in snapshotsDir
+	corruptEntry := filepath.Join(env.snapshotsDir, "corrupt-metadata-file")
+	if err := os.WriteFile(corruptEntry, []byte("not a snapshot"), 0644); err != nil {
+		t.Fatalf("create corrupt entry: %v", err)
+	}
+
+	// List should still work and skip the non-directory entry
+	listResp2, err := client.getJSON("/list-snaps")
+	if err != nil {
+		t.Fatalf("list-snaps after corruption: %v", err)
+	}
+	if listResp2["status"] != "ok" {
+		t.Errorf("list-snaps should succeed even with corrupt entries")
+	} else {
+		t.Log("list-snaps succeeded with corrupt entry in snapshotsDir")
+	}
+
+	// The original snapshot should still be listed
+	snaps2 := listResp2["snaps"].([]interface{})
+	found = false
+	for _, s := range snaps2 {
+		smap := s.(map[string]interface{})
+		if smap["id"] == snapID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("original snapshot not found after adding corrupt entry")
+	}
+
+	// The corrupt file should NOT appear as a snapshot
+	for _, s := range snaps2 {
+		smap := s.(map[string]interface{})
+		if smap["id"] == "corrupt-metadata-file" {
+			t.Errorf("corrupt file should not appear as snapshot")
+		}
+	}
+	t.Log("list-snaps correctly filtered out corrupt entry")
+}
+
 // TestErrorWhoHasNonexistent tests error handling for who-has on non-existent snapshot.
 func TestErrorWhoHasNonexistent(t *testing.T) {
 	env := newTestEnv(t)

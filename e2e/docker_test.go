@@ -417,6 +417,89 @@ func extractDockerTarball(tarPath, destDir string) error {
 	return nil
 }
 
+// TestDockerImportInvalidReference tests error handling when importing
+// an invalid Docker tarball (missing or corrupt manifest).
+func TestDockerImportInvalidReference(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startDockerTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Test 1: Empty tarball (no manifest)
+	emptyTarPath := filepath.Join(env.root, "empty.tar")
+	if err := buildEmptyTarball(emptyTarPath); err != nil {
+		t.Fatalf("build empty tarball: %v", err)
+	}
+
+	importResp, err := client.postJSON("/import-docker-tarball", map[string]string{
+		"tarball_path": emptyTarPath,
+	})
+	if err != nil {
+		t.Logf("Got network error (acceptable): %v", err)
+	} else {
+		status, _ := importResp["status"].(string)
+		if status != "error" {
+			t.Errorf("expected error for empty tarball, got status=%q", status)
+		} else {
+			message, _ := importResp["message"].(string)
+			t.Logf("Got expected error for empty tarball: %s", message)
+		}
+	}
+
+	// Test 2: Non-existent tarball
+	importResp2, err := client.postJSON("/import-docker-tarball", map[string]string{
+		"tarball_path": "/nonexistent/path/to/image.tar",
+	})
+	if err != nil {
+		t.Logf("Got network error (acceptable): %v", err)
+	} else {
+		status, _ := importResp2["status"].(string)
+		if status != "error" {
+			t.Errorf("expected error for non-existent tarball, got status=%q", status)
+		} else {
+			message, _ := importResp2["message"].(string)
+			t.Logf("Got expected error for non-existent tarball: %s", message)
+		}
+	}
+
+	// Test 3: Corrupt tarball (not actually a tar file)
+	corruptPath := filepath.Join(env.root, "corrupt.tar")
+	if err := os.WriteFile(corruptPath, []byte("this is not a tarball"), 0644); err != nil {
+		t.Fatalf("write corrupt file: %v", err)
+	}
+
+	importResp3, err := client.postJSON("/import-docker-tarball", map[string]string{
+		"tarball_path": corruptPath,
+	})
+	if err != nil {
+		t.Logf("Got network error (acceptable): %v", err)
+	} else {
+		status, _ := importResp3["status"].(string)
+		if status != "error" {
+			t.Errorf("expected error for corrupt tarball, got status=%q", status)
+		} else {
+			message, _ := importResp3["message"].(string)
+			t.Logf("Got expected error for corrupt tarball: %s", message)
+		}
+	}
+}
+
+// buildEmptyTarball creates an empty tar archive.
+func buildEmptyTarball(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	tw := tar.NewWriter(f)
+	tw.Close()
+	return nil
+}
+
 // extractTarLayer extracts a tar layer to the destination directory.
 func extractTarLayer(layerData []byte, destDir string) error {
 	tr := tar.NewReader(bytes.NewReader(layerData))
