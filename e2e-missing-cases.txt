@@ -95,11 +95,11 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 
 ## Mesh/Content-Addressed Operations
 - [x] BASIC: Two in-process instances; create snap on A, who-has from B finds it, download-snap succeeds
-- [ ] who-has query for existing snapshot
-- [ ] who-has query for non-existent snapshot
+- [x] who-has query for existing snapshot
+- [x] who-has query for non-existent snapshot
 - [ ] who-has with frame spec (colon-separated) shows helpful error
-- [ ] download-snap from mesh peer
-- [ ] download-snap already present (skip re-download)
+- [x] download-snap from mesh peer
+- [x] download-snap already present (skip re-download)
 - [ ] download-snap for frame spec (parallel downloads)
 - [ ] Peer discovery via mesh
 
@@ -191,8 +191,8 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 
 ## Hardlink Handling
 - [x] BASIC: Create hardlink, snapshot, restore, verify both paths point to same inode
-- [ ] Hardlink inode preservation across snapshot
-- [ ] Hardlinks spanning directories
+- [x] Hardlink inode preservation across snapshot
+- [x] Hardlinks spanning directories
 - [ ] Breaking hardlink by modifying one copy
 
 ## TSM/TSC Format

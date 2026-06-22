@@ -421,6 +421,77 @@ func (s *meshTestControlServer) handleDownloadSnap(w http.ResponseWriter, r *htt
 	})
 }
 
+// TestMeshDownloadAlreadyPresent tests that download-snap returns immediately
+// when the snapshot is already present locally.
+func TestMeshDownloadAlreadyPresent(t *testing.T) {
+	envA := newTestEnv(t)
+	envB := newTestEnv(t)
+
+	// Create a snapshot on instance A
+	baseSnapA := envA.createBaseSnapshot()
+	t.Logf("Instance A created snapshot: %s", baseSnapA)
+
+	// Start HTTP server on A
+	lnA, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on A: %v", err)
+	}
+	defer lnA.Close()
+	serverAddrA := lnA.Addr().String()
+
+	muxA := http.NewServeMux()
+	muxA.Handle("/bupdate/", http.StripPrefix("/bupdate", http.FileServer(http.Dir(envA.snapshotsDir))))
+	muxA.HandleFunc("/who-has", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ok",
+			"peers": []map[string]string{
+				{"hostname": "instanceA", "url": "http://" + serverAddrA},
+			},
+		})
+	})
+	srvA := &http.Server{Handler: muxA}
+	go srvA.Serve(lnA)
+	defer srvA.Close()
+
+	// Create control server for B
+	sockPathB := filepath.Join(envB.root, "ctrl.sock")
+	ctrlB := startMeshTestControlServer(t, envB, sockPathB, "http://"+serverAddrA)
+	defer ctrlB.Close()
+
+	clientB := newTestHTTPClient(sockPathB)
+
+	// First, download the snapshot to B
+	downloadResp, err := clientB.postJSON("/download-snap", map[string]string{
+		"snapshot_id": baseSnapA,
+	})
+	if err != nil {
+		t.Fatalf("first download-snap: %v", err)
+	}
+	if downloadResp["status"] != "ok" {
+		t.Fatalf("first download failed: %v", downloadResp["message"])
+	}
+	t.Log("First download completed")
+
+	// Try to download again - should return immediately with already_had=true
+	downloadResp2, err := clientB.postJSON("/download-snap", map[string]string{
+		"snapshot_id": baseSnapA,
+	})
+	if err != nil {
+		t.Fatalf("second download-snap: %v", err)
+	}
+	if downloadResp2["status"] != "ok" {
+		t.Fatalf("second download failed: %v", downloadResp2["message"])
+	}
+
+	alreadyHad, _ := downloadResp2["already_had"].(bool)
+	if !alreadyHad {
+		t.Errorf("expected already_had=true for second download, got %v", downloadResp2)
+	} else {
+		t.Log("Second download correctly returned already_had=true")
+	}
+}
+
 // jsonReader creates an io.Reader from a JSON-serializable value.
 func jsonReader(v interface{}) *jsonReaderImpl {
 	return &jsonReaderImpl{v: v}

@@ -73,3 +73,94 @@ func TestHardlinkHandlingBasic(t *testing.T) {
 		t.Logf("Hardlink file has nlink=%d", hardlinkStat.Nlink)
 	}
 }
+
+// TestHardlinkSpanningDirectories tests that hardlinks spanning directories
+// are preserved correctly through snapshot and restore.
+func TestHardlinkSpanningDirectories(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create a base snapshot
+	baseSnap := env.createBaseSnapshot()
+
+	// Create a frame from the snapshot
+	framePath := filepath.Join(env.fsDir, "testuser", "hardlinkspan")
+	if err := os.MkdirAll(filepath.Dir(framePath), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	cmd := exec.Command("btrfs", "subvolume", "snapshot",
+		filepath.Join(env.snapshotsDir, baseSnap), framePath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("btrfs snapshot: %v\n%s", err, out)
+	}
+
+	// Create a file in one directory
+	dir1 := filepath.Join(framePath, "tmp", "dir1")
+	dir2 := filepath.Join(framePath, "tmp", "dir2")
+	if err := os.MkdirAll(dir1, 0755); err != nil {
+		t.Fatalf("mkdir dir1: %v", err)
+	}
+	if err := os.MkdirAll(dir2, 0755); err != nil {
+		t.Fatalf("mkdir dir2: %v", err)
+	}
+
+	origFile := filepath.Join(dir1, "orig.txt")
+	if err := os.WriteFile(origFile, []byte("hardlink spanning dirs test\n"), 0644); err != nil {
+		t.Fatalf("write orig file: %v", err)
+	}
+
+	// Create hardlink in a different directory
+	linkFile := filepath.Join(dir2, "link.txt")
+	if err := os.Link(origFile, linkFile); err != nil {
+		t.Fatalf("create hardlink: %v", err)
+	}
+
+	// Verify they share the same inode
+	var origStat, linkStat syscall.Stat_t
+	if err := syscall.Stat(origFile, &origStat); err != nil {
+		t.Fatalf("stat orig: %v", err)
+	}
+	if err := syscall.Stat(linkFile, &linkStat); err != nil {
+		t.Fatalf("stat link: %v", err)
+	}
+	if origStat.Ino != linkStat.Ino {
+		t.Fatalf("files don't share inode before snapshot")
+	}
+	t.Logf("Before snapshot: inode=%d, nlink=%d", origStat.Ino, origStat.Nlink)
+
+	// Create a snapshot of the frame
+	snap2Path := filepath.Join(env.snapshotsDir, "hardlink-span-snap")
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", "-r", framePath, snap2Path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("btrfs snapshot frame: %v\n%s", err, out)
+	}
+
+	// Create a new frame from the snapshot
+	frame2Path := filepath.Join(env.fsDir, "testuser", "hardlinkspan2")
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", snap2Path, frame2Path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("btrfs snapshot to frame2: %v\n%s", err, out)
+	}
+
+	// Verify the hardlink is preserved in the restored frame
+	origFile2 := filepath.Join(frame2Path, "tmp", "dir1", "orig.txt")
+	linkFile2 := filepath.Join(frame2Path, "tmp", "dir2", "link.txt")
+
+	var origStat2, linkStat2 syscall.Stat_t
+	if err := syscall.Stat(origFile2, &origStat2); err != nil {
+		t.Fatalf("stat orig in frame2: %v", err)
+	}
+	if err := syscall.Stat(linkFile2, &linkStat2); err != nil {
+		t.Fatalf("stat link in frame2: %v", err)
+	}
+
+	if origStat2.Ino != linkStat2.Ino {
+		t.Errorf("hardlink not preserved: orig inode=%d, link inode=%d", origStat2.Ino, linkStat2.Ino)
+	} else {
+		t.Logf("After restore: files share inode=%d, nlink=%d", origStat2.Ino, origStat2.Nlink)
+	}
+
+	if origStat2.Nlink < 2 {
+		t.Errorf("nlink=%d, want >= 2", origStat2.Nlink)
+	}
+}
