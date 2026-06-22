@@ -124,10 +124,17 @@ func handleConnection(conn *vsock.Conn) {
 }
 
 // runInteractiveShell spawns an interactive login shell as the specified user with PTY.
-// Uses "su - <user>" to get a proper login shell with correct environment.
+// For root, runs /bin/sh directly. For other users, uses "su - <user>".
 func runInteractiveShell(id uint64, conn *vsock.Conn, reader *bufio.Reader, runAsUser string) {
-	// Use su - <user> for a login shell (sets HOME, reads profile, etc.)
-	cmd := exec.Command("su", "-", runAsUser)
+	var cmd *exec.Cmd
+	if runAsUser == "root" {
+		// When running as root, start a shell directly without su.
+		// This avoids the need for a dynamically-linked su binary in minimal containers.
+		cmd = exec.Command("/bin/sh", "-l")
+	} else {
+		// Use su - <user> for a login shell (sets HOME, reads profile, etc.)
+		cmd = exec.Command("su", "-", runAsUser)
+	}
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
 	ptmx, err := pty.Start(cmd)
@@ -162,18 +169,25 @@ func runInteractiveShell(id uint64, conn *vsock.Conn, reader *bufio.Reader, runA
 }
 
 // runCommand executes a command as the specified user without PTY and exits when done.
-// Uses "su <user> -c '<command>'" for a non-login shell.
+// For root, runs the command directly. For other users, uses "su <user> -c".
 func runCommand(id uint64, conn *vsock.Conn, reader *bufio.Reader, runAsUser string, cmdArgs []string) {
-	// Build the command string with proper quoting for su -c
-	// We use single quotes and escape any single quotes in the arguments
-	quotedArgs := make([]string, len(cmdArgs))
-	for i, arg := range cmdArgs {
-		quotedArgs[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
-	}
-	cmdStr := strings.Join(quotedArgs, " ")
+	var cmd *exec.Cmd
 
-	// Use su <user> -c for a non-login shell (reads .bashrc, not profile)
-	cmd := exec.Command("su", runAsUser, "-c", cmdStr)
+	if runAsUser == "root" {
+		// When running as root, execute the command directly without su.
+		// This avoids the need for a dynamically-linked su binary in minimal containers.
+		cmd = exec.Command(cmdArgs[0], cmdArgs[1:]...)
+	} else {
+		// For non-root users, use su to switch users.
+		// Build the command string with proper quoting for su -c
+		// We use single quotes and escape any single quotes in the arguments
+		quotedArgs := make([]string, len(cmdArgs))
+		for i, arg := range cmdArgs {
+			quotedArgs[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
+		}
+		cmdStr := strings.Join(quotedArgs, " ")
+		cmd = exec.Command("su", runAsUser, "-c", cmdStr)
+	}
 	cmd.Env = os.Environ()
 
 	// Set up pipes for stdin/stdout/stderr

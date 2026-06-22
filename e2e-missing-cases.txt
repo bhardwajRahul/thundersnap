@@ -132,14 +132,14 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 
 ## VM Mode
 - [x] BASIC: Launch VM, run simple command via vshd, verify output, shut down cleanly
-- [ ] VM launch success with sufficient memory
-- [ ] VM launch failure with insufficient memory (< 512MB)
-- [ ] virtiofs filesystem sharing works
-- [ ] vshd communication over vsock
-- [ ] VM networking via passt
-- [ ] VM process isolation (separate from host)
-- [ ] VM graceful shutdown
-- [ ] VM panic recovery (already tested, but add timeout scenarios)
+- [x] VM launch success with sufficient memory
+- [x] VM launch failure with insufficient memory (< 512MB)
+- [x] virtiofs filesystem sharing works
+- [x] vshd communication over vsock
+- [x] VM networking via passt
+- [x] VM process isolation (separate from host)
+- [x] VM graceful shutdown
+- [x] VM panic recovery (already tested, but add timeout scenarios)
 
 ## Error Handling
 - [x] BASIC: Verify helpful error message when daemon not running or snapshot doesn't exist

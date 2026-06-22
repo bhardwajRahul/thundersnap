@@ -578,7 +578,10 @@ func vmDir() string {
 	}
 
 	// Check common locations for cloud-hypervisor
+	// Also check repo's vm/ directory relative to where we're running
 	candidates := []string{
+		"vm",     // repo's vm/ directory (when running from repo root)
+		"../vm",  // when running from e2e/
 		"/usr/local/lib/thundersnap",
 		"/usr/lib/thundersnap",
 		"/opt/thundersnap",
@@ -654,14 +657,20 @@ func testDevSetupVM(t *testing.T) {
 		t.Fatalf("copy vshd to frame: %v", err)
 	}
 
-	// We also need busybox for the init script (poweroff)
-	// For now, just create a minimal script that doesn't need busybox
-	// Actually, let's copy /bin/busybox if it exists
-	if busybox, err := exec.LookPath("busybox"); err == nil {
-		busyboxDst := filepath.Join(framePath, "bin/busybox")
-		if err := copyFile(busybox, busyboxDst); err != nil {
-			t.Logf("Warning: couldn't copy busybox: %v", err)
+	// Copy su binary - vshd uses "su" to switch users when running commands
+	if su, err := exec.LookPath("su"); err == nil {
+		suDst := filepath.Join(framePath, "bin/su")
+		if err := copyFile(su, suDst); err != nil {
+			t.Fatalf("Failed to copy su from %s to %s: %v", su, suDst, err)
 		}
+		// Verify the copy worked
+		if info, err := os.Stat(suDst); err != nil {
+			t.Fatalf("su binary not present after copy: %v", err)
+		} else {
+			t.Logf("Copied su from %s to %s (mode=%o, size=%d)", su, suDst, info.Mode(), info.Size())
+		}
+	} else {
+		t.Fatalf("su binary not found in PATH: %v", err)
 	}
 
 	// Get absolute path for the frame
@@ -748,7 +757,9 @@ func testDevSetupVM(t *testing.T) {
 	// Build kernel command line - use sh as init, then call ts drop-caps-and-run
 	// for consistent /dev setup between container and VM modes.
 	// panic=1 ensures the VM reboots (and thus terminates) on kernel panic.
-	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
+	// Use kernel IP autoconfiguration (ip=) instead of manual ip commands because
+	// the test container doesn't have the ip binary.
+	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
 
 	// Create pipe for event monitor to detect panics
 	eventReadPipe, eventWritePipe, err := os.Pipe()
@@ -798,9 +809,8 @@ func testDevSetupVM(t *testing.T) {
 	vmLogs := &vmConsoleMonitor{}
 	go vmLogs.monitor(t, chvPty)
 
-	// Wait for vshd to be ready (vsock port socket to exist)
-	vshSockPath := fmt.Sprintf("%s_%d", vsockSock, 5222)
-	t.Logf("Waiting for vshd at %s", vshSockPath)
+	// Wait for vshd to be ready by trying to connect
+	t.Logf("Waiting for vshd at vsock %s", vsockSock)
 	var vshReady bool
 	for i := 0; i < 50; i++ { // 5 seconds max
 		// Check if VM panicked
@@ -812,7 +822,8 @@ func testDevSetupVM(t *testing.T) {
 		default:
 		}
 
-		if _, err := os.Stat(vshSockPath); err == nil {
+		// Try to connect to vshd - this will fail until vshd is ready
+		if err := tryVsockConnect(vsockSock, 5222); err == nil {
 			vshReady = true
 			break
 		}
@@ -827,7 +838,7 @@ func testDevSetupVM(t *testing.T) {
 			t.Fatalf("VM exited unexpectedly: %v\n\nVM console output:\n%s", err, vmLogs.output())
 		default:
 		}
-		t.Fatalf("vshd did not become ready (socket %s not created)\n\nVM console output:\n%s", vshSockPath, vmLogs.output())
+		t.Fatalf("vshd did not become ready\n\nVM console output:\n%s", vmLogs.output())
 	}
 	t.Logf("vshd is ready")
 
@@ -1097,18 +1108,33 @@ func openPty() (ptmx, tty *os.File, err error) {
 
 // runVshCommand connects to vshd via vsock and runs a command.
 func runVshCommand(vsockSock, user string, args ...string) (string, error) {
-	// Connect to cloud-hypervisor's vsock socket
-	vshSockPath := fmt.Sprintf("%s_%d", vsockSock, 5222)
-	conn, err := net.Dial("unix", vshSockPath)
+	// Connect to cloud-hypervisor's vsock socket (the base socket, not port-specific)
+	conn, err := net.Dial("unix", vsockSock)
 	if err != nil {
-		return "", fmt.Errorf("dial vsh socket: %w", err)
+		return "", fmt.Errorf("dial vsock socket: %w", err)
 	}
 	defer conn.Close()
 
 	// Set deadline for the whole operation
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	// Send vshd protocol:
+	// Cloud-hypervisor vsock protocol: send "CONNECT <port>\n"
+	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", 5222); err != nil {
+		return "", fmt.Errorf("send CONNECT: %w", err)
+	}
+
+	// Read response - should be "OK <port>\n"
+	reader := bufio.NewReader(conn)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read handshake response: %w", err)
+	}
+	response = strings.TrimSpace(response)
+	if !strings.HasPrefix(response, "OK") {
+		return "", fmt.Errorf("vsock handshake failed: %s", response)
+	}
+
+	// Now send vshd protocol:
 	// 1. target username (null-terminated)
 	// 2. arg count (null-terminated)
 	// 3. each arg (null-terminated)
@@ -1126,7 +1152,37 @@ func runVshCommand(vsockSock, user string, args ...string) (string, error) {
 
 	// Read response
 	var buf bytes.Buffer
-	io.Copy(&buf, conn)
+	io.Copy(&buf, reader)
 
 	return buf.String(), nil
+}
+
+// tryVsockConnect attempts to connect to the VM's vsock port and immediately closes.
+// Returns nil if connection succeeded, error otherwise.
+func tryVsockConnect(vsockSock string, port int) error {
+	conn, err := net.DialTimeout("unix", vsockSock, 1*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(1 * time.Second))
+
+	// Send CONNECT handshake
+	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", port); err != nil {
+		return err
+	}
+
+	// Read response
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return err
+	}
+	response := strings.TrimSpace(string(buf[:n]))
+	if !strings.HasPrefix(response, "OK") {
+		return fmt.Errorf("handshake failed: %s", response)
+	}
+
+	return nil
 }
