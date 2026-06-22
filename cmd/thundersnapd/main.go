@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -32,6 +31,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
+	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/thundersnap"
 	"github.com/tailscale/thundersnap/tsm"
 	gossh "golang.org/x/crypto/ssh"
@@ -66,6 +66,15 @@ var (
 	// authURLFile is the path where the server writes the auth URL
 	// while waiting for Tailscale login. The --activate client reads it.
 	authURLFile = "/run/thundersnap/auth-url"
+
+	// statusFile is the path where the server writes its current status
+	// after successful authentication. The --status client reads it.
+	statusFile = "/run/thundersnap/status"
+
+	// controlSocket is the path for the local admin control socket.
+	// Used for commands like --force-reauth that need to communicate with
+	// the running daemon.
+	controlSocket = "/run/thundersnap/control.sock"
 )
 
 // vmSessionManager tracks running VM sessions and allows multiple clients to share them.
@@ -204,21 +213,33 @@ func (m *vmSessionManager) releaseVM(tailscaleUser, vmUser string) {
 }
 
 func main() {
-	activate := flag.Bool("activate", false, "Print the Tailscale auth URL and wait for login to complete")
-	hostname := flag.String("hostname", "thundersnap", "Tailscale hostname for this server")
-	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
-	flagFsDir = flag.String("fs-dir", "", "Directory to store per-user live filesystems (required)")
-	flagSnapshotsDir = flag.String("snapshots-dir", "", "Directory to store base snapshots for cloning (required)")
-	flagVmDir = flag.String("vm-dir", "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
-	flagLibexecDir = flag.String("libexec-dir", "", "Directory containing helper binaries like ts and vshd (default: <exe-dir>)")
-	flagPolicyPath = flag.String("policy", "", "Path to policy file (required)")
-	flagMesh = flag.Bool("mesh", false, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
-	flagNfsd = flag.Bool("nfsd", false, "Enable NFSv4 server to export -snapshots-dir")
-	flagNfsPort = flag.Int("nfs-port", 2049, "Port for NFSv4 server (default: 2049)")
-	flag.Parse()
+	activate := getopt.BoolLong("activate", 0, "Print the Tailscale auth URL and wait for login to complete")
+	showStatus := getopt.BoolLong("status", 0, "Print the current server status and exit")
+	forceReauth := getopt.BoolLong("force-reauth", 0, "Force re-authentication with Tailscale")
+	hostname := getopt.StringLong("hostname", 0, "thundersnap", "Tailscale hostname for this server")
+	stateDir := getopt.StringLong("state-dir", 0, "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
+	flagFsDir = getopt.StringLong("fs-dir", 0, "", "Directory to store per-user live filesystems (required)")
+	flagSnapshotsDir = getopt.StringLong("snapshots-dir", 0, "", "Directory to store base snapshots for cloning (required)")
+	flagVmDir = getopt.StringLong("vm-dir", 0, "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
+	flagLibexecDir = getopt.StringLong("libexec-dir", 0, "", "Directory containing helper binaries like ts and vshd (default: <exe-dir>)")
+	flagPolicyPath = getopt.StringLong("policy", 0, "", "Path to policy file (required)")
+	flagMesh = getopt.BoolLong("mesh", 0, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
+	flagNfsd = getopt.BoolLong("nfsd", 0, "Enable NFSv4 server to export -snapshots-dir")
+	flagNfsPort = getopt.IntLong("nfs-port", 0, 2049, "Port for NFSv4 server")
+	getopt.Parse()
 
 	if *activate {
 		runActivate()
+		return
+	}
+
+	if *showStatus {
+		runStatus()
+		return
+	}
+
+	if *forceReauth {
+		runForceReauth()
 		return
 	}
 
@@ -320,6 +341,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to get LocalClient: %v", err)
 	}
+
+	// Write status file with current server info
+	writeStatusFile(status)
+
+	// Start admin control socket for local commands like --force-reauth
+	go startAdminControlSocket(lc)
 
 	// Create SSH server with gliderlabs/ssh and persistent host key
 	forwardHandler := &ssh.ForwardedTCPHandler{}
@@ -570,6 +597,169 @@ func runActivate() {
 			fmt.Println("Login complete.")
 			return
 		}
+	}
+}
+
+// runStatus implements the --status client mode.
+// It reads and prints the status file written by the running server.
+func runStatus() {
+	data, err := os.ReadFile(statusFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "No status file found at %s.\nThe server may not be running or not yet authenticated.\n", statusFile)
+			os.Exit(1)
+		}
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			fmt.Fprintf(os.Stderr, "%s: %s\n", statusFile, errno)
+		} else {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", statusFile, err)
+		}
+		fmt.Fprintf(os.Stderr, "Try running as root.\n")
+		os.Exit(1)
+	}
+	fmt.Print(string(data))
+}
+
+// runForceReauth implements the --force-reauth client mode.
+// It connects to the control socket and requests re-authentication.
+func runForceReauth() {
+	conn, err := net.Dial("unix", controlSocket)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Control socket not found at %s.\nThe server may not be running.\n", controlSocket)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Failed to connect to control socket: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	// Send reauth command
+	fmt.Fprintln(conn, "reauth")
+
+	// Read response
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read response: %v\n", err)
+		os.Exit(1)
+	}
+
+	line = strings.TrimSpace(line)
+	if strings.HasPrefix(line, "OK") {
+		fmt.Println(line)
+	} else {
+		fmt.Fprintf(os.Stderr, "%s\n", line)
+		os.Exit(1)
+	}
+}
+
+// writeStatusFile writes the current server status to the status file.
+func writeStatusFile(status *ipnstate.Status) {
+	// Ensure the directory exists
+	if err := os.MkdirAll(filepath.Dir(statusFile), 0755); err != nil {
+		log.Printf("Warning: failed to create status file directory: %v", err)
+		return
+	}
+
+	// Determine the logged-in identity (user login or tags)
+	login := "unknown"
+	if status.Self != nil {
+		if status.Self.Tags != nil && status.Self.Tags.Len() > 0 {
+			var tags []string
+			for i := range status.Self.Tags.Len() {
+				tags = append(tags, status.Self.Tags.At(i))
+			}
+			login = strings.Join(tags, ",")
+		} else if status.Self.UserID != 0 {
+			if user, ok := status.User[status.Self.UserID]; ok {
+				login = user.LoginName
+			}
+		}
+	}
+
+	// Get the actual hostname from control server (DNSName without trailing dot)
+	hostname := "unknown"
+	if status.Self != nil && status.Self.DNSName != "" {
+		hostname = strings.TrimSuffix(status.Self.DNSName, ".")
+	}
+
+	// Format IP addresses
+	var ips []string
+	for _, ip := range status.TailscaleIPs {
+		ips = append(ips, ip.String())
+	}
+
+	// Build status content
+	var buf strings.Builder
+	buf.WriteString(fmt.Sprintf("state: %s\n", status.BackendState))
+	buf.WriteString(fmt.Sprintf("hostname: %s\n", hostname))
+	buf.WriteString(fmt.Sprintf("login: %s\n", login))
+	buf.WriteString(fmt.Sprintf("tailscale-ips: %s\n", strings.Join(ips, " ")))
+
+	if err := os.WriteFile(statusFile, []byte(buf.String()), 0644); err != nil {
+		log.Printf("Warning: failed to write status file: %v", err)
+	}
+}
+
+// startAdminControlSocket starts a Unix socket for local admin commands.
+func startAdminControlSocket(lc *tailscale.LocalClient) {
+	// Remove any stale socket file
+	os.Remove(controlSocket)
+
+	// Ensure the directory exists
+	if err := os.MkdirAll(filepath.Dir(controlSocket), 0755); err != nil {
+		log.Printf("Warning: failed to create control socket directory: %v", err)
+		return
+	}
+
+	ln, err := net.Listen("unix", controlSocket)
+	if err != nil {
+		log.Printf("Warning: failed to start admin control socket: %v", err)
+		return
+	}
+
+	// Make socket accessible only to root
+	if err := os.Chmod(controlSocket, 0600); err != nil {
+		log.Printf("Warning: failed to chmod control socket: %v", err)
+	}
+
+	log.Printf("Admin control socket listening on %s", controlSocket)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("Admin control socket accept error: %v", err)
+			continue
+		}
+		go handleAdminConnection(conn, lc)
+	}
+}
+
+// handleAdminConnection handles a single connection to the admin control socket.
+func handleAdminConnection(conn net.Conn, lc *tailscale.LocalClient) {
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("Admin control: failed to read command: %v", err)
+		return
+	}
+
+	cmd := strings.TrimSpace(line)
+	log.Printf("Admin control: received command: %s", cmd)
+
+	switch cmd {
+	case "reauth":
+		if err := lc.StartLoginInteractive(context.Background()); err != nil {
+			fmt.Fprintf(conn, "ERROR: %v\n", err)
+			return
+		}
+		fmt.Fprintln(conn, "OK: re-authentication started, use --activate to complete")
+	default:
+		fmt.Fprintf(conn, "ERROR: unknown command: %s\n", cmd)
 	}
 }
 
@@ -883,19 +1073,38 @@ func stripDomain(s string) string {
 
 // selectTargetUser determines which Unix user to run as in a container/VM.
 // If targetUser is non-empty, it's used directly (caller specified it).
-// Otherwise, auto-detect by checking if /home/<user> exists for each candidate
-// in order: [ubuntu, user]. If none exist, fall back to root.
+// Otherwise, auto-detect:
+//  1. Check if "ubuntu" user's home exists -> use ubuntu
+//  2. Ensure "user" exists in /etc/passwd (add if missing, with home=/home)
+//  3. If user's home directory exists -> use user
+//  4. Fall back to root
 func selectTargetUser(rootFS, targetUser string) string {
 	if targetUser != "" {
 		return targetUser
 	}
-	// Auto-detect: check candidates in order
-	for _, candidate := range []string{"ubuntu", "user"} {
-		homeDir := filepath.Join(rootFS, "home", candidate)
-		if info, err := os.Stat(homeDir); err == nil && info.IsDir() {
-			return candidate
+
+	// First check for ubuntu user (legacy behavior)
+	ubuntuHome := filepath.Join(rootFS, "home", "ubuntu")
+	if info, err := os.Stat(ubuntuHome); err == nil && info.IsDir() {
+		return "ubuntu"
+	}
+
+	// Ensure "user" exists in /etc/passwd, adding it if necessary.
+	// This returns the home directory from passwd (e.g., "/home" for new entries).
+	userHome, err := tsm.EnsureUserInPasswd(rootFS)
+	if err != nil {
+		log.Printf("Warning: failed to ensure user in passwd: %v", err)
+	}
+
+	// If we have a home path, check if it exists in the rootfs
+	if userHome != "" {
+		// userHome is absolute (e.g., "/home"), join with rootFS
+		homePath := filepath.Join(rootFS, userHome)
+		if info, err := os.Stat(homePath); err == nil && info.IsDir() {
+			return "user"
 		}
 	}
+
 	return "root"
 }
 
@@ -1619,6 +1828,29 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 	// Step 9: Ensure /tmp has correct permissions (1777 with sticky bit)
 	if err := ensureTmpDir(rootFS); err != nil {
 		log.Printf("Warning: ensure /tmp on %s: %v", rootFS, err)
+	}
+
+	// Step 10: Create /id subvolume for frame-local secrets (never persisted in snapshots)
+	// This is always created fresh and empty, never cloned from a snapshot.
+	// Since it's a btrfs subvolume, it's automatically excluded from snapshots.
+	idPath := filepath.Join(rootFS, "id")
+	// Remove existing /id directory if it's not a subvolume (from the rootfs snap)
+	if fi, err := os.Stat(idPath); err == nil && fi.IsDir() && !isSubvolume(idPath) {
+		if err := os.RemoveAll(idPath); err != nil {
+			log.Printf("Warning: failed to remove existing /id directory: %v", err)
+		}
+	}
+	if !isSubvolume(idPath) {
+		cmd := exec.Command("btrfs", "subvolume", "create", idPath)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("btrfs subvolume create id at %s failed: %w\noutput: %s",
+				idPath, err, string(output))
+		}
+		// Set permissions: 0700 (only root can access)
+		if err := os.Chmod(idPath, 0700); err != nil {
+			log.Printf("Warning: failed to chmod /id subvolume: %v", err)
+		}
 	}
 
 	log.Printf("Created frame %s with rootfs:%s home:%s work:%s taints:%v",
@@ -2486,9 +2718,10 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Delete nested subvolumes first (home and work) if they exist
+	// Delete nested subvolumes first (home, work, id) if they exist
 	homePath := filepath.Join(framePath, "home")
 	workPath := filepath.Join(framePath, "work")
+	idPath := filepath.Join(framePath, "id")
 
 	if isSubvolume(homePath) {
 		cmd := exec.Command("btrfs", "subvolume", "delete", homePath)
@@ -2501,6 +2734,13 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		cmd := exec.Command("btrfs", "subvolume", "delete", workPath)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			log.Printf("Warning: failed to delete work subvolume: %v\noutput: %s", err, string(output))
+		}
+	}
+
+	if isSubvolume(idPath) {
+		cmd := exec.Command("btrfs", "subvolume", "delete", idPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: failed to delete id subvolume: %v\noutput: %s", err, string(output))
 		}
 	}
 
