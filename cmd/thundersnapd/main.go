@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -32,6 +31,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
+	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/thundersnap"
 	"github.com/tailscale/thundersnap/tsm"
 	gossh "golang.org/x/crypto/ssh"
@@ -70,6 +70,11 @@ var (
 	// statusFile is the path where the server writes its current status
 	// after successful authentication. The --status client reads it.
 	statusFile = "/run/thundersnap/status"
+
+	// controlSocket is the path for the local admin control socket.
+	// Used for commands like --force-reauth that need to communicate with
+	// the running daemon.
+	controlSocket = "/run/thundersnap/control.sock"
 )
 
 // vmSessionManager tracks running VM sessions and allows multiple clients to share them.
@@ -208,19 +213,20 @@ func (m *vmSessionManager) releaseVM(tailscaleUser, vmUser string) {
 }
 
 func main() {
-	activate := flag.Bool("activate", false, "Print the Tailscale auth URL and wait for login to complete")
-	showStatus := flag.Bool("status", false, "Print the current server status and exit")
-	hostname := flag.String("hostname", "thundersnap", "Tailscale hostname for this server")
-	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
-	flagFsDir = flag.String("fs-dir", "", "Directory to store per-user live filesystems (required)")
-	flagSnapshotsDir = flag.String("snapshots-dir", "", "Directory to store base snapshots for cloning (required)")
-	flagVmDir = flag.String("vm-dir", "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
-	flagLibexecDir = flag.String("libexec-dir", "", "Directory containing helper binaries like ts and vshd (default: <exe-dir>)")
-	flagPolicyPath = flag.String("policy", "", "Path to policy file (required)")
-	flagMesh = flag.Bool("mesh", false, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
-	flagNfsd = flag.Bool("nfsd", false, "Enable NFSv4 server to export -snapshots-dir")
-	flagNfsPort = flag.Int("nfs-port", 2049, "Port for NFSv4 server (default: 2049)")
-	flag.Parse()
+	activate := getopt.BoolLong("activate", 0, "Print the Tailscale auth URL and wait for login to complete")
+	showStatus := getopt.BoolLong("status", 0, "Print the current server status and exit")
+	forceReauth := getopt.BoolLong("force-reauth", 0, "Force re-authentication with Tailscale")
+	hostname := getopt.StringLong("hostname", 0, "thundersnap", "Tailscale hostname for this server")
+	stateDir := getopt.StringLong("state-dir", 0, "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
+	flagFsDir = getopt.StringLong("fs-dir", 0, "", "Directory to store per-user live filesystems (required)")
+	flagSnapshotsDir = getopt.StringLong("snapshots-dir", 0, "", "Directory to store base snapshots for cloning (required)")
+	flagVmDir = getopt.StringLong("vm-dir", 0, "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
+	flagLibexecDir = getopt.StringLong("libexec-dir", 0, "", "Directory containing helper binaries like ts and vshd (default: <exe-dir>)")
+	flagPolicyPath = getopt.StringLong("policy", 0, "", "Path to policy file (required)")
+	flagMesh = getopt.BoolLong("mesh", 0, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
+	flagNfsd = getopt.BoolLong("nfsd", 0, "Enable NFSv4 server to export -snapshots-dir")
+	flagNfsPort = getopt.IntLong("nfs-port", 0, 2049, "Port for NFSv4 server")
+	getopt.Parse()
 
 	if *activate {
 		runActivate()
@@ -229,6 +235,11 @@ func main() {
 
 	if *showStatus {
 		runStatus()
+		return
+	}
+
+	if *forceReauth {
+		runForceReauth()
 		return
 	}
 
@@ -333,6 +344,9 @@ func main() {
 
 	// Write status file with current server info
 	writeStatusFile(status)
+
+	// Start admin control socket for local commands like --force-reauth
+	go startAdminControlSocket(lc)
 
 	// Create SSH server with gliderlabs/ssh and persistent host key
 	forwardHandler := &ssh.ForwardedTCPHandler{}
@@ -607,6 +621,40 @@ func runStatus() {
 	fmt.Print(string(data))
 }
 
+// runForceReauth implements the --force-reauth client mode.
+// It connects to the control socket and requests re-authentication.
+func runForceReauth() {
+	conn, err := net.Dial("unix", controlSocket)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Control socket not found at %s.\nThe server may not be running.\n", controlSocket)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Failed to connect to control socket: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	// Send reauth command
+	fmt.Fprintln(conn, "reauth")
+
+	// Read response
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read response: %v\n", err)
+		os.Exit(1)
+	}
+
+	line = strings.TrimSpace(line)
+	if strings.HasPrefix(line, "OK") {
+		fmt.Println(line)
+	} else {
+		fmt.Fprintf(os.Stderr, "%s\n", line)
+		os.Exit(1)
+	}
+}
+
 // writeStatusFile writes the current server status to the status file.
 func writeStatusFile(status *ipnstate.Status) {
 	// Ensure the directory exists
@@ -652,6 +700,66 @@ func writeStatusFile(status *ipnstate.Status) {
 
 	if err := os.WriteFile(statusFile, []byte(buf.String()), 0644); err != nil {
 		log.Printf("Warning: failed to write status file: %v", err)
+	}
+}
+
+// startAdminControlSocket starts a Unix socket for local admin commands.
+func startAdminControlSocket(lc *tailscale.LocalClient) {
+	// Remove any stale socket file
+	os.Remove(controlSocket)
+
+	// Ensure the directory exists
+	if err := os.MkdirAll(filepath.Dir(controlSocket), 0755); err != nil {
+		log.Printf("Warning: failed to create control socket directory: %v", err)
+		return
+	}
+
+	ln, err := net.Listen("unix", controlSocket)
+	if err != nil {
+		log.Printf("Warning: failed to start admin control socket: %v", err)
+		return
+	}
+
+	// Make socket accessible only to root
+	if err := os.Chmod(controlSocket, 0600); err != nil {
+		log.Printf("Warning: failed to chmod control socket: %v", err)
+	}
+
+	log.Printf("Admin control socket listening on %s", controlSocket)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("Admin control socket accept error: %v", err)
+			continue
+		}
+		go handleAdminConnection(conn, lc)
+	}
+}
+
+// handleAdminConnection handles a single connection to the admin control socket.
+func handleAdminConnection(conn net.Conn, lc *tailscale.LocalClient) {
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("Admin control: failed to read command: %v", err)
+		return
+	}
+
+	cmd := strings.TrimSpace(line)
+	log.Printf("Admin control: received command: %s", cmd)
+
+	switch cmd {
+	case "reauth":
+		if err := lc.StartLoginInteractive(context.Background()); err != nil {
+			fmt.Fprintf(conn, "ERROR: %v\n", err)
+			return
+		}
+		fmt.Fprintln(conn, "OK: re-authentication started, use --activate to complete")
+	default:
+		fmt.Fprintf(conn, "ERROR: unknown command: %s\n", cmd)
 	}
 }
 
