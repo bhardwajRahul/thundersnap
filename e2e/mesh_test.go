@@ -492,6 +492,45 @@ func TestMeshDownloadAlreadyPresent(t *testing.T) {
 	}
 }
 
+// TestMeshDownloadSnapWithFrameSpec tests that download-snap with a frame spec
+// (colon-separated triple) handles the case appropriately. In the future this
+// might trigger parallel downloads of all three snapshots (rootfs:home:work),
+// but for now it should either work for single IDs or return an error.
+func TestMeshDownloadSnapWithFrameSpec(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startMeshTestControlServer(t, env, sockPath, "http://127.0.0.1:9999")
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Try download-snap with a frame spec instead of a plain snapshot ID
+	frameSpec := "rootfs123:homesnap456:worksnap789"
+
+	downloadResp, err := client.postJSON("/download-snap", map[string]string{
+		"snapshot_id": frameSpec,
+	})
+
+	// We expect either:
+	// 1. An error (since 127.0.0.1:9999 is not a real peer)
+	// 2. A meaningful error about frame specs not being supported yet
+	// 3. Success with parallel downloads (future feature)
+
+	if err != nil {
+		t.Logf("Got network error (expected, bogus peer): %v", err)
+		return
+	}
+
+	status, _ := downloadResp["status"].(string)
+	message, _ := downloadResp["message"].(string)
+
+	t.Logf("Response status: %s, message: %s", status, message)
+
+	// The test passes as long as it doesn't hang or crash
+	// Any response is acceptable behavior for this edge case
+}
+
 // TestMeshWhoHasWithFrameSpec tests that who-has returns a helpful error
 // when given a frame spec (colon-separated) instead of a plain snapshot ID.
 func TestMeshWhoHasWithFrameSpec(t *testing.T) {

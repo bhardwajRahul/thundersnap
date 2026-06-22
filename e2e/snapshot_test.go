@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -662,6 +663,108 @@ func TestLargeDirectoryTree(t *testing.T) {
 		t.Errorf("sample file content: got %q, want %q", content, expected)
 	} else {
 		t.Logf("Verified large directory tree restored correctly")
+	}
+}
+
+// TestConcurrentModificationDuringSnapshot tests behavior when files are
+// modified while a snapshot is being created. Btrfs handles this atomically,
+// so the snapshot should capture a consistent state.
+func TestConcurrentModificationDuringSnapshot(t *testing.T) {
+	env := newTestEnv(t)
+
+	baseSnap := env.createBaseSnapshot()
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a frame
+	frameName := "concurrent"
+	frameSpec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+
+	framePath := filepath.Join(env.fsDir, "testuser", frameName)
+
+	// Create initial file
+	testFile := filepath.Join(framePath, "tmp", "concurrent-test.txt")
+	if err := os.WriteFile(testFile, []byte("initial content\n"), 0644); err != nil {
+		t.Fatalf("write initial file: %v", err)
+	}
+
+	// Start a goroutine that continuously modifies files
+	stopModify := make(chan struct{})
+	modifyDone := make(chan struct{})
+	modifyCount := 0
+
+	go func() {
+		defer close(modifyDone)
+		for i := 0; ; i++ {
+			select {
+			case <-stopModify:
+				return
+			default:
+			}
+			// Write to the test file
+			content := fmt.Sprintf("modification %d\n", i)
+			os.WriteFile(testFile, []byte(content), 0644)
+			modifyCount = i
+		}
+	}()
+
+	// Create a snapshot while modifications are happening
+	snapResp, err := client.postJSON("/snap", map[string]string{
+		"frame_name": frameName,
+	})
+
+	// Stop the modifier
+	close(stopModify)
+	<-modifyDone
+
+	if err != nil {
+		t.Fatalf("snap request failed: %v", err)
+	}
+	if snapResp["status"] != "ok" {
+		t.Fatalf("snap failed: %v", snapResp["message"])
+	}
+
+	snapID := snapResp["snapshot_id"].(string)
+	t.Logf("Created snapshot %s while %d modifications were happening", snapID, modifyCount)
+
+	// Verify the snapshot has consistent content
+	// (the file should have SOME content, not be corrupted)
+	snapPath := filepath.Join(env.snapshotsDir, snapID)
+	snapTestFile := filepath.Join(snapPath, "tmp", "concurrent-test.txt")
+	content, err := os.ReadFile(snapTestFile)
+	if err != nil {
+		t.Fatalf("read snapshot file: %v", err)
+	}
+
+	// The content should be valid (either "initial content" or "modification N")
+	contentStr := string(content)
+	if contentStr == "initial content\n" {
+		t.Logf("Snapshot captured initial content")
+	} else if len(contentStr) > 0 {
+		t.Logf("Snapshot captured content during modification: %q", contentStr)
+	} else {
+		t.Errorf("Snapshot file is empty, expected content")
+	}
+
+	// The key test: content should not be corrupted (partial write, mixed content, etc.)
+	// A simple validation is that it should end with a newline
+	if len(contentStr) > 0 && !strings.HasSuffix(contentStr, "\n") {
+		t.Errorf("Content appears truncated (no trailing newline): %q", contentStr)
 	}
 }
 

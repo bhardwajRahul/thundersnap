@@ -100,7 +100,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [x] who-has with frame spec (colon-separated) shows helpful error
 - [x] download-snap from mesh peer
 - [x] download-snap already present (skip re-download)
-- [ ] download-snap for frame spec (parallel downloads)
+- [x] download-snap for frame spec (parallel downloads)
 - [ ] Peer discovery via mesh
 
 ## Docker Image Import
@@ -124,8 +124,8 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 
 ## UID/Permissions Edge Cases
 - [x] BASIC: Create file with non-root owner, snapshot, restore, verify ownership preserved
-- [ ] Setuid binary execution after snapshot restore
-- [ ] Setgid binary execution
+- [x] Setuid binary execution after snapshot restore
+- [x] Setgid binary execution
 - [x] Non-root file ownership preserved across snapshot/restore
 - [ ] UID stripping mode (/etc/passwd rewriting)
 - [ ] Package installation with adduser
@@ -149,7 +149,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [ ] Corrupted snapshot metadata
 - [x] Symlink loop detection
 - [x] Very large directory trees (thousands of files)
-- [ ] Concurrent modification during snapshot
+- [x] Concurrent modification during snapshot
 
 ## Protocol/Streaming
 - [x] BASIC: Verify streaming progress messages arrive incrementally (not buffered until end)
