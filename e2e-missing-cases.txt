@@ -112,22 +112,6 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [ ] download-docker private registry (auth error case)
 - [ ] download-docker invalid image reference (error case)
 
-## FIDX/Bupdate Operations (SKIP FOR NOW - see fidx-to-tsm transition below)
-
-These tests are for the legacy fidx format. Per fidx-to-tsm-transition.md, we're migrating
-to tsm/tsc. Don't write tests for `ts fidx` or `ts bupdate` commands - they'll be removed.
-Instead, mesh download tests (in Mesh/Content-Addressed section) will cover the underlying
-chunk transfer, and TSM/TSC tests below will cover the new format.
-
-- [ ] ~~fidx single file~~ (skip - being deprecated)
-- [ ] ~~fidx directory tree~~ (skip - being deprecated)
-- [ ] ~~fidx with --ref for incremental update~~ (skip - being deprecated)
-- [ ] ~~fidx output file naming (.fidx suffix)~~ (skip - being deprecated)
-- [ ] ~~bupdate reconstruction from mesh~~ (covered by Mesh tests)
-- [ ] ~~bupdate local chunk reuse~~ (covered by TSM/TSC dedup tests)
-- [ ] ~~bupdate missing chunks (download from peers)~~ (covered by Mesh tests)
-- [ ] ~~Zero-block handling in fidx~~ (skip - being deprecated)
-
 ## Container Isolation (drop-caps-and-run)
 - [x] BASIC: Run command in container, verify /proc mounted and dangerous caps dropped
 - [x] Namespace isolation (pid, net, mount, uts)
@@ -142,7 +126,7 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 - [x] BASIC: Create file with non-root owner, snapshot, restore, verify ownership preserved
 - [ ] Setuid binary execution after snapshot restore
 - [ ] Setgid binary execution
-- [ ] Non-root file ownership preserved across snapshot/restore
+- [x] Non-root file ownership preserved across snapshot/restore
 - [ ] UID stripping mode (/etc/passwd rewriting)
 - [ ] Package installation with adduser
 
@@ -176,14 +160,14 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 
 ## Integration/Workflow Tests
 - [x] BASIC: Create frame, modify a file, snap, create new frame from snap, verify modification present
-- [ ] Full workflow: create frame -> modify -> snap -> new frame from snap
+- [x] Full workflow: create frame -> modify -> snap -> new frame from snap
 - [ ] SSH session flow end-to-end
 - [ ] Cross-frame data sharing via work volume
 - [ ] Mesh replication: create on node A, download on node B
 
 ## Infrastructure/Daemon
 - [x] BASIC: Start in-process thundersnapd, ping it, verify response
-- [ ] thundersnapd startup and ping response
+- [x] thundersnapd startup and ping response
 - [ ] Mesh mode peer coordination
 - [ ] NFS export functionality
 - [ ] Tailscale identity authentication
@@ -202,8 +186,6 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 - [x] TSC deduplication (same content across files = single chunk entry)
 - [x] TSM chunk references resolve correctly to TSC entries
 - [x] Symlinks and device nodes stored correctly in TSM
-
----
 
 ## fidx-to-tsm Transition (DO THIS AFTER OTHER TESTS PASS)
 
