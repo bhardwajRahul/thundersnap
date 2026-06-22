@@ -14,6 +14,7 @@
 * Don't stop and ask questions along the way, I'm not watching you. Do your
   best and we'll fix it later. You can add a "notes for things to think
   about later" section at the end of this file if you want.
+* Obviously you must run `make e2e` after each step. Yes, you have sudo access so this will work.
 
 ## Bug-Fixing Process
 
@@ -28,6 +29,7 @@ Fix them as you find them, but follow this process:
 4. Commit the unit test(s) + bugfix together. If this also fixes the e2e test, include
    the e2e test in the same commit. If multiple mini-fixes are needed before the e2e passes,
    put the e2e test in a separate commit after the individual fixes.
+5. As you complete new tests, check them off in this file in the same commit.
 
 ## Commit Workflow (jj)
 
@@ -61,7 +63,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 
 
 ## Frame Lifecycle
-- [ ] BASIC: Create frame with rootfs-only spec, verify it exists in `frames` list, delete it
+- [x] BASIC: Create frame with rootfs-only spec, verify it exists in `frames` list, delete it
 - [ ] Create frame with rootfs-only spec (abc123::)
 - [ ] Create frame with rootfs+home spec (abc123:def456:)
 - [ ] Create frame with all three (rootfs:home:work)
@@ -73,7 +75,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [ ] Multiple concurrent sessions to same frame
 
 ## Snapshot Operations
-- [ ] BASIC: Create snapshot, verify it appears in `snaps` list with correct size
+- [x] BASIC: Create snapshot, verify it appears in `snaps` list with correct size
 - [ ] Snapshot large files (multi-GB)
 - [ ] Snapshot with modified files (delta verification)
 - [ ] Snapshot deduplication (identical content = same hash)
@@ -83,7 +85,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [ ] List snapshots (snaps command)
 
 ## Taint System
-- [ ] BASIC: Add a taint to a frame, verify it's recorded and queryable
+- [x] BASIC: Add a taint to a frame, verify it's recorded and queryable
 - [ ] Add taint to frame (taint command)
 - [ ] Multiple taints on one frame
 - [ ] Taint propagation through fork/snapshot
@@ -92,7 +94,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [ ] Taint types: pii:<dataset>, unsafe-permissions, untrusted-code
 
 ## Mesh/Content-Addressed Operations
-- [ ] BASIC: Two in-process instances; create snap on A, who-has from B finds it, download-snap succeeds
+- [x] BASIC: Two in-process instances; create snap on A, who-has from B finds it, download-snap succeeds
 - [ ] who-has query for existing snapshot
 - [ ] who-has query for non-existent snapshot
 - [ ] who-has with frame spec (colon-separated) shows helpful error
