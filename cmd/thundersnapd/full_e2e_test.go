@@ -222,8 +222,9 @@ func populateTestRootFS(t *testing.T, dir string, tsBinary string) {
 	}
 
 	// Create directory structure
+	// Note: lib64 is a symlink to lib, not a directory
 	dirs := []string{
-		"bin", "dev", "etc", "home", "home/user", "lib", "lib64",
+		"bin", "dev", "etc", "home", "home/user", "lib",
 		"proc", "root", "run", "sbin", "sys", "tmp",
 		"usr", "usr/bin", "usr/lib", "usr/sbin",
 		"var", "var/log", "var/run", "work",
@@ -874,5 +875,116 @@ func TestE2EDownloadSnap(t *testing.T) {
 		t.Errorf("snap specs differ: inst1=%s, inst2=%s", snapSpec1, snapSpec2)
 	} else {
 		t.Logf("SUCCESS: Both instances have same snap spec: %s", snapSpec1)
+	}
+}
+
+// TestE2EPtyVisibleInContainer verifies that when running an interactive
+// session with a PTY, the PTY device is visible inside the container's
+// /dev/pts directory. This tests that the PTY is allocated AFTER the
+// container's devpts mount, not before.
+func TestE2EPtyVisibleInContainer(t *testing.T) {
+	root := requireBtrfsRoot2(t)
+
+	env := createTestEnv(t, root, "pty-test")
+	defer env.cleanup()
+
+	// Build ts binary
+	tsBinary := buildTsBinaryForTest(t, root)
+
+	// Download a real Docker image (need actual /bin/sh and tty command)
+	snapID := downloadDockerImageForTest(t, env, "library/debian:bookworm-slim")
+
+	setFlagsForTest(env.fsDir, env.snapshotsDir, env.libexecDir)
+	defer resetFlagsForTest()
+
+	// Create frame
+	framePath := filepath.Join(env.fsDir, "testuser", "ptyframe")
+	if err := createFrame(framePath, snapID, "", "", "container"); err != nil {
+		t.Fatalf("createFrame: %v", err)
+	}
+
+	// Copy ts binary into the frame
+	copyTsBinaryToFrameForTest(t, tsBinary, framePath)
+
+	// Run a command inside the container that:
+	// 1. Gets its TTY path via `tty` command
+	// 2. Checks if that path exists
+	// 3. Lists /dev/pts to show what's there
+	//
+	// We use ts drop-caps-and-run with a PTY to simulate what thundersnapd does.
+	// The test script outputs:
+	//   TTY_PATH:<path>
+	//   TTY_EXISTS:<yes|no>
+	//   DEV_PTS_CONTENTS:<listing>
+	absFramePath, _ := filepath.Abs(framePath)
+	innerTsBinary := filepath.Join(absFramePath, "bin", "ts")
+
+	// Create a test script inside the frame
+	testScript := `#!/bin/sh
+TTY_PATH=$(tty 2>/dev/null || echo "none")
+echo "TTY_PATH:$TTY_PATH"
+if [ "$TTY_PATH" != "none" ] && [ "$TTY_PATH" != "not a tty" ] && [ -e "$TTY_PATH" ]; then
+    echo "TTY_EXISTS:yes"
+else
+    echo "TTY_EXISTS:no"
+fi
+echo "DEV_PTS_CONTENTS:$(ls -la /dev/pts 2>&1 | tr '\n' ' ')"
+`
+	testScriptPath := filepath.Join(framePath, "tmp", "pty_test.sh")
+	os.MkdirAll(filepath.Dir(testScriptPath), 0755)
+	if err := os.WriteFile(testScriptPath, []byte(testScript), 0755); err != nil {
+		t.Fatalf("write test script: %v", err)
+	}
+
+	// Run with PTY using the same approach as thundersnapd:
+	// ts drop-caps-and-run --chroot=<path> --pty -- /bin/sh /tmp/pty_test.sh
+	// The --pty flag tells ts to allocate the PTY INSIDE the container after
+	// devpts is mounted, which is the fix for the PTY visibility bug.
+	cmd := exec.Command(innerTsBinary, "drop-caps-and-run",
+		"--chroot="+absFramePath,
+		"--pty",
+		"--", "/bin/sh", "/tmp/pty_test.sh")
+	cmd.Dir = "/"
+	cmd.Env = []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"TERM=xterm-256color",
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
+	}
+
+	// Set up pipes - ts --pty will proxy between stdin/stdout and the PTY
+	var output strings.Builder
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+
+	// Wait for command to finish
+	cmd.Wait()
+
+	result := output.String()
+	t.Logf("PTY test output:\n%s", result)
+
+	// Parse results
+	var ttyPath, ttyExists string
+	for _, line := range strings.Split(result, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "TTY_PATH:") {
+			ttyPath = strings.TrimPrefix(line, "TTY_PATH:")
+		} else if strings.HasPrefix(line, "TTY_EXISTS:") {
+			ttyExists = strings.TrimPrefix(line, "TTY_EXISTS:")
+		}
+	}
+
+	t.Logf("TTY path: %q, exists: %q", ttyPath, ttyExists)
+
+	// The PTY should be visible inside the container
+	if ttyExists != "yes" {
+		t.Errorf("PTY is not visible inside container! tty=%q, exists=%q\n"+
+			"This indicates the PTY was allocated before the container's devpts mount.\n"+
+			"Full output:\n%s", ttyPath, ttyExists, result)
 	}
 }

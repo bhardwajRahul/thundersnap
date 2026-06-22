@@ -21,6 +21,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/mdlayher/vsock"
 	"github.com/pborman/getopt/v2"
@@ -1368,6 +1369,7 @@ func doDownloadSnap(sockPath, snapshotID string) error {
 func cmdDropCapsAndRun(args []string) {
 	// Parse our flags manually since we need to pass remaining args to exec
 	var hostname, domainname, chrootPath string
+	var usePty bool
 	var cmdArgs []string
 
 	for i := 0; i < len(args); i++ {
@@ -1386,6 +1388,8 @@ func cmdDropCapsAndRun(args []string) {
 			i++
 		} else if strings.HasPrefix(args[i], "--chroot=") {
 			chrootPath = strings.TrimPrefix(args[i], "--chroot=")
+		} else if args[i] == "--pty" {
+			usePty = true
 		} else if args[i] == "--" {
 			cmdArgs = args[i+1:]
 			break
@@ -1495,11 +1499,124 @@ func cmdDropCapsAndRun(args []string) {
 		os.Exit(1)
 	}
 
-	// Exec the command, replacing this process
-	if err := syscall.Exec(executable, cmdArgs, os.Environ()); err != nil {
-		fmt.Fprintf(os.Stderr, "error: exec %s: %v\n", cmdArgs[0], err)
+	if usePty {
+		// Allocate a PTY inside the container (after devpts is mounted)
+		// and run the command with it, proxying I/O to our stdin/stdout.
+		runWithPty(executable, cmdArgs)
+	} else {
+		// Exec the command, replacing this process
+		if err := syscall.Exec(executable, cmdArgs, os.Environ()); err != nil {
+			fmt.Fprintf(os.Stderr, "error: exec %s: %v\n", cmdArgs[0], err)
+			os.Exit(1)
+		}
+	}
+}
+
+// runWithPty allocates a PTY inside the container and runs the command with it.
+// It proxies I/O between the PTY master and our stdin/stdout. This is used when
+// --pty is specified, ensuring the PTY is allocated AFTER devpts is mounted.
+func runWithPty(executable string, cmdArgs []string) {
+	// Open the PTY master
+	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: open /dev/ptmx: %v\n", err)
 		os.Exit(1)
 	}
+	defer ptmx.Close()
+
+	// Get the PTY slave name and unlock it
+	ptsName, err := ptsname(ptmx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: ptsname: %v\n", err)
+		os.Exit(1)
+	}
+	if err := unlockpt(ptmx); err != nil {
+		fmt.Fprintf(os.Stderr, "error: unlockpt: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Open the PTY slave
+	pts, err := os.OpenFile(ptsName, os.O_RDWR, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: open pty slave %s: %v\n", ptsName, err)
+		os.Exit(1)
+	}
+
+	// Fork and exec the command with the PTY slave as stdin/stdout/stderr
+	pid, err := syscall.ForkExec(executable, cmdArgs, &syscall.ProcAttr{
+		Dir:   "/",
+		Env:   os.Environ(),
+		Files: []uintptr{pts.Fd(), pts.Fd(), pts.Fd()},
+		Sys: &syscall.SysProcAttr{
+			Setsid:  true,
+			Setctty: true,
+			Ctty:    0, // The first fd (stdin) is the controlling terminal
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: fork/exec %s: %v\n", cmdArgs[0], err)
+		os.Exit(1)
+	}
+
+	// Close the slave in the parent - the child has it
+	pts.Close()
+
+	// Proxy I/O between stdin/stdout and the PTY master
+	done := make(chan struct{}, 2)
+
+	// stdin -> ptmx
+	go func() {
+		io.Copy(ptmx, os.Stdin)
+		done <- struct{}{}
+	}()
+
+	// ptmx -> stdout
+	go func() {
+		io.Copy(os.Stdout, ptmx)
+		done <- struct{}{}
+	}()
+
+	// Wait for the child to exit
+	var status syscall.WaitStatus
+	for {
+		wpid, err := syscall.Wait4(pid, &status, 0, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: wait: %v\n", err)
+			os.Exit(1)
+		}
+		if wpid == pid {
+			break
+		}
+	}
+
+	// Exit with the child's exit code
+	if status.Exited() {
+		os.Exit(status.ExitStatus())
+	}
+	if status.Signaled() {
+		os.Exit(128 + int(status.Signal()))
+	}
+	os.Exit(1)
+}
+
+// ptsname returns the name of the PTY slave device for the given PTY master.
+func ptsname(f *os.File) (string, error) {
+	var ptyno uint32
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&ptyno)))
+	if errno != 0 {
+		return "", errno
+	}
+	return fmt.Sprintf("/dev/pts/%d", ptyno), nil
+}
+
+// unlockpt unlocks the PTY slave device for the given PTY master.
+func unlockpt(f *os.File) error {
+	var unlock int32 = 0
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&unlock)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 // setupDev creates a minimal /dev filesystem like Docker/containerd.

@@ -27,9 +27,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
-	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/thundersnap"
@@ -855,12 +853,6 @@ func getTailscaleUser(ctx context.Context, lc *tailscale.LocalClient, remoteAddr
 	return "unknown"
 }
 
-// setWinsize sets the size of the given pty.
-func setWinsize(f *os.File, w, h int) {
-	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCSWINSZ),
-		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0})))
-}
-
 // Resource limit constants for container isolation.
 // These provide defense against runaway processes while allowing efficient memory sharing.
 const (
@@ -1150,7 +1142,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	log.Printf("Control socket created successfully")
 
 	// Check if a command was requested
-	ptyReq, winCh, isPty := s.Pty()
+	ptyReq, _, isPty := s.Pty()
 	rawCmd := s.RawCommand()
 
 	// Determine which Unix user to run as
@@ -1220,30 +1212,59 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	cgroupName := fmt.Sprintf("thundersnap/%s/%s", safeTailscaleUser, safeSSHUser)
 
 	if isPty {
-		cmd.Env = append(cmd.Env, "TERM="+ptyReq.Term)
-		ptmx, err := pty.Start(cmd)
+		// For PTY sessions, we need to allocate the PTY INSIDE the container
+		// after devpts is mounted, otherwise the PTY won't be visible in
+		// /dev/pts inside the container. We pass --pty to ts drop-caps-and-run
+		// which handles PTY allocation after setting up the mount namespace.
+		//
+		// Rebuild the command with --pty flag inserted before --
+		tsArgsWithPty := make([]string, 0, len(tsArgs)+1)
+		for _, arg := range tsArgs {
+			if arg == "--" {
+				tsArgsWithPty = append(tsArgsWithPty, "--pty", "--")
+			} else {
+				tsArgsWithPty = append(tsArgsWithPty, arg)
+			}
+		}
+		if rawCmd != "" {
+			cmd = exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgsWithPty...)...)
+		} else {
+			cmd = exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgsWithPty...)...)
+		}
+		cmd.Dir = "/"
+		cmd.Env = []string{
+			"SSH_USER=" + sshUser,
+			"TAILSCALE_USER=" + tailscaleUser,
+			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"TERM=" + ptyReq.Term,
+		}
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
+		}
+
+		// Set up pipes - ts --pty will proxy between stdin/stdout and the PTY
+		stdin, err := cmd.StdinPipe()
 		if err != nil {
+			return fmt.Errorf("create stdin pipe: %w", err)
+		}
+		cmd.Stdout = s
+		cmd.Stderr = s.Stderr()
+
+		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("start shell: %w", err)
 		}
-		defer ptmx.Close()
 
 		// Configure resource limits: OOM priority, memory soft limit, fork bomb
 		// protection (pids.max), and CPU fairness
 		configureContainerResources(cmd.Process.Pid, cgroupName)
 
-		// Handle window size changes
+		// Copy stdin from SSH session to command
 		go func() {
-			for win := range winCh {
-				setWinsize(ptmx, win.Width, win.Height)
-			}
+			io.Copy(stdin, s)
+			stdin.Close()
 		}()
 
-		// Copy data between SSH session and PTY
-		go func() {
-			io.Copy(ptmx, s) // stdin
-		}()
-		io.Copy(s, ptmx) // stdout
-
+		// Wait for the command to complete
 		cmd.Wait()
 		s.Exit(cmd.ProcessState.ExitCode())
 	} else {
