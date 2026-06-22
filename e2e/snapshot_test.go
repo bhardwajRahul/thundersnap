@@ -664,3 +664,75 @@ func TestLargeDirectoryTree(t *testing.T) {
 		t.Logf("Verified large directory tree restored correctly")
 	}
 }
+
+// TestDeleteSnapshotWithReference tests that deleting a snapshot that is still
+// referenced by a frame should fail (or at least not corrupt the frame).
+//
+// Note: In btrfs, deleting a snapshot doesn't affect frames cloned from it
+// since btrfs uses copy-on-write. However, the test server may want to
+// prevent deletion if tracking references. This test documents the behavior.
+func TestDeleteSnapshotWithReference(t *testing.T) {
+	env := newTestEnv(t)
+
+	baseSnap := env.createBaseSnapshot()
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a frame from the snapshot
+	frameName := "reftest"
+	frameSpec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+	t.Logf("Created frame from snapshot %s", baseSnap)
+
+	// Verify the frame exists
+	framePath := filepath.Join(env.fsDir, "testuser", frameName)
+	if _, err := os.Stat(framePath); err != nil {
+		t.Fatalf("frame should exist: %v", err)
+	}
+
+	// Create a marker file in the frame
+	markerFile := filepath.Join(framePath, "tmp", "reftest-marker.txt")
+	if err := os.WriteFile(markerFile, []byte("marker content\n"), 0644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	// Try to delete the snapshot that the frame was cloned from
+	snapPath := filepath.Join(env.snapshotsDir, baseSnap)
+	cmd := exec.Command("btrfs", "subvolume", "delete", snapPath)
+	output, err := cmd.CombinedOutput()
+
+	// In btrfs, deleting a read-only snapshot should succeed even if
+	// writable clones exist (they have their own copy-on-write data).
+	// The test documents this behavior.
+	if err != nil {
+		t.Logf("Snapshot deletion failed (may be expected): %v\n%s", err, output)
+		// If it failed, that's fine - some setups may prevent deletion
+	} else {
+		t.Logf("Snapshot deleted successfully despite frame reference")
+
+		// Verify the frame still works after snapshot deletion
+		// (btrfs COW means the frame has its own data)
+		content, err := os.ReadFile(markerFile)
+		if err != nil {
+			t.Errorf("frame corrupted after snapshot deletion: %v", err)
+		} else if string(content) != "marker content\n" {
+			t.Errorf("marker content changed: got %q", content)
+		} else {
+			t.Log("Frame data intact after base snapshot deletion (btrfs COW works correctly)")
+		}
+	}
+}

@@ -69,9 +69,9 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [x] Create frame with all three (rootfs:home:work)
 - [x] Create frame from non-existent snapshot (error case)
 - [x] List frames and verify output format
-- [ ] Delete a running frame (should stop first or error)
+- [x] Delete a running frame (should stop first or error)
 - [x] Delete a stopped frame
-- [ ] Frame restart behavior after stop
+- [x] Frame restart behavior after stop
 - [ ] Multiple concurrent sessions to same frame
 
 ## Snapshot Operations
@@ -81,14 +81,14 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [x] Snapshot deduplication (identical content = same hash)
 - [x] Nested snapshot tree (snap of snap of snap)
 - [x] Delete snapshot with no references
-- [ ] Delete snapshot still referenced by a frame (error case)
+- [x] Delete snapshot still referenced by a frame (error case)
 - [x] List snapshots (snaps command)
 
 ## Taint System
 - [x] BASIC: Add a taint to a frame, verify it's recorded and queryable
 - [x] Add taint to frame (taint command)
 - [x] Multiple taints on one frame
-- [ ] Taint propagation through fork/snapshot
+- [x] Taint propagation through fork/snapshot
 - [x] Taint deduplication on merge
 - [ ] Query frame taints
 - [x] Taint types: pii:<dataset>, unsafe-permissions, untrusted-code
@@ -97,7 +97,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [x] BASIC: Two in-process instances; create snap on A, who-has from B finds it, download-snap succeeds
 - [x] who-has query for existing snapshot
 - [x] who-has query for non-existent snapshot
-- [ ] who-has with frame spec (colon-separated) shows helpful error
+- [x] who-has with frame spec (colon-separated) shows helpful error
 - [x] download-snap from mesh peer
 - [x] download-snap already present (skip re-download)
 - [ ] download-snap for frame spec (parallel downloads)

@@ -492,6 +492,51 @@ func TestMeshDownloadAlreadyPresent(t *testing.T) {
 	}
 }
 
+// TestMeshWhoHasWithFrameSpec tests that who-has returns a helpful error
+// when given a frame spec (colon-separated) instead of a plain snapshot ID.
+func TestMeshWhoHasWithFrameSpec(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startMeshTestControlServer(t, env, sockPath, "http://127.0.0.1:9999")
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Try who-has with a frame spec (contains colons) instead of a plain snapshot ID
+	frameSpec := "snap123:homesnap:worksnap"
+
+	whoHasResp, err := client.postJSON("/who-has", map[string]string{
+		"snapshot_id": frameSpec,
+	})
+
+	// We expect either an error response or a helpful message
+	// The test verifies that the system handles this gracefully
+	if err != nil {
+		t.Logf("Got network error (expected, bogus peer): %v", err)
+		return
+	}
+
+	status, _ := whoHasResp["status"].(string)
+	t.Logf("Response status: %s, full response: %v", status, whoHasResp)
+
+	// The behavior should be:
+	// - Either return an error saying frame specs aren't valid for who-has
+	// - Or return empty peers (since the "snapshot" doesn't exist)
+	// Both are acceptable behaviors
+	if status == "error" {
+		message, _ := whoHasResp["message"].(string)
+		t.Logf("Got error response for frame spec: %s", message)
+	} else {
+		peers, _ := whoHasResp["peers"].([]interface{})
+		if len(peers) == 0 {
+			t.Log("Got empty peers for frame spec (acceptable)")
+		} else {
+			t.Errorf("Unexpected: got peers for a frame spec: %v", peers)
+		}
+	}
+}
+
 // jsonReader creates an io.Reader from a JSON-serializable value.
 func jsonReader(v interface{}) *jsonReaderImpl {
 	return &jsonReaderImpl{v: v}

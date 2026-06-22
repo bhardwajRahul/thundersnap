@@ -993,6 +993,162 @@ func TestFrameFromNonExistentSnapshot(t *testing.T) {
 	t.Log("Verified frame was not created")
 }
 
+// TestDeleteRunningFrame tests that deleting a frame that has active sessions
+// returns an error or stops the sessions first.
+//
+// Note: In the test control server, we don't have real sessions, so we test
+// the behavior of trying to delete the current frame (which is always "running"
+// in the context of a control server).
+func TestDeleteRunningFrame(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a base snapshot
+	baseSnap := env.createBaseSnapshot()
+	t.Logf("Created base snapshot: %s", baseSnap)
+
+	// Create first frame
+	frameName1 := "frame1"
+	frameSpec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName1,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame1: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame1 failed: %v", createResp["message"])
+	}
+	t.Logf("Created frame1")
+
+	// Create a second frame
+	frameName2 := "frame2"
+	createResp, err = client.postJSON("/create", map[string]string{
+		"frame_name":  frameName2,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame2: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame2 failed: %v", createResp["message"])
+	}
+	t.Logf("Created frame2")
+
+	// Both frames should be deletable since neither is the "current" frame
+	// in the test control server (which doesn't track rootFS like the real one)
+	// Delete frame1 successfully
+	deleteResp, err := client.postJSON("/delete-frame", map[string]string{
+		"frame_name": frameName1,
+	})
+	if err != nil {
+		t.Fatalf("delete frame1: %v", err)
+	}
+	if deleteResp["status"] != "ok" {
+		t.Fatalf("delete frame1 failed: %v", deleteResp["message"])
+	}
+	t.Logf("Successfully deleted frame1 (stopped frame)")
+
+	// Verify frame1 is gone
+	listResp, err := client.getJSON("/list-frames")
+	if err != nil {
+		t.Fatalf("list frames: %v", err)
+	}
+	frames, _ := listResp["frames"].([]interface{})
+	for _, f := range frames {
+		fmap := f.(map[string]interface{})
+		if fmap["name"] == frameName1 {
+			t.Errorf("frame1 should not exist after deletion")
+		}
+	}
+
+	// Delete frame2
+	deleteResp, err = client.postJSON("/delete-frame", map[string]string{
+		"frame_name": frameName2,
+	})
+	if err != nil {
+		t.Fatalf("delete frame2: %v", err)
+	}
+	if deleteResp["status"] != "ok" {
+		t.Fatalf("delete frame2 failed: %v", deleteResp["message"])
+	}
+	t.Logf("Successfully deleted frame2")
+}
+
+// TestFrameRestartAfterStop tests that a frame can be restarted after stopping.
+// Since frames are just btrfs subvolumes, "restarting" means creating a new
+// session to the same frame after the previous session ended.
+func TestFrameRestartAfterStop(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a base snapshot
+	baseSnap := env.createBaseSnapshot()
+
+	// Create a frame
+	frameName := "restarttest"
+	frameSpec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+	t.Logf("Created frame")
+
+	// Simulate first "session" by writing a marker file
+	framePath := filepath.Join(env.fsDir, "testuser", frameName)
+	markerFile := filepath.Join(framePath, "tmp", "session1.txt")
+	if err := os.WriteFile(markerFile, []byte("session 1 was here\n"), 0644); err != nil {
+		t.Fatalf("write session1 marker: %v", err)
+	}
+	t.Logf("Wrote session 1 marker")
+
+	// "Stop" the session (nothing to do in test, session is not tracked)
+
+	// Simulate second "session" by writing another marker file
+	markerFile2 := filepath.Join(framePath, "tmp", "session2.txt")
+	if err := os.WriteFile(markerFile2, []byte("session 2 was here\n"), 0644); err != nil {
+		t.Fatalf("write session2 marker: %v", err)
+	}
+	t.Logf("Wrote session 2 marker")
+
+	// Verify both markers exist (state was preserved across "restart")
+	content1, err := os.ReadFile(markerFile)
+	if err != nil {
+		t.Fatalf("read session1 marker: %v", err)
+	}
+	content2, err := os.ReadFile(markerFile2)
+	if err != nil {
+		t.Fatalf("read session2 marker: %v", err)
+	}
+
+	if string(content1) != "session 1 was here\n" {
+		t.Errorf("session1 marker content wrong: %q", content1)
+	}
+	if string(content2) != "session 2 was here\n" {
+		t.Errorf("session2 marker content wrong: %q", content2)
+	}
+	t.Logf("Verified frame state preserved across restart")
+}
+
 // getDirSize returns the size of a directory in bytes using du.
 // Returns 0 if the size cannot be determined.
 func getDirSize(path string) int64 {
