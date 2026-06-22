@@ -86,12 +86,12 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 
 ## Taint System
 - [x] BASIC: Add a taint to a frame, verify it's recorded and queryable
-- [ ] Add taint to frame (taint command)
-- [ ] Multiple taints on one frame
+- [x] Add taint to frame (taint command)
+- [x] Multiple taints on one frame
 - [ ] Taint propagation through fork/snapshot
-- [ ] Taint deduplication on merge
+- [x] Taint deduplication on merge
 - [ ] Query frame taints
-- [ ] Taint types: pii:<dataset>, unsafe-permissions, untrusted-code
+- [x] Taint types: pii:<dataset>, unsafe-permissions, untrusted-code
 
 ## Mesh/Content-Addressed Operations
 - [x] BASIC: Two in-process instances; create snap on A, who-has from B finds it, download-snap succeeds

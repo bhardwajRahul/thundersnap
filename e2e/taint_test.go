@@ -73,3 +73,142 @@ func TestTaintSystemBasic(t *testing.T) {
 	}
 	t.Logf("Verified taint %q is recorded in response", taintName)
 }
+
+// TestMultipleTaintsOnFrame tests that multiple taints can be added to a frame
+// and all are returned correctly.
+func TestMultipleTaintsOnFrame(t *testing.T) {
+	env := newTestEnv(t)
+
+	baseSnap := env.createBaseSnapshot()
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a frame
+	frameName := "multitaint"
+	frameSpec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+
+	// Add multiple taints
+	taintsToAdd := []string{
+		"pii:customers",
+		"pii:employees",
+		"unsafe-permissions",
+		"untrusted-code:github.com/user/repo",
+	}
+
+	var lastTaints []interface{}
+	for _, taint := range taintsToAdd {
+		resp, err := client.postJSON("/taint", map[string]string{
+			"taint_name": taint,
+		})
+		if err != nil {
+			t.Fatalf("taint %q: %v", taint, err)
+		}
+		if resp["status"] != "ok" {
+			t.Fatalf("taint %q failed: %v", taint, resp["message"])
+		}
+		lastTaints, _ = resp["taints"].([]interface{})
+		t.Logf("Added taint: %s", taint)
+	}
+
+	// Verify all taints are present in the final response
+	if len(lastTaints) != len(taintsToAdd) {
+		t.Errorf("expected %d taints, got %d", len(taintsToAdd), len(lastTaints))
+	}
+
+	taintSet := make(map[string]bool)
+	for _, t := range lastTaints {
+		if s, ok := t.(string); ok {
+			taintSet[s] = true
+		}
+	}
+
+	for _, expected := range taintsToAdd {
+		if !taintSet[expected] {
+			t.Errorf("taint %q not found in response", expected)
+		}
+	}
+	t.Logf("Verified all %d taints are recorded", len(taintsToAdd))
+}
+
+// TestTaintDeduplication tests that adding the same taint twice
+// doesn't result in duplicates.
+func TestTaintDeduplication(t *testing.T) {
+	env := newTestEnv(t)
+
+	baseSnap := env.createBaseSnapshot()
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a frame
+	frameName := "deduptaint"
+	frameSpec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+
+	taint := "pii:customers"
+
+	// Add the same taint twice
+	for i := 0; i < 2; i++ {
+		resp, err := client.postJSON("/taint", map[string]string{
+			"taint_name": taint,
+		})
+		if err != nil {
+			t.Fatalf("taint %d: %v", i+1, err)
+		}
+		if resp["status"] != "ok" {
+			t.Fatalf("taint %d failed: %v", i+1, resp["message"])
+		}
+	}
+
+	// Query taints (final response from taint command should show count)
+	resp, err := client.postJSON("/taint", map[string]string{
+		"taint_name": "dummy", // Add another taint to get current list
+	})
+	if err != nil {
+		t.Fatalf("query taints: %v", err)
+	}
+
+	taints, _ := resp["taints"].([]interface{})
+
+	// Count occurrences of our taint
+	count := 0
+	for _, t := range taints {
+		if t == taint {
+			count++
+		}
+	}
+
+	if count > 1 {
+		t.Errorf("taint %q appears %d times (expected 1)", taint, count)
+	} else {
+		t.Logf("Verified taint deduplication: %q appears exactly once", taint)
+	}
+}

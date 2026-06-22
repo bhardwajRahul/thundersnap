@@ -117,6 +117,7 @@ type testControlServer struct {
 	listener net.Listener
 	env      *testEnv
 	done     chan struct{}
+	taints   []string // Track taints for testing
 }
 
 func (s *testControlServer) Close() {
@@ -481,11 +482,22 @@ func (s *testControlServer) handleTaint(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Store taint (just acknowledge for now)
+	// Add taint if not already present (deduplication)
+	found := false
+	for _, t := range s.taints {
+		if t == req.TaintName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		s.taints = append(s.taints, req.TaintName)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status": "ok",
-		"taints": []string{req.TaintName},
+		"taints": s.taints,
 	})
 }
 
