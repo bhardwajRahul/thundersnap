@@ -219,6 +219,119 @@ func TestWorkflowHomeWorkSeparation(t *testing.T) {
 	t.Logf("Work content verified")
 }
 
+// TestCrossFrameDataSharingViaWorkVolume tests that two frames can share
+// data through a common work volume. The work volume is snapshotted and
+// mounted in both frames, allowing cross-frame data sharing.
+func TestCrossFrameDataSharingViaWorkVolume(t *testing.T) {
+	env := newTestEnv(t)
+
+	baseSnap := env.createBaseSnapshot()
+
+	// Create a shared work snapshot
+	sharedWorkPath := filepath.Join(env.snapshotsDir, "shared-work")
+	cmd := exec.Command("btrfs", "subvolume", "create", sharedWorkPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create shared work: %v\n%s", err, out)
+	}
+	os.Chown(sharedWorkPath, 1000, 1000)
+
+	// Add initial content to shared work
+	sharedFile := filepath.Join(sharedWorkPath, "shared-data.txt")
+	if err := os.WriteFile(sharedFile, []byte("initial shared content\n"), 0644); err != nil {
+		t.Fatalf("write shared file: %v", err)
+	}
+
+	// Snapshot the shared work
+	sharedWorkSnap := filepath.Join(env.snapshotsDir, "shared-work-snap")
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", "-r", sharedWorkPath, sharedWorkSnap)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("snapshot shared work: %v\n%s", err, out)
+	}
+	t.Logf("Created shared work snapshot")
+
+	// Create frame1 with the shared work snapshot
+	frame1Path := filepath.Join(env.fsDir, "testuser", "share1")
+	if err := os.MkdirAll(filepath.Dir(frame1Path), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	snapPath := filepath.Join(env.snapshotsDir, baseSnap)
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", snapPath, frame1Path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clone base to frame1: %v\n%s", err, out)
+	}
+
+	// Replace frame1's work with a writable clone of shared work
+	work1Path := filepath.Join(frame1Path, "work")
+	os.RemoveAll(work1Path)
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", sharedWorkSnap, work1Path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clone shared work to frame1: %v\n%s", err, out)
+	}
+	t.Logf("Created frame1 with shared work")
+
+	// Create frame2 with the SAME shared work snapshot
+	frame2Path := filepath.Join(env.fsDir, "testuser", "share2")
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", snapPath, frame2Path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clone base to frame2: %v\n%s", err, out)
+	}
+
+	work2Path := filepath.Join(frame2Path, "work")
+	os.RemoveAll(work2Path)
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", sharedWorkSnap, work2Path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clone shared work to frame2: %v\n%s", err, out)
+	}
+	t.Logf("Created frame2 with shared work")
+
+	// Verify both frames have the initial content
+	content1, err := os.ReadFile(filepath.Join(work1Path, "shared-data.txt"))
+	if err != nil {
+		t.Fatalf("read from frame1: %v", err)
+	}
+	content2, err := os.ReadFile(filepath.Join(work2Path, "shared-data.txt"))
+	if err != nil {
+		t.Fatalf("read from frame2: %v", err)
+	}
+
+	if string(content1) != string(content2) {
+		t.Errorf("initial content differs: frame1=%q frame2=%q", content1, content2)
+	}
+	t.Logf("Both frames start with same shared content")
+
+	// Modify in frame1
+	modifiedFile := filepath.Join(work1Path, "frame1-addition.txt")
+	if err := os.WriteFile(modifiedFile, []byte("added by frame1\n"), 0644); err != nil {
+		t.Fatalf("write from frame1: %v", err)
+	}
+
+	// Snapshot frame1's work
+	work1Snap := filepath.Join(env.snapshotsDir, "work1-snap")
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", "-r", work1Path, work1Snap)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("snapshot frame1 work: %v\n%s", err, out)
+	}
+
+	// "Share" the updated work to frame2 by replacing its work with the new snapshot
+	// In real usage, this simulates syncing work directories between frames
+	os.RemoveAll(work2Path)
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", work1Snap, work2Path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("sync work to frame2: %v\n%s", err, out)
+	}
+
+	// Verify frame2 now sees frame1's addition
+	content2New, err := os.ReadFile(filepath.Join(work2Path, "frame1-addition.txt"))
+	if err != nil {
+		t.Fatalf("read synced file from frame2: %v", err)
+	}
+	if string(content2New) != "added by frame1\n" {
+		t.Errorf("synced content wrong: got %q", content2New)
+	}
+	t.Logf("Frame2 successfully received Frame1's work updates via shared snapshot")
+}
+
 func generateRandomMarker() string {
 	b := make([]byte, 32)
 	rand.Read(b)

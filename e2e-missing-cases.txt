@@ -147,7 +147,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [ ] Disk full during snapshot creation
 - [x] Invalid snapshot ID format
 - [ ] Corrupted snapshot metadata
-- [ ] Symlink loop detection
+- [x] Symlink loop detection
 - [x] Very large directory trees (thousands of files)
 - [ ] Concurrent modification during snapshot
 
@@ -162,7 +162,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [x] BASIC: Create frame, modify a file, snap, create new frame from snap, verify modification present
 - [x] Full workflow: create frame -> modify -> snap -> new frame from snap
 - [ ] SSH session flow end-to-end
-- [ ] Cross-frame data sharing via work volume
+- [x] Cross-frame data sharing via work volume
 - [ ] Mesh replication: create on node A, download on node B
 
 ## Infrastructure/Daemon

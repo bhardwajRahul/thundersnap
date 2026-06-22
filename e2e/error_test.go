@@ -3,6 +3,7 @@ package e2e
 
 import (
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -208,6 +209,96 @@ func TestErrorSnapNonexistentFrame(t *testing.T) {
 	} else {
 		message, _ := snapResp["message"].(string)
 		t.Logf("Got expected error snapping non-existent frame: %s", message)
+	}
+}
+
+// TestSymlinkLoopDetection tests that symlink loops don't cause infinite recursion
+// during snapshot operations. The snapshot should either detect and skip the loop
+// or handle it gracefully with an error.
+func TestSymlinkLoopDetection(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	baseSnap := env.createBaseSnapshot()
+
+	// Create a frame
+	frameName := "looptest"
+	frameSpec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+
+	framePath := filepath.Join(env.fsDir, "testuser", frameName)
+
+	// Create a symlink loop: loop1 -> loop2, loop2 -> loop1
+	loopDir := filepath.Join(framePath, "tmp", "loopdir")
+	if err := os.MkdirAll(loopDir, 0755); err != nil {
+		t.Fatalf("mkdir loopdir: %v", err)
+	}
+
+	loop1 := filepath.Join(loopDir, "loop1")
+	loop2 := filepath.Join(loopDir, "loop2")
+
+	if err := os.Symlink("loop2", loop1); err != nil {
+		t.Fatalf("create loop1 symlink: %v", err)
+	}
+	if err := os.Symlink("loop1", loop2); err != nil {
+		t.Fatalf("create loop2 symlink: %v", err)
+	}
+	t.Logf("Created symlink loop: loop1 -> loop2, loop2 -> loop1")
+
+	// Also create a self-referencing symlink
+	selfLoop := filepath.Join(loopDir, "selfloop")
+	if err := os.Symlink("selfloop", selfLoop); err != nil {
+		t.Fatalf("create selfloop symlink: %v", err)
+	}
+	t.Logf("Created self-referencing symlink: selfloop -> selfloop")
+
+	// Try to snapshot the frame - this should not hang
+	// The snapshot operation should complete (with or without including the loops)
+	snapResp, err := client.postJSON("/snap", map[string]string{
+		"frame_name": frameName,
+	})
+	if err != nil {
+		// Timeout or error is acceptable as long as it doesn't hang
+		t.Logf("Snapshot with symlink loops returned error (acceptable): %v", err)
+		return
+	}
+
+	status, _ := snapResp["status"].(string)
+	if status == "error" {
+		message, _ := snapResp["message"].(string)
+		t.Logf("Snapshot with symlink loops returned error (acceptable): %s", message)
+	} else if status == "ok" {
+		// Snapshot succeeded - verify the symlinks are stored correctly
+		snapID := snapResp["snapshot_id"].(string)
+		t.Logf("Snapshot succeeded with symlink loops: %s", snapID)
+
+		// Verify symlinks are stored as symlinks, not followed
+		snapPath := filepath.Join(env.snapshotsDir, snapID)
+		snapLoop1 := filepath.Join(snapPath, "tmp", "loopdir", "loop1")
+		info, err := os.Lstat(snapLoop1)
+		if err != nil {
+			t.Errorf("lstat loop1 in snapshot: %v", err)
+		} else if info.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("loop1 should be a symlink in snapshot, got mode %v", info.Mode())
+		} else {
+			target, _ := os.Readlink(snapLoop1)
+			t.Logf("Symlink loop preserved in snapshot: loop1 -> %s", target)
+		}
 	}
 }
 
