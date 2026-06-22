@@ -136,9 +136,12 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// Build kernel command line
 	// The VM uses /bin/sh as init, which runs a script that:
 	// 1. Calls "ts drop-caps-and-run" to set up /dev (consistent with container mode)
-	// 2. Configures networking (eth0 with static IP for passt)
-	// 3. Starts vshd in the foreground
-	// 4. Powers off the VM when vshd exits
+	// 2. Starts vshd in the foreground
+	// 3. Powers off the VM when vshd exits
+	//
+	// Networking is configured via the kernel's IP autoconfiguration (ip=) rather
+	// than running ip commands in userspace. Format: ip=<client-ip>::<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>
+	// This requires CONFIG_IP_PNP=y in the kernel config.
 	//
 	// We use sh as init because kernel cmdline argument parsing is limited -
 	// it doesn't handle complex quoting well when passing args directly to init.
@@ -146,7 +149,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	//
 	// panic=1 tells the kernel to reboot 1 second after a panic. Since there's
 	// no bootable device, cloud-hypervisor will exit when the VM reboots.
-	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
+	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
 
 	// Create pipe for event monitor - cloud-hypervisor writes events, we read them
 	eventReadPipe, eventWritePipe, err := os.Pipe()
