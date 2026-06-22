@@ -8,6 +8,9 @@
 * Tests should never have arbitrary timeouts; they cause flakes. Use channels or mutexes or
   some other sync primitive when possible, or in worst case, a polling loop
   with short timeouts and 'up to many' iterations that add up to a much longer one.
+* **Timeout limits**: Each individual e2e test MUST complete in under 10 seconds. The entire
+  e2e test suite MUST complete in under 30 seconds. Use `go test -timeout 10s` when running
+  individual tests during development. Long timeouts (e.g., 10 minutes) hide hangs and bugs.
 * Don't stop and ask questions along the way, I'm not watching you. Do your
   best and we'll fix it later. You can add a "notes for things to think
   about later" section at the end of this file if you want.

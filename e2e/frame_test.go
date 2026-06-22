@@ -4,6 +4,8 @@ package e2e
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -156,6 +158,7 @@ func startTestControlServer(t *testing.T, env *testEnv, sockPath string) *testCo
 	mux.HandleFunc("/snap", srv.handleSnap)
 	mux.HandleFunc("/list-snaps", srv.handleListSnaps)
 	mux.HandleFunc("/taint", srv.handleTaint)
+	mux.HandleFunc("/import-docker-tarball", srv.handleImportDockerTarball)
 
 	go func() {
 		defer close(srv.done)
@@ -370,12 +373,66 @@ func (s *testControlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Req
 }
 
 func (s *testControlServer) handleSnap(w http.ResponseWriter, r *http.Request) {
-	// Placeholder - will be implemented in snapshot_test.go
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		FrameName string `json:"frame_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"type":    "result",
+			"status":  "error",
+			"message": "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	// Find the frame path
+	framePath := filepath.Join(s.env.fsDir, "testuser", req.FrameName)
+	if _, err := os.Stat(framePath); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"type":    "result",
+			"status":  "error",
+			"message": fmt.Sprintf("frame not found: %s", req.FrameName),
+		})
+		return
+	}
+
+	// Generate a random snapshot ID
+	snapID, err := generateSnapshotID()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"type":    "result",
+			"status":  "error",
+			"message": "generate snapshot ID: " + err.Error(),
+		})
+		return
+	}
+
+	// Create btrfs snapshot (read-only) in the snapshots directory
+	snapPath := filepath.Join(s.env.snapshotsDir, snapID)
+	cmd := exec.Command("btrfs", "subvolume", "snapshot", "-r", framePath, snapPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"type":    "result",
+			"status":  "error",
+			"message": fmt.Sprintf("btrfs snapshot: %v: %s", err, string(out)),
+		})
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"type":        "result",
 		"status":      "ok",
-		"snapshot_id": "test-snap-id",
+		"snapshot_id": snapID,
 	})
 }
 
@@ -388,13 +445,14 @@ func (s *testControlServer) handleListSnaps(w http.ResponseWriter, r *http.Reque
 		if !entry.IsDir() {
 			continue
 		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
+
+		// Get actual directory size using du
+		snapPath := filepath.Join(s.env.snapshotsDir, entry.Name())
+		size := getDirSize(snapPath)
+
 		snaps = append(snaps, map[string]interface{}{
 			"id":   entry.Name(),
-			"size": info.Size(),
+			"size": size,
 		})
 	}
 
@@ -584,4 +642,28 @@ func (w *testResponseWriter) finish() error {
 	// Write body
 	w.conn.Write(w.body.Bytes())
 	return nil
+}
+
+// generateSnapshotID generates a random hex string for snapshot naming.
+func generateSnapshotID() (string, error) {
+	b := make([]byte, 16) // 32 hex characters
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// getDirSize returns the size of a directory in bytes using du.
+// Returns 0 if the size cannot be determined.
+func getDirSize(path string) int64 {
+	cmd := exec.Command("du", "-sb", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+
+	// Parse output: "12345\t/path/to/dir\n"
+	var size int64
+	fmt.Sscanf(string(out), "%d", &size)
+	return size
 }
