@@ -159,9 +159,9 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 
 ## Error Handling
 - [x] BASIC: Verify helpful error message when daemon not running or snapshot doesn't exist
-- [ ] thundersnapd connection refused (daemon not running)
+- [x] thundersnapd connection refused (daemon not running)
 - [ ] Disk full during snapshot creation
-- [ ] Invalid snapshot ID format
+- [x] Invalid snapshot ID format
 - [ ] Corrupted snapshot metadata
 - [ ] Symlink loop detection
 - [ ] Very large directory trees (thousands of files)

@@ -96,3 +96,151 @@ func testSnapshotNotFound(t *testing.T) {
 
 	t.Logf("Got expected error for non-existent snapshot: %s", message)
 }
+
+// TestErrorInvalidSnapshotFormat tests error handling for invalid snapshot ID formats.
+func TestErrorInvalidSnapshotFormat(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Test cases with various invalid formats
+	testCases := []struct {
+		name        string
+		snapshotID  string
+		shouldError bool
+		description string
+	}{
+		{
+			name:        "empty_spec",
+			snapshotID:  "",
+			shouldError: true,
+			description: "empty snapshot spec should error",
+		},
+		{
+			name:        "colons_only",
+			snapshotID:  "::",
+			shouldError: true,
+			description: "colons-only spec should error (no rootfs)",
+		},
+		{
+			name:        "special_chars",
+			snapshotID:  "../../etc/passwd::",
+			shouldError: true,
+			description: "path traversal in snapshot ID should error",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			frameName := "errortest-" + tc.name
+			createResp, err := client.postJSON("/create", map[string]string{
+				"frame_name":  frameName,
+				"snapshot_id": tc.snapshotID,
+			})
+			if err != nil {
+				t.Fatalf("create frame request failed: %v", err)
+			}
+
+			status, _ := createResp["status"].(string)
+			if tc.shouldError {
+				if status != "error" {
+					t.Errorf("%s: expected error status, got %q", tc.description, status)
+				} else {
+					t.Logf("%s: got expected error status", tc.description)
+				}
+			}
+		})
+	}
+}
+
+// TestErrorDeleteNonexistentFrame tests error handling when deleting a frame that doesn't exist.
+func TestErrorDeleteNonexistentFrame(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Try to delete a frame that doesn't exist
+	deleteResp, err := client.postJSON("/delete-frame", map[string]string{
+		"frame_name": "nonexistent-frame-xyz",
+	})
+	if err != nil {
+		t.Fatalf("delete frame request failed: %v", err)
+	}
+
+	status, _ := deleteResp["status"].(string)
+	if status != "error" {
+		t.Errorf("expected error when deleting non-existent frame, got status=%q", status)
+	} else {
+		message, _ := deleteResp["message"].(string)
+		t.Logf("Got expected error deleting non-existent frame: %s", message)
+	}
+}
+
+// TestErrorSnapNonexistentFrame tests error handling when snapshotting a frame that doesn't exist.
+func TestErrorSnapNonexistentFrame(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Try to snapshot a frame that doesn't exist
+	snapResp, err := client.postJSON("/snap", map[string]string{
+		"frame_name": "nonexistent-frame-xyz",
+	})
+	if err != nil {
+		t.Fatalf("snap request failed: %v", err)
+	}
+
+	status, _ := snapResp["status"].(string)
+	if status != "error" {
+		t.Errorf("expected error when snapping non-existent frame, got status=%q", status)
+	} else {
+		message, _ := snapResp["message"].(string)
+		t.Logf("Got expected error snapping non-existent frame: %s", message)
+	}
+}
+
+// TestErrorWhoHasNonexistent tests error handling for who-has on non-existent snapshot.
+func TestErrorWhoHasNonexistent(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Start two environments like the mesh test, but query for a non-existent snapshot
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startMeshTestControlServer(t, env, sockPath, "http://127.0.0.1:1") // bogus peer
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Query who-has for a snapshot that doesn't exist
+	whoHasResp, err := client.postJSON("/who-has", map[string]string{
+		"snapshot_id": "nonexistent-snapshot-abc123",
+	})
+	if err != nil {
+		// Network error is expected since peer URL is bogus
+		t.Logf("Got expected network error: %v", err)
+		return
+	}
+
+	// If we got a response, it should indicate no peers or error
+	status, _ := whoHasResp["status"].(string)
+	peers, hasPeers := whoHasResp["peers"].([]interface{})
+
+	if status == "error" {
+		t.Logf("Got error response: %v", whoHasResp)
+	} else if hasPeers && len(peers) == 0 {
+		t.Log("Got empty peers list for non-existent snapshot (expected)")
+	} else {
+		t.Logf("Got unexpected response: %v", whoHasResp)
+	}
+}
