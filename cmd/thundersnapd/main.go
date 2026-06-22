@@ -66,6 +66,10 @@ var (
 	// authURLFile is the path where the server writes the auth URL
 	// while waiting for Tailscale login. The --activate client reads it.
 	authURLFile = "/run/thundersnap/auth-url"
+
+	// statusFile is the path where the server writes its current status
+	// after successful authentication. The --status client reads it.
+	statusFile = "/run/thundersnap/status"
 )
 
 // vmSessionManager tracks running VM sessions and allows multiple clients to share them.
@@ -205,6 +209,7 @@ func (m *vmSessionManager) releaseVM(tailscaleUser, vmUser string) {
 
 func main() {
 	activate := flag.Bool("activate", false, "Print the Tailscale auth URL and wait for login to complete")
+	showStatus := flag.Bool("status", false, "Print the current server status and exit")
 	hostname := flag.String("hostname", "thundersnap", "Tailscale hostname for this server")
 	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
 	flagFsDir = flag.String("fs-dir", "", "Directory to store per-user live filesystems (required)")
@@ -219,6 +224,11 @@ func main() {
 
 	if *activate {
 		runActivate()
+		return
+	}
+
+	if *showStatus {
+		runStatus()
 		return
 	}
 
@@ -320,6 +330,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to get LocalClient: %v", err)
 	}
+
+	// Write status file with current server info
+	writeStatusFile(status)
 
 	// Create SSH server with gliderlabs/ssh and persistent host key
 	forwardHandler := &ssh.ForwardedTCPHandler{}
@@ -570,6 +583,75 @@ func runActivate() {
 			fmt.Println("Login complete.")
 			return
 		}
+	}
+}
+
+// runStatus implements the --status client mode.
+// It reads and prints the status file written by the running server.
+func runStatus() {
+	data, err := os.ReadFile(statusFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "No status file found at %s.\nThe server may not be running or not yet authenticated.\n", statusFile)
+			os.Exit(1)
+		}
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			fmt.Fprintf(os.Stderr, "%s: %s\n", statusFile, errno)
+		} else {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", statusFile, err)
+		}
+		fmt.Fprintf(os.Stderr, "Try running as root.\n")
+		os.Exit(1)
+	}
+	fmt.Print(string(data))
+}
+
+// writeStatusFile writes the current server status to the status file.
+func writeStatusFile(status *ipnstate.Status) {
+	// Ensure the directory exists
+	if err := os.MkdirAll(filepath.Dir(statusFile), 0755); err != nil {
+		log.Printf("Warning: failed to create status file directory: %v", err)
+		return
+	}
+
+	// Determine the logged-in identity (user login or tags)
+	login := "unknown"
+	if status.Self != nil {
+		if status.Self.Tags != nil && status.Self.Tags.Len() > 0 {
+			var tags []string
+			for i := range status.Self.Tags.Len() {
+				tags = append(tags, status.Self.Tags.At(i))
+			}
+			login = strings.Join(tags, ",")
+		} else if status.Self.UserID != 0 {
+			if user, ok := status.User[status.Self.UserID]; ok {
+				login = user.LoginName
+			}
+		}
+	}
+
+	// Get the actual hostname from control server (DNSName without trailing dot)
+	hostname := "unknown"
+	if status.Self != nil && status.Self.DNSName != "" {
+		hostname = strings.TrimSuffix(status.Self.DNSName, ".")
+	}
+
+	// Format IP addresses
+	var ips []string
+	for _, ip := range status.TailscaleIPs {
+		ips = append(ips, ip.String())
+	}
+
+	// Build status content
+	var buf strings.Builder
+	buf.WriteString(fmt.Sprintf("state: %s\n", status.BackendState))
+	buf.WriteString(fmt.Sprintf("hostname: %s\n", hostname))
+	buf.WriteString(fmt.Sprintf("login: %s\n", login))
+	buf.WriteString(fmt.Sprintf("tailscale-ips: %s\n", strings.Join(ips, " ")))
+
+	if err := os.WriteFile(statusFile, []byte(buf.String()), 0644); err != nil {
+		log.Printf("Warning: failed to write status file: %v", err)
 	}
 }
 
