@@ -27,6 +27,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/gliderlabs/ssh"
 	"github.com/pborman/getopt/v2"
@@ -1212,25 +1213,38 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	cgroupName := fmt.Sprintf("thundersnap/%s/%s", safeTailscaleUser, safeSSHUser)
 
 	if isPty {
-		// For PTY sessions, we need to allocate the PTY INSIDE the container
-		// after devpts is mounted, otherwise the PTY won't be visible in
-		// /dev/pts inside the container. We pass --pty to ts drop-caps-and-run
-		// which handles PTY allocation after setting up the mount namespace.
+		// For PTY sessions, we allocate the PTY from outside the namespace by
+		// opening the container's devpts ptmx directly. This gives us the master
+		// fd for direct I/O and window size control, eliminating the need for
+		// file-based communication and an intermediary process.
 		//
-		// Rebuild the command with --pty flag inserted before --
+		// The handshake protocol:
+		// 1. We create a pipe and pass the write end to ts as --pty-handshake-fd
+		// 2. ts sets up devpts, writes "READY\n" to the pipe
+		// 3. We open <rootfs>/dev/pts/ptmx, get the slave path
+		// 4. We write the slave path back to ts via the pipe
+		// 5. ts opens the slave as its controlling terminal and execs the shell
+
+		// Create handshake socket pair for bidirectional communication
+		fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+		if err != nil {
+			return fmt.Errorf("create handshake socketpair: %w", err)
+		}
+		handshakeOurs := os.NewFile(uintptr(fds[0]), "handshake-ours")
+		handshakeTheirs := os.NewFile(uintptr(fds[1]), "handshake-theirs")
+		defer handshakeOurs.Close()
+
+		// Build command with --pty-handshake-fd flag
+		// The fd number will be 3 (after stdin=0, stdout=1, stderr=2)
 		tsArgsWithPty := make([]string, 0, len(tsArgs)+1)
 		for _, arg := range tsArgs {
 			if arg == "--" {
-				tsArgsWithPty = append(tsArgsWithPty, "--pty", "--")
+				tsArgsWithPty = append(tsArgsWithPty, "--pty-handshake-fd=3", "--")
 			} else {
 				tsArgsWithPty = append(tsArgsWithPty, arg)
 			}
 		}
-		if rawCmd != "" {
-			cmd = exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgsWithPty...)...)
-		} else {
-			cmd = exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgsWithPty...)...)
-		}
+		cmd = exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgsWithPty...)...)
 		cmd.Dir = "/"
 		cmd.Env = []string{
 			"SSH_USER=" + sshUser,
@@ -1242,46 +1256,71 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 			Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
 		}
 
-		// Set up pipes - ts --pty will proxy between stdin/stdout and the PTY
-		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			return fmt.Errorf("create stdin pipe: %w", err)
-		}
-		cmd.Stdout = s
-		cmd.Stderr = s.Stderr()
+		// Pass their end of the socket as extra fd (fd 3)
+		cmd.ExtraFiles = []*os.File{handshakeTheirs}
 
-		// Write initial window size to file (ts reads this on startup)
-		winsizeFile := filepath.Join(rootFS, "tmp", ".pty-winsize")
-		os.MkdirAll(filepath.Dir(winsizeFile), 0755)
-		os.WriteFile(winsizeFile, []byte(fmt.Sprintf("%d %d\n", ptyReq.Window.Width, ptyReq.Window.Height)), 0644)
-
+		// Start the command - it will set up devpts and wait for the PTY slave path
 		if err := cmd.Start(); err != nil {
+			handshakeTheirs.Close()
 			return fmt.Errorf("start shell: %w", err)
 		}
+		handshakeTheirs.Close() // Close our copy of their end
 
 		// Configure resource limits: OOM priority, memory soft limit, fork bomb
 		// protection (pids.max), and CPU fairness
 		configureContainerResources(cmd.Process.Pid, cgroupName)
 
-		// Handle window size changes by writing to file and signaling ts
+		// Wait for "READY\n" from ts indicating devpts is mounted
+		readyBuf := make([]byte, 64)
+		n, err := handshakeOurs.Read(readyBuf)
+		if err != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			return fmt.Errorf("handshake read: %w", err)
+		}
+		if !strings.HasPrefix(string(readyBuf[:n]), "READY") {
+			cmd.Process.Kill()
+			cmd.Wait()
+			return fmt.Errorf("unexpected handshake: %q", string(readyBuf[:n]))
+		}
+
+		// Now open the container's ptmx via /proc/<pid>/root - this lets us
+		// see the container's mount namespace including the devpts mount
+		ptmx, slavePath, err := openContainerPTY(cmd.Process.Pid)
+		if err != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			return fmt.Errorf("open container PTY: %w", err)
+		}
+		defer ptmx.Close()
+
+		// Set initial window size
+		setPTYWinsize(ptmx, int(ptyReq.Window.Width), int(ptyReq.Window.Height))
+
+		// Send the slave path back to ts
+		if _, err := handshakeOurs.Write([]byte(slavePath + "\n")); err != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			return fmt.Errorf("send slave path: %w", err)
+		}
+
+		// Handle window size changes - now we can do this directly on the master
 		go func() {
 			for win := range winCh {
-				os.WriteFile(winsizeFile, []byte(fmt.Sprintf("%d %d\n", win.Width, win.Height)), 0644)
-				if cmd.Process != nil {
-					cmd.Process.Signal(syscall.SIGWINCH)
-				}
+				setPTYWinsize(ptmx, int(win.Width), int(win.Height))
 			}
 		}()
 
-		// Copy stdin from SSH session to command
+		// Proxy I/O between SSH session and PTY master
 		go func() {
-			io.Copy(stdin, s)
-			stdin.Close()
+			io.Copy(ptmx, s) // SSH -> PTY
+		}()
+		go func() {
+			io.Copy(s, ptmx) // PTY -> SSH
 		}()
 
 		// Wait for the command to complete
 		cmd.Wait()
-		os.Remove(winsizeFile) // Clean up
 		s.Exit(cmd.ProcessState.ExitCode())
 	} else {
 		// No PTY requested, run without one
@@ -4516,4 +4555,67 @@ func parseRangeHeader(header string, fileSize int64) (start, end int64, err erro
 	}
 
 	return start, end, nil
+}
+
+// PTY helper functions for allocating PTYs from outside the container namespace.
+// These allow thundersnapd to open the container's devpts ptmx directly, giving
+// it the master fd for direct I/O and window size control.
+
+// openContainerPTY opens a PTY on the container's devpts mount and returns
+// the master fd and the slave device path (e.g., "/dev/pts/0").
+// The pid is the container's init process - we access its mount namespace
+// via /proc/<pid>/root to see the devpts mount.
+func openContainerPTY(pid int) (*os.File, string, error) {
+	// Access the container's filesystem through /proc/<pid>/root
+	// This gives us a view into the container's mount namespace
+	ptmxPath := fmt.Sprintf("/proc/%d/root/dev/pts/ptmx", pid)
+	ptmx, err := os.OpenFile(ptmxPath, os.O_RDWR, 0)
+	if err != nil {
+		return nil, "", fmt.Errorf("open %s: %w", ptmxPath, err)
+	}
+
+	// Get the slave device number
+	slavePath, err := ptsnameFromMaster(ptmx)
+	if err != nil {
+		ptmx.Close()
+		return nil, "", fmt.Errorf("ptsname: %w", err)
+	}
+
+	// Unlock the slave device
+	if err := unlockPTY(ptmx); err != nil {
+		ptmx.Close()
+		return nil, "", fmt.Errorf("unlockpt: %w", err)
+	}
+
+	return ptmx, slavePath, nil
+}
+
+// ptsnameFromMaster returns the slave device path for the given PTY master.
+func ptsnameFromMaster(ptmx *os.File) (string, error) {
+	var ptyno uint32
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&ptyno)))
+	if errno != 0 {
+		return "", errno
+	}
+	return fmt.Sprintf("/dev/pts/%d", ptyno), nil
+}
+
+// unlockPTY unlocks the PTY slave device.
+func unlockPTY(ptmx *os.File) error {
+	var unlock int32 = 0
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&unlock)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// setPTYWinsize sets the window size on the PTY master.
+func setPTYWinsize(ptmx *os.File, width, height int) error {
+	ws := struct{ row, col, xpixel, ypixel uint16 }{uint16(height), uint16(width), 0, 0}
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(&ws)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
