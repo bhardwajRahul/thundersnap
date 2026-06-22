@@ -260,6 +260,207 @@ func TestTSMDeviceNodeStorage(t *testing.T) {
 	}
 }
 
+// TestTSCSortedSHA256 verifies TSC chunks are sorted by SHA-256 (binary searchable).
+func TestTSCSortedSHA256(t *testing.T) {
+	env := newTestEnv(t)
+
+	baseSnap := env.createBaseSnapshot()
+	snapPath := filepath.Join(env.snapshotsDir, baseSnap)
+	tsmPath := snapPath + ".tsm"
+	tscPath := snapPath + ".tsc"
+
+	err := generateTSMFiles(t, snapPath, tsmPath, tscPath)
+	if err != nil {
+		t.Fatalf("generate TSM files: %v", err)
+	}
+
+	tscReader, err := tsm.ReadTSC(tscPath)
+	if err != nil {
+		t.Fatalf("open TSC: %v", err)
+	}
+
+	if len(tscReader.Entries) < 2 {
+		t.Skip("not enough chunks to verify sorting")
+	}
+
+	// Verify each entry's SHA is >= the previous
+	for i := 1; i < len(tscReader.Entries); i++ {
+		prev := tscReader.Entries[i-1].SHA256[:]
+		curr := tscReader.Entries[i].SHA256[:]
+
+		cmp := 0
+		for j := 0; j < 32; j++ {
+			if prev[j] < curr[j] {
+				cmp = -1
+				break
+			} else if prev[j] > curr[j] {
+				cmp = 1
+				break
+			}
+		}
+
+		if cmp > 0 {
+			t.Errorf("TSC not sorted at index %d: %x > %x", i, prev, curr)
+		}
+	}
+
+	t.Logf("Verified %d TSC chunks are sorted by SHA-256", len(tscReader.Entries))
+}
+
+// TestTSCDeduplication verifies same content across files = single chunk entry.
+func TestTSCDeduplication(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create a snapshot with duplicate content
+	baseSnap := env.createBaseSnapshot()
+	snapPath := filepath.Join(env.snapshotsDir, baseSnap)
+
+	// The base snapshot has bin/sh and bin/ts which are the same file (both busybox)
+	// Let's create additional duplicate files to be sure
+	dupContent := []byte("This is duplicate content for testing TSC deduplication.\n")
+	dup1Path := filepath.Join(snapPath, "home", "user", "dup1.txt")
+	dup2Path := filepath.Join(snapPath, "home", "user", "dup2.txt")
+	dup3Path := filepath.Join(snapPath, "home", "user", "dup3.txt")
+
+	for _, p := range []string{dup1Path, dup2Path, dup3Path} {
+		if err := os.WriteFile(p, dupContent, 0644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	tsmPath := snapPath + ".tsm"
+	tscPath := snapPath + ".tsc"
+
+	err := generateTSMFiles(t, snapPath, tsmPath, tscPath)
+	if err != nil {
+		t.Fatalf("generate TSM files: %v", err)
+	}
+
+	tsmReader, err := tsm.ReadTSM(tsmPath)
+	if err != nil {
+		t.Fatalf("open TSM: %v", err)
+	}
+
+	tscReader, err := tsm.ReadTSC(tscPath)
+	if err != nil {
+		t.Fatalf("open TSC: %v", err)
+	}
+
+	// Find the dup files and verify they reference the same TSC chunk
+	var dupEntries []*tsm.TSMEntry
+	for i := range tsmReader.Entries {
+		e := &tsmReader.Entries[i]
+		if e.Path == "home/user/dup1.txt" || e.Path == "home/user/dup2.txt" || e.Path == "home/user/dup3.txt" {
+			dupEntries = append(dupEntries, e)
+		}
+	}
+
+	if len(dupEntries) != 3 {
+		t.Fatalf("expected 3 dup entries, found %d", len(dupEntries))
+	}
+
+	// All three files should reference the same chunk(s)
+	if dupEntries[0].ChunkCount == 0 {
+		t.Fatal("dup1 has no chunks")
+	}
+
+	// Get the chunk SHA for each file
+	chunkSHAs := make(map[string][][32]byte)
+	for _, e := range dupEntries {
+		shas := tsm.GetFileChunkSHAs(e, tscReader)
+		chunkSHAs[e.Path] = shas
+		t.Logf("%s: %d chunks", e.Path, len(shas))
+	}
+
+	// Verify all files have the same chunk SHA(s)
+	ref := chunkSHAs["home/user/dup1.txt"]
+	for path, shas := range chunkSHAs {
+		if len(shas) != len(ref) {
+			t.Errorf("%s: chunk count %d != ref %d", path, len(shas), len(ref))
+			continue
+		}
+		for i := range shas {
+			if shas[i] != ref[i] {
+				t.Errorf("%s: chunk %d SHA mismatch", path, i)
+			}
+		}
+	}
+
+	t.Logf("Verified deduplication: 3 identical files share the same %d chunk(s)", len(ref))
+}
+
+// TestTSMChunkReferenceResolution verifies TSM chunk refs resolve to valid TSC entries.
+func TestTSMChunkReferenceResolution(t *testing.T) {
+	env := newTestEnv(t)
+
+	baseSnap := env.createBaseSnapshot()
+	snapPath := filepath.Join(env.snapshotsDir, baseSnap)
+	tsmPath := snapPath + ".tsm"
+	tscPath := snapPath + ".tsc"
+
+	err := generateTSMFiles(t, snapPath, tsmPath, tscPath)
+	if err != nil {
+		t.Fatalf("generate TSM files: %v", err)
+	}
+
+	tsmReader, err := tsm.ReadTSM(tsmPath)
+	if err != nil {
+		t.Fatalf("open TSM: %v", err)
+	}
+
+	tscReader, err := tsm.ReadTSC(tscPath)
+	if err != nil {
+		t.Fatalf("open TSC: %v", err)
+	}
+
+	// Find a file with chunks (bin/sh is large)
+	var fileEntry *tsm.TSMEntry
+	for i := range tsmReader.Entries {
+		e := &tsmReader.Entries[i]
+		if e.Type == tsm.EntryTypeFile && e.ChunkCount > 0 {
+			fileEntry = e
+			break
+		}
+	}
+
+	if fileEntry == nil {
+		t.Fatal("no file with chunks found")
+	}
+
+	t.Logf("Testing chunk resolution for %s (%d chunks)", fileEntry.Path, fileEntry.ChunkCount)
+
+	// Verify each chunk reference is valid
+	totalChunkSize := uint64(0)
+	for i, tscIdx := range fileEntry.ChunkRefs {
+		if int(tscIdx) >= len(tscReader.Entries) {
+			t.Errorf("chunk ref %d: index %d out of range (TSC has %d entries)",
+				i, tscIdx, len(tscReader.Entries))
+			continue
+		}
+
+		chunk := tscReader.Entries[tscIdx]
+		if chunk.Size == 0 {
+			t.Errorf("chunk ref %d: zero size", i)
+		}
+
+		totalChunkSize += uint64(chunk.Size)
+
+		if i < 3 {
+			t.Logf("  Chunk %d: TSC[%d] SHA=%x... size=%d",
+				i, tscIdx, chunk.SHA256[:8], chunk.Size)
+		}
+	}
+
+	// The total chunk size should approximately equal the file size
+	// (may be slightly larger due to chunking overhead)
+	if totalChunkSize < fileEntry.Size {
+		t.Errorf("total chunk size %d < file size %d", totalChunkSize, fileEntry.Size)
+	}
+
+	t.Logf("Verified %d chunk refs resolve correctly (total chunk size: %d, file size: %d)",
+		len(fileEntry.ChunkRefs), totalChunkSize, fileEntry.Size)
+}
+
 // Make sure tsm package constants exist
 func init() {
 	// Verify the tsm package is importable

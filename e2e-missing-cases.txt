@@ -196,12 +196,12 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 - [ ] Breaking hardlink by modifying one copy
 
 ## TSM/TSC Format
-- [ ] BASIC: Create snapshot, verify .tsm and .tsc files exist with valid structure
-- [ ] TSM contains correct file metadata (mode, uid, gid, times)
-- [ ] TSC chunks are sorted by SHA-256 (binary searchable)
-- [ ] TSC deduplication (same content across files = single chunk entry)
-- [ ] TSM chunk references resolve correctly to TSC entries
-- [ ] Symlinks and device nodes stored correctly in TSM
+- [x] BASIC: Create snapshot, verify .tsm and .tsc files exist with valid structure
+- [x] TSM contains correct file metadata (mode, uid, gid, times)
+- [x] TSC chunks are sorted by SHA-256 (binary searchable)
+- [x] TSC deduplication (same content across files = single chunk entry)
+- [x] TSM chunk references resolve correctly to TSC entries
+- [x] Symlinks and device nodes stored correctly in TSM
 
 ---
 
@@ -211,10 +211,10 @@ See fidx-to-tsm-transition.md for full details. This transition replaces the leg
 fidx/mfidx format (SHA-1, 24-byte entries) with tsm/tsc (SHA-256, 40-byte entries).
 
 **Prerequisites before starting transition:**
-- [ ] All Mesh/Content-Addressed tests pass (proves current download works)
-- [ ] All Snapshot Operations tests pass (proves snapshot creation works)
-- [ ] TSM/TSC Format tests pass (proves new format is correct)
-- [ ] Integration/Workflow tests pass (proves end-to-end works)
+- [x] All Mesh/Content-Addressed tests pass (proves current download works)
+- [x] All Snapshot Operations tests pass (proves snapshot creation works)
+- [x] TSM/TSC Format tests pass (proves new format is correct)
+- [x] Integration/Workflow tests pass (proves end-to-end works)
 
 **Transition phases (do in order):**
 - [ ] Phase 1: Add TSC-based local deduplication (LoadLocalChunkMap in tsm package)
