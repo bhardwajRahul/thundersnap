@@ -2,6 +2,7 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -533,4 +534,133 @@ func TestSnapshotDeletion(t *testing.T) {
 		}
 	}
 	t.Log("Verified snapshot removed from list after deletion")
+}
+
+// TestLargeDirectoryTree tests snapshot handling of a directory tree with
+// thousands of files. This exercises the TSM/TSC format's ability to handle
+// large file counts efficiently.
+func TestLargeDirectoryTree(t *testing.T) {
+	env := newTestEnv(t)
+
+	baseSnap := env.createBaseSnapshot()
+
+	// Create a frame
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	frameName := "largedir"
+	frameSpec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+
+	framePath := filepath.Join(env.fsDir, "testuser", frameName)
+
+	// Create a directory tree with 1000 files
+	// Using 1000 instead of thousands to keep test time reasonable
+	numFiles := 1000
+	numDirs := 10
+	filesPerDir := numFiles / numDirs
+
+	baseDir := filepath.Join(framePath, "tmp", "largedir")
+	for d := 0; d < numDirs; d++ {
+		dirPath := filepath.Join(baseDir, fmt.Sprintf("dir%03d", d))
+		if err := os.MkdirAll(dirPath, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dirPath, err)
+		}
+
+		for f := 0; f < filesPerDir; f++ {
+			filePath := filepath.Join(dirPath, fmt.Sprintf("file%04d.txt", f))
+			content := fmt.Sprintf("File %d in dir %d\n", f, d)
+			if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+				t.Fatalf("write %s: %v", filePath, err)
+			}
+		}
+	}
+	t.Logf("Created %d files in %d directories", numFiles, numDirs)
+
+	// Create a snapshot of the frame with the large directory tree
+	snapResp, err := client.postJSON("/snap", map[string]string{
+		"frame_name": frameName,
+	})
+	if err != nil {
+		t.Fatalf("snap: %v", err)
+	}
+	if snapResp["status"] != "ok" {
+		t.Fatalf("snap failed: %v", snapResp["message"])
+	}
+
+	snapID := snapResp["snapshot_id"].(string)
+	t.Logf("Created snapshot %s with %d files", snapID, numFiles)
+
+	// Verify the snapshot appears in the list
+	listResp, err := client.getJSON("/list-snaps")
+	if err != nil {
+		t.Fatalf("list-snaps: %v", err)
+	}
+	snaps := listResp["snaps"].([]interface{})
+	found := false
+	for _, s := range snaps {
+		smap := s.(map[string]interface{})
+		if smap["id"] == snapID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("snapshot %s not in list", snapID)
+	}
+
+	// Count files in the snapshot (should be base files + our 1000 files)
+	snapDir := filepath.Join(env.snapshotsDir, snapID)
+	count, err := countFiles(snapDir)
+	if err != nil {
+		t.Fatalf("count files: %v", err)
+	}
+	// We added numFiles files, but snapshot also has base content
+	// Just verify we have at least the files we added
+	if count < numFiles {
+		t.Errorf("snapshot has %d files, expected at least %d", count, numFiles)
+	} else {
+		t.Logf("Snapshot contains %d files (including base + %d added)", count, numFiles)
+	}
+
+	// Create a new frame from the snapshot to verify it can be restored
+	frame2Name := "largedir2"
+	createResp2, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frame2Name,
+		"snapshot_id": snapID + "::",
+	})
+	if err != nil {
+		t.Fatalf("create frame2: %v", err)
+	}
+	if createResp2["status"] != "ok" {
+		t.Fatalf("create frame2 failed: %v", createResp2["message"])
+	}
+
+	frame2Path := filepath.Join(env.fsDir, "testuser", frame2Name)
+
+	// Verify a sample of files exist in the restored frame
+	sampleFile := filepath.Join(frame2Path, "tmp", "largedir", "dir005", "file0050.txt")
+	content, err := os.ReadFile(sampleFile)
+	if err != nil {
+		t.Fatalf("read sample file: %v", err)
+	}
+	expected := "File 50 in dir 5\n"
+	if string(content) != expected {
+		t.Errorf("sample file content: got %q, want %q", content, expected)
+	} else {
+		t.Logf("Verified large directory tree restored correctly")
+	}
 }
