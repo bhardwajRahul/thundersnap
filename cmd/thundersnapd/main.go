@@ -1142,7 +1142,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	log.Printf("Control socket created successfully")
 
 	// Check if a command was requested
-	ptyReq, _, isPty := s.Pty()
+	ptyReq, winCh, isPty := s.Pty()
 	rawCmd := s.RawCommand()
 
 	// Determine which Unix user to run as
@@ -1250,6 +1250,11 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		cmd.Stdout = s
 		cmd.Stderr = s.Stderr()
 
+		// Write initial window size to file (ts reads this on startup)
+		winsizeFile := filepath.Join(rootFS, "tmp", ".pty-winsize")
+		os.MkdirAll(filepath.Dir(winsizeFile), 0755)
+		os.WriteFile(winsizeFile, []byte(fmt.Sprintf("%d %d\n", ptyReq.Window.Width, ptyReq.Window.Height)), 0644)
+
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("start shell: %w", err)
 		}
@@ -1257,6 +1262,16 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		// Configure resource limits: OOM priority, memory soft limit, fork bomb
 		// protection (pids.max), and CPU fairness
 		configureContainerResources(cmd.Process.Pid, cgroupName)
+
+		// Handle window size changes by writing to file and signaling ts
+		go func() {
+			for win := range winCh {
+				os.WriteFile(winsizeFile, []byte(fmt.Sprintf("%d %d\n", win.Width, win.Height)), 0644)
+				if cmd.Process != nil {
+					cmd.Process.Signal(syscall.SIGWINCH)
+				}
+			}
+		}()
 
 		// Copy stdin from SSH session to command
 		go func() {
@@ -1266,6 +1281,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 
 		// Wait for the command to complete
 		cmd.Wait()
+		os.Remove(winsizeFile) // Clean up
 		s.Exit(cmd.ProcessState.ExitCode())
 	} else {
 		// No PTY requested, run without one

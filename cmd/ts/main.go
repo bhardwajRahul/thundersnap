@@ -16,8 +16,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -1515,6 +1517,9 @@ func cmdDropCapsAndRun(args []string) {
 // runWithPty allocates a PTY inside the container and runs the command with it.
 // It proxies I/O between the PTY master and our stdin/stdout. This is used when
 // --pty is specified, ensuring the PTY is allocated AFTER devpts is mounted.
+//
+// Window resize handling: the parent (thundersnapd) writes "WIDTH HEIGHT\n" to
+// /tmp/.pty-winsize and sends SIGWINCH. We read that file and apply the size.
 func runWithPty(executable string, cmdArgs []string) {
 	// Open the PTY master
 	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
@@ -1541,6 +1546,18 @@ func runWithPty(executable string, cmdArgs []string) {
 		fmt.Fprintf(os.Stderr, "error: open pty slave %s: %v\n", ptsName, err)
 		os.Exit(1)
 	}
+
+	// Set initial window size if available
+	applyWinsize(ptmx)
+
+	// Set up SIGWINCH handler to resize PTY when notified
+	sigwinch := make(chan os.Signal, 1)
+	signal.Notify(sigwinch, syscall.SIGWINCH)
+	go func() {
+		for range sigwinch {
+			applyWinsize(ptmx)
+		}
+	}()
 
 	// Fork and exec the command with the PTY slave as stdin/stdout/stderr
 	pid, err := syscall.ForkExec(executable, cmdArgs, &syscall.ProcAttr{
@@ -1589,6 +1606,8 @@ func runWithPty(executable string, cmdArgs []string) {
 		}
 	}
 
+	signal.Stop(sigwinch)
+
 	// Exit with the child's exit code
 	if status.Exited() {
 		os.Exit(status.ExitStatus())
@@ -1617,6 +1636,34 @@ func unlockpt(f *os.File) error {
 		return errno
 	}
 	return nil
+}
+
+// winsizeFile is where thundersnapd writes "WIDTH HEIGHT\n" for window resizes.
+const winsizeFile = "/tmp/.pty-winsize"
+
+// applyWinsize reads the window size from winsizeFile and applies it to the PTY.
+// Silently does nothing if the file doesn't exist or is malformed.
+func applyWinsize(ptmx *os.File) {
+	data, err := os.ReadFile(winsizeFile)
+	if err != nil {
+		return
+	}
+	parts := strings.Fields(strings.TrimSpace(string(data)))
+	if len(parts) != 2 {
+		return
+	}
+	width, err1 := strconv.Atoi(parts[0])
+	height, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || width <= 0 || height <= 0 {
+		return
+	}
+	setWinsize(ptmx, width, height)
+}
+
+// setWinsize sets the window size of the given PTY.
+func setWinsize(f *os.File, w, h int) {
+	ws := struct{ row, col, xpixel, ypixel uint16 }{uint16(h), uint16(w), 0, 0}
+	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(&ws)))
 }
 
 // setupDev creates a minimal /dev filesystem like Docker/containerd.
