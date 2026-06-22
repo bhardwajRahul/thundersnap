@@ -2,6 +2,7 @@
 #
 # Development targets:
 #   make test       - run all tests
+#   make e2e        - run e2e tests (requires sudo and btrfs)
 #   make binaries   - build all binaries for local development
 #   make ts         - build just the ts binary
 #
@@ -21,7 +22,7 @@ OUT ?= dist
 # Output directory for local binaries
 BIN ?= ./bin
 
-.PHONY: all test binaries ts vsh vshd thundersnapd bupdate tsm fidx slab \
+.PHONY: all test e2e binaries ts vsh vshd thundersnapd bupdate tsm fidx slab \
         list build build-deb build-rpm build-tgz clean
 
 all: build
@@ -29,6 +30,20 @@ all: build
 # Run all tests (requires CGO_ENABLED=0 for cmd/ts tests)
 test:
 	CGO_ENABLED=0 go test ./...
+
+# Run e2e tests (requires root and btrfs)
+# Compiles the test binary and dependencies as the current user, then runs with sudo.
+# TMPDIR must be on btrfs (not /tmp which is typically tmpfs).
+E2E_TMPDIR ?= $(CURDIR)/.tmp-e2e
+e2e: ts vshd thundersnapd
+	@mkdir -p $(E2E_TMPDIR)
+	CGO_ENABLED=0 go test -c -o $(BIN)/e2e.test ./e2e
+	sudo -E env \
+		TMPDIR="$(E2E_TMPDIR)" \
+		TS_BINARY="$(CURDIR)/$(BIN)/ts" \
+		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
+		THUNDERSNAPD_BINARY="$(CURDIR)/$(BIN)/thundersnapd" \
+		$(BIN)/e2e.test -test.v
 
 # Build all binaries for local development
 binaries: ts vsh vshd thundersnapd bupdate tsm fidx slab

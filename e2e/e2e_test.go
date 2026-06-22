@@ -1,12 +1,17 @@
 // Package e2e contains end-to-end tests for thundersnap.
 //
-// These tests build and run the actual binaries (thundersnapd, ts) and
-// interact with them only via CLI and HTTP APIs - no internal function calls.
+// These tests run the actual binaries (thundersnapd, ts) and interact with
+// them only via CLI and HTTP APIs - no internal function calls.
 //
 // Requirements:
 //   - root access (for btrfs subvolume operations)
 //   - btrfs filesystem for temp directory
-//   - go toolchain to build binaries
+//   - pre-built binaries specified via environment variables:
+//     - TS_BINARY: path to pre-built ts binary
+//     - VSHD_BINARY: path to pre-built vshd binary
+//     - THUNDERSNAPD_BINARY: path to pre-built thundersnapd binary
+//
+// Use "make e2e" to build binaries and run tests with the correct environment.
 package e2e
 
 import (
@@ -114,9 +119,9 @@ func newTestEnv(t *testing.T) *testEnv {
 		}
 	}
 
-	// Build binaries
-	env.tsBinary = env.buildBinary("./cmd/ts", "ts")
-	env.daemonBinary = env.buildBinary("./cmd/thundersnapd", "thundersnapd")
+	// Get pre-built binaries from environment
+	env.tsBinary = env.requireBinary("ts")
+	env.daemonBinary = env.requireBinary("thundersnapd")
 
 	// Copy ts to libexec (thundersnapd looks for it there)
 	if err := copyFile(env.tsBinary, filepath.Join(env.libexecDir, "ts")); err != nil {
@@ -128,20 +133,19 @@ func newTestEnv(t *testing.T) *testEnv {
 	return env
 }
 
-func (e *testEnv) buildBinary(pkg, name string) string {
+func (e *testEnv) requireBinary(name string) string {
 	e.t.Helper()
 
-	outPath := filepath.Join(e.root, name)
-	cmd := exec.Command("go", "build", "-o", outPath, pkg)
-	cmd.Dir = e.repoRoot
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		e.t.Fatalf("building %s: %v\noutput: %s", name, err, out)
+	envVar := strings.ToUpper(name) + "_BINARY"
+	path := os.Getenv(envVar)
+	if path == "" {
+		e.t.Fatalf("%s not set; use 'make e2e' to run e2e tests", envVar)
 	}
-
-	return outPath
+	if _, err := os.Stat(path); err != nil {
+		e.t.Fatalf("%s=%s but file not found: %v", envVar, path, err)
+	}
+	e.t.Logf("using %s from %s", name, path)
+	return path
 }
 
 func (e *testEnv) cleanup() {
@@ -640,8 +644,8 @@ func testDevSetupVM(t *testing.T) {
 		t.Fatalf("copy ts to frame: %v", err)
 	}
 
-	// Build vshd and copy it into the frame
-	vshdBinary := env.buildBinary("./cmd/vshd", "vshd")
+	// Get vshd and copy it into the frame
+	vshdBinary := env.requireBinary("vshd")
 	vshdDst := filepath.Join(framePath, "sbin/vshd")
 	if err := os.MkdirAll(filepath.Dir(vshdDst), 0755); err != nil {
 		t.Fatalf("mkdir sbin: %v", err)
