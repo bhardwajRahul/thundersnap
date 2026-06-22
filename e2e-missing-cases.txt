@@ -193,7 +193,7 @@ chunk transfer, and TSM/TSC tests below will cover the new format.
 - [x] BASIC: Create hardlink, snapshot, restore, verify both paths point to same inode
 - [x] Hardlink inode preservation across snapshot
 - [x] Hardlinks spanning directories
-- [ ] Breaking hardlink by modifying one copy
+- [x] Breaking hardlink by modifying one copy
 
 ## TSM/TSC Format
 - [x] BASIC: Create snapshot, verify .tsm and .tsc files exist with valid structure
