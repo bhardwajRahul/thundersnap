@@ -1830,6 +1830,29 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 		log.Printf("Warning: ensure /tmp on %s: %v", rootFS, err)
 	}
 
+	// Step 10: Create /id subvolume for frame-local secrets (never persisted in snapshots)
+	// This is always created fresh and empty, never cloned from a snapshot.
+	// Since it's a btrfs subvolume, it's automatically excluded from snapshots.
+	idPath := filepath.Join(rootFS, "id")
+	// Remove existing /id directory if it's not a subvolume (from the rootfs snap)
+	if fi, err := os.Stat(idPath); err == nil && fi.IsDir() && !isSubvolume(idPath) {
+		if err := os.RemoveAll(idPath); err != nil {
+			log.Printf("Warning: failed to remove existing /id directory: %v", err)
+		}
+	}
+	if !isSubvolume(idPath) {
+		cmd := exec.Command("btrfs", "subvolume", "create", idPath)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("btrfs subvolume create id at %s failed: %w\noutput: %s",
+				idPath, err, string(output))
+		}
+		// Set permissions: 0700 (only root can access)
+		if err := os.Chmod(idPath, 0700); err != nil {
+			log.Printf("Warning: failed to chmod /id subvolume: %v", err)
+		}
+	}
+
 	log.Printf("Created frame %s with rootfs:%s home:%s work:%s taints:%v",
 		rootFS, meta.Rootfs, meta.Home, meta.Work, meta.Taints)
 	return nil
@@ -2695,9 +2718,10 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Delete nested subvolumes first (home and work) if they exist
+	// Delete nested subvolumes first (home, work, id) if they exist
 	homePath := filepath.Join(framePath, "home")
 	workPath := filepath.Join(framePath, "work")
+	idPath := filepath.Join(framePath, "id")
 
 	if isSubvolume(homePath) {
 		cmd := exec.Command("btrfs", "subvolume", "delete", homePath)
@@ -2710,6 +2734,13 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		cmd := exec.Command("btrfs", "subvolume", "delete", workPath)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			log.Printf("Warning: failed to delete work subvolume: %v\noutput: %s", err, string(output))
+		}
+	}
+
+	if isSubvolume(idPath) {
+		cmd := exec.Command("btrfs", "subvolume", "delete", idPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: failed to delete id subvolume: %v\noutput: %s", err, string(output))
 		}
 	}
 

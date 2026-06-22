@@ -111,6 +111,127 @@ func TestFrameLifecycleBasic(t *testing.T) {
 	t.Logf("Verified frame is deleted")
 }
 
+// TestIdSubvolumeNotCloned tests that the /id subvolume is:
+// 1. Created when a frame is created
+// 2. Not included in snapshots (btrfs excludes nested subvolumes)
+// 3. Created fresh (empty) when creating a new frame from a snapshot
+//
+// This is used for storing frame-local secrets like keys that should
+// never be persisted or cloned.
+func TestIdSubvolumeNotCloned(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Start test control server
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a base snapshot
+	baseSnap := env.createBaseSnapshot()
+	t.Logf("Created base snapshot: %s", baseSnap)
+
+	// Step 1: Create first frame
+	frame1Name := "frame1"
+	frame1Spec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frame1Name,
+		"snapshot_id": frame1Spec,
+	})
+	if err != nil {
+		t.Fatalf("create frame1: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame1 failed: %v", createResp["message"])
+	}
+
+	frame1Path := filepath.Join(env.fsDir, "testuser", frame1Name)
+	idPath1 := filepath.Join(frame1Path, "id")
+
+	// Step 2: Verify /id exists and is a subvolume
+	if _, err := os.Stat(idPath1); err != nil {
+		t.Fatalf("/id should exist in frame1: %v", err)
+	}
+	cmd := exec.Command("btrfs", "subvolume", "show", idPath1)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("/id should be a btrfs subvolume: %v", err)
+	}
+	t.Logf("/id exists and is a subvolume in frame1")
+
+	// Step 3: Write a secret file to /id
+	secretPath := filepath.Join(idPath1, "secret.key")
+	secretContent := []byte("super-secret-key-12345")
+	if err := os.WriteFile(secretPath, secretContent, 0600); err != nil {
+		t.Fatalf("write secret to /id: %v", err)
+	}
+	t.Logf("Wrote secret to /id/secret.key")
+
+	// Step 4: Take a snapshot of frame1
+	snapResp, err := client.postJSON("/snap", map[string]string{
+		"frame_name": frame1Name,
+	})
+	if err != nil {
+		t.Fatalf("snap frame1: %v", err)
+	}
+	if snapResp["status"] != "ok" {
+		t.Fatalf("snap frame1 failed: %v", snapResp["message"])
+	}
+	snapID := snapResp["snapshot_id"].(string)
+	t.Logf("Created snapshot: %s", snapID)
+
+	// Step 5: Create a second frame from the snapshot
+	frame2Name := "frame2"
+	frame2Spec := snapID + "::"
+
+	createResp, err = client.postJSON("/create", map[string]string{
+		"frame_name":  frame2Name,
+		"snapshot_id": frame2Spec,
+	})
+	if err != nil {
+		t.Fatalf("create frame2: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame2 failed: %v", createResp["message"])
+	}
+
+	frame2Path := filepath.Join(env.fsDir, "testuser", frame2Name)
+	idPath2 := filepath.Join(frame2Path, "id")
+
+	// Step 6: Verify /id exists in frame2
+	if _, err := os.Stat(idPath2); err != nil {
+		t.Fatalf("/id should exist in frame2: %v", err)
+	}
+	t.Logf("/id exists in frame2")
+
+	// Step 7: Verify /id is a subvolume (not a regular directory)
+	cmd = exec.Command("btrfs", "subvolume", "show", idPath2)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("/id should be a btrfs subvolume in frame2: %v", err)
+	}
+	t.Logf("/id is a btrfs subvolume in frame2")
+
+	// Step 8: Verify /id is EMPTY (the secret was NOT cloned)
+	entries, err := os.ReadDir(idPath2)
+	if err != nil {
+		t.Fatalf("read /id in frame2: %v", err)
+	}
+	if len(entries) != 0 {
+		for _, e := range entries {
+			t.Logf("Unexpected file in frame2 /id: %s", e.Name())
+		}
+		t.Fatalf("/id in frame2 should be empty, but has %d entries", len(entries))
+	}
+	t.Logf("/id in frame2 is empty as expected - secret was NOT cloned")
+
+	// Step 9: Verify the secret still exists in frame1 /id (sanity check)
+	if _, err := os.Stat(secretPath); err != nil {
+		t.Fatalf("secret should still exist in frame1: %v", err)
+	}
+	t.Logf("Secret still exists in frame1 /id (sanity check passed)")
+}
+
 // testControlServer wraps a test control socket server.
 type testControlServer struct {
 	sockPath string
@@ -291,6 +412,13 @@ func (s *testControlServer) handleCreate(w http.ResponseWriter, r *http.Request)
 		cmd.CombinedOutput()
 	}
 
+	// Create id subvolume (always empty, never cloned from snapshot)
+	idPath := filepath.Join(framePath, "id")
+	os.RemoveAll(idPath)
+	cmd = exec.Command("btrfs", "subvolume", "create", idPath)
+	cmd.CombinedOutput()
+	os.Chmod(idPath, 0700)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"type":   "result",
@@ -349,8 +477,8 @@ func (s *testControlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Req
 	// Find and delete the frame
 	framePath := filepath.Join(s.env.fsDir, "testuser", req.FrameName)
 
-	// Delete nested subvolumes first (home, work)
-	for _, subvol := range []string{"home", "work"} {
+	// Delete nested subvolumes first (home, work, id)
+	for _, subvol := range []string{"home", "work", "id"} {
 		subvolPath := filepath.Join(framePath, subvol)
 		exec.Command("btrfs", "subvolume", "delete", subvolPath).Run()
 	}
