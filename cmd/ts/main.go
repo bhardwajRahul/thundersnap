@@ -28,6 +28,8 @@ import (
 	"github.com/tailscale/thundersnap/bupdate"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
+	"mvdan.cc/sh/v3/interp"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 // thunderPort is the vsock port used for the thunder control protocol.
@@ -2092,118 +2094,143 @@ func findExecutable(name string) (string, error) {
 	return "", fmt.Errorf("executable not found in PATH: %s", name)
 }
 
-// runAsShell implements a minimal shell mode for containers without /bin/sh.
+// runAsShell implements a POSIX-compatible shell using mvdan.cc/sh.
 //
-// When ts is symlinked to /bin/sh, SSH commands like "ssh host cmd args" invoke:
-//   /bin/sh -c "cmd args"
+// When ts is symlinked to /bin/sh, it acts as a real shell supporting:
+//   - sh -c 'command' - run a command string
+//   - sh script.sh - run a script file
+//   - sh (no args) - interactive shell
 //
-// This function handles that by parsing the -c argument and executing the command.
-// It only supports single, non-interactive commands - no pipes, redirects, or
-// job control. This is sufficient for basic operations like "ssh host ts snap".
+// This uses the mvdan.cc/sh/v3 interpreter which provides proper POSIX shell
+// semantics including pipes, redirects, variable expansion, and control flow.
 func runAsShell() {
-	args := os.Args[1:]
-
-	// Handle common shell invocations:
-	// 1. "sh -c 'command args'" - run command
-	// 2. "sh script.sh" - not supported (we only do -c)
-	// 3. "sh" with no args - interactive shell (not supported)
-
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "ts: interactive shell mode not supported")
-		fmt.Fprintln(os.Stderr, "ts can only run single commands via: sh -c 'command'")
+	err := runShell(os.Stdin, os.Stdout, os.Stderr, os.Args[1:]...)
+	if status, ok := interp.IsExitStatus(err); ok {
+		os.Exit(int(status))
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ts: %v\n", err)
 		os.Exit(1)
 	}
+}
 
-	// Parse flags - we only care about -c
+// runShell is the core shell implementation.
+func runShell(stdin io.Reader, stdout, stderr io.Writer, args ...string) error {
+	runner, err := interp.New(interp.StdIO(stdin, stdout, stderr))
+	if err != nil {
+		return err
+	}
+
+	parser := syntax.NewParser()
+
+	// Parse arguments to find -c command or script file
 	var commandStr string
+	var scriptFile string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-c":
 			if i+1 >= len(args) {
-				fmt.Fprintln(os.Stderr, "ts: -c requires an argument")
-				os.Exit(1)
+				return fmt.Errorf("-c requires an argument")
 			}
 			commandStr = args[i+1]
 			i++
-		case "-i", "-l", "--login":
-			// Interactive/login flags - ignore but continue
-		case "-e", "-x", "-v":
-			// Debug flags - ignore
+		case "-i", "-l", "--login", "-e", "-x", "-v":
+			// Flags we recognize but ignore for now
 		default:
 			if strings.HasPrefix(args[i], "-") {
 				// Unknown flag - ignore
 				continue
 			}
-			// Non-flag argument without -c means script file - not supported
-			fmt.Fprintf(os.Stderr, "ts: running script files not supported: %s\n", args[i])
-			os.Exit(1)
+			// First non-flag argument is a script file
+			scriptFile = args[i]
 		}
 	}
 
-	if commandStr == "" {
-		fmt.Fprintln(os.Stderr, "ts: no command specified (use -c 'command')")
-		os.Exit(1)
+	// Execute based on what we found
+	if commandStr != "" {
+		// sh -c 'command'
+		return runShellCommand(runner, parser, commandStr)
 	}
 
-	// Parse the command string into words.
-	// This is a simple tokenizer that handles quoted strings.
-	cmdArgs := parseShellCommand(commandStr)
-	if len(cmdArgs) == 0 {
-		os.Exit(0) // Empty command
+	if scriptFile != "" {
+		// sh script.sh
+		return runShellScript(runner, parser, scriptFile)
 	}
 
-	// Find the executable
-	executable, err := findExecutable(cmdArgs[0])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ts: %v\n", err)
-		os.Exit(127) // Standard "command not found" exit code
+	// Interactive shell (or reading from stdin if not a TTY)
+	if r, ok := stdin.(*os.File); ok && term.IsTerminal(int(r.Fd())) {
+		return runShellInteractive(runner, parser, stdin, stdout)
 	}
 
-	// Exec the command, replacing this process
-	if err := syscall.Exec(executable, cmdArgs, os.Environ()); err != nil {
-		fmt.Fprintf(os.Stderr, "ts: exec %s: %v\n", cmdArgs[0], err)
-		os.Exit(126) // Standard "cannot execute" exit code
-	}
+	// Reading commands from stdin (non-interactive)
+	return runShellCommand(runner, parser, "")
 }
 
-// parseShellCommand tokenizes a shell command string into arguments.
-// It handles single and double quotes but does NOT handle:
-//   - Escape sequences (\n, \t, etc.) outside quotes
-//   - Variable expansion ($VAR)
-//   - Command substitution $(...)
-//   - Pipes, redirects, or other shell operators
-func parseShellCommand(cmd string) []string {
-	var args []string
-	var current strings.Builder
-	var inSingleQuote, inDoubleQuote bool
+// runShellCommand executes a command string.
+func runShellCommand(runner *interp.Runner, parser *syntax.Parser, command string) error {
+	var reader io.Reader
+	if command != "" {
+		reader = strings.NewReader(command)
+	} else {
+		reader = os.Stdin
+	}
 
-	for i := 0; i < len(cmd); i++ {
-		c := cmd[i]
+	prog, err := parser.Parse(reader, "")
+	if err != nil {
+		return err
+	}
 
-		switch {
-		case c == '\'' && !inDoubleQuote:
-			inSingleQuote = !inSingleQuote
-		case c == '"' && !inSingleQuote:
-			inDoubleQuote = !inDoubleQuote
-		case c == '\\' && inDoubleQuote && i+1 < len(cmd):
-			// In double quotes, backslash escapes the next character
-			i++
-			current.WriteByte(cmd[i])
-		case c == ' ' || c == '\t':
-			if inSingleQuote || inDoubleQuote {
-				current.WriteByte(c)
-			} else if current.Len() > 0 {
-				args = append(args, current.String())
-				current.Reset()
-			}
-		default:
-			current.WriteByte(c)
+	runner.Reset()
+	return runner.Run(context.Background(), prog)
+}
+
+// runShellScript executes a script file.
+func runShellScript(runner *interp.Runner, parser *syntax.Parser, filename string) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	prog, err := parser.Parse(f, filename)
+	if err != nil {
+		return err
+	}
+
+	runner.Reset()
+	return runner.Run(context.Background(), prog)
+}
+
+// runShellInteractive runs a simple interactive shell.
+func runShellInteractive(runner *interp.Runner, parser *syntax.Parser, stdin io.Reader, stdout io.Writer) error {
+	fmt.Fprintf(stdout, "$ ")
+
+	scanner := bufio.NewScanner(stdin)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			fmt.Fprintf(stdout, "$ ")
+			continue
 		}
+
+		prog, err := parser.Parse(strings.NewReader(line), "")
+		if err != nil {
+			fmt.Fprintf(stdout, "error: %v\n$ ", err)
+			continue
+		}
+
+		if err := runner.Run(context.Background(), prog); err != nil {
+			if _, ok := interp.IsExitStatus(err); !ok {
+				fmt.Fprintf(stdout, "error: %v\n", err)
+			}
+		}
+
+		if runner.Exited() {
+			return nil
+		}
+
+		fmt.Fprintf(stdout, "$ ")
 	}
 
-	if current.Len() > 0 {
-		args = append(args, current.String())
-	}
-
-	return args
+	return scanner.Err()
 }

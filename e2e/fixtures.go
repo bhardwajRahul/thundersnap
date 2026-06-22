@@ -384,7 +384,8 @@ func CreateHardlinkTest(t *testing.T, dir string) {
 
 // CreateTestContainer creates a test container filesystem on disk and returns the path.
 // The caller should have already created the parent directory.
-// If tsBinaryPath is non-empty, the ts binary is copied to /bin/ts.
+// If tsBinaryPath is non-empty, the ts binary is copied to /bin/ts and
+// /bin/sh is hardlinked to it (ts acts as a shell when invoked as "sh").
 func CreateTestContainer(t *testing.T, dir string, tsBinaryPath string) {
 	t.Helper()
 
@@ -399,6 +400,11 @@ func CreateTestContainer(t *testing.T, dir string, tsBinaryPath string) {
 		tsDst := filepath.Join(dir, "bin/ts")
 		if err := copyFilePreserveMode(tsBinaryPath, tsDst); err != nil {
 			t.Fatalf("copy ts binary: %v", err)
+		}
+		// Create /bin/sh as hardlink to ts - ts acts as a shell when invoked as "sh"
+		shDst := filepath.Join(dir, "bin/sh")
+		if err := os.Link(tsDst, shDst); err != nil {
+			t.Fatalf("link bin/sh to bin/ts: %v", err)
 		}
 	}
 }
