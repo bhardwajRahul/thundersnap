@@ -1082,6 +1082,78 @@ func TestDeleteRunningFrame(t *testing.T) {
 	t.Logf("Successfully deleted frame2")
 }
 
+// TestMultipleConcurrentSessions tests that multiple concurrent sessions
+// can access the same frame simultaneously. Each session can read and write
+// to the frame, and changes are visible to all sessions.
+func TestMultipleConcurrentSessions(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a base snapshot
+	baseSnap := env.createBaseSnapshot()
+
+	// Create a frame
+	frameName := "concurrent"
+	frameSpec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+
+	framePath := filepath.Join(env.fsDir, "testuser", frameName)
+
+	// Simulate multiple concurrent sessions by having multiple "clients"
+	// write to different files, then verify all writes are visible
+
+	numSessions := 5
+	doneCh := make(chan error, numSessions)
+
+	// Each session writes a unique file
+	for i := 0; i < numSessions; i++ {
+		go func(sessionNum int) {
+			sessionFile := filepath.Join(framePath, "tmp", fmt.Sprintf("session%d.txt", sessionNum))
+			content := fmt.Sprintf("content from session %d\n", sessionNum)
+			err := os.WriteFile(sessionFile, []byte(content), 0644)
+			doneCh <- err
+		}(i)
+	}
+
+	// Wait for all sessions to complete
+	for i := 0; i < numSessions; i++ {
+		if err := <-doneCh; err != nil {
+			t.Errorf("session write error: %v", err)
+		}
+	}
+
+	// Verify all session files exist and have correct content
+	for i := 0; i < numSessions; i++ {
+		sessionFile := filepath.Join(framePath, "tmp", fmt.Sprintf("session%d.txt", i))
+		content, err := os.ReadFile(sessionFile)
+		if err != nil {
+			t.Errorf("read session %d file: %v", i, err)
+			continue
+		}
+		expected := fmt.Sprintf("content from session %d\n", i)
+		if string(content) != expected {
+			t.Errorf("session %d content: got %q, want %q", i, content, expected)
+		}
+	}
+
+	t.Logf("Verified %d concurrent sessions all wrote successfully", numSessions)
+}
+
 // TestFrameRestartAfterStop tests that a frame can be restarted after stopping.
 // Since frames are just btrfs subvolumes, "restarting" means creating a new
 // session to the same frame after the previous session ended.

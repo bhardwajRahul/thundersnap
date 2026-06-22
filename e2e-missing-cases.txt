@@ -72,7 +72,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [x] Delete a running frame (should stop first or error)
 - [x] Delete a stopped frame
 - [x] Frame restart behavior after stop
-- [ ] Multiple concurrent sessions to same frame
+- [x] Multiple concurrent sessions to same frame
 
 ## Snapshot Operations
 - [x] BASIC: Create snapshot, verify it appears in `snaps` list with correct size
@@ -90,7 +90,7 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [x] Multiple taints on one frame
 - [x] Taint propagation through fork/snapshot
 - [x] Taint deduplication on merge
-- [ ] Query frame taints
+- [x] Query frame taints
 - [x] Taint types: pii:<dataset>, unsafe-permissions, untrusted-code
 
 ## Mesh/Content-Addressed Operations

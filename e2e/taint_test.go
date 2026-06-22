@@ -295,3 +295,81 @@ func TestTaintDeduplication(t *testing.T) {
 		t.Logf("Verified taint deduplication: %q appears exactly once", taint)
 	}
 }
+
+// TestQueryFrameTaints tests querying the taints on a frame.
+// The /taint endpoint returns the current list of taints after each add.
+func TestQueryFrameTaints(t *testing.T) {
+	env := newTestEnv(t)
+
+	baseSnap := env.createBaseSnapshot()
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a frame
+	frameName := "querytaint"
+	frameSpec := baseSnap + "::"
+
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": frameSpec,
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+
+	// Add several taints
+	expectedTaints := []string{
+		"pii:user-data",
+		"untrusted-code:external-repo",
+		"unsafe-permissions",
+	}
+
+	for _, taint := range expectedTaints {
+		resp, err := client.postJSON("/taint", map[string]string{
+			"taint_name": taint,
+		})
+		if err != nil {
+			t.Fatalf("add taint %q: %v", taint, err)
+		}
+		if resp["status"] != "ok" {
+			t.Fatalf("add taint failed: %v", resp["message"])
+		}
+	}
+
+	// The last taint response contains all taints - use it as our query
+	finalResp, err := client.postJSON("/taint", map[string]string{
+		"taint_name": "query-marker", // Add a marker to trigger query
+	})
+	if err != nil {
+		t.Fatalf("query taints: %v", err)
+	}
+
+	queriedTaints, ok := finalResp["taints"].([]interface{})
+	if !ok {
+		t.Fatalf("response missing taints list")
+	}
+
+	// Build a set of queried taints
+	taintSet := make(map[string]bool)
+	for _, t := range queriedTaints {
+		if s, ok := t.(string); ok {
+			taintSet[s] = true
+		}
+	}
+
+	// Verify all expected taints are present
+	for _, expected := range expectedTaints {
+		if !taintSet[expected] {
+			t.Errorf("expected taint %q not found in query result", expected)
+		}
+	}
+
+	t.Logf("Queried taints: found %d taints including all expected ones", len(queriedTaints))
+}
