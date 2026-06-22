@@ -103,6 +103,9 @@ func main() {
 	case "check-dev":
 		// Hidden command for e2e testing - outputs /dev state
 		cmdCheckDev()
+	case "check-isolation":
+		// Hidden command for e2e testing - outputs isolation state
+		cmdCheckIsolation()
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command: %s\n", cmd)
 		os.Exit(1)
@@ -1649,6 +1652,94 @@ func cmdCheckDev() {
 		for _, entry := range entries {
 			fmt.Printf("ENTRY:%s\n", entry.Name())
 		}
+	}
+
+	fmt.Println("DONE")
+}
+
+// cmdCheckIsolation outputs the container isolation state for e2e testing.
+// Output format is one item per line:
+//
+//	HOSTNAME:<hostname>
+//	DOMAINNAME:<domainname>
+//	PID1:<pid-is-1>
+//	PROC:<mounted|not-mounted>
+//	SYS:<mounted|not-mounted>
+//	CAP:<name>:<has|dropped>
+//	NS:<name>:<inode>
+//	DONE
+func cmdCheckIsolation() {
+	// Check hostname
+	hostname, _ := os.Hostname()
+	fmt.Printf("HOSTNAME:%s\n", hostname)
+
+	// Check domainname via syscall
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err == nil {
+		domainname := string(uts.Domainname[:])
+		if idx := strings.IndexByte(domainname, 0); idx >= 0 {
+			domainname = domainname[:idx]
+		}
+		fmt.Printf("DOMAINNAME:%s\n", domainname)
+	}
+
+	// Check if we're PID 1 (indicates PID namespace isolation)
+	if os.Getpid() == 1 {
+		fmt.Println("PID1:yes")
+	} else {
+		fmt.Printf("PID1:no:%d\n", os.Getpid())
+	}
+
+	// Check /proc mount
+	if _, err := os.Stat("/proc/self"); err == nil {
+		fmt.Println("PROC:mounted")
+	} else {
+		fmt.Println("PROC:not-mounted")
+	}
+
+	// Check /sys mount
+	if _, err := os.Stat("/sys/class"); err == nil {
+		fmt.Println("SYS:mounted")
+	} else {
+		fmt.Println("SYS:not-mounted")
+	}
+
+	// Check capabilities in bounding set
+	// These are the caps that cmdDropCapsAndRun drops
+	capsToCheck := []struct {
+		name string
+		cap  uintptr
+	}{
+		{"NET_ADMIN", unix.CAP_NET_ADMIN},
+		{"SYS_MODULE", unix.CAP_SYS_MODULE},
+		{"SYS_BOOT", unix.CAP_SYS_BOOT},
+		{"SYS_TIME", unix.CAP_SYS_TIME},
+		{"MKNOD", unix.CAP_MKNOD},
+		{"AUDIT_WRITE", unix.CAP_AUDIT_WRITE},
+		{"SETFCAP", unix.CAP_SETFCAP},
+	}
+
+	for _, c := range capsToCheck {
+		// Use prctl to check if capability is in bounding set
+		ret, _, _ := unix.Syscall(unix.SYS_PRCTL, unix.PR_CAPBSET_READ, c.cap, 0)
+		if ret == 1 {
+			fmt.Printf("CAP:%s:has\n", c.name)
+		} else {
+			fmt.Printf("CAP:%s:dropped\n", c.name)
+		}
+	}
+
+	// Check namespace inodes (to verify we're in new namespaces)
+	namespaces := []string{"pid", "mnt", "uts", "net"}
+	for _, ns := range namespaces {
+		path := fmt.Sprintf("/proc/self/ns/%s", ns)
+		info, err := os.Stat(path)
+		if err != nil {
+			fmt.Printf("NS:%s:error\n", ns)
+			continue
+		}
+		stat := info.Sys().(*syscall.Stat_t)
+		fmt.Printf("NS:%s:%d\n", ns, stat.Ino)
 	}
 
 	fmt.Println("DONE")
