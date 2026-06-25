@@ -504,7 +504,19 @@ func main() {
 					containerName = sshUser[idx+1:]
 				}
 
-				rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(containerName))
+				// Sanitize usernames for filesystem paths
+				safeTailscaleUser := sanitizeForPath(tailscaleUser)
+				safeContainerName := sanitizeForPath(containerName)
+				homeUser := stripDomain(safeTailscaleUser)
+
+				// Set up the root filesystem (same setup as container sessions)
+				rootFS := filepath.Join(*flagFsDir, safeTailscaleUser, safeContainerName)
+				baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
+				if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
+					log.Printf("SFTP session failed: %v", err)
+					return
+				}
+
 				if err := runSFTPSession(s, rootFS, targetUser); err != nil {
 					log.Printf("SFTP session failed: %v", err)
 				}
@@ -1166,19 +1178,8 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	// the base user's filesystem first, falling back to the clean snapshot
 	rootFS := filepath.Join(*flagFsDir, safeTailscaleUser, safeSSHUser)
 	baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
-	if err := ensureRootFS(rootFS, baseUserFS); err != nil {
-		return fmt.Errorf("set up root filesystem: %w", err)
-	}
-
-	// Ensure /proc mount point exists in the rootfs
-	procDir := filepath.Join(rootFS, "proc")
-	if err := os.MkdirAll(procDir, 0555); err != nil {
-		return fmt.Errorf("create /proc directory: %w", err)
-	}
-
-	// Copy ts binary into container's /bin using btrfs reflink
-	if err := copyTsBinary(rootFS); err != nil {
-		return fmt.Errorf("copy ts binary: %w", err)
+	if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
+		return err
 	}
 
 	// Start control socket server for this container
@@ -1711,6 +1712,29 @@ func writeStampFile(path, snapshotID string) error {
 		return err
 	}
 	return os.Rename(tmpPath, stampPath)
+}
+
+// prepareContainerRootFS sets up a container's root filesystem for use.
+// It ensures the rootFS exists (cloning from baseUserFS or a base snapshot),
+// creates required mount points (/proc), and copies the ts binary.
+// This is the common setup needed before running any container session.
+func prepareContainerRootFS(rootFS, baseUserFS string) error {
+	if err := ensureRootFS(rootFS, baseUserFS); err != nil {
+		return fmt.Errorf("set up root filesystem: %w", err)
+	}
+
+	// Ensure /proc mount point exists in the rootfs
+	procDir := filepath.Join(rootFS, "proc")
+	if err := os.MkdirAll(procDir, 0555); err != nil {
+		return fmt.Errorf("create /proc directory: %w", err)
+	}
+
+	// Copy ts binary into container's /bin using btrfs reflink
+	if err := copyTsBinary(rootFS); err != nil {
+		return fmt.Errorf("copy ts binary: %w", err)
+	}
+
+	return nil
 }
 
 // ensureRootFS ensures the root filesystem exists at the given path.
