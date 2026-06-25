@@ -502,41 +502,10 @@ func main() {
 			}
 
 			// Parse SSH username to extract target user and frame name.
-			// Formats:
-			//   vmx/<isolation>/<frame>  - container inside named VM
-			//   vmx/<isolation>          - shell into outer VM directly
-			//   vm/<frame>               - sugar for vmx/default/<frame>
-			//   <frame>                  - container (default)
-			// If user@ prefix is present in frame, use that specific Unix user.
-			// Otherwise, auto-detect from [ubuntu, user] or fall back to root.
-			sshUser := s.User()
-			var vmxIsolation string // non-empty if vmx mode
-
-			// Check for vmx/ prefix first (containers inside named VMs)
-			if strings.HasPrefix(sshUser, "vmx/") {
-				cap.Isolation = "vmx"
-				rest := strings.TrimPrefix(sshUser, "vmx/")
-				if slashIdx := strings.Index(rest, "/"); slashIdx >= 0 {
-					vmxIsolation = rest[:slashIdx]
-					sshUser = rest[slashIdx+1:] // frame name (may be empty for outer shell)
-				} else {
-					vmxIsolation = rest
-					sshUser = "" // direct shell into outer VM
-				}
-			} else if strings.HasPrefix(sshUser, "vm/") {
-				// Legacy support: vm/<frame> becomes vmx/default/<frame>
-				// This gives the same isolation semantics but uses the VMX infrastructure
-				cap.Isolation = "vmx"
-				vmxIsolation = "default"
-				sshUser = strings.TrimPrefix(sshUser, "vm/")
-			}
-
-			// Parse optional user prefix: <user>@<name> or <name>
-			targetUser := "" // empty means auto-detect
-			frameName := sshUser
-			if idx := strings.Index(sshUser, "@"); idx != -1 {
-				targetUser = sshUser[:idx]
-				frameName = sshUser[idx+1:]
+			// See parseSSHUser for format documentation.
+			parsedIsolation, vmxIsolation, targetUser, frameName := parseSSHUser(s.User())
+			if parsedIsolation != "container" {
+				cap.Isolation = parsedIsolation
 			}
 
 			rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(frameName))
@@ -1282,6 +1251,68 @@ func stripDomain(s string) string {
 		return s[:idx]
 	}
 	return s
+}
+
+// parseSSHUser parses an SSH username into isolation mode and frame information.
+// Returns (isolation, vmxIsolation, targetUser, frameName).
+//
+// Formats:
+//   - <user>@vmx/<isolation>/<frame>  - container inside named VM, as user
+//   - vmx/<isolation>/<user>@<frame>  - same, alternate syntax
+//   - vmx/<isolation>/<frame>         - container inside named VM
+//   - <user>@vmx/<isolation>          - shell into outer VM, as user
+//   - vmx/<isolation>                 - shell into outer VM directly
+//   - <user>@vm/<frame>               - sugar for vmx/default/<frame>, as user
+//   - vm/<user>@<frame>               - same, alternate syntax
+//   - vm/<frame>                      - sugar for vmx/default/<frame>
+//   - <user>@<frame>                  - container as user
+//   - <frame>                         - container (default)
+func parseSSHUser(sshUser string) (isolation, vmxIsolation, targetUser, frameName string) {
+	isolation = "container"
+
+	// First, check if there's a user@ prefix before the mode prefix (vmx/ or vm/)
+	// This handles cases like "root@vmx/dev/frame" or "root@vm/frame"
+	var modePrefix string
+	if idx := strings.Index(sshUser, "@"); idx != -1 {
+		afterAt := sshUser[idx+1:]
+		if strings.HasPrefix(afterAt, "vmx/") || strings.HasPrefix(afterAt, "vm/") {
+			targetUser = sshUser[:idx]
+			sshUser = afterAt
+		}
+	}
+
+	// Check for vmx/ prefix (containers inside named VMs)
+	if strings.HasPrefix(sshUser, "vmx/") {
+		isolation = "vmx"
+		rest := strings.TrimPrefix(sshUser, "vmx/")
+		if slashIdx := strings.Index(rest, "/"); slashIdx >= 0 {
+			vmxIsolation = rest[:slashIdx]
+			modePrefix = rest[slashIdx+1:] // frame name (may be empty for outer shell)
+		} else {
+			vmxIsolation = rest
+			modePrefix = "" // direct shell into outer VM
+		}
+	} else if strings.HasPrefix(sshUser, "vm/") {
+		// Legacy support: vm/<frame> becomes vmx/default/<frame>
+		isolation = "vmx"
+		vmxIsolation = "default"
+		modePrefix = strings.TrimPrefix(sshUser, "vm/")
+	} else {
+		// No mode prefix, just frame name (possibly with user@)
+		modePrefix = sshUser
+	}
+
+	// Parse optional user prefix in frame: <user>@<name> or <name>
+	// (only if we didn't already extract user from before the mode prefix)
+	frameName = modePrefix
+	if targetUser == "" {
+		if idx := strings.Index(modePrefix, "@"); idx != -1 {
+			targetUser = modePrefix[:idx]
+			frameName = modePrefix[idx+1:]
+		}
+	}
+
+	return isolation, vmxIsolation, targetUser, frameName
 }
 
 // selectTargetUser determines which Unix user to run as in a container/VM.
