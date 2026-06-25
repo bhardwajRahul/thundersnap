@@ -115,6 +115,68 @@ var vmSessions = &vmSessionManager{
 	sessions: make(map[string]*managedVMSession),
 }
 
+// controlServerManager manages shared control servers for container sessions.
+// Multiple SSH sessions to the same rootFS share one control server.
+type controlServerManager struct {
+	mu      sync.Mutex
+	servers map[string]*managedControlServer // key: rootFS path
+}
+
+type managedControlServer struct {
+	server   *controlServer
+	refCount int
+}
+
+var controlServers = &controlServerManager{
+	servers: make(map[string]*managedControlServer),
+}
+
+// getOrCreateControlServer returns an existing control server or creates a new one.
+// The caller must call releaseControlServer when done.
+func (m *controlServerManager) getOrCreateControlServer(rootFS string) (*controlServer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if ms, ok := m.servers[rootFS]; ok {
+		ms.refCount++
+		log.Printf("Reusing control server for %s (refCount=%d)", rootFS, ms.refCount)
+		return ms.server, nil
+	}
+
+	// Create new control server
+	sockPath := filepath.Join(rootFS, "thunder.sock")
+	cs, err := startControlServer(sockPath, rootFS)
+	if err != nil {
+		return nil, err
+	}
+
+	m.servers[rootFS] = &managedControlServer{
+		server:   cs,
+		refCount: 1,
+	}
+	log.Printf("Created new control server for %s", rootFS)
+	return cs, nil
+}
+
+// releaseControlServer decrements the reference count and closes the server if zero.
+func (m *controlServerManager) releaseControlServer(rootFS string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ms, ok := m.servers[rootFS]
+	if !ok {
+		return
+	}
+
+	ms.refCount--
+	log.Printf("Released control server for %s (refCount=%d)", rootFS, ms.refCount)
+	if ms.refCount <= 0 {
+		ms.server.Close()
+		delete(m.servers, rootFS)
+		log.Printf("Closed control server for %s", rootFS)
+	}
+}
+
 // activeFrames tracks which frames have active control servers (and thus active sessions).
 // Key is the frame path (e.g., /fs/user/framename), value is the number of active sessions.
 var activeFrames = struct {
@@ -1243,15 +1305,12 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		return err
 	}
 
-	// Start control socket server for this container
-	sockPath := filepath.Join(rootFS, "thunder.sock")
-	log.Printf("Creating control socket at %s", sockPath)
-	ctrlServer, err := startControlServer(sockPath, rootFS)
+	// Get or create shared control socket server for this container
+	_, err := controlServers.getOrCreateControlServer(rootFS)
 	if err != nil {
 		return fmt.Errorf("start control socket: %w", err)
 	}
-	defer ctrlServer.Close()
-	log.Printf("Control socket created successfully")
+	defer controlServers.releaseControlServer(rootFS)
 
 	// Check if a command was requested
 	ptyReq, winCh, isPty := s.Pty()
