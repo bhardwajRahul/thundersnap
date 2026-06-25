@@ -10,6 +10,7 @@ require (
 	github.com/goreleaser/nfpm/v2 v2.45.0
 	github.com/mdlayher/vsock v1.2.1
 	github.com/pborman/getopt/v2 v2.1.0
+	github.com/pkg/sftp v1.13.10
 	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd
 	github.com/willscott/go-nfs v0.0.4
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00
@@ -79,6 +80,7 @@ require (
 	github.com/kevinburke/ssh_config v1.2.0 // indirect
 	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
+	github.com/kr/fs v0.1.0 // indirect
 	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
 	github.com/mdlayher/socket v0.5.0 // indirect
 	github.com/mitchellh/copystructure v1.2.0 // indirect

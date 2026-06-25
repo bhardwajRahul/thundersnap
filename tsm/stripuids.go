@@ -177,6 +177,41 @@ func parsePasswdEntry(line string) *passwdEntry {
 	}
 }
 
+// UserInfo contains information about a user from /etc/passwd.
+type UserInfo struct {
+	Username string
+	UID      uint32
+	GID      uint32
+	Home     string
+	Shell    string
+}
+
+// LookupUser looks up a user by name in the container's /etc/passwd.
+// Returns nil if the user is not found or the passwd file doesn't exist.
+func LookupUser(rootfs, username string) *UserInfo {
+	passwdPath := filepath.Join(rootfs, "etc", "passwd")
+	data, err := os.ReadFile(passwdPath)
+	if err != nil {
+		return nil
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		entry := parsePasswdEntry(scanner.Text())
+		if entry != nil && entry.Username == username {
+			return &UserInfo{
+				Username: entry.Username,
+				UID:      entry.UID,
+				GID:      entry.GID,
+				Home:     entry.Home,
+				Shell:    entry.Shell,
+			}
+		}
+	}
+	return nil
+}
+
 // ensureUserInShadow adds a "user" entry to /etc/shadow if the file exists
 // and doesn't already have a "user" entry. The entry uses "!" (locked password)
 // which allows login via su/sudo but not direct password auth.

@@ -31,6 +31,7 @@ import (
 
 	"github.com/gliderlabs/ssh"
 	"github.com/pborman/getopt/v2"
+	"github.com/pkg/sftp"
 	"github.com/tailscale/thundersnap/thundersnap"
 	"github.com/tailscale/thundersnap/tsm"
 	gossh "golang.org/x/crypto/ssh"
@@ -1472,89 +1473,240 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	return nil
 }
 
-// runSFTPSession handles an SFTP subsystem request by running sftp-server in the container.
+// runSFTPSession handles an SFTP subsystem request using the built-in Go SFTP server.
+// All paths are served relative to the container's rootFS with the user's home as
+// the starting directory.
 func runSFTPSession(s ssh.Session, rootFS, targetUser string) error {
 	// Check if rootFS exists
 	if _, err := os.Stat(rootFS); err != nil {
 		return fmt.Errorf("container filesystem not found: %s", rootFS)
 	}
 
-	// Determine which Unix user to run as
-	runAsUser := selectTargetUser(rootFS, targetUser)
-
-	// Build the command to run sftp-server inside the container
 	absRootFS, err := filepath.Abs(rootFS)
 	if err != nil {
 		return fmt.Errorf("get absolute path for rootFS: %w", err)
 	}
-	tsBinary := filepath.Join(absRootFS, "bin", "ts")
-	tsArgs := []string{"--chroot=" + absRootFS}
 
-	// Find sftp-server - it's typically in /usr/lib/openssh/ or /usr/libexec/
-	sftpServerPaths := []string{
-		"/usr/lib/openssh/sftp-server",
-		"/usr/libexec/openssh/sftp-server",
-		"/usr/lib/sftp-server",
-		"/usr/libexec/sftp-server",
+	// Determine which Unix user to run as and get their home directory
+	runAsUser := selectTargetUser(rootFS, targetUser)
+	userInfo := tsm.LookupUser(rootFS, runAsUser)
+
+	// Default to /home/user if we can't look up the user
+	homeDir := "/home/user"
+	if userInfo != nil && userInfo.Home != "" {
+		homeDir = userInfo.Home
 	}
-	sftpServer := ""
-	for _, p := range sftpServerPaths {
-		if _, err := os.Stat(filepath.Join(rootFS, p)); err == nil {
-			sftpServer = p
-			break
+
+	// Create the SFTP handler that maps paths through the container rootFS
+	handler := &sftpHandler{
+		rootFS:  absRootFS,
+		homeDir: homeDir,
+	}
+
+	server := sftp.NewRequestServer(s, sftp.Handlers{
+		FileGet:  handler,
+		FilePut:  handler,
+		FileCmd:  handler,
+		FileList: handler,
+	}, sftp.WithStartDirectory(homeDir))
+
+	if err := server.Serve(); err != nil {
+		if err != io.EOF {
+			return fmt.Errorf("sftp server error: %w", err)
 		}
-	}
-	if sftpServer == "" {
-		return fmt.Errorf("sftp-server not found in container (tried %v)", sftpServerPaths)
-	}
-
-	// Run sftp-server as the target user
-	tsArgs = append(tsArgs, "--", "su", runAsUser, "-c", sftpServer)
-	cmd := exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgs...)...)
-
-	cmd.Dir = "/"
-	cmd.Env = []string{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
-	}
-
-	// SFTP uses stdin/stdout for the protocol, no PTY
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("create stdin pipe: %w", err)
-	}
-	cmd.Stdout = s
-	cmd.Stderr = s.Stderr()
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start sftp-server: %w", err)
-	}
-
-	// Configure resource limits: OOM priority, memory soft limit, fork bomb
-	// protection (pids.max), and CPU fairness.
-	// Derive cgroup name from rootFS path (e.g., /fs/user/container -> thundersnap-1234/user/container)
-	cgroupName := parentCgroupName + "/" + filepath.Base(filepath.Dir(rootFS)) + "/" + filepath.Base(rootFS)
-	configureContainerResources(cmd.Process.Pid, cgroupName)
-
-	// Copy stdin from SSH session to sftp-server
-	go func() {
-		io.Copy(stdin, s)
-		stdin.Close()
-	}()
-
-	// Wait for sftp-server to complete
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			s.Exit(exitErr.ExitCode())
-			return nil
-		}
-		return fmt.Errorf("sftp-server error: %w", err)
 	}
 	s.Exit(0)
 	return nil
 }
+
+// sftpHandler implements the sftp.Handlers interfaces for serving files from
+// a container rootFS.
+type sftpHandler struct {
+	rootFS  string // absolute path to container root
+	homeDir string // user's home directory (container-relative, e.g., "/home/user")
+}
+
+// toHostPath converts a container-relative path to an absolute host path.
+// It ensures the resulting path is within the rootFS (no escaping via ..).
+func (h *sftpHandler) toHostPath(p string) (string, error) {
+	// Clean the path to resolve . and ..
+	cleaned := filepath.Clean("/" + p)
+
+	// Join with rootFS
+	hostPath := filepath.Join(h.rootFS, cleaned)
+
+	// Verify the path is still within rootFS (防止目录遍历攻击)
+	if !strings.HasPrefix(hostPath, h.rootFS+"/") && hostPath != h.rootFS {
+		return "", fmt.Errorf("path escapes container root: %s", p)
+	}
+
+	return hostPath, nil
+}
+
+// Fileread implements sftp.FileReader
+func (h *sftpHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+	hostPath, err := h.toHostPath(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(hostPath)
+}
+
+// Filewrite implements sftp.FileWriter
+func (h *sftpHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	hostPath, err := h.toHostPath(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Determine flags from the SFTP request
+	pflags := r.Pflags()
+	flags := os.O_WRONLY
+	if pflags.Creat {
+		flags |= os.O_CREATE
+	}
+	if pflags.Trunc {
+		flags |= os.O_TRUNC
+	}
+	if pflags.Append {
+		flags |= os.O_APPEND
+	}
+	if pflags.Excl {
+		flags |= os.O_EXCL
+	}
+
+	return os.OpenFile(hostPath, flags, 0644)
+}
+
+// Filecmd implements sftp.FileCmder
+func (h *sftpHandler) Filecmd(r *sftp.Request) error {
+	hostPath, err := h.toHostPath(r.Filepath)
+	if err != nil {
+		return err
+	}
+
+	switch r.Method {
+	case "Setstat":
+		if r.AttrFlags().Size {
+			if err := os.Truncate(hostPath, int64(r.Attributes().Size)); err != nil {
+				return err
+			}
+		}
+		if r.AttrFlags().Permissions {
+			if err := os.Chmod(hostPath, r.Attributes().FileMode()); err != nil {
+				return err
+			}
+		}
+		return nil
+
+	case "Rename":
+		targetPath, err := h.toHostPath(r.Target)
+		if err != nil {
+			return err
+		}
+		return os.Rename(hostPath, targetPath)
+
+	case "Rmdir":
+		return os.Remove(hostPath)
+
+	case "Remove":
+		return os.Remove(hostPath)
+
+	case "Mkdir":
+		mode := os.FileMode(0755)
+		if r.AttrFlags().Permissions {
+			mode = r.Attributes().FileMode()
+		}
+		return os.Mkdir(hostPath, mode)
+
+	case "Symlink":
+		// r.Filepath is the link name, r.Target is what it points to
+		targetPath, err := h.toHostPath(r.Target)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(targetPath, hostPath)
+
+	default:
+		return fmt.Errorf("unsupported command: %s", r.Method)
+	}
+}
+
+// Filelist implements sftp.FileLister
+func (h *sftpHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	hostPath, err := h.toHostPath(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+
+	switch r.Method {
+	case "List":
+		entries, err := os.ReadDir(hostPath)
+		if err != nil {
+			return nil, err
+		}
+		infos := make([]os.FileInfo, 0, len(entries))
+		for _, e := range entries {
+			info, err := e.Info()
+			if err != nil {
+				continue // skip entries we can't stat
+			}
+			infos = append(infos, info)
+		}
+		return listerat(infos), nil
+
+	case "Stat":
+		info, err := os.Stat(hostPath)
+		if err != nil {
+			return nil, err
+		}
+		return listerat([]os.FileInfo{info}), nil
+
+	case "Lstat":
+		info, err := os.Lstat(hostPath)
+		if err != nil {
+			return nil, err
+		}
+		return listerat([]os.FileInfo{info}), nil
+
+	case "Readlink":
+		target, err := os.Readlink(hostPath)
+		if err != nil {
+			return nil, err
+		}
+		// Return a fake FileInfo with the link target as the name
+		return listerat([]os.FileInfo{linkInfo{name: target}}), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported list method: %s", r.Method)
+	}
+}
+
+// listerat implements sftp.ListerAt for a slice of os.FileInfo
+type listerat []os.FileInfo
+
+func (l listerat) ListAt(ls []os.FileInfo, offset int64) (int, error) {
+	if offset >= int64(len(l)) {
+		return 0, io.EOF
+	}
+	n := copy(ls, l[offset:])
+	if n < len(ls) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// linkInfo is a minimal FileInfo for returning readlink results
+type linkInfo struct {
+	name string
+}
+
+func (l linkInfo) Name() string       { return l.name }
+func (l linkInfo) Size() int64        { return 0 }
+func (l linkInfo) Mode() os.FileMode  { return os.ModeSymlink }
+func (l linkInfo) ModTime() time.Time { return time.Time{} }
+func (l linkInfo) IsDir() bool        { return false }
+func (l linkInfo) Sys() any           { return nil }
 
 // runVMSession handles a VM-based SSH session using cloud-hypervisor.
 // Multiple SSH connections to the same VM (same tailscaleUser + vmUser) share
