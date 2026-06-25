@@ -1876,15 +1876,13 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		log.Printf("Warning: failed to write stamp file for %s: %v", rootFS, err)
 	}
 
-	// Apply the simplified UID model to the live filesystem before any
-	// session enters it. All non-root users in /etc/passwd resolve to the
-	// shared UID, all non-root groups in /etc/group to the shared GID, and
-	// every file owned by a non-root UID/GID is chowned to match. This
-	// runs once per fresh fs-dir clone, never against the read-only
-	// snaps-dir subvolumes. See strip-all-uids-design.md.
-	stripOpts := tsm.StripOptions{ChownFiles: true}
-	if err := tsm.StripRootfs(rootFS, stripOpts); err != nil {
-		log.Printf("Warning: strip-uids on %s: %v", rootFS, err)
+	// Ensure a "user" account exists in /etc/passwd for the container.
+	// This creates UID/GID 7575 if "user" doesn't already exist.
+	if _, err := tsm.EnsureUserInPasswd(rootFS); err != nil {
+		log.Printf("Warning: EnsureUserInPasswd on %s: %v", rootFS, err)
+	}
+	if err := tsm.EnsureSudoers(rootFS); err != nil {
+		log.Printf("Warning: EnsureSudoers on %s: %v", rootFS, err)
 	}
 
 	// Ensure resolv.conf exists for DNS resolution inside the frame
@@ -1954,8 +1952,8 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 			return fmt.Errorf("btrfs subvolume create home at %s failed: %w\noutput: %s",
 				homePath, err, string(output))
 		}
-		// Chown to user 1000 (the standard container user)
-		if err := os.Chown(homePath, 1000, 1000); err != nil {
+		// Chown to the thundersnap user (UID 7575)
+		if err := os.Chown(homePath, tsm.ThundersnapUID, tsm.ThundersnapGID); err != nil {
 			log.Printf("Warning: failed to chown home subvolume: %v", err)
 		}
 	}
@@ -1989,8 +1987,8 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 			return fmt.Errorf("btrfs subvolume create work at %s failed: %w\noutput: %s",
 				workPath, err, string(output))
 		}
-		// Chown to user 1000 (the standard container user)
-		if err := os.Chown(workPath, 1000, 1000); err != nil {
+		// Chown to the thundersnap user (UID 7575)
+		if err := os.Chown(workPath, tsm.ThundersnapUID, tsm.ThundersnapGID); err != nil {
 			log.Printf("Warning: failed to chown work subvolume: %v", err)
 		}
 	}
@@ -2011,10 +2009,12 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 		log.Printf("Warning: failed to write stamp file for %s: %v", rootFS, err)
 	}
 
-	// Step 7: Apply strip-uids to the rootfs
-	stripOpts := tsm.StripOptions{ChownFiles: true}
-	if err := tsm.StripRootfs(rootFS, stripOpts); err != nil {
-		log.Printf("Warning: strip-uids on %s: %v", rootFS, err)
+	// Step 7: Ensure a "user" account exists in /etc/passwd
+	if _, err := tsm.EnsureUserInPasswd(rootFS); err != nil {
+		log.Printf("Warning: EnsureUserInPasswd on %s: %v", rootFS, err)
+	}
+	if err := tsm.EnsureSudoers(rootFS); err != nil {
+		log.Printf("Warning: EnsureSudoers on %s: %v", rootFS, err)
 	}
 
 	// Step 8: Ensure resolv.conf exists for DNS resolution inside the frame
@@ -3491,11 +3491,12 @@ func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) er
 		log.Printf("Warning: failed to copy ts binary to %s: %v", framePath, err)
 	}
 
-	// Apply the simplified UID model so this frame works regardless of
-	// whether the source snapshot was stripped already. Idempotent: calling
-	// it on an already-stripped tree leaves it unchanged.
-	if err := tsm.StripRootfs(framePath, tsm.StripOptions{ChownFiles: true}); err != nil {
-		log.Printf("Warning: strip-uids on %s: %v", framePath, err)
+	// Ensure a "user" account exists in /etc/passwd for the container.
+	if _, err := tsm.EnsureUserInPasswd(framePath); err != nil {
+		log.Printf("Warning: EnsureUserInPasswd on %s: %v", framePath, err)
+	}
+	if err := tsm.EnsureSudoers(framePath); err != nil {
+		log.Printf("Warning: EnsureSudoers on %s: %v", framePath, err)
 	}
 
 	// Ensure resolv.conf exists for DNS resolution inside the frame

@@ -13,16 +13,16 @@ import (
 
 const (
 	// TSM file format version
-	TSMVersion = 2
+	TSMVersion = 3
 
 	// TSC file format version
-	TSCVersion = 2
+	TSCVersion = 3
 
 	// TSM magic bytes
-	TSMMagic = "TSM\x02"
+	TSMMagic = "TSM\x03"
 
 	// TSC magic bytes
-	TSCMagic = "TSC\x02"
+	TSCMagic = "TSC\x03"
 
 	// Header sizes
 	TSMHeaderSize  = 64

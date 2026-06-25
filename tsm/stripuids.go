@@ -1,17 +1,11 @@
 package tsm
 
-// Simplified UID model: all non-root users in a container map to a single
-// shared UID. Root keeps UID 0; everyone else (postgres, www-data, etc.)
-// resolves via /etc/passwd to one common UID. See strip-all-uids-design.md.
+// This file provides helpers to ensure a "user" account exists in /etc/passwd
+// for container environments. Unlike the previous UID stripping approach,
+// we now preserve all original UIDs from Docker images and snapshots.
 //
-// This file provides helpers to:
-//   1. Rewrite /etc/passwd so every non-root entry uses the shared UID.
-//   2. Rewrite /etc/group similarly so every non-root entry uses the shared GID.
-//   3. Walk a rootfs and chown every non-root file to the shared UID/GID,
-//      preserving the setuid/setgid/sticky bits.
-//
-// We intentionally keep the operation idempotent: applying it twice
-// produces the same result as applying it once.
+// The "user" account uses UID/GID 7575 (matching the thundersnap HTTP port)
+// which is unlikely to conflict with existing container users.
 
 import (
 	"bufio"
@@ -22,314 +16,21 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
-// DefaultSharedUID is the UID used for all non-root accounts inside a
-// container after stripping. We pick 1000 because that matches the
-// conventional first user UID on Debian/Ubuntu, so existing files owned
-// by uid=1000 in the snapshot continue to work without touching them.
-const DefaultSharedUID = 1000
+// ThundersnapUID is the UID used for the "user" account created by thundersnap.
+// 7575 matches the thundersnap HTTP port and is unlikely to conflict with
+// existing container users.
+const ThundersnapUID = 7575
 
-// DefaultSharedGID mirrors the above for groups.
-const DefaultSharedGID = 1000
-
-// StripOptions configures how UID stripping is applied.
-type StripOptions struct {
-	// SharedUID is the UID assigned to all non-root accounts.
-	// If 0 (the zero value), DefaultSharedUID is used.
-	SharedUID uint32
-
-	// SharedGID is the GID assigned to all non-root groups.
-	// If 0, DefaultSharedGID is used.
-	SharedGID uint32
-
-	// ChownFiles, if true, walks the rootfs and chowns every file
-	// owned by a non-root UID/GID to the shared UID/GID. This is a
-	// one-time fix-up done at rootfs creation. Skipped on the snapshots
-	// dir because those subvolumes are read-only.
-	ChownFiles bool
-}
-
-func (o StripOptions) uid() uint32 {
-	if o.SharedUID == 0 {
-		return DefaultSharedUID
-	}
-	return o.SharedUID
-}
-
-func (o StripOptions) gid() uint32 {
-	if o.SharedGID == 0 {
-		return DefaultSharedGID
-	}
-	return o.SharedGID
-}
-
-// StripPasswdFile rewrites the /etc/passwd file at path so every entry
-// other than root (UID 0) is rewritten to use sharedUID/sharedGID.
-// The home directory and shell fields are left untouched.
-//
-// Returns nil if the file does not exist.
-func StripPasswdFile(path string, opts StripOptions) error {
-	uid := opts.uid()
-	gid := opts.gid()
-
-	in, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-
-	var out strings.Builder
-	scanner := bufio.NewScanner(strings.NewReader(string(in)))
-	// The default Scanner buffer is 64KB which can be too small for very
-	// large passwd files; bump it.
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		// Preserve comments / blank lines verbatim.
-		if line == "" || strings.HasPrefix(line, "#") {
-			out.WriteString(line)
-			out.WriteByte('\n')
-			continue
-		}
-		fields := strings.Split(line, ":")
-		if len(fields) < 7 {
-			// Malformed line; preserve as-is.
-			out.WriteString(line)
-			out.WriteByte('\n')
-			continue
-		}
-		// Skip root (UID 0).
-		curUID, err := strconv.ParseUint(fields[2], 10, 32)
-		if err == nil && curUID == 0 {
-			out.WriteString(line)
-			out.WriteByte('\n')
-			continue
-		}
-		fields[2] = strconv.FormatUint(uint64(uid), 10)
-		fields[3] = strconv.FormatUint(uint64(gid), 10)
-		out.WriteString(strings.Join(fields, ":"))
-		out.WriteByte('\n')
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan passwd: %w", err)
-	}
-	return atomicWriteFile(path, []byte(out.String()), 0644)
-}
-
-// StripGroupFile rewrites /etc/group so every group with non-zero GID uses
-// sharedGID. The membership list (fourth field) is preserved.
-func StripGroupFile(path string, opts StripOptions) error {
-	gid := opts.gid()
-
-	in, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-
-	var out strings.Builder
-	scanner := bufio.NewScanner(strings.NewReader(string(in)))
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" || strings.HasPrefix(line, "#") {
-			out.WriteString(line)
-			out.WriteByte('\n')
-			continue
-		}
-		fields := strings.Split(line, ":")
-		if len(fields) < 4 {
-			out.WriteString(line)
-			out.WriteByte('\n')
-			continue
-		}
-		curGID, err := strconv.ParseUint(fields[2], 10, 32)
-		if err == nil && curGID == 0 {
-			out.WriteString(line)
-			out.WriteByte('\n')
-			continue
-		}
-		fields[2] = strconv.FormatUint(uint64(gid), 10)
-		out.WriteString(strings.Join(fields, ":"))
-		out.WriteByte('\n')
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan group: %w", err)
-	}
-	return atomicWriteFile(path, []byte(out.String()), 0644)
-}
-
-// ChownNonRootFiles walks rootfs and re-owns every entry not already owned
-// by uid 0 / gid 0 to the shared UID/GID. Symlinks are chowned (lchown).
-// Errors on individual files are logged via logf (if non-nil) but do not
-// abort the walk.
-func ChownNonRootFiles(rootfs string, opts StripOptions, logf func(format string, args ...any)) error {
-	uid := opts.uid()
-	gid := opts.gid()
-
-	if logf == nil {
-		logf = func(string, ...any) {}
-	}
-
-	return filepath.Walk(rootfs, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			// Don't abort: a missing file or unreadable directory inside
-			// the snapshot shouldn't prevent the rest from being chowned.
-			logf("walk error at %s: %v", path, err)
-			if info != nil && info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return nil
-		}
-		// Decide new UID/GID: keep root, otherwise rewrite.
-		newUID := stat.Uid
-		newGID := stat.Gid
-		if newUID != 0 {
-			newUID = uid
-		}
-		if newGID != 0 {
-			newGID = gid
-		}
-		if newUID == stat.Uid && newGID == stat.Gid {
-			return nil
-		}
-		// Use Lchown so we don't follow symlinks.
-		if err := os.Lchown(path, int(newUID), int(newGID)); err != nil {
-			logf("lchown %s: %v", path, err)
-		}
-		return nil
-	})
-}
-
-// StripRootfs is the top-level convenience function: rewrite passwd and
-// group, and (if opts.ChownFiles) walk the rootfs to align ownership.
-// Operations missing a file are skipped silently.
-func StripRootfs(rootfs string, opts StripOptions) error {
-	if err := StripPasswdFile(filepath.Join(rootfs, "etc", "passwd"), opts); err != nil {
-		return fmt.Errorf("strip passwd: %w", err)
-	}
-	if err := StripGroupFile(filepath.Join(rootfs, "etc", "group"), opts); err != nil {
-		return fmt.Errorf("strip group: %w", err)
-	}
-	// /etc/shadow and /etc/gshadow contain no UID/GID columns, so they
-	// don't need modification — usernames remain the same, just with
-	// different UIDs in passwd.
-	if opts.ChownFiles {
-		if err := ChownNonRootFiles(rootfs, opts, nil); err != nil {
-			return fmt.Errorf("chown rootfs: %w", err)
-		}
-	}
-	// Configure passwordless sudo for the shared UID user so they can
-	// run apt-get, systemctl, etc. without a password prompt.
-	if err := EnsureSudoers(rootfs); err != nil {
-		// Non-fatal: some minimal containers don't have sudo
-		// Log would be nice but we don't have a logger here
-	}
-	return nil
-}
-
-// EnsureSudoers creates a sudoers.d drop-in file that grants passwordless
-// sudo to the "user" account (the shared UID account). This is necessary
-// because containers typically need root access for package management,
-// service control, etc.
-//
-// Returns nil if /etc/sudoers.d doesn't exist (container has no sudo).
-func EnsureSudoers(rootfs string) error {
-	sudoersDir := filepath.Join(rootfs, "etc", "sudoers.d")
-	if _, err := os.Stat(sudoersDir); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil // No sudo installed, skip
-		}
-		return err
-	}
-
-	// Create a drop-in file for the user account
-	dropinPath := filepath.Join(sudoersDir, "thundersnap-user")
-	content := "# Thundersnap: allow the shared UID user passwordless sudo\nuser ALL=(ALL) NOPASSWD: ALL\n"
-
-	// sudoers files must be mode 0440 and owned by root
-	if err := os.WriteFile(dropinPath, []byte(content), 0440); err != nil {
-		return fmt.Errorf("write sudoers drop-in: %w", err)
-	}
-
-	return nil
-}
-
-// PasswdEntry represents a single line from /etc/passwd.
-type PasswdEntry struct {
-	Username string
-	Password string // usually "x" meaning shadow
-	UID      uint32
-	GID      uint32
-	GECOS    string // comment/full name
-	Home     string
-	Shell    string
-}
-
-// ParsePasswdEntry parses a single colon-delimited passwd line.
-// Returns nil if the line is a comment, blank, or malformed.
-func ParsePasswdEntry(line string) *PasswdEntry {
-	if line == "" || strings.HasPrefix(line, "#") {
-		return nil
-	}
-	fields := strings.Split(line, ":")
-	if len(fields) < 7 {
-		return nil
-	}
-	uid, err := strconv.ParseUint(fields[2], 10, 32)
-	if err != nil {
-		return nil
-	}
-	gid, err := strconv.ParseUint(fields[3], 10, 32)
-	if err != nil {
-		return nil
-	}
-	return &PasswdEntry{
-		Username: fields[0],
-		Password: fields[1],
-		UID:      uint32(uid),
-		GID:      uint32(gid),
-		GECOS:    fields[4],
-		Home:     fields[5],
-		Shell:    fields[6],
-	}
-}
-
-// LookupPasswdUser reads /etc/passwd at rootfs and returns the entry for username.
-// Returns nil if the file doesn't exist or the user is not found.
-func LookupPasswdUser(rootfs, username string) *PasswdEntry {
-	path := filepath.Join(rootfs, "etc", "passwd")
-	in, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	scanner := bufio.NewScanner(strings.NewReader(string(in)))
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		entry := ParsePasswdEntry(scanner.Text())
-		if entry != nil && entry.Username == username {
-			return entry
-		}
-	}
-	return nil
-}
+// ThundersnapGID is the GID used for the "user" account.
+const ThundersnapGID = 7575
 
 // EnsureUserInPasswd ensures that a user named "user" exists in /etc/passwd
-// (and /etc/shadow if it exists). If the user doesn't exist, it's added as
-// the first entry after root with:
-//   - UID/GID: DefaultSharedUID/DefaultSharedGID (1000)
+// (and /etc/shadow if it exists). If the user doesn't exist, it's added with:
+//   - UID/GID: ThundersnapUID/ThundersnapGID (7575)
 //   - Home: /home
-//   - Shell: /bin/sh (or /bin/bash if available)
+//   - Shell: /bin/bash if available, otherwise /bin/sh
 //
 // Returns the home directory of the "user" account (from passwd, not filesystem).
 // Returns empty string if /etc/passwd doesn't exist.
@@ -352,7 +53,7 @@ func EnsureUserInPasswd(rootfs string) (home string, err error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		lines = append(lines, line)
-		entry := ParsePasswdEntry(line)
+		entry := parsePasswdEntry(line)
 		if entry != nil && entry.Username == "user" {
 			userExists = true
 			userHome = entry.Home
@@ -374,7 +75,7 @@ func EnsureUserInPasswd(rootfs string) (home string, err error) {
 	}
 
 	newPasswdEntry := fmt.Sprintf("user:x:%d:%d:user:/home:%s",
-		DefaultSharedUID, DefaultSharedGID, shell)
+		ThundersnapUID, ThundersnapGID, shell)
 
 	// Insert after root line in passwd
 	var out strings.Builder
@@ -384,7 +85,7 @@ func EnsureUserInPasswd(rootfs string) (home string, err error) {
 		out.WriteByte('\n')
 		// Insert after root entry (UID 0)
 		if !inserted {
-			entry := ParsePasswdEntry(line)
+			entry := parsePasswdEntry(line)
 			if entry != nil && entry.UID == 0 {
 				out.WriteString(newPasswdEntry)
 				out.WriteByte('\n')
@@ -408,6 +109,72 @@ func EnsureUserInPasswd(rootfs string) (home string, err error) {
 	}
 
 	return "/home", nil
+}
+
+// EnsureSudoers creates a sudoers.d drop-in file that grants passwordless
+// sudo to the "user" account. This is necessary because containers typically
+// need root access for package management, service control, etc.
+//
+// Returns nil if /etc/sudoers.d doesn't exist (container has no sudo).
+func EnsureSudoers(rootfs string) error {
+	sudoersDir := filepath.Join(rootfs, "etc", "sudoers.d")
+	if _, err := os.Stat(sudoersDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // No sudo installed, skip
+		}
+		return err
+	}
+
+	// Create a drop-in file for the user account
+	dropinPath := filepath.Join(sudoersDir, "thundersnap-user")
+	content := "# Thundersnap: allow the user account passwordless sudo\nuser ALL=(ALL) NOPASSWD: ALL\n"
+
+	// sudoers files must be mode 0440 and owned by root
+	if err := os.WriteFile(dropinPath, []byte(content), 0440); err != nil {
+		return fmt.Errorf("write sudoers drop-in: %w", err)
+	}
+
+	return nil
+}
+
+// passwdEntry represents a single line from /etc/passwd.
+type passwdEntry struct {
+	Username string
+	Password string // usually "x" meaning shadow
+	UID      uint32
+	GID      uint32
+	GECOS    string // comment/full name
+	Home     string
+	Shell    string
+}
+
+// parsePasswdEntry parses a single colon-delimited passwd line.
+// Returns nil if the line is a comment, blank, or malformed.
+func parsePasswdEntry(line string) *passwdEntry {
+	if line == "" || strings.HasPrefix(line, "#") {
+		return nil
+	}
+	fields := strings.Split(line, ":")
+	if len(fields) < 7 {
+		return nil
+	}
+	uid, err := strconv.ParseUint(fields[2], 10, 32)
+	if err != nil {
+		return nil
+	}
+	gid, err := strconv.ParseUint(fields[3], 10, 32)
+	if err != nil {
+		return nil
+	}
+	return &passwdEntry{
+		Username: fields[0],
+		Password: fields[1],
+		UID:      uint32(uid),
+		GID:      uint32(gid),
+		GECOS:    fields[4],
+		Home:     fields[5],
+		Shell:    fields[6],
+	}
 }
 
 // ensureUserInShadow adds a "user" entry to /etc/shadow if the file exists
@@ -482,7 +249,7 @@ func atomicWriteFile(path string, data []byte, defaultMode os.FileMode) error {
 	if st, err := os.Stat(path); err == nil {
 		mode = st.Mode().Perm()
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".strip-tmp-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err
 	}

@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
 )
@@ -320,15 +319,15 @@ func TestSetgidBinaryExecution(t *testing.T) {
 	t.Logf("setgid file mode after restore: %o (executable and setgid preserved)", info.Mode())
 }
 
-// TestUIDStrippingPasswdRewrite tests the UID stripping mode where /etc/passwd
-// is rewritten to consolidate all non-root UIDs to a single shared UID.
-func TestUIDStrippingPasswdRewrite(t *testing.T) {
+// TestUIDPreservation tests that file UIDs are preserved across snapshot/restore,
+// verifying that we no longer strip UIDs to a single shared value.
+func TestUIDPreservation(t *testing.T) {
 	env := newTestEnv(t)
 
 	baseSnap := env.createBaseSnapshot()
 
 	// Create a frame from the snapshot
-	framePath := filepath.Join(env.fsDir, "testuser", "uidstriptest")
+	framePath := filepath.Join(env.fsDir, "testuser", "uidpreservetest")
 	if err := os.MkdirAll(filepath.Dir(framePath), 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -339,42 +338,7 @@ func TestUIDStrippingPasswdRewrite(t *testing.T) {
 		t.Fatalf("btrfs snapshot: %v\n%s", err, out)
 	}
 
-	// Create a passwd file with multiple users with different UIDs
-	etcDir := filepath.Join(framePath, "etc")
-	passwdPath := filepath.Join(etcDir, "passwd")
-	passwdContent := `root:x:0:0:root:/root:/bin/bash
-daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
-nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
-www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
-postgres:x:111:115:PostgreSQL administrator:/var/lib/postgresql:/bin/bash
-user:x:1000:1000:User:/home/user:/bin/bash
-`
-	if err := os.WriteFile(passwdPath, []byte(passwdContent), 0644); err != nil {
-		t.Fatalf("write passwd: %v", err)
-	}
-
-	// Also create a group file
-	groupPath := filepath.Join(etcDir, "group")
-	groupContent := `root:x:0:
-daemon:x:1:
-nogroup:x:65534:
-www-data:x:33:
-postgres:x:115:
-user:x:1000:
-`
-	if err := os.WriteFile(groupPath, []byte(groupContent), 0644); err != nil {
-		t.Fatalf("write group: %v", err)
-	}
-
-	// Import the tsm package to use StripRootfs
-	// Since we can't easily import tsm from e2e, we'll call the ts binary
-	// with a strip-uids command, or directly test the file operations
-
-	// Actually, we can use exec to call the binary that does stripping,
-	// or we test by creating files owned by different UIDs and running StripRootfs.
-	// For simplicity, let's test via direct file manipulation and verify the results.
-
-	// Create files with different UIDs
+	// Create files with different UIDs to simulate a real Docker image
 	testFiles := []struct {
 		path string
 		uid  int
@@ -383,6 +347,7 @@ user:x:1000:
 		{filepath.Join(framePath, "var", "lib", "postgresql", "test.db"), 111, 115},
 		{filepath.Join(framePath, "var", "www", "html", "index.html"), 33, 33},
 		{filepath.Join(framePath, "home", "user", "data.txt"), 1000, 1000},
+		{filepath.Join(framePath, "opt", "app", "config.json"), 999, 999},
 	}
 
 	for _, tf := range testFiles {
@@ -404,56 +369,52 @@ user:x:1000:
 			t.Fatalf("stat %s: %v", tf.path, err)
 		}
 		stat := info.Sys().(*syscall.Stat_t)
-		t.Logf("Before strip: %s owned by %d:%d", tf.path, stat.Uid, stat.Gid)
+		if int(stat.Uid) != tf.uid || int(stat.Gid) != tf.gid {
+			t.Errorf("%s: initial ownership %d:%d, want %d:%d",
+				tf.path, stat.Uid, stat.Gid, tf.uid, tf.gid)
+		}
+		t.Logf("Initial: %s owned by %d:%d", tf.path, stat.Uid, stat.Gid)
 	}
 
-	// Run ts strip-rootfs command (or use the tsm package directly)
-	// Since this is an e2e test, we'll use the binary
-	stripCmd := exec.Command(env.tsBinary, "strip-rootfs", framePath)
-	stripCmd.Dir = framePath
-	if out, err := stripCmd.CombinedOutput(); err != nil {
-		// If strip-rootfs command doesn't exist, that's ok - we test the files directly
-		t.Logf("strip-rootfs command: %v (output: %s)", err, out)
-		// Fall back to importing and calling the function directly
-		// But since we can't import, we'll verify the passwd file was modified
-		// by the fixture generator or thundersnapd
+	// Create a snapshot of the frame
+	snap2Path := filepath.Join(env.snapshotsDir, "uidpreserve2")
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", "-r", framePath, snap2Path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("btrfs snapshot frame: %v\n%s", err, out)
 	}
+	t.Logf("Created snapshot from frame")
 
-	// Verify passwd file was rewritten (all non-root UIDs become 1000)
-	passwdData, err := os.ReadFile(passwdPath)
-	if err != nil {
-		t.Fatalf("read passwd after strip: %v", err)
+	// Restore to a new frame
+	frame2Path := filepath.Join(env.fsDir, "testuser", "uidpreservetest2")
+	cmd = exec.Command("btrfs", "subvolume", "snapshot", snap2Path, frame2Path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("btrfs snapshot to frame2: %v\n%s", err, out)
 	}
-	passwdStr := string(passwdData)
-	t.Logf("passwd after strip:\n%s", passwdStr)
+	t.Logf("Restored to frame2")
 
-	// For this test, we verify the structure is correct
-	// The actual stripping would be done by thundersnapd during frame creation
-	lines := strings.Split(strings.TrimSpace(passwdStr), "\n")
-	for _, line := range lines {
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+	// Verify UIDs are preserved after snapshot/restore
+	for _, tf := range testFiles {
+		// Adjust path to frame2
+		restoredPath := filepath.Join(frame2Path, tf.path[len(framePath):])
+		info, err := os.Stat(restoredPath)
+		if err != nil {
+			t.Fatalf("stat restored %s: %v", restoredPath, err)
 		}
-		fields := strings.Split(line, ":")
-		if len(fields) < 4 {
-			continue
+		stat := info.Sys().(*syscall.Stat_t)
+		if int(stat.Uid) != tf.uid {
+			t.Errorf("%s: UID after restore %d, want %d (UIDs should be preserved)",
+				restoredPath, stat.Uid, tf.uid)
 		}
-		username := fields[0]
-		uid := fields[2]
-
-		// Root should stay as UID 0
-		if username == "root" {
-			if uid != "0" {
-				t.Errorf("root UID should be 0, got %s", uid)
-			}
+		if int(stat.Gid) != tf.gid {
+			t.Errorf("%s: GID after restore %d, want %d (GIDs should be preserved)",
+				restoredPath, stat.Gid, tf.gid)
 		}
+		t.Logf("After restore: %s owned by %d:%d (preserved)", restoredPath, stat.Uid, stat.Gid)
 	}
 }
 
 // TestHardlinkSetuidBinaryInSnapshot tests that hardlinks to setuid binaries
 // preserve the setuid bit correctly when creating and restoring snapshots.
-// This is a specific edge case where chown operations during UID stripping
-// might inadvertently clear the setuid bit on a hardlinked binary.
 func TestHardlinkSetuidBinaryInSnapshot(t *testing.T) {
 	env := newTestEnv(t)
 
@@ -583,79 +544,6 @@ func TestHardlinkSetuidBinaryInSnapshot(t *testing.T) {
 	} else {
 		t.Logf("Hardlink preserved after restore (inode %d)", origStat.Ino)
 	}
-}
-
-// TestChownClearsSetuidBit documents and tests the Linux kernel behavior where
-// chown() ALWAYS clears the setuid/setgid bits, even when the ownership doesn't
-// change. This is important for UID stripping code to understand - it must:
-// 1. Skip chown on files that are already owned by the target UID, OR
-// 2. Re-apply setuid/setgid bits after chown if they were set
-func TestChownClearsSetuidBit(t *testing.T) {
-	env := newTestEnv(t)
-
-	baseSnap := env.createBaseSnapshot()
-
-	// Create a frame
-	framePath := filepath.Join(env.fsDir, "testuser", "chown-setuid")
-	if err := os.MkdirAll(filepath.Dir(framePath), 0755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-
-	snapPath := filepath.Join(env.snapshotsDir, baseSnap)
-	cmd := exec.Command("btrfs", "subvolume", "snapshot", snapPath, framePath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("btrfs snapshot: %v\n%s", err, out)
-	}
-
-	// Create a setuid binary owned by root first
-	binDir := filepath.Join(framePath, "tmp")
-	setuidFile := filepath.Join(binDir, "test-setuid")
-
-	busyboxPath, err := exec.LookPath("busybox")
-	if err != nil {
-		busyboxPath = env.tsBinary
-	}
-
-	if err := copyFile(busyboxPath, setuidFile); err != nil {
-		t.Fatalf("copy binary: %v", err)
-	}
-
-	// Set setuid bit while owned by root
-	if err := os.Chmod(setuidFile, 0755|os.ModeSetuid); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-
-	// Verify setuid bit is set
-	info, err := os.Stat(setuidFile)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-	if info.Mode()&os.ModeSetuid == 0 {
-		t.Fatalf("setuid bit not set initially (mode: %o)", info.Mode())
-	}
-	t.Logf("Initial: mode=%o (setuid bit is set)", info.Mode())
-
-	// Document the kernel behavior: chown to same owner clears setuid
-	// This is a security feature of Linux
-	if err := os.Chown(setuidFile, 0, 0); err != nil { // chown to root:root (same owner)
-		t.Fatalf("chown: %v", err)
-	}
-
-	info, err = os.Stat(setuidFile)
-	if err != nil {
-		t.Fatalf("stat after chown: %v", err)
-	}
-	// Linux ALWAYS clears setuid bit on chown, even to same owner
-	if info.Mode()&os.ModeSetuid != 0 {
-		t.Logf("Note: setuid bit preserved on chown (unexpected on Linux)")
-	} else {
-		t.Logf("Confirmed: setuid bit cleared by chown to same owner (Linux kernel behavior)")
-		t.Logf("After chown: mode=%o", info.Mode())
-	}
-
-	// This test documents the behavior that UID stripping code must handle:
-	// ChownNonRootFiles should check if uid already matches before calling chown
-	// to avoid clearing setuid bits on files that don't need ownership changes
 }
 
 // Note: copyFile is defined in e2e_test.go

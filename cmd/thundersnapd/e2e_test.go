@@ -1,20 +1,21 @@
 package main
 
-// End-to-end-ish integration test for the snapshot/clone/strip-uids flow.
+// End-to-end-ish integration test for the snapshot/clone flow.
 //
-// This test exercises the actual btrfs subvolume operations, the .tsm/.tsc
-// generation path, and the strip-all-uids logic against a real filesystem.
-// It deliberately bypasses tsnet/SSH, since that path requires real
-// Tailscale auth and an external network. What it covers:
+// This test exercises the actual btrfs subvolume operations and the .tsm/.tsc
+// generation path against a real filesystem. It deliberately bypasses
+// tsnet/SSH, since that path requires real Tailscale auth and an external
+// network. What it covers:
 //
 //   1. Fresh btrfs subvolume "1" used as a base snapshot.
-//   2. ensureRootFS clones it into fs-dir/<user>/<frame>, runs the
-//      strip-uids pass, and writes a .stamp file.
+//   2. ensureRootFS clones it into fs-dir/<user>/<frame>, ensures user
+//      account exists, and writes a .stamp file.
 //   3. createSnapshot from the live frame produces .tsm and .tsc
 //      files in snaps-dir alongside .fidx/.fidx.fidx/.stamp.
 //   4. createFrameFromSnapshot from that newly-created snapshot
 //      produces a usable frame with a /bin/ts binary.
 //   5. The ts binary inside the frame is executable.
+//   6. UIDs are preserved across snapshot/restore (not stripped).
 //
 // The test requires root + btrfs. It skips otherwise.
 
@@ -54,7 +55,7 @@ func requireBtrfsRoot(t *testing.T, dir string) {
 // makeSeedRootFS populates a directory with a minimal "snapshot 1" tree:
 // /etc/passwd, /etc/group, /home/<user>, /bin, /usr/bin, /usr/bin/ts (a
 // tiny shim), plus a couple of files owned by non-root UIDs to verify
-// strip-uids actually rewrites ownership.
+// UID preservation across snapshot/restore.
 func makeSeedRootFS(t *testing.T, dir string) {
 	t.Helper()
 	mk := func(p string, mode os.FileMode) {
@@ -220,7 +221,7 @@ func resetFlagsForTest() {
 	flagNfsPort = &zero
 }
 
-func TestE2ESnapshotCloneStripUIDs(t *testing.T) {
+func TestE2ESnapshotCloneUIDPreservation(t *testing.T) {
 	fsDir, snapsDir, libexecDir, cleanup := setupTestEnv(t)
 	defer cleanup()
 	setFlagsForTest(fsDir, snapsDir, libexecDir)
@@ -232,7 +233,7 @@ func TestE2ESnapshotCloneStripUIDs(t *testing.T) {
 	baseUserFS := filepath.Join(fsDir, tailscaleUser, "alice") // doesn't exist yet
 
 	// Step 1: ensureRootFS clones from /snapshots/1 -> fs-dir/<user>/dev,
-	// generates an intermediate snapshot, and runs strip-uids.
+	// generates an intermediate snapshot, and ensures user account exists.
 	if err := ensureRootFS(rootFS, baseUserFS); err != nil {
 		t.Fatalf("ensureRootFS: %v", err)
 	}
@@ -240,28 +241,34 @@ func TestE2ESnapshotCloneStripUIDs(t *testing.T) {
 		t.Fatalf("rootFS not created: %v", err)
 	}
 
-	// Verify strip-uids: postgres entry should now resolve to UID 1000.
+	// Verify passwd: postgres entry should still have original UID (111),
+	// and a "user" entry with UID 7575 should be added.
 	pwBytes, err := os.ReadFile(filepath.Join(rootFS, "etc", "passwd"))
 	if err != nil {
 		t.Fatalf("read passwd: %v", err)
 	}
 	pw := string(pwBytes)
-	if !strings.Contains(pw, "postgres:x:1000:1000:") {
-		t.Errorf("postgres entry not rewritten:\n%s", pw)
+	// postgres should keep original UID 111 (UIDs are preserved now)
+	if !strings.Contains(pw, "postgres:x:111:115:") {
+		t.Errorf("postgres entry should preserve original UID 111:\n%s", pw)
 	}
 	if !strings.Contains(pw, "root::0:0:root:") {
 		t.Errorf("root entry mangled:\n%s", pw)
 	}
+	// user account should be added with UID 7575
+	if !strings.Contains(pw, "user:x:7575:7575:") {
+		t.Errorf("user entry with UID 7575 not added:\n%s", pw)
+	}
 
-	// Verify the postgres data file got chowned to the shared UID.
+	// Verify the postgres data file keeps its original UID (not chowned).
 	pgFile := filepath.Join(rootFS, "var", "lib", "postgresql", "PG_VERSION")
 	st, err := os.Lstat(pgFile)
 	if err != nil {
 		t.Fatalf("stat PG_VERSION: %v", err)
 	}
 	sys := st.Sys().(*syscall.Stat_t)
-	if sys.Uid != 1000 || sys.Gid != 1000 {
-		t.Errorf("PG_VERSION uid/gid = %d/%d, want 1000/1000", sys.Uid, sys.Gid)
+	if sys.Uid != 111 || sys.Gid != 115 {
+		t.Errorf("PG_VERSION uid/gid = %d/%d, want 111/115 (original preserved)", sys.Uid, sys.Gid)
 	}
 
 	// Step 2: At least one intermediate snapshot should exist now in
@@ -342,7 +349,7 @@ func TestE2ESnapshotCloneStripUIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hdr) < 4 || string(hdr[:4]) != "TSM\x02" {
+	if len(hdr) < 4 || string(hdr[:4]) != "TSM\x03" {
 		t.Errorf("bad TSM magic in %s", tsmPath)
 	}
 }
@@ -799,7 +806,7 @@ func TestSelectTargetUserEnsuresUserInPasswd(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(string(got), "user:x:1000:1000:user:/home:") {
+		if !strings.Contains(string(got), "user:x:7575:7575:user:/home:") {
 			t.Errorf("user entry not added to passwd:\n%s", got)
 		}
 	})
@@ -828,7 +835,7 @@ func TestSelectTargetUserEnsuresUserInPasswd(t *testing.T) {
 
 		// User should still have been added to passwd (for future use)
 		got, _ := os.ReadFile(filepath.Join(etcDir, "passwd"))
-		if !strings.Contains(string(got), "user:x:1000:1000:user:/home:") {
+		if !strings.Contains(string(got), "user:x:7575:7575:user:/home:") {
 			t.Errorf("user entry should still be added to passwd:\n%s", got)
 		}
 	})
@@ -861,7 +868,7 @@ func TestSelectTargetUserEnsuresUserInPasswd(t *testing.T) {
 
 		// user should NOT have been added (ubuntu wins first)
 		got, _ := os.ReadFile(filepath.Join(etcDir, "passwd"))
-		if strings.Contains(string(got), "user:x:1000:1000:user:/home:") {
+		if strings.Contains(string(got), "user:x:7575:7575:user:/home:") {
 			t.Errorf("user entry should not be added when ubuntu exists:\n%s", got)
 		}
 
