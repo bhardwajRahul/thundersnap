@@ -371,16 +371,31 @@ func (s *testControlServer) handleCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Clone rootfs snapshot to frame
-	rootfsPath := filepath.Join(s.env.snapshotsDir, rootfs)
-	cmd := exec.Command("btrfs", "subvolume", "snapshot", rootfsPath, framePath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "error",
-			"message": "btrfs snapshot: " + err.Error() + ": " + string(out),
-		})
-		return
+	// Clone rootfs snapshot to frame, or create empty subvolume if rootfs is empty/nil
+	if rootfs == "" || rootfs == "nil" {
+		// Create empty rootfs subvolume with minimal structure
+		cmd := exec.Command("btrfs", "subvolume", "create", framePath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"status":  "error",
+				"message": "btrfs subvolume create: " + err.Error() + ": " + string(out),
+			})
+			return
+		}
+		// Create minimal directory structure for blank container
+		setupMinimalRootfsForTest(framePath, s.env.tsBinary)
+	} else {
+		rootfsPath := filepath.Join(s.env.snapshotsDir, rootfs)
+		cmd := exec.Command("btrfs", "subvolume", "snapshot", rootfsPath, framePath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"status":  "error",
+				"message": "btrfs snapshot: " + err.Error() + ": " + string(out),
+			})
+			return
+		}
 	}
 
 	// Create home subvolume if specified empty or with snap
@@ -388,36 +403,31 @@ func (s *testControlServer) handleCreate(w http.ResponseWriter, r *http.Request)
 	if home == "" {
 		// Remove existing home directory contents and create empty subvolume
 		os.RemoveAll(homePath)
-		cmd = exec.Command("btrfs", "subvolume", "create", homePath)
-		cmd.CombinedOutput()
+		exec.Command("btrfs", "subvolume", "create", homePath).CombinedOutput()
 		os.Chown(homePath, 1000, 1000)
 	} else if home != "nil" {
 		// Clone from home snapshot
 		homeSnapPath := filepath.Join(s.env.snapshotsDir, home)
 		os.RemoveAll(homePath)
-		cmd = exec.Command("btrfs", "subvolume", "snapshot", homeSnapPath, homePath)
-		cmd.CombinedOutput()
+		exec.Command("btrfs", "subvolume", "snapshot", homeSnapPath, homePath).CombinedOutput()
 	}
 
 	// Create work subvolume if specified empty or with snap
 	workPath := filepath.Join(framePath, "work")
 	if work == "" {
 		os.RemoveAll(workPath)
-		cmd = exec.Command("btrfs", "subvolume", "create", workPath)
-		cmd.CombinedOutput()
+		exec.Command("btrfs", "subvolume", "create", workPath).CombinedOutput()
 		os.Chown(workPath, 1000, 1000)
 	} else if work != "nil" {
 		workSnapPath := filepath.Join(s.env.snapshotsDir, work)
 		os.RemoveAll(workPath)
-		cmd = exec.Command("btrfs", "subvolume", "snapshot", workSnapPath, workPath)
-		cmd.CombinedOutput()
+		exec.Command("btrfs", "subvolume", "snapshot", workSnapPath, workPath).CombinedOutput()
 	}
 
 	// Create id subvolume (always empty, never cloned from snapshot)
 	idPath := filepath.Join(framePath, "id")
 	os.RemoveAll(idPath)
-	cmd = exec.Command("btrfs", "subvolume", "create", idPath)
-	cmd.CombinedOutput()
+	exec.Command("btrfs", "subvolume", "create", idPath).CombinedOutput()
 	os.Chmod(idPath, 0700)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -627,6 +637,40 @@ func (s *testControlServer) handleTaint(w http.ResponseWriter, r *http.Request) 
 		"status": "ok",
 		"taints": s.taints,
 	})
+}
+
+// setupMinimalRootfsForTest creates the minimal directory structure and files
+// needed for a blank container to function in tests.
+func setupMinimalRootfsForTest(rootFS, tsBinary string) {
+	// Create essential directories
+	dirs := []string{
+		"bin", "sbin", "etc", "tmp", "proc", "sys", "dev",
+		"root", "var", "var/log", "run", "usr", "usr/bin",
+	}
+	for _, dir := range dirs {
+		os.MkdirAll(filepath.Join(rootFS, dir), 0755)
+	}
+	os.Chmod(filepath.Join(rootFS, "tmp"), 01777)
+	os.Chmod(filepath.Join(rootFS, "root"), 0700)
+
+	// Copy ts binary
+	if tsBinary != "" {
+		tsDst := filepath.Join(rootFS, "bin/ts")
+		copyFile(tsBinary, tsDst)
+		// Create /bin/sh symlink to ts
+		os.Symlink("ts", filepath.Join(rootFS, "bin/sh"))
+	}
+
+	// Create minimal /etc files
+	passwdContent := "root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+	os.WriteFile(filepath.Join(rootFS, "etc/passwd"), []byte(passwdContent), 0644)
+
+	groupContent := "root:x:0:\nuser:x:1000:\nnogroup:x:65534:\n"
+	os.WriteFile(filepath.Join(rootFS, "etc/group"), []byte(groupContent), 0644)
+
+	os.WriteFile(filepath.Join(rootFS, "etc/hostname"), []byte("minimal\n"), 0644)
+	os.WriteFile(filepath.Join(rootFS, "etc/hosts"), []byte("127.0.0.1\tlocalhost\n"), 0644)
+	os.WriteFile(filepath.Join(rootFS, "etc/resolv.conf"), []byte("nameserver 8.8.8.8\n"), 0644)
 }
 
 // parseFrameSpec parses a frame spec like "rootfs:home:work" or "rootfs::"

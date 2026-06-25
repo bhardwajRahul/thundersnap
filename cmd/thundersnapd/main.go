@@ -2289,6 +2289,9 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 // - rootFS: the rootfs subvolume (the frame directory itself)
 // - rootFS/home: nested home subvolume
 // - rootFS/work: nested work subvolume
+//
+// If meta.Rootfs is empty (nil:nil:nil frame spec), creates an empty rootfs
+// with minimal directory structure needed for the container to function.
 func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 	// Ensure the parent directory exists
 	parentDir := filepath.Dir(rootFS)
@@ -2296,17 +2299,33 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 		return fmt.Errorf("creating parent directory: %w", err)
 	}
 
-	// Step 1: Clone rootfs component from snapshot
-	rootfsSnapPath := filepath.Join(*flagSnapsDir, meta.Rootfs)
-	if _, err := os.Stat(rootfsSnapPath); err != nil {
-		return fmt.Errorf("rootfs snap %s: %w", meta.Rootfs, err)
-	}
+	// Step 1: Clone rootfs component from snapshot, or create empty rootfs
+	if meta.Rootfs != "" {
+		// Clone from existing snapshot
+		rootfsSnapPath := filepath.Join(*flagSnapsDir, meta.Rootfs)
+		if _, err := os.Stat(rootfsSnapPath); err != nil {
+			return fmt.Errorf("rootfs snap %s: %w", meta.Rootfs, err)
+		}
 
-	cmd := exec.Command("btrfs", "subvolume", "snapshot", rootfsSnapPath, rootFS)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("btrfs snapshot rootfs from %s to %s failed: %w\noutput: %s",
-			rootfsSnapPath, rootFS, err, string(output))
+		cmd := exec.Command("btrfs", "subvolume", "snapshot", rootfsSnapPath, rootFS)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("btrfs snapshot rootfs from %s to %s failed: %w\noutput: %s",
+				rootfsSnapPath, rootFS, err, string(output))
+		}
+	} else {
+		// Create empty rootfs subvolume with minimal structure
+		cmd := exec.Command("btrfs", "subvolume", "create", rootFS)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("btrfs subvolume create rootfs at %s failed: %w\noutput: %s",
+				rootFS, err, string(output))
+		}
+
+		// Set up minimal directory structure for a functional container
+		if err := setupMinimalRootfs(rootFS); err != nil {
+			return fmt.Errorf("setup minimal rootfs: %w", err)
+		}
 	}
 
 	// Step 2: Create or clone home subvolume
@@ -2518,6 +2537,86 @@ func ensureTmpDir(rootFS string) error {
 		return fmt.Errorf("chmod /tmp: %w", err)
 	}
 
+	return nil
+}
+
+// setupMinimalRootfs creates the minimal directory structure and files needed
+// for a functional container when no rootfs snapshot is provided (nil:nil:nil).
+// This allows creating "blank" containers that still work with SSH and ts commands.
+func setupMinimalRootfs(rootFS string) error {
+	// Create essential directories
+	dirs := []struct {
+		path string
+		mode os.FileMode
+	}{
+		{"bin", 0755},
+		{"sbin", 0755},
+		{"etc", 0755},
+		{"tmp", 01777}, // sticky bit
+		{"proc", 0555},
+		{"sys", 0555},
+		{"dev", 0755},
+		{"root", 0700},
+		{"var", 0755},
+		{"var/log", 0755},
+		{"var/tmp", 01777},
+		{"run", 0755},
+		{"usr", 0755},
+		{"usr/bin", 0755},
+		{"usr/sbin", 0755},
+		{"usr/lib", 0755},
+	}
+
+	for _, d := range dirs {
+		path := filepath.Join(rootFS, d.path)
+		if err := os.MkdirAll(path, d.mode); err != nil {
+			return fmt.Errorf("mkdir %s: %w", d.path, err)
+		}
+		// MkdirAll doesn't set mode correctly for existing dirs or sticky bit
+		if err := os.Chmod(path, d.mode); err != nil {
+			return fmt.Errorf("chmod %s: %w", d.path, err)
+		}
+	}
+
+	// Create minimal /etc/passwd
+	passwdContent := "root:x:0:0:root:/root:/bin/sh\n" +
+		fmt.Sprintf("user:x:%d:%d:user:/home/user:/bin/sh\n", tsm.ThundersnapUID, tsm.ThundersnapGID) +
+		"nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+	if err := os.WriteFile(filepath.Join(rootFS, "etc/passwd"), []byte(passwdContent), 0644); err != nil {
+		return fmt.Errorf("write /etc/passwd: %w", err)
+	}
+
+	// Create minimal /etc/group
+	groupContent := "root:x:0:\n" +
+		fmt.Sprintf("user:x:%d:\n", tsm.ThundersnapGID) +
+		"nogroup:x:65534:\n"
+	if err := os.WriteFile(filepath.Join(rootFS, "etc/group"), []byte(groupContent), 0644); err != nil {
+		return fmt.Errorf("write /etc/group: %w", err)
+	}
+
+	// Create /etc/hostname
+	if err := os.WriteFile(filepath.Join(rootFS, "etc/hostname"), []byte("thundersnap\n"), 0644); err != nil {
+		return fmt.Errorf("write /etc/hostname: %w", err)
+	}
+
+	// Create /etc/hosts
+	hostsContent := "127.0.0.1\tlocalhost\n::1\tlocalhost\n"
+	if err := os.WriteFile(filepath.Join(rootFS, "etc/hosts"), []byte(hostsContent), 0644); err != nil {
+		return fmt.Errorf("write /etc/hosts: %w", err)
+	}
+
+	// Create /etc/resolv.conf (placeholder - will be overwritten at runtime)
+	if err := os.WriteFile(filepath.Join(rootFS, "etc/resolv.conf"), []byte("nameserver 8.8.8.8\n"), 0644); err != nil {
+		return fmt.Errorf("write /etc/resolv.conf: %w", err)
+	}
+
+	// Create /etc/nsswitch.conf for basic name resolution
+	nsswitchContent := "passwd: files\ngroup: files\nhosts: files dns\n"
+	if err := os.WriteFile(filepath.Join(rootFS, "etc/nsswitch.conf"), []byte(nsswitchContent), 0644); err != nil {
+		return fmt.Errorf("write /etc/nsswitch.conf: %w", err)
+	}
+
+	log.Printf("Created minimal rootfs at %s", rootFS)
 	return nil
 }
 
