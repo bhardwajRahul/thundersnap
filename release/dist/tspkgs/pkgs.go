@@ -46,6 +46,14 @@ func (t *tgzTarget) Build(b *Build) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	vshd, err := b.BuildGoBinary("github.com/tailscale/thundersnap/cmd/vshd", t.goEnv)
+	if err != nil {
+		return nil, err
+	}
+	vsh, err := b.BuildGoBinary("github.com/tailscale/thundersnap/cmd/vsh", t.goEnv)
+	if err != nil {
+		return nil, err
+	}
 
 	filename := fmt.Sprintf("thundersnap_%s_%s.tgz", b.Version, t.arch())
 	log.Printf("Building %s", filename)
@@ -105,11 +113,17 @@ func (t *tgzTarget) Build(b *Build) ([]string, error) {
 	if err := addFile(tsd, filepath.Join(dir, "thundersnapd"), 0755); err != nil {
 		return nil, err
 	}
+	if err := addFile(vsh, filepath.Join(dir, "vsh"), 0755); err != nil {
+		return nil, err
+	}
 	libexecDir := filepath.Join(dir, "libexec")
 	if err := addDir(libexecDir); err != nil {
 		return nil, err
 	}
 	if err := addFile(ts, filepath.Join(libexecDir, "ts"), 0755); err != nil {
+		return nil, err
+	}
+	if err := addFile(vshd, filepath.Join(libexecDir, "vshd"), 0755); err != nil {
 		return nil, err
 	}
 
@@ -169,6 +183,14 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	vshd, err := b.BuildGoBinary("github.com/tailscale/thundersnap/cmd/vshd", t.goEnv)
+	if err != nil {
+		return nil, err
+	}
+	vsh, err := b.BuildGoBinary("github.com/tailscale/thundersnap/cmd/vsh", t.goEnv)
+	if err != nil {
+		return nil, err
+	}
 
 	thundersnapdDir, err := b.GoPkg("github.com/tailscale/thundersnap/cmd/thundersnapd")
 	if err != nil {
@@ -184,8 +206,18 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 		},
 		&files.Content{
 			Type:        files.TypeFile,
+			Source:      vshd,
+			Destination: "/usr/libexec/thundersnap/vshd",
+		},
+		&files.Content{
+			Type:        files.TypeFile,
 			Source:      tsd,
 			Destination: "/usr/sbin/thundersnapd",
+		},
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      vsh,
+			Destination: "/usr/bin/vsh",
 		},
 		&files.Content{
 			Type:        files.TypeFile,
@@ -272,6 +304,14 @@ func (t *rpmTarget) Build(b *Build) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	vshd, err := b.BuildGoBinary("github.com/tailscale/thundersnap/cmd/vshd", t.goEnv)
+	if err != nil {
+		return nil, err
+	}
+	vsh, err := b.BuildGoBinary("github.com/tailscale/thundersnap/cmd/vsh", t.goEnv)
+	if err != nil {
+		return nil, err
+	}
 
 	thundersnapdDir, err := b.GoPkg("github.com/tailscale/thundersnap/cmd/thundersnapd")
 	if err != nil {
@@ -287,8 +327,18 @@ func (t *rpmTarget) Build(b *Build) ([]string, error) {
 		},
 		&files.Content{
 			Type:        files.TypeFile,
+			Source:      vshd,
+			Destination: "/usr/libexec/thundersnap/vshd",
+		},
+		&files.Content{
+			Type:        files.TypeFile,
 			Source:      tsd,
 			Destination: "/usr/sbin/thundersnapd",
+		},
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      vsh,
+			Destination: "/usr/bin/vsh",
 		},
 		&files.Content{
 			Type:        files.TypeFile,
