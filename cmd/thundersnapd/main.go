@@ -924,10 +924,6 @@ const (
 	// likely to be killed than the host OS or thundersnapd itself during memory pressure.
 	containerOOMScore = 500
 
-	// parentCgroupName is the cgroup that contains all thundersnap containers.
-	// System-wide limits are applied here as a backstop.
-	parentCgroupName = "thundersnap"
-
 	// parentMemoryMaxPercent is the percentage of system RAM that all thundersnap
 	// containers combined can use. This is a hard limit to protect the host OS.
 	parentMemoryMaxPercent = 80
@@ -956,6 +952,11 @@ const (
 
 // cgroupInitialized tracks whether the parent cgroup has been set up.
 var cgroupInitialized bool
+
+// parentCgroupName is the cgroup that contains all thundersnap containers for this instance.
+// Uses the daemon's PID to allow multiple instances on the same machine and nested instances.
+// Format: "thundersnap-{pid}" (e.g., "thundersnap-1234").
+var parentCgroupName = fmt.Sprintf("thundersnap-%d", os.Getpid())
 
 // getSystemMemoryBytes returns the total system memory in bytes.
 func getSystemMemoryBytes() (uint64, error) {
@@ -1260,7 +1261,8 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	}
 
 	// Build cgroup name for this container (used for OOM group killing)
-	cgroupName := fmt.Sprintf("thundersnap/%s/%s", safeTailscaleUser, safeSSHUser)
+	// Uses parentCgroupName which includes daemon PID to avoid conflicts with other instances
+	cgroupName := fmt.Sprintf("%s/%s/%s", parentCgroupName, safeTailscaleUser, safeSSHUser)
 
 	if isPty {
 		// For PTY sessions, we allocate the PTY from outside the namespace by
@@ -1473,8 +1475,8 @@ func runSFTPSession(s ssh.Session, rootFS, targetUser string) error {
 
 	// Configure resource limits: OOM priority, memory soft limit, fork bomb
 	// protection (pids.max), and CPU fairness.
-	// Derive cgroup name from rootFS path (e.g., /fs/user/container -> thundersnap/user/container)
-	cgroupName := "thundersnap/" + filepath.Base(filepath.Dir(rootFS)) + "/" + filepath.Base(rootFS)
+	// Derive cgroup name from rootFS path (e.g., /fs/user/container -> thundersnap-1234/user/container)
+	cgroupName := parentCgroupName + "/" + filepath.Base(filepath.Dir(rootFS)) + "/" + filepath.Base(rootFS)
 	configureContainerResources(cmd.Process.Pid, cgroupName)
 
 	// Copy stdin from SSH session to sftp-server
