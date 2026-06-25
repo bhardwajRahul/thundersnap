@@ -1103,6 +1103,19 @@ func setupContainerCgroup(pid int, cgroupName string) {
 		return
 	}
 
+	// Enable subtree_control on all intermediate directories between parent and leaf.
+	// In cgroup v2, each intermediate directory must have controllers enabled for
+	// children to use them. The cgroupName is like "thundersnap-123/user/container",
+	// so we need to enable controllers on "thundersnap-123/user" as well.
+	parts := strings.Split(cgroupName, "/")
+	for i := 1; i < len(parts); i++ {
+		intermediateDir := filepath.Join("/sys/fs/cgroup", filepath.Join(parts[:i]...))
+		subtreeControl := filepath.Join(intermediateDir, "cgroup.subtree_control")
+		// Ignore errors - the parent's initParentCgroup already set the top level,
+		// and some systems may not support all controllers
+		os.WriteFile(subtreeControl, []byte("+memory +pids +cpu"), 0644)
+	}
+
 	// Set memory.high (soft limit) - kernel reclaims aggressively above this
 	totalMem, err := getSystemMemoryBytes()
 	if err == nil {
