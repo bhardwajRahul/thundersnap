@@ -917,3 +917,54 @@ func TestSelectTargetUserEnsuresUserInPasswd(t *testing.T) {
 		}
 	})
 }
+
+// TestPrepareContainerRootFS tests that prepareContainerRootFS correctly sets up
+// a container's root filesystem. This is the shared helper used by both
+// container sessions (SSH) and SFTP sessions (SCP).
+func TestPrepareContainerRootFS(t *testing.T) {
+	fsDir, snapsDir, libexecDir, cleanup := setupTestEnv(t)
+	defer cleanup()
+	setFlagsForTest(fsDir, snapsDir, libexecDir)
+	defer resetFlagsForTest()
+
+	tailscaleUser := "test@example.com"
+	sshUser := "testcontainer"
+	rootFS := filepath.Join(fsDir, tailscaleUser, sshUser)
+	baseUserFS := filepath.Join(fsDir, tailscaleUser, "test")
+
+	// Call prepareContainerRootFS (the shared setup function)
+	if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
+		t.Fatalf("prepareContainerRootFS: %v", err)
+	}
+
+	// Verify the rootfs was created
+	if _, err := os.Stat(rootFS); err != nil {
+		t.Fatalf("rootFS not created: %v", err)
+	}
+
+	// Verify /proc mount point exists
+	procDir := filepath.Join(rootFS, "proc")
+	info, err := os.Stat(procDir)
+	if err != nil {
+		t.Errorf("/proc directory not created: %v", err)
+	} else if !info.IsDir() {
+		t.Errorf("/proc should be a directory")
+	}
+
+	// Verify ts binary was copied
+	tsBinary := filepath.Join(rootFS, "bin", "ts")
+	info, err = os.Stat(tsBinary)
+	if err != nil {
+		t.Errorf("ts binary not copied: %v", err)
+	} else {
+		// Verify it's executable
+		if info.Mode()&0111 == 0 {
+			t.Errorf("ts binary should be executable, mode=%o", info.Mode())
+		}
+	}
+
+	// Call prepareContainerRootFS again to verify it's idempotent
+	if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
+		t.Errorf("prepareContainerRootFS should be idempotent: %v", err)
+	}
+}
