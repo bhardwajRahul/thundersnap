@@ -80,6 +80,12 @@ var (
 	// Set after tsnet.Server.Up() completes. Protected by globalTsnetHostnameMu.
 	globalTsnetHostname   string
 	globalTsnetHostnameMu sync.RWMutex
+
+	// fsDirLibexec is the path to $fs-dir/libexec/ where binaries are cached
+	// for btrfs reflink copying into frames. This is on the same filesystem
+	// as frames, allowing reflinks to work even when the original libexec-dir
+	// is on a different filesystem.
+	fsDirLibexec string
 )
 
 // vmSessionManager tracks running VM sessions and allows multiple clients to share them.
@@ -280,6 +286,7 @@ func main() {
 	}
 
 	// Set default vm-dir and libexec-dir relative to executable
+	// (must be done before setupFsDirLibexec)
 	exe, err := os.Executable()
 	if err != nil {
 		log.Fatalf("Failed to get executable path: %v", err)
@@ -289,6 +296,14 @@ func main() {
 	}
 	if *flagLibexecDir == "" {
 		*flagLibexecDir = filepath.Dir(exe)
+	}
+
+	// Set up fs-dir/libexec directory with copies of binaries.
+	// This ensures binaries are on the same btrfs filesystem as frames,
+	// allowing reflink copies to work even when the original libexec-dir
+	// is on a different filesystem.
+	if err := setupFsDirLibexec(); err != nil {
+		log.Fatalf("Failed to set up fs-dir libexec: %v", err)
 	}
 
 	// Set up state directory
@@ -2079,16 +2094,77 @@ func copyVshdBinary(rootFS string) error {
 	return copyBinaryToRootFS(rootFS, "vshd", "sbin/vshd")
 }
 
-// copyBinaryToRootFS copies a binary from the libexec directory into the rootfs.
+// setupFsDirLibexec creates $fs-dir/libexec/ and copies binaries there.
+// This ensures binaries are on the same btrfs filesystem as frames, allowing
+// reflink copies to work even when the original libexec-dir is on a different
+// filesystem (e.g., /usr/libexec/thundersnap on ext4, fs-dir on btrfs).
+func setupFsDirLibexec() error {
+	fsDirLibexec = filepath.Join(*flagFsDir, "libexec")
+	if err := os.MkdirAll(fsDirLibexec, 0755); err != nil {
+		return fmt.Errorf("create %s: %w", fsDirLibexec, err)
+	}
+
+	// List of binaries to copy
+	binaries := []string{"ts", "vshd"}
+
+	for _, name := range binaries {
+		src := filepath.Join(*flagLibexecDir, name)
+		dst := filepath.Join(fsDirLibexec, name)
+
+		// Check if source exists
+		srcInfo, err := os.Stat(src)
+		if err != nil {
+			return fmt.Errorf("%s binary not found at %s: %w", name, src, err)
+		}
+
+		// Check if destination exists and is up to date
+		if dstInfo, err := os.Stat(dst); err == nil {
+			// Destination exists - check if it's the same size and not older
+			if dstInfo.Size() == srcInfo.Size() && !dstInfo.ModTime().Before(srcInfo.ModTime()) {
+				log.Printf("libexec/%s is up to date", name)
+				continue
+			}
+		}
+
+		// Remove existing destination
+		os.Remove(dst)
+
+		// Try btrfs reflink first
+		cmd := exec.Command("cp", "--reflink=always", src, dst)
+		if _, err := cmd.CombinedOutput(); err != nil {
+			// Reflink failed (cross-device), fall back to regular copy
+			log.Printf("Reflink copy of %s failed (expected if cross-device), using regular copy: %v", name, err)
+			cmd = exec.Command("cp", src, dst)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("failed to copy %s to %s: %w\noutput: %s", src, dst, err, string(output))
+			}
+		}
+
+		// Make it executable
+		if err := os.Chmod(dst, 0755); err != nil {
+			return fmt.Errorf("chmod %s: %w", dst, err)
+		}
+
+		log.Printf("Copied %s to %s", name, dst)
+	}
+
+	return nil
+}
+
+// copyBinaryToRootFS copies a binary from the fs-dir libexec directory into the rootfs.
+// It uses btrfs reflink (COW copy) which requires source and destination to be on the
+// same btrfs filesystem. The source is $fs-dir/libexec/<binary>, which was populated
+// by setupFsDirLibexec() at startup.
 func copyBinaryToRootFS(rootFS, binaryName, destPath string) error {
-	src := filepath.Join(*flagLibexecDir, binaryName)
+	// Use the fs-dir libexec directory as source (same filesystem as rootFS)
+	src := filepath.Join(fsDirLibexec, binaryName)
 
 	// Destination in rootfs
 	dst := filepath.Join(rootFS, destPath)
 
 	// Check if source exists
 	if _, err := os.Stat(src); err != nil {
-		return fmt.Errorf("%s binary not found at %s: %w", binaryName, src, err)
+		return fmt.Errorf("%s binary not found at %s (run setupFsDirLibexec first): %w", binaryName, src, err)
 	}
 
 	// Ensure destination directory exists
@@ -2100,6 +2176,7 @@ func copyBinaryToRootFS(rootFS, binaryName, destPath string) error {
 	os.Remove(dst)
 
 	// Use cp --reflink=always for btrfs COW copy
+	// This should now always work since source and destination are on the same btrfs
 	cmd := exec.Command("cp", "--reflink=always", src, dst)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("cp --reflink=always failed: %w\noutput: %s", err, string(output))
