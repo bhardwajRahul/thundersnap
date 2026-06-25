@@ -14,6 +14,7 @@ import (
 func main() {
 	vmDir := flag.String("vm-dir", "", "Directory containing cloud-hypervisor and vmlinux (required)")
 	rootFS := flag.String("root", "", "Path to root filesystem (required)")
+	hostname := flag.String("hostname", "", "Hostname to set inside the VM (optional)")
 	flag.Parse()
 
 	if *vmDir == "" {
@@ -29,8 +30,9 @@ func main() {
 
 	// Start the VM
 	session, err := thundersnap.StartVM(thundersnap.VMConfig{
-		RootFS: *rootFS,
-		VMDir:  *vmDir,
+		RootFS:   *rootFS,
+		VMDir:    *vmDir,
+		Hostname: *hostname,
 	})
 	if err != nil {
 		log.Fatalf("Failed to start VM: %v", err)

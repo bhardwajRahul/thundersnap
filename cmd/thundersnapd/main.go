@@ -36,6 +36,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
@@ -74,6 +75,11 @@ var (
 	// Used for commands like --force-reauth that need to communicate with
 	// the running daemon.
 	controlSocket = "/run/thundersnap/control.sock"
+
+	// globalTsnetHostname stores the tsnet hostname (FQDN) for use by VM sessions.
+	// Set after tsnet.Server.Up() completes. Protected by globalTsnetHostnameMu.
+	globalTsnetHostname   string
+	globalTsnetHostnameMu sync.RWMutex
 )
 
 // vmSessionManager tracks running VM sessions and allows multiple clients to share them.
@@ -129,6 +135,13 @@ func getActiveFrameCount(framePath string) int {
 	return activeFrames.count[framePath]
 }
 
+// getTsnetHostname returns the current tsnet hostname (FQDN).
+func getTsnetHostname() string {
+	globalTsnetHostnameMu.RLock()
+	defer globalTsnetHostnameMu.RUnlock()
+	return globalTsnetHostname
+}
+
 // getOrCreateVM returns an existing VM session or creates a new one.
 // The caller must call releaseVM when done.
 func (m *vmSessionManager) getOrCreateVM(tailscaleUser, vmUser, rootFS, vmDir string, controlHandler http.Handler) (*managedVMSession, error) {
@@ -159,6 +172,7 @@ func (m *vmSessionManager) getOrCreateVM(tailscaleUser, vmUser, rootFS, vmDir st
 		RootFS:         rootFS,
 		VMDir:          vmDir,
 		ControlHandler: controlHandler,
+		Hostname:       getTsnetHostname(),
 	})
 	if err != nil {
 		return nil, err
@@ -320,6 +334,14 @@ func main() {
 	os.Remove(authURLFile)
 	log.Printf("tsnet server is up! Tailscale IP: %v", status.TailscaleIPs)
 
+	// Store the tsnet hostname (FQDN) globally for VM sessions
+	if status.Self != nil && status.Self.DNSName != "" {
+		globalTsnetHostnameMu.Lock()
+		globalTsnetHostname = strings.TrimSuffix(status.Self.DNSName, ".")
+		globalTsnetHostnameMu.Unlock()
+		log.Printf("tsnet hostname: %s", globalTsnetHostname)
+	}
+
 	// Listen on port 22 for SSH connections
 	ln, err := srv.Listen("tcp", ":22")
 	if err != nil {
@@ -339,6 +361,18 @@ func main() {
 	lc, err := srv.LocalClient()
 	if err != nil {
 		log.Fatalf("Failed to get LocalClient: %v", err)
+	}
+
+	// Ensure the hostname is set with the control server.
+	// When the node already has state, tsnet.Server.Hostname only affects the initial
+	// registration. We need to call EditPrefs to update the hostname for existing nodes.
+	if _, err := lc.EditPrefs(context.Background(), &ipn.MaskedPrefs{
+		Prefs:       ipn.Prefs{Hostname: *hostname},
+		HostnameSet: true,
+	}); err != nil {
+		log.Printf("Warning: failed to set hostname via EditPrefs: %v", err)
+	} else {
+		log.Printf("Hostname set to %q via EditPrefs", *hostname)
 	}
 
 	// Write status file with current server info

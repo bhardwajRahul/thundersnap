@@ -27,6 +27,9 @@ type VMConfig struct {
 	// ControlHandler is the HTTP handler for serving the control socket protocol
 	// over vsock. If nil, no vsock control socket is set up.
 	ControlHandler http.Handler
+	// Hostname is the hostname to set inside the VM via kernel IP autoconfig.
+	// If empty, defaults to "thundersnap".
+	Hostname string
 }
 
 // VsockPort is the vsock port used for the thunder control socket.
@@ -149,7 +152,11 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	//
 	// panic=1 tells the kernel to reboot 1 second after a panic. Since there's
 	// no bootable device, cloud-hypervisor will exit when the VM reboots.
-	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
+	hostname := cfg.Hostname
+	if hostname == "" {
+		hostname = "thundersnap"
+	}
+	cmdline := fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`, hostname)
 
 	// Create pipe for event monitor - cloud-hypervisor writes events, we read them
 	eventReadPipe, eventWritePipe, err := os.Pipe()

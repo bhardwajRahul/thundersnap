@@ -270,7 +270,14 @@ func prepareVMFrame(t *testing.T, env *testEnv, name string) string {
 // Uses kernel IP autoconfiguration (ip=) instead of manual ip commands because
 // the test container doesn't have the ip binary. This matches thundersnap/vm.go.
 func standardVMCmdline() string {
-	return `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
+	return vmCmdlineWithHostname("thundersnap")
+}
+
+// vmCmdlineWithHostname returns a kernel command line with the specified hostname.
+// The hostname is passed via the kernel IP autoconfig ip= parameter:
+// ip=<client-ip>::<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>
+func vmCmdlineWithHostname(hostname string) string {
+	return fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`, hostname)
 }
 
 // TestVMLaunchSuccess tests that a VM launches successfully with sufficient memory.
@@ -483,6 +490,48 @@ func TestVMNetworkingPasst(t *testing.T) {
 	}
 
 	t.Log("VM networking via passt is configured")
+}
+
+// TestVMHostname tests that the hostname is correctly set via kernel IP autoconfig.
+func TestVMHostname(t *testing.T) {
+	env := newTestEnv(t)
+	vmDir := requireVMDeps(t)
+
+	framePath := prepareVMFrame(t, env, "vm-hostname")
+
+	// Use a custom hostname that's clearly different from the default
+	testHostname := "test-custom-hostname"
+	session, err := startVM(t, env, framePath, vmDir, 512, vmCmdlineWithHostname(testHostname))
+	if err != nil {
+		t.Fatalf("Failed to start VM: %v", err)
+	}
+	defer session.cleanup()
+
+	_, err = session.waitForVshd(10 * time.Second)
+	if err != nil {
+		t.Fatalf("VM did not become ready: %v", err)
+	}
+
+	// Check the hostname using /proc/sys/kernel/hostname (always available)
+	output, err := runVshCommand(session.vsockSock, "root", "/bin/sh", "-c",
+		"while read line; do echo $line; done < /proc/sys/kernel/hostname")
+	if err != nil {
+		t.Fatalf("Failed to read hostname: %v", err)
+	}
+
+	hostname := strings.TrimSpace(output)
+	if hostname != testHostname {
+		t.Errorf("Expected hostname %q, got %q", testHostname, hostname)
+	} else {
+		t.Logf("Hostname correctly set to %q", hostname)
+	}
+
+	// Also verify the hostname appears in /proc/cmdline ip= parameter
+	cmdline, err := runVshCommand(session.vsockSock, "root", "/bin/sh", "-c",
+		"while read line; do echo $line; done < /proc/cmdline")
+	if err == nil && strings.Contains(cmdline, testHostname) {
+		t.Logf("Hostname %q found in kernel cmdline ip= parameter", testHostname)
+	}
 }
 
 // TestVMProcessIsolation tests that the VM is properly isolated from the host.
