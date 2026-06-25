@@ -52,7 +52,7 @@ func init() {
 
 var (
 	flagFsDir        *string
-	flagSnapshotsDir *string
+	flagSnapsDir *string
 	flagVmDir        *string
 	flagLibexecDir   *string
 	flagPolicyPath   *string
@@ -238,12 +238,12 @@ func main() {
 	hostname := getopt.StringLong("hostname", 0, "thundersnap", "Tailscale hostname for this server")
 	stateDir := getopt.StringLong("state-dir", 0, "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
 	flagFsDir = getopt.StringLong("fs-dir", 0, "", "Directory to store per-user live filesystems (required)")
-	flagSnapshotsDir = getopt.StringLong("snapshots-dir", 0, "", "Directory to store base snapshots for cloning (required)")
+	flagSnapsDir = getopt.StringLong("snaps-dir", 0, "", "Directory to store base snapshots for cloning (required)")
 	flagVmDir = getopt.StringLong("vm-dir", 0, "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
 	flagLibexecDir = getopt.StringLong("libexec-dir", 0, "", "Directory containing helper binaries like ts and vshd (default: <exe-dir>)")
 	flagPolicyPath = getopt.StringLong("policy", 0, "", "Path to policy file (required)")
 	flagMesh = getopt.BoolLong("mesh", 0, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
-	flagNfsd = getopt.BoolLong("nfsd", 0, "Enable NFSv4 server to export -snapshots-dir")
+	flagNfsd = getopt.BoolLong("nfsd", 0, "Enable NFSv4 server to export -snaps-dir")
 	flagNfsPort = getopt.IntLong("nfs-port", 0, 2049, "Port for NFSv4 server")
 	getopt.Parse()
 
@@ -265,8 +265,8 @@ func main() {
 	if *flagFsDir == "" {
 		log.Fatalf("-fs-dir is required")
 	}
-	if *flagSnapshotsDir == "" {
-		log.Fatalf("-snapshots-dir is required")
+	if *flagSnapsDir == "" {
+		log.Fatalf("-snaps-dir is required")
 	}
 	if *flagPolicyPath == "" {
 		log.Fatalf("-policy is required")
@@ -281,7 +281,7 @@ func main() {
 	log.Printf("Loaded policy with %d grants", len(globalPolicy.Grants))
 
 	// Verify both directories are on btrfs and on the same filesystem
-	if err := checkBtrfsFilesystems(*flagFsDir, *flagSnapshotsDir); err != nil {
+	if err := checkBtrfsFilesystems(*flagFsDir, *flagSnapsDir); err != nil {
 		fatalWithStatus("%v", err)
 	}
 
@@ -561,8 +561,8 @@ func main() {
 	// Web UI showing connected hosts
 	httpMux.HandleFunc("/", meshState.handleIndex)
 
-	// File server for bupdate (serves -snapshots-dir contents)
-	bupdateServer := &bupdateFileServer{root: *flagSnapshotsDir}
+	// File server for bupdate (serves -snaps-dir contents)
+	bupdateServer := &bupdateFileServer{root: *flagSnapsDir}
 	httpMux.Handle("/bupdate/", http.StripPrefix("/bupdate", bupdateServer))
 
 	httpServer := &http.Server{Handler: httpMux}
@@ -604,7 +604,7 @@ func main() {
 		}
 		defer nfsLn.Close()
 
-		nfsSrv, err := startNFSServer(*flagSnapshotsDir, nfsLn)
+		nfsSrv, err := startNFSServer(*flagSnapsDir, nfsLn)
 		if err != nil {
 			log.Fatalf("Failed to start NFS server: %v", err)
 		}
@@ -1781,8 +1781,8 @@ func prepareContainerRootFS(rootFS, baseUserFS string) error {
 }
 
 // ensureRootFS ensures the root filesystem exists at the given path.
-// If it doesn't exist, it first creates an intermediate snapshot in snapshots-dir,
-// then clones from that to the destination. This ensures snapshots-dir contains
+// If it doesn't exist, it first creates an intermediate snapshot in snaps-dir,
+// then clones from that to the destination. This ensures snaps-dir contains
 // stable reference points while fs-dir contains the live, changing filesystems.
 //
 // If a frame.jsonc file exists at rootFS+".jsonc", the frame model is used:
@@ -1791,8 +1791,8 @@ func prepareContainerRootFS(rootFS, baseUserFS string) error {
 // - Taints are computed as the union of all component snaps' taints
 //
 // The snapshotting flow (legacy single-component):
-// 1. Determine source: baseUserFS (if exists) or $snapshots-dir/1
-// 2. Create intermediate snapshot in $snapshots-dir with random hex ID
+// 1. Determine source: baseUserFS (if exists) or $snaps-dir/1
+// 2. Create intermediate snapshot in $snaps-dir with random hex ID
 // 3. Clone from intermediate snapshot to rootFS in $fs-dir
 // 4. Create .stamp files tracking the base snapshot ID
 func ensureRootFS(rootFS, baseUserFS string) error {
@@ -1824,8 +1824,8 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 	// Determine which source to clone from and what stamp ID to use:
 	// 1. If baseUserFS exists and is different from rootFS, use it
 	//    (inherit the stamp from the source's .stamp file)
-	// 2. Otherwise fall back to $snapshots-dir/1 (stamp ID = "1")
-	defaultSnapshot := filepath.Join(*flagSnapshotsDir, "1")
+	// 2. Otherwise fall back to $snaps-dir/1 (stamp ID = "1")
+	defaultSnapshot := filepath.Join(*flagSnapsDir, "1")
 	snapshotSource := defaultSnapshot
 	baseStampID := "1" // default base is "1"
 
@@ -1847,14 +1847,14 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		return fmt.Errorf("snapshot source %s: %w", snapshotSource, err)
 	}
 
-	// Step 1: Create intermediate snapshot in snapshots-dir with fidx
+	// Step 1: Create intermediate snapshot in snaps-dir with fidx
 	// (no progress reporting for ensureRootFS - happens at SSH login time)
 	// The snapshot ID is based on the TSM SHA-256, so duplicates are detected.
 	intermediateID, err := createSnapshotWithFidx(snapshotSource, baseStampID, nil, false)
 	if err != nil {
 		return fmt.Errorf("create intermediate snapshot from %s: %w", snapshotSource, err)
 	}
-	intermediatePath := filepath.Join(*flagSnapshotsDir, intermediateID)
+	intermediatePath := filepath.Join(*flagSnapsDir, intermediateID)
 
 	// Step 2: Clone from intermediate snapshot to rootFS
 	cmd := exec.Command("btrfs", "subvolume", "snapshot", intermediatePath, rootFS)
@@ -1866,7 +1866,7 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 
 	// Write stamp file for the live filesystem
 	// For fs-dir snapshots, the stamp contains the intermediate snapshot ID
-	// (which is the basename of the snapshot in snapshots-dir)
+	// (which is the basename of the snapshot in snaps-dir)
 	if err := writeStampFile(rootFS, intermediateID); err != nil {
 		log.Printf("Warning: failed to write stamp file for %s: %v", rootFS, err)
 	}
@@ -1876,7 +1876,7 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 	// shared UID, all non-root groups in /etc/group to the shared GID, and
 	// every file owned by a non-root UID/GID is chowned to match. This
 	// runs once per fresh fs-dir clone, never against the read-only
-	// snapshots-dir subvolumes. See strip-all-uids-design.md.
+	// snaps-dir subvolumes. See strip-all-uids-design.md.
 	stripOpts := tsm.StripOptions{ChownFiles: true}
 	if err := tsm.StripRootfs(rootFS, stripOpts); err != nil {
 		log.Printf("Warning: strip-uids on %s: %v", rootFS, err)
@@ -1908,7 +1908,7 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 	}
 
 	// Step 1: Clone rootfs component from snapshot
-	rootfsSnapPath := filepath.Join(*flagSnapshotsDir, meta.Rootfs)
+	rootfsSnapPath := filepath.Join(*flagSnapsDir, meta.Rootfs)
 	if _, err := os.Stat(rootfsSnapPath); err != nil {
 		return fmt.Errorf("rootfs snap %s: %w", meta.Rootfs, err)
 	}
@@ -1931,7 +1931,7 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 
 	if meta.Home != "" {
 		// Clone from home snap
-		homeSnapPath := filepath.Join(*flagSnapshotsDir, meta.Home)
+		homeSnapPath := filepath.Join(*flagSnapsDir, meta.Home)
 		if _, err := os.Stat(homeSnapPath); err != nil {
 			return fmt.Errorf("home snap %s: %w", meta.Home, err)
 		}
@@ -1966,7 +1966,7 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 
 	if meta.Work != "" {
 		// Clone from work snap
-		workSnapPath := filepath.Join(*flagSnapshotsDir, meta.Work)
+		workSnapPath := filepath.Join(*flagSnapsDir, meta.Work)
 		if _, err := os.Stat(workSnapPath); err != nil {
 			return fmt.Errorf("work snap %s: %w", meta.Work, err)
 		}
@@ -1991,9 +1991,9 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 	}
 
 	// Step 4: Compute taints as union of all component snaps' taints
-	rootfsTaints := getSnapTaints(*flagSnapshotsDir, meta.Rootfs)
-	homeTaints := getSnapTaints(*flagSnapshotsDir, meta.Home)
-	workTaints := getSnapTaints(*flagSnapshotsDir, meta.Work)
+	rootfsTaints := getSnapTaints(*flagSnapsDir, meta.Rootfs)
+	homeTaints := getSnapTaints(*flagSnapsDir, meta.Home)
+	workTaints := getSnapTaints(*flagSnapsDir, meta.Work)
 	meta.Taints = UnionTaints(rootfsTaints, homeTaints, workTaints)
 
 	// Step 5: Write frame.jsonc with updated taints
@@ -2810,7 +2810,7 @@ func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check that the snapshot exists
-	snapPath := filepath.Join(*flagSnapshotsDir, req.SnapshotID)
+	snapPath := filepath.Join(*flagSnapsDir, req.SnapshotID)
 	if _, err := os.Stat(snapPath); os.IsNotExist(err) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
@@ -2822,14 +2822,14 @@ func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Read the snap's metadata to get its parent
-	snapMeta, _ := readSnapMeta(*flagSnapshotsDir, req.SnapshotID)
+	snapMeta, _ := readSnapMeta(*flagSnapsDir, req.SnapshotID)
 	var deletedParent string
 	if snapMeta != nil {
 		deletedParent = snapMeta.Parent
 	}
 
 	// Find all snaps that have this snap as their parent and update them
-	if err := relinkSnapChildren(*flagSnapshotsDir, req.SnapshotID, deletedParent); err != nil {
+	if err := relinkSnapChildren(*flagSnapsDir, req.SnapshotID, deletedParent); err != nil {
 		log.Printf("Warning: failed to relink children of %s: %v", req.SnapshotID, err)
 	}
 
@@ -2862,8 +2862,8 @@ func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
 
 // relinkSnapChildren finds all snaps that have oldParent as their parent
 // and updates them to point to newParent instead.
-func relinkSnapChildren(snapshotsDir, oldParent, newParent string) error {
-	entries, err := os.ReadDir(snapshotsDir)
+func relinkSnapChildren(snapsDir, oldParent, newParent string) error {
+	entries, err := os.ReadDir(snapsDir)
 	if err != nil {
 		return fmt.Errorf("read snapshots dir: %w", err)
 	}
@@ -2878,14 +2878,14 @@ func relinkSnapChildren(snapshotsDir, oldParent, newParent string) error {
 			continue // Skip the snap being deleted
 		}
 
-		meta, err := readSnapMeta(snapshotsDir, snapID)
+		meta, err := readSnapMeta(snapsDir, snapID)
 		if err != nil || meta == nil {
 			continue
 		}
 
 		if meta.Parent == oldParent {
 			meta.Parent = newParent
-			if err := writeSnapMeta(snapshotsDir, snapID, meta); err != nil {
+			if err := writeSnapMeta(snapsDir, snapID, meta); err != nil {
 				log.Printf("Warning: failed to update parent for snap %s: %v", snapID, err)
 			} else {
 				log.Printf("Relinked snap %s: parent changed from %s to %s", snapID, oldParent, newParent)
@@ -3042,7 +3042,7 @@ func handleListSnaps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, err := os.ReadDir(*flagSnapshotsDir)
+	entries, err := os.ReadDir(*flagSnapsDir)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -3062,7 +3062,7 @@ func handleListSnaps(w http.ResponseWriter, r *http.Request) {
 		snapID := strings.TrimSuffix(entry.Name(), ".tsm")
 
 		// Read TSM to get size from header
-		tsmPath := filepath.Join(*flagSnapshotsDir, entry.Name())
+		tsmPath := filepath.Join(*flagSnapsDir, entry.Name())
 		tsmReader, err := tsm.ReadTSM(tsmPath)
 		if err != nil {
 			// If we can't read the TSM, skip this snap
@@ -3287,7 +3287,7 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if isFrameSpec(req.SnapshotID) {
 		rootfsSnap, _, _ = parseFrameSpec(req.SnapshotID)
 	}
-	snapshotPath := filepath.Join(*flagSnapshotsDir, rootfsSnap)
+	snapshotPath := filepath.Join(*flagSnapsDir, rootfsSnap)
 	if _, err := os.Stat(snapshotPath); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
@@ -3346,7 +3346,7 @@ func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, framePath s
 	if isFrameSpec(req.SnapshotID) {
 		rootfsSnap, _, _ = parseFrameSpec(req.SnapshotID)
 	}
-	snapshotPath := filepath.Join(*flagSnapshotsDir, rootfsSnap)
+	snapshotPath := filepath.Join(*flagSnapsDir, rootfsSnap)
 	if _, err := os.Stat(snapshotPath); err != nil {
 		// Snapshot doesn't exist - try to download it
 		pw.writeProgress(fmt.Sprintf("Snapshot %s not found locally, downloading from mesh peers...", rootfsSnap))
@@ -3459,7 +3459,7 @@ func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) er
 	}
 
 	// Legacy single-snapshot mode
-	snapshotPath := filepath.Join(*flagSnapshotsDir, rootfsSnap)
+	snapshotPath := filepath.Join(*flagSnapsDir, rootfsSnap)
 
 	// Ensure the parent directory exists
 	parentDir := filepath.Dir(framePath)
@@ -3755,7 +3755,7 @@ func (pw *downloadProgressWriter) Write(p []byte) (n int, err error) {
 // doDownloadSnap performs the actual download operation using TSM/TSC format.
 func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*tsm.DownloadResult, error) {
 	// Check if snapshot already exists
-	snapshotPath := filepath.Join(*flagSnapshotsDir, snapshotID)
+	snapshotPath := filepath.Join(*flagSnapsDir, snapshotID)
 	if _, err := os.Stat(snapshotPath); err == nil {
 		return &tsm.DownloadResult{
 			SnapshotPath:  snapshotPath,
@@ -3806,7 +3806,7 @@ func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*t
 	// Download using TSM/TSC format
 	opts := tsm.DownloadOptions{
 		SnapshotID:     snapshotID,
-		SnapshotsDir:   *flagSnapshotsDir,
+		SnapsDir:       *flagSnapsDir,
 		BaseURL:        baseURL,
 		ProgressWriter: progressWriter,
 
@@ -3869,7 +3869,7 @@ func findLocalAncestor(stampID string) string {
 
 	currentID := stampID
 	for i := 0; i < maxDepth && currentID != "" && currentID != "1"; i++ {
-		snapPath := filepath.Join(*flagSnapshotsDir, currentID)
+		snapPath := filepath.Join(*flagSnapsDir, currentID)
 
 		// Check if this snapshot exists locally and is a btrfs subvolume
 		if _, err := os.Stat(snapPath); err == nil {
@@ -3884,7 +3884,7 @@ func findLocalAncestor(stampID string) string {
 	}
 
 	// Also check if the base "1" snapshot exists (common ancestor for all)
-	basePath := filepath.Join(*flagSnapshotsDir, "1")
+	basePath := filepath.Join(*flagSnapsDir, "1")
 	if _, err := os.Stat(basePath); err == nil && isSubvolume(basePath) {
 		return basePath
 	}
@@ -3950,7 +3950,7 @@ func prepareDownloadDir(targetDir string, fileList []string, progress io.Writer)
 	return nil
 }
 
-// createSnapshot creates a read-only snapshot of the given rootFS in snapshots-dir.
+// createSnapshot creates a read-only snapshot of the given rootFS in snaps-dir.
 // Returns the snapshot ID (based on the fidx checksum).
 // If progressWriter is non-nil, progress updates are written to it.
 func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string, error) {
@@ -4039,7 +4039,7 @@ func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string
 	return fmt.Sprintf("%s:%s:%s", rootfsID, homeStr, workStr), nil
 }
 
-// createSnapshotWithFidx creates a read-only snapshot in snapshots-dir and generates
+// createSnapshotWithFidx creates a read-only snapshot in snaps-dir and generates
 // fidx and tsm files for it. The snapshot is named after the SHA-256 of its TSM manifest.
 // If a snapshot with the same SHA-256 already exists, it returns the existing ID
 // and discards the new snapshot, performing taint intersection on the metadata.
@@ -4065,7 +4065,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		return "", fmt.Errorf("generating temporary ID: %w", err)
 	}
 
-	tmpPath := filepath.Join(*flagSnapshotsDir, tmpID+".tmp")
+	tmpPath := filepath.Join(*flagSnapsDir, tmpID+".tmp")
 	tmpTSMPath := tmpPath + ".tsm"
 	tmpTSCPath := tmpPath + ".tsc"
 
@@ -4109,14 +4109,14 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 	}
 	snapshotID := hex.EncodeToString(tsmReader.SHA256[:])
 
-	finalPath := filepath.Join(*flagSnapshotsDir, snapshotID)
+	finalPath := filepath.Join(*flagSnapsDir, snapshotID)
 	finalTSMPath := finalPath + ".tsm"
 	finalTSCPath := finalPath + ".tsc"
 
 	// Determine taints for this snapshot
 	if taints == nil {
 		// Inherit from parent if available
-		taints = getSnapTaints(*flagSnapshotsDir, parentStampID)
+		taints = getSnapTaints(*flagSnapsDir, parentStampID)
 	}
 
 	// Step 4: Check if a snapshot with this SHA-256 already exists
@@ -4124,14 +4124,14 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		// Snapshot already exists! Perform taint intersection and discard the new one.
 		log.Printf("Snapshot %s already exists, checking taints", snapshotID)
 
-		existingMeta, _ := readSnapMeta(*flagSnapshotsDir, snapshotID)
+		existingMeta, _ := readSnapMeta(*flagSnapsDir, snapshotID)
 		if existingMeta != nil && len(taints) > 0 {
 			// Taint intersection: if we can produce the same content with fewer taints,
 			// the removed taints are not inherent to the content.
 			intersected := IntersectTaints(existingMeta.Taints, taints)
 			if !taintsEqual(existingMeta.Taints, intersected) {
 				existingMeta.Taints = intersected
-				if err := writeSnapMeta(*flagSnapshotsDir, snapshotID, existingMeta); err != nil {
+				if err := writeSnapMeta(*flagSnapsDir, snapshotID, existingMeta); err != nil {
 					log.Printf("Warning: failed to update snap meta for taint intersection: %v", err)
 				} else {
 					log.Printf("Taint intersection for %s: %v", snapshotID, intersected)
@@ -4164,7 +4164,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		Parent: parentStampID,
 		Taints: taints,
 	}
-	if err := writeSnapMeta(*flagSnapshotsDir, snapshotID, snapMeta); err != nil {
+	if err := writeSnapMeta(*flagSnapsDir, snapshotID, snapMeta); err != nil {
 		log.Printf("Warning: failed to write snap.jsonc for %s: %v", snapshotID, err)
 	}
 
@@ -4485,7 +4485,7 @@ func (m *meshState) pingPeer(ctx context.Context, fqdn string, pingBody []byte, 
 	}
 }
 
-// bupdateFileServer serves files from -snapshots-dir with range request support
+// bupdateFileServer serves files from -snaps-dir with range request support
 type bupdateFileServer struct {
 	root string
 }
@@ -4620,13 +4620,13 @@ const btrfsMagic = 0x9123683E
 
 // checkBtrfsFilesystems verifies that both directories exist, are on btrfs,
 // and are on the same btrfs filesystem (required for subvolume snapshots).
-func checkBtrfsFilesystems(fsDir, snapshotsDir string) error {
+func checkBtrfsFilesystems(fsDir, snapsDir string) error {
 	// Ensure both directories exist
 	if err := os.MkdirAll(fsDir, 0755); err != nil {
 		return fmt.Errorf("creating fs-dir %s: %w", fsDir, err)
 	}
-	if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
-		return fmt.Errorf("creating snapshots-dir %s: %w", snapshotsDir, err)
+	if err := os.MkdirAll(snapsDir, 0755); err != nil {
+		return fmt.Errorf("creating snaps-dir %s: %w", snapsDir, err)
 	}
 
 	// Check that fs-dir is on btrfs
@@ -4638,13 +4638,13 @@ func checkBtrfsFilesystems(fsDir, snapshotsDir string) error {
 		return fmt.Errorf("-fs-dir %s is not on a btrfs filesystem (type=0x%x, need btrfs=0x%x)", fsDir, fsDirStatfs.Type, btrfsMagic)
 	}
 
-	// Check that snapshots-dir is on btrfs
-	var snapshotsDirStatfs syscall.Statfs_t
-	if err := syscall.Statfs(snapshotsDir, &snapshotsDirStatfs); err != nil {
-		return fmt.Errorf("statfs on snapshots-dir %s: %w", snapshotsDir, err)
+	// Check that snaps-dir is on btrfs
+	var snapsDirStatfs syscall.Statfs_t
+	if err := syscall.Statfs(snapsDir, &snapsDirStatfs); err != nil {
+		return fmt.Errorf("statfs on snaps-dir %s: %w", snapsDir, err)
 	}
-	if snapshotsDirStatfs.Type != btrfsMagic {
-		return fmt.Errorf("-snapshots-dir %s is not on a btrfs filesystem (type=0x%x, need btrfs=0x%x)", snapshotsDir, snapshotsDirStatfs.Type, btrfsMagic)
+	if snapsDirStatfs.Type != btrfsMagic {
+		return fmt.Errorf("-snaps-dir %s is not on a btrfs filesystem (type=0x%x, need btrfs=0x%x)", snapsDir, snapsDirStatfs.Type, btrfsMagic)
 	}
 
 	// Check that both are on the same filesystem by comparing device IDs
@@ -4653,13 +4653,13 @@ func checkBtrfsFilesystems(fsDir, snapshotsDir string) error {
 		return fmt.Errorf("stat on fs-dir %s: %w", fsDir, err)
 	}
 
-	var snapshotsDirStat syscall.Stat_t
-	if err := syscall.Stat(snapshotsDir, &snapshotsDirStat); err != nil {
-		return fmt.Errorf("stat on snapshots-dir %s: %w", snapshotsDir, err)
+	var snapsDirStat syscall.Stat_t
+	if err := syscall.Stat(snapsDir, &snapsDirStat); err != nil {
+		return fmt.Errorf("stat on snaps-dir %s: %w", snapsDir, err)
 	}
 
-	if fsDirStat.Dev != snapshotsDirStat.Dev {
-		return fmt.Errorf("-fs-dir and -snapshots-dir must be on the same btrfs filesystem for subvolume snapshots; fs-dir device=%d, snapshots-dir device=%d", fsDirStat.Dev, snapshotsDirStat.Dev)
+	if fsDirStat.Dev != snapsDirStat.Dev {
+		return fmt.Errorf("-fs-dir and -snaps-dir must be on the same btrfs filesystem for subvolume snapshots; fs-dir device=%d, snaps-dir device=%d", fsDirStat.Dev, snapsDirStat.Dev)
 	}
 
 	return nil

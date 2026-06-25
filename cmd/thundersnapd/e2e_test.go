@@ -11,7 +11,7 @@ package main
 //   2. ensureRootFS clones it into fs-dir/<user>/<frame>, runs the
 //      strip-uids pass, and writes a .stamp file.
 //   3. createSnapshot from the live frame produces .tsm and .tsc
-//      files in snapshots-dir alongside .fidx/.fidx.fidx/.stamp.
+//      files in snaps-dir alongside .fidx/.fidx.fidx/.stamp.
 //   4. createFrameFromSnapshot from that newly-created snapshot
 //      produces a usable frame with a /bin/ts binary.
 //   5. The ts binary inside the frame is executable.
@@ -121,7 +121,7 @@ func btrfsDelete(path string) {
 	exec.Command("btrfs", "subvolume", "delete", path).Run()
 }
 
-// setupTestEnv prepares fs-dir, snapshots-dir, and a base "1" subvolume.
+// setupTestEnv prepares fs-dir, snaps-dir, and a base "1" subvolume.
 // Returns (fsDir, snapshotsDir, libexecDir, cleanup).
 func setupTestEnv(t *testing.T) (string, string, string, func()) {
 	t.Helper()
@@ -189,7 +189,7 @@ func setFlagsForTest(fsDir, snapsDir, libexecDir string) {
 	snapsCopy := snapsDir
 	libexecCopy := libexecDir
 	flagFsDir = &fsCopy
-	flagSnapshotsDir = &snapsCopy
+	flagSnapsDir = &snapsCopy
 	flagLibexecDir = &libexecCopy
 	// flagMesh / flagNfsd may be nil; ensure they're non-nil so any code
 	// that dereferences them doesn't panic.
@@ -211,7 +211,7 @@ func setFlagsForTest(fsDir, snapsDir, libexecDir string) {
 func resetFlagsForTest() {
 	fs := flag.NewFlagSet("reset", flag.ContinueOnError)
 	flagFsDir = fs.String("fs-dir", "", "")
-	flagSnapshotsDir = fs.String("snapshots-dir", "", "")
+	flagSnapsDir = fs.String("snaps-dir", "", "")
 	flagLibexecDir = fs.String("libexec-dir", "", "")
 	f := false
 	flagMesh = &f
@@ -265,7 +265,7 @@ func TestE2ESnapshotCloneStripUIDs(t *testing.T) {
 	}
 
 	// Step 2: At least one intermediate snapshot should exist now in
-	// snapshots-dir, plus its .fidx, .stamp, .tsm, .tsc files.
+	// snaps-dir, plus its .fidx, .stamp, .tsm, .tsc files.
 	entries, err := os.ReadDir(snapsDir)
 	if err != nil {
 		t.Fatal(err)
@@ -285,7 +285,7 @@ func TestE2ESnapshotCloneStripUIDs(t *testing.T) {
 		for _, e := range entries {
 			names = append(names, e.Name())
 		}
-		t.Fatalf("no intermediate snapshot found in snapshots-dir; entries=%v", names)
+		t.Fatalf("no intermediate snapshot found in snaps-dir; entries=%v", names)
 	}
 	for _, ext := range []string{".fidx", ".fidx.fidx", ".stamp", ".tsm", ".tsc"} {
 		p := filepath.Join(snapsDir, snapID+ext)
@@ -386,10 +386,10 @@ func TestDownloadTargetDirCreation(t *testing.T) {
 		requireBtrfsRoot(t, tmpSnapsDir)
 		os.MkdirAll(tmpSnapsDir, 0755)
 
-		// Point flagSnapshotsDir to our empty dir temporarily
-		oldSnapsDir := *flagSnapshotsDir
-		*flagSnapshotsDir = tmpSnapsDir
-		defer func() { *flagSnapshotsDir = oldSnapsDir }()
+		// Point flagSnapsDir to our empty dir temporarily
+		oldSnapsDir := *flagSnapsDir
+		*flagSnapsDir = tmpSnapsDir
+		defer func() { *flagSnapsDir = oldSnapsDir }()
 
 		target := filepath.Join(tmpSnapsDir, "truly-fresh")
 		defer btrfsDelete(target)
@@ -650,7 +650,7 @@ func TestListSnapsAndFrames(t *testing.T) {
 		}
 
 		// Directly test the handler by calling the underlying logic
-		// (handleListSnaps uses flagSnapshotsDir which we've set)
+		// (handleListSnaps uses flagSnapsDir which we've set)
 		tsmFiles, err := os.ReadDir(snapsDir)
 		if err != nil {
 			t.Fatal(err)

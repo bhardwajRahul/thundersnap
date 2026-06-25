@@ -16,8 +16,8 @@ import (
 type DownloadOptions struct {
 	// SnapshotID is the ID of the snapshot to download
 	SnapshotID string
-	// SnapshotsDir is the directory where snapshots are stored
-	SnapshotsDir string
+	// SnapsDir is the directory where snapshots are stored
+	SnapsDir string
 	// BaseURL is the base URL of the peer's HTTP server (e.g., "http://host:7575")
 	BaseURL string
 	// ProgressWriter receives progress updates (can be nil)
@@ -60,7 +60,7 @@ type DownloadResult struct {
 // 3. Download .tsc file (chunk index)
 // 4. For each file, fetch chunks via HTTP range requests (with local dedup)
 func Download(opts DownloadOptions) (*DownloadResult, error) {
-	snapshotPath := filepath.Join(opts.SnapshotsDir, opts.SnapshotID)
+	snapshotPath := filepath.Join(opts.SnapsDir, opts.SnapshotID)
 
 	// Check if snapshot already exists
 	if _, err := os.Stat(snapshotPath); err == nil {
@@ -168,7 +168,7 @@ func Download(opts DownloadOptions) (*DownloadResult, error) {
 	}
 
 	// Step 6: Load local chunk map for deduplication
-	localChunks, err := LoadLocalChunkMap(opts.SnapshotsDir)
+	localChunks, err := LoadLocalChunkMap(opts.SnapsDir)
 	if err != nil {
 		// Non-fatal: just won't deduplicate
 		localChunks = &ChunkMap{}

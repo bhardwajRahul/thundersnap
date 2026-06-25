@@ -91,22 +91,22 @@ Packages include two binaries:
 ### Setting Up a Base Snapshot
 
 Thundersnap needs at least one base filesystem snapshot named `1` in
-`--snapshots-dir` before it can create workspaces. This should be an
+`--snaps-dir` before it can create workspaces. This should be an
 extracted Linux root filesystem (a full directory tree with `/bin`,
 `/etc`, `/usr`, etc.).
 
 The easiest way to get one is to export a Docker/OCI container image:
 
 ```sh
-# Create the snapshots directory on your btrfs filesystem
-sudo btrfs subvolume create /var/lib/thundersnap/snapshots/1
+# Create the snaps directory on your btrfs filesystem
+sudo btrfs subvolume create /var/lib/thundersnap/snaps/1
 
 # Export an Ubuntu image (or Debian, Alpine, etc.)
 docker export $(docker create ubuntu:24.04) | \
-  sudo tar -xf - -C /var/lib/thundersnap/snapshots/1
+  sudo tar -xf - -C /var/lib/thundersnap/snaps/1
 
 # Or use debootstrap directly:
-sudo debootstrap noble /var/lib/thundersnap/snapshots/1
+sudo debootstrap noble /var/lib/thundersnap/snaps/1
 ```
 
 Good sources for base images:
@@ -120,12 +120,12 @@ Good sources for base images:
 
 ```sh
 # Create the required btrfs directories
-sudo mkdir -p /var/lib/thundersnap/fs /var/lib/thundersnap/snapshots
+sudo mkdir -p /var/lib/thundersnap/fs /var/lib/thundersnap/snaps
 
 # Run directly:
 sudo thundersnapd \
   --fs-dir=/var/lib/thundersnap/fs \
-  --snapshots-dir=/var/lib/thundersnap/snapshots
+  --snaps-dir=/var/lib/thundersnap/snaps
 
 # Or install the .deb and use systemd:
 sudo dpkg -i dist/thundersnap_*_amd64.deb
@@ -157,7 +157,7 @@ ts download-snap <snapshot-id>       # download a snapshot from the mesh
 Enable mesh discovery to share snapshots across multiple thundersnap nodes:
 
 ```sh
-thundersnapd --mesh --fs-dir=... --snapshots-dir=...
+thundersnapd --mesh --fs-dir=... --snaps-dir=...
 ```
 
 Mesh nodes discover each other via Tailscale and can transfer snapshots
@@ -176,7 +176,7 @@ using content-defined chunking — only changed chunks are transferred.
 │  drop-caps)  │  passt)      │   chunking)               │
 ├──────────────┴──────────────┴───────────────────────────┤
 │                    btrfs filesystem                      │
-│  snapshots-dir/          fs-dir/<tailscale-user>/<name>/ │
+│  snaps-dir/          fs-dir/<tailscale-user>/<name>/ │
 │    1/  (base)              (live workspaces)             │
 │    <snap-hash>/                                         │
 └─────────────────────────────────────────────────────────┘
@@ -202,7 +202,7 @@ This is early-stage software. Notable gaps:
   in, creates snapshots, and verifies the full flow.
 
 - **No garbage collection of old snapshots.** Snapshots accumulate in
-  `snapshots-dir` indefinitely. There is no policy for expiring old or
+  `snaps-dir` indefinitely. There is no policy for expiring old or
   unreferenced snapshots — you'll need to clean them up manually.
 
 - **No RAM/resource isolation between containers.** All containers share

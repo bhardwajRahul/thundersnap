@@ -210,7 +210,7 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 	}
 
 	// Create a temporary directory for extraction
-	tmpDir, err := os.MkdirTemp(*flagSnapshotsDir, "docker-extract-")
+	tmpDir, err := os.MkdirTemp(*flagSnapsDir, "docker-extract-")
 	if err != nil {
 		return "", false, fmt.Errorf("create temp dir: %w", err)
 	}
@@ -221,7 +221,7 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 	if err != nil {
 		return "", false, fmt.Errorf("generate temp ID: %w", err)
 	}
-	extractPath := filepath.Join(*flagSnapshotsDir, tmpID+".extract")
+	extractPath := filepath.Join(*flagSnapsDir, tmpID+".extract")
 
 	cmd := exec.Command("btrfs", "subvolume", "create", extractPath)
 	output, err := cmd.CombinedOutput()
@@ -271,7 +271,7 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 	}
 
 	// Add source metadata to the snap
-	snapMeta, _ := readSnapMeta(*flagSnapshotsDir, snapshotID)
+	snapMeta, _ := readSnapMeta(*flagSnapsDir, snapshotID)
 	if snapMeta == nil {
 		snapMeta = &SnapMeta{}
 	}
@@ -279,7 +279,7 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 		Type: "docker",
 		Ref:  canonicalRef,
 	}
-	if err := writeSnapMeta(*flagSnapshotsDir, snapshotID, snapMeta); err != nil {
+	if err := writeSnapMeta(*flagSnapsDir, snapshotID, snapMeta); err != nil {
 		log.Printf("Warning: failed to write snap meta with source: %v", err)
 	}
 
@@ -292,7 +292,7 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 
 // findSnapByDockerSource finds a snap with the given docker source ref.
 func findSnapByDockerSource(ref string) string {
-	entries, err := os.ReadDir(*flagSnapshotsDir)
+	entries, err := os.ReadDir(*flagSnapsDir)
 	if err != nil {
 		return ""
 	}
@@ -302,7 +302,7 @@ func findSnapByDockerSource(ref string) string {
 			continue
 		}
 		snapID := strings.TrimSuffix(entry.Name(), ".jsonc")
-		meta, err := readSnapMeta(*flagSnapshotsDir, snapID)
+		meta, err := readSnapMeta(*flagSnapsDir, snapID)
 		if err != nil || meta == nil {
 			continue
 		}

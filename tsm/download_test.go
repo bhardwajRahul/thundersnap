@@ -148,7 +148,7 @@ func TestDownloadIntegration(t *testing.T) {
 
 	result, err := Download(DownloadOptions{
 		SnapshotID:   snapName,
-		SnapshotsDir: localDir,
+		SnapsDir: localDir,
 		BaseURL:      server.URL,
 	})
 	if err != nil {
@@ -214,7 +214,7 @@ func TestDownloadAlreadyExists(t *testing.T) {
 
 	result, err := Download(DownloadOptions{
 		SnapshotID:   snapName,
-		SnapshotsDir: tmpDir,
+		SnapsDir: tmpDir,
 		BaseURL:      "http://localhost:9999", // Won't be used
 	})
 	if err != nil {
