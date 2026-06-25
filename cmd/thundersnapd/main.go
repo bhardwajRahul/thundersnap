@@ -67,9 +67,13 @@ var (
 	// while waiting for Tailscale login. The --activate client reads it.
 	authURLFile = "/run/thundersnap/auth-url"
 
-	// statusFile is the path where the server writes its current status
-	// after successful authentication. The --status client reads it.
-	statusFile = "/run/thundersnap/status"
+	// statusFiles are the paths where the server writes its current status.
+	// We write to both locations: /run for humans, /var/lib for --status client
+	// (since /run/thundersnap/ is wiped by systemd when the service exits).
+	statusFiles = []string{
+		"/run/thundersnap/status",
+		"/var/lib/thundersnap/status",
+	}
 
 	// controlSocket is the path for the local admin control socket.
 	// Used for commands like --force-reauth that need to communicate with
@@ -664,23 +668,36 @@ func runActivate() {
 
 // runStatus implements the --status client mode.
 // It reads and prints the status file written by the running server.
+// Reads from the persistent location (/var/lib) since /run is wiped on exit.
 func runStatus() {
-	data, err := os.ReadFile(statusFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "No status file found at %s.\nThe server may not be running or not yet authenticated.\n", statusFile)
-			os.Exit(1)
+	// Try each status file location, preferring the persistent one
+	var data []byte
+	var lastErr error
+	var lastPath string
+	for _, path := range statusFiles {
+		var err error
+		data, err = os.ReadFile(path)
+		if err == nil {
+			fmt.Print(string(data))
+			return
 		}
-		var errno syscall.Errno
-		if errors.As(err, &errno) {
-			fmt.Fprintf(os.Stderr, "%s: %s\n", statusFile, errno)
-		} else {
-			fmt.Fprintf(os.Stderr, "%s: %v\n", statusFile, err)
-		}
-		fmt.Fprintf(os.Stderr, "Try running as root.\n")
+		lastErr = err
+		lastPath = path
+	}
+
+	// All locations failed
+	if os.IsNotExist(lastErr) {
+		fmt.Fprintf(os.Stderr, "No status file found.\nThe server may not be running or not yet authenticated.\n")
 		os.Exit(1)
 	}
-	fmt.Print(string(data))
+	var errno syscall.Errno
+	if errors.As(lastErr, &errno) {
+		fmt.Fprintf(os.Stderr, "%s: %s\n", lastPath, errno)
+	} else {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", lastPath, lastErr)
+	}
+	fmt.Fprintf(os.Stderr, "Try running as root.\n")
+	os.Exit(1)
 }
 
 // runForceReauth implements the --force-reauth client mode.
@@ -717,14 +734,23 @@ func runForceReauth() {
 	}
 }
 
-// writeStatusFile writes the current server status to the status file.
-func writeStatusFile(status *ipnstate.Status) {
-	// Ensure the directory exists
-	if err := os.MkdirAll(filepath.Dir(statusFile), 0755); err != nil {
-		log.Printf("Warning: failed to create status file directory: %v", err)
-		return
+// writeStatusToAllFiles writes content to all status file locations.
+// We write to both /run (for humans) and /var/lib (for --status client,
+// since /run/thundersnap/ is wiped by systemd when the service exits).
+func writeStatusToAllFiles(content string) {
+	for _, path := range statusFiles {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			log.Printf("Warning: failed to create status file directory %s: %v", filepath.Dir(path), err)
+			continue
+		}
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			log.Printf("Warning: failed to write status file %s: %v", path, err)
+		}
 	}
+}
 
+// writeStatusFile writes the current server status to all status files.
+func writeStatusFile(status *ipnstate.Status) {
 	// Determine the logged-in identity (user login or tags)
 	login := "unknown"
 	if status.Self != nil {
@@ -760,41 +786,20 @@ func writeStatusFile(status *ipnstate.Status) {
 	buf.WriteString(fmt.Sprintf("login: %s\n", login))
 	buf.WriteString(fmt.Sprintf("tailscale-ips: %s\n", strings.Join(ips, " ")))
 
-	if err := os.WriteFile(statusFile, []byte(buf.String()), 0644); err != nil {
-		log.Printf("Warning: failed to write status file: %v", err)
-	}
+	writeStatusToAllFiles(buf.String())
 }
 
 // writeStatusWaitingForAuth writes a status file indicating auth is needed.
 func writeStatusWaitingForAuth(authURL string) {
-	// Ensure the directory exists
-	if err := os.MkdirAll(filepath.Dir(statusFile), 0755); err != nil {
-		log.Printf("Warning: failed to create status file directory: %v", err)
-		return
-	}
-
 	var buf strings.Builder
 	buf.WriteString("state: waiting_for_auth\n")
 	buf.WriteString(fmt.Sprintf("auth_url: %s\n", authURL))
-
-	if err := os.WriteFile(statusFile, []byte(buf.String()), 0644); err != nil {
-		log.Printf("Warning: failed to write status file: %v", err)
-	}
+	writeStatusToAllFiles(buf.String())
 }
 
 // writeStatusError writes a fatal error to the status file before exiting.
 func writeStatusError(errMsg string) {
-	// Ensure the directory exists
-	if err := os.MkdirAll(filepath.Dir(statusFile), 0755); err != nil {
-		// Can't even create directory, just log and return
-		log.Printf("Warning: failed to create status file directory: %v", err)
-		return
-	}
-
-	content := fmt.Sprintf("error: %s\n", errMsg)
-	if err := os.WriteFile(statusFile, []byte(content), 0644); err != nil {
-		log.Printf("Warning: failed to write status file: %v", err)
-	}
+	writeStatusToAllFiles(fmt.Sprintf("error: %s\n", errMsg))
 }
 
 // fatalWithStatus logs a fatal error, writes it to the status file, and exits.
