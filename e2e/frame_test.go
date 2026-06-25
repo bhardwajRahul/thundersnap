@@ -357,6 +357,16 @@ func (s *testControlServer) handleCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Validate snapshot_id is not empty
+	if req.SnapshotID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "error",
+			"message": "snapshot_id is required",
+		})
+		return
+	}
+
 	// Parse snapshot spec (rootfs:home:work)
 	rootfs, home, work := parseFrameSpec(req.SnapshotID)
 
@@ -371,8 +381,9 @@ func (s *testControlServer) handleCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Clone rootfs snapshot to frame, or create empty subvolume if rootfs is empty/nil
-	if rootfs == "" || rootfs == "nil" {
+	// Clone rootfs snapshot to frame, or create empty subvolume if rootfs is explicitly "nil"
+	// Note: empty string rootfs (from "::") should error, only explicit "nil" creates blank container
+	if rootfs == "nil" {
 		// Create empty rootfs subvolume with minimal structure
 		cmd := exec.Command("btrfs", "subvolume", "create", framePath)
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -385,6 +396,14 @@ func (s *testControlServer) handleCreate(w http.ResponseWriter, r *http.Request)
 		}
 		// Create minimal directory structure for blank container
 		setupMinimalRootfsForTest(framePath, s.env.tsBinary)
+	} else if rootfs == "" {
+		// Empty rootfs component (e.g., from "::") without explicit "nil" is an error
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "error",
+			"message": "rootfs component is required (use 'nil' for blank container)",
+		})
+		return
 	} else {
 		rootfsPath := filepath.Join(s.env.snapshotsDir, rootfs)
 		cmd := exec.Command("btrfs", "subvolume", "snapshot", rootfsPath, framePath)

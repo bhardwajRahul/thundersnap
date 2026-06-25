@@ -3696,6 +3696,27 @@ func isFrameSpec(spec string) bool {
 	return strings.Contains(spec, ":")
 }
 
+// hasBlankRootfs checks if the frame spec has an empty or "nil" rootfs component.
+// This is used to detect when a blank container is being requested.
+// Returns (isBlank, isExplicitNil) where isExplicitNil means the user wrote "nil".
+func hasBlankRootfs(spec string) (isBlank, isExplicitNil bool) {
+	if !isFrameSpec(spec) {
+		return false, false
+	}
+	parts := strings.Split(spec, ":")
+	if len(parts) == 0 {
+		return false, false
+	}
+	rootfs := parts[0]
+	if rootfs == "nil" {
+		return true, true
+	}
+	if rootfs == "" {
+		return true, false
+	}
+	return false, false
+}
+
 // CreateResponse is the response from /create
 type CreateResponse struct {
 	Status  string `json:"status"`
@@ -3777,15 +3798,32 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if isFrameSpec(req.SnapshotID) {
 		rootfsSnap, _, _ = parseFrameSpec(req.SnapshotID)
 	}
-	snapshotPath := filepath.Join(*flagSnapsDir, rootfsSnap)
-	if _, err := os.Stat(snapshotPath); err != nil {
+
+	// Check if this is a blank container request
+	isBlank, isExplicitNil := hasBlankRootfs(req.SnapshotID)
+	if isBlank && !isExplicitNil {
+		// Empty rootfs component (e.g., from "::") without explicit "nil" is an error
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(CreateResponse{
 			Status:  "error",
-			Message: fmt.Sprintf("snapshot %q not found", rootfsSnap),
+			Message: "rootfs component is required (use 'nil' for blank container)",
 		})
 		return
+	}
+
+	// For blank containers (nil:...), skip snapshot existence check
+	if !isBlank {
+		snapshotPath := filepath.Join(*flagSnapsDir, rootfsSnap)
+		if _, err := os.Stat(snapshotPath); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(CreateResponse{
+				Status:  "error",
+				Message: fmt.Sprintf("snapshot %q not found", rootfsSnap),
+			})
+			return
+		}
 	}
 
 	// Create frame from the snapshot/frame spec
@@ -3836,8 +3874,19 @@ func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, framePath s
 	if isFrameSpec(req.SnapshotID) {
 		rootfsSnap, _, _ = parseFrameSpec(req.SnapshotID)
 	}
-	snapshotPath := filepath.Join(*flagSnapsDir, rootfsSnap)
-	if _, err := os.Stat(snapshotPath); err != nil {
+
+	// Check if this is a blank container request
+	isBlank, isExplicitNil := hasBlankRootfs(req.SnapshotID)
+	if isBlank && !isExplicitNil {
+		// Empty rootfs component (e.g., from "::") without explicit "nil" is an error
+		pw.writeResult("error", "", "rootfs component is required (use 'nil' for blank container)")
+		return
+	}
+
+	// For blank containers (nil:...), skip snapshot existence check
+	if isBlank {
+		// Skip to frame creation below
+	} else if _, err := os.Stat(filepath.Join(*flagSnapsDir, rootfsSnap)); err != nil {
 		// Snapshot doesn't exist - try to download it
 		pw.writeProgress(fmt.Sprintf("Snapshot %s not found locally, downloading from mesh peers...", rootfsSnap))
 
