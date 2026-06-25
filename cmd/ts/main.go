@@ -1442,15 +1442,19 @@ func cmdDropCapsAndRun(args []string) {
 		}
 	}
 
+	// Ensure mount points exist (blank containers may not have them)
+	os.MkdirAll("/proc", 0555)
+	os.MkdirAll("/sys", 0555)
+
 	// Mount /proc filesystem
 	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		// Ignore errors - /proc might already be mounted or not exist
+		// Ignore errors - /proc might already be mounted
 		_ = err
 	}
 
 	// Mount /sys filesystem
 	if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
-		// Ignore errors - /sys might already be mounted or not exist
+		// Ignore errors - /sys might already be mounted
 		_ = err
 	}
 
@@ -1762,9 +1766,12 @@ func setupDev() {
 		}
 	}
 
+	// Ensure /dev exists (blank containers may not have it)
+	os.MkdirAll("/dev", 0755)
+
 	// Mount tmpfs at /dev
 	if err := unix.Mount("tmpfs", "/dev", "tmpfs", unix.MS_NOSUID|unix.MS_STRICTATIME, "mode=755,size=65536k"); err != nil {
-		// /dev might not exist or we might not have permissions
+		// We might not have permissions
 		return
 	}
 
