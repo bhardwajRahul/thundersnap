@@ -235,6 +235,119 @@ func (m *vmSessionManager) releaseVM(tailscaleUser, vmUser string) {
 	}
 }
 
+// vmxSessionManager tracks running VMX isolation VMs.
+// Each VM hosts multiple frames as containers.
+// Keyed by "tailscaleUser/isolationName" (not vmUser like vmSessionManager).
+type vmxSessionManager struct {
+	mu       sync.Mutex
+	sessions map[string]*managedVMXSession
+}
+
+// managedVMXSession represents an outer VM that hosts containers.
+type managedVMXSession struct {
+	session       *thundersnap.VMSession
+	vsockPath     string
+	refCount      int
+	done          chan struct{}
+	panicked      <-chan struct{}
+	vmRootFS      string // the outer VM's minimal rootfs (fs-dir/<user>/.vmx-<isolation>/)
+	tailscaleUser string
+	isolationName string
+}
+
+var vmxSessions = &vmxSessionManager{
+	sessions: make(map[string]*managedVMXSession),
+}
+
+// getOrCreateVMX returns an existing VMX session or creates a new one.
+// The caller must call releaseVMX when done.
+// userFsDir is the path to fs-dir/<user>/ which becomes the virtiofs root.
+// initPrefix is the subdirectory within userFsDir containing the VMX rootfs (e.g., ".vmx-<isolation>").
+func (m *vmxSessionManager) getOrCreateVMX(tailscaleUser, isolationName, userFsDir, initPrefix, vmDir string, controlHandler http.Handler) (*managedVMXSession, error) {
+	key := tailscaleUser + "/" + isolationName
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check if session already exists
+	if ms, ok := m.sessions[key]; ok {
+		// Make sure it's still running
+		select {
+		case <-ms.done:
+			// VM has exited, remove it and create a new one
+			delete(m.sessions, key)
+		default:
+			// VM is still running, increment ref count and update handler
+			ms.refCount++
+			ms.session.SetControlHandler(controlHandler)
+			log.Printf("VMX session %s: reusing existing session (refCount=%d)", key, ms.refCount)
+			return ms, nil
+		}
+	}
+
+	// Create new VMX session
+	// The virtiofs root is fs-dir/<user>/, so:
+	// - VMX rootfs binaries are at /<initPrefix>/bin/ts, /<initPrefix>/sbin/vshd
+	// - Frame rootfs directories are at /<frame>/
+	log.Printf("VMX session %s: starting new VM (userFsDir=%s, initPrefix=%s)", key, userFsDir, initPrefix)
+	session, err := thundersnap.StartVM(thundersnap.VMConfig{
+		RootFS:         userFsDir,
+		VMDir:          vmDir,
+		ControlHandler: controlHandler,
+		Hostname:       getTsnetHostname(),
+		InitPrefix:     initPrefix,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ms := &managedVMXSession{
+		session:       session,
+		vsockPath:     session.VshSocketPath(),
+		refCount:      1,
+		done:          make(chan struct{}),
+		panicked:      session.Panicked(),
+		vmRootFS:      filepath.Join(userFsDir, initPrefix),
+		tailscaleUser: tailscaleUser,
+		isolationName: isolationName,
+	}
+
+	// Monitor VM exit in background
+	go func() {
+		<-session.Done()
+		close(ms.done)
+		m.mu.Lock()
+		delete(m.sessions, key)
+		m.mu.Unlock()
+		log.Printf("VMX session %s: VM exited, removed from manager", key)
+	}()
+
+	m.sessions[key] = ms
+	return ms, nil
+}
+
+// releaseVMX decrements the reference count and shuts down the VM if it reaches zero.
+func (m *vmxSessionManager) releaseVMX(tailscaleUser, isolationName string) {
+	key := tailscaleUser + "/" + isolationName
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ms, ok := m.sessions[key]
+	if !ok {
+		return
+	}
+
+	ms.refCount--
+	log.Printf("VMX session %s: released (refCount=%d)", key, ms.refCount)
+
+	if ms.refCount <= 0 {
+		log.Printf("VMX session %s: no more clients, shutting down VM", key)
+		ms.session.Close()
+		delete(m.sessions, key)
+	}
+}
+
 func main() {
 	activate := getopt.BoolLong("activate", 0, "Print the Tailscale auth URL and wait for login to complete")
 	showStatus := getopt.BoolLong("status", 0, "Print the current server status and exit")
@@ -431,13 +544,29 @@ func main() {
 			}
 
 			// Parse SSH username to extract target user and frame name.
-			// Format: [<user>@]<name> or [<user>@]vm/<name> (legacy)
-			// If user@ prefix is present, use that specific Unix user.
+			// Formats:
+			//   vmx/<isolation>/<frame>  - container inside named VM
+			//   vmx/<isolation>          - shell into outer VM directly
+			//   vm/<frame>               - legacy: dedicated VM per frame
+			//   <frame>                  - container (default)
+			// If user@ prefix is present in frame, use that specific Unix user.
 			// Otherwise, auto-detect from [ubuntu, user] or fall back to root.
 			sshUser := s.User()
+			var vmxIsolation string // non-empty if vmx mode
 
-			// Legacy support: vm/ prefix overrides isolation to "vm"
-			if strings.HasPrefix(sshUser, "vm/") {
+			// Check for vmx/ prefix first (containers inside named VMs)
+			if strings.HasPrefix(sshUser, "vmx/") {
+				cap.Isolation = "vmx"
+				rest := strings.TrimPrefix(sshUser, "vmx/")
+				if slashIdx := strings.Index(rest, "/"); slashIdx >= 0 {
+					vmxIsolation = rest[:slashIdx]
+					sshUser = rest[slashIdx+1:] // frame name (may be empty for outer shell)
+				} else {
+					vmxIsolation = rest
+					sshUser = "" // direct shell into outer VM
+				}
+			} else if strings.HasPrefix(sshUser, "vm/") {
+				// Legacy support: vm/ prefix overrides isolation to "vm"
 				cap.Isolation = "vm"
 				sshUser = strings.TrimPrefix(sshUser, "vm/")
 			}
@@ -455,6 +584,22 @@ func main() {
 
 			// Route based on isolation level
 			switch cap.Isolation {
+			case "vmx":
+				if frameName == "" {
+					// Direct shell into outer VM
+					fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to outer VM <%s>\r\n", tailscaleUser, vmxIsolation)
+					if err := runVMXOuterShell(s, tailscaleUser, vmxIsolation, targetUser, logErr); err != nil {
+						logErr("VMX outer shell failed: %v", err)
+						s.Exit(1)
+					}
+				} else {
+					// Container inside VM
+					fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s> (VMX/%s)\r\n", tailscaleUser, runAsUser, frameName, vmxIsolation)
+					if err := runVMXSession(s, tailscaleUser, vmxIsolation, frameName, targetUser, logErr); err != nil {
+						logErr("VMX session failed: %v", err)
+						s.Exit(1)
+					}
+				}
 			case "vm":
 				fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s> (VM)\r\n", tailscaleUser, runAsUser, frameName)
 				if err := runVMSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
@@ -1740,6 +1885,228 @@ func generateRandomID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// prepareVMXRootFS creates a minimal rootfs for the VMX outer VM.
+// This is a "mini frame" containing only the statically-linked binaries
+// needed to run vshd and spawn containers (ts, vshd).
+func prepareVMXRootFS(vmxRootFS string) error {
+	// Check if already exists
+	if _, err := os.Stat(vmxRootFS); err == nil {
+		// Exists - ensure binaries are up to date
+		if err := copyTsBinary(vmxRootFS); err != nil {
+			return fmt.Errorf("update ts binary: %w", err)
+		}
+		if err := copyVshdBinary(vmxRootFS); err != nil {
+			return fmt.Errorf("update vshd binary: %w", err)
+		}
+		return nil
+	}
+
+	log.Printf("Creating VMX rootfs at %s", vmxRootFS)
+
+	// Create minimal directory structure
+	dirs := []string{
+		"bin", "sbin", "dev", "proc", "sys", "tmp", "etc", "run", "root",
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(filepath.Join(vmxRootFS, dir), 0755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dir, err)
+		}
+	}
+
+	// Set /tmp permissions (sticky bit)
+	if err := os.Chmod(filepath.Join(vmxRootFS, "tmp"), 01777); err != nil {
+		return fmt.Errorf("chmod tmp: %w", err)
+	}
+
+	// Create minimal /etc/passwd with root user
+	passwd := "root:x:0:0:root:/root:/bin/sh\n"
+	if err := os.WriteFile(filepath.Join(vmxRootFS, "etc/passwd"), []byte(passwd), 0644); err != nil {
+		return fmt.Errorf("write passwd: %w", err)
+	}
+
+	// Create minimal /etc/group with root group
+	group := "root:x:0:\n"
+	if err := os.WriteFile(filepath.Join(vmxRootFS, "etc/group"), []byte(group), 0644); err != nil {
+		return fmt.Errorf("write group: %w", err)
+	}
+
+	// Copy statically-linked binaries
+	if err := copyTsBinary(vmxRootFS); err != nil {
+		return fmt.Errorf("copy ts binary: %w", err)
+	}
+	if err := copyVshdBinary(vmxRootFS); err != nil {
+		return fmt.Errorf("copy vshd binary: %w", err)
+	}
+
+	// Symlink /bin/sh -> ts (relative symlink to ts in same directory)
+	shPath := filepath.Join(vmxRootFS, "bin/sh")
+	if err := os.Symlink("ts", shPath); err != nil && !os.IsExist(err) {
+		return fmt.Errorf("symlink sh: %w", err)
+	}
+
+	log.Printf("VMX rootfs created at %s", vmxRootFS)
+	return nil
+}
+
+// runVMXSession handles a VMX session: a container running inside a shared VM.
+// Multiple frames can share the same outer VM (keyed by tailscaleUser/isolationName).
+func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targetUser string, logErr func(string, ...any)) error {
+	safeTailscaleUser := sanitizeForPath(tailscaleUser)
+	safeIsolationName := sanitizeForPath(isolationName)
+	safeFrameName := sanitizeForPath(frameName)
+
+	// The user's fs directory (becomes virtiofs root)
+	userFsDir := filepath.Join(*flagFsDir, safeTailscaleUser)
+
+	// Prepare the frame's rootfs (same as container mode)
+	homeUser := stripDomain(safeTailscaleUser)
+	frameRootFS := filepath.Join(userFsDir, safeFrameName)
+	baseUserFS := filepath.Join(userFsDir, homeUser)
+	if err := prepareContainerRootFS(frameRootFS, baseUserFS); err != nil {
+		return fmt.Errorf("prepare frame rootfs: %w", err)
+	}
+
+	// Prepare the outer VM's minimal rootfs
+	initPrefix := ".vmx-" + safeIsolationName
+	vmxRootFS := filepath.Join(userFsDir, initPrefix)
+	if err := prepareVMXRootFS(vmxRootFS); err != nil {
+		return fmt.Errorf("prepare VMX rootfs: %w", err)
+	}
+
+	// Create control handler for this frame
+	controlMux := makeVMXControlHandler(frameRootFS)
+
+	// Get or create the shared VMX session
+	ms, err := vmxSessions.getOrCreateVMX(safeTailscaleUser, safeIsolationName, userFsDir, initPrefix, *flagVmDir, controlMux)
+	if err != nil {
+		return fmt.Errorf("start VMX: %w", err)
+	}
+	defer vmxSessions.releaseVMX(safeTailscaleUser, safeIsolationName)
+
+	// Connect to vshd in the VM
+	conn, err := connectToVshd(ms.vsockPath, ms.panicked)
+	if err != nil {
+		return fmt.Errorf("connect to vshd: %w", err)
+	}
+	defer conn.Close()
+
+	// Send VMX protocol: VMX\0framePath\0targetUser\0argCount\0args...
+	// framePath is relative to the virtiofs root (which is userFsDir)
+	framePath := safeFrameName
+	cmdArgs := s.Command()
+	fmt.Fprintf(conn, "VMX\x00%s\x00%s\x00%d\x00", framePath, targetUser, len(cmdArgs))
+	for _, arg := range cmdArgs {
+		fmt.Fprintf(conn, "%s\x00", arg)
+	}
+
+	// Proxy SSH I/O (same as runVMSession)
+	return proxyVMSession(s, conn, ms.done, ms.panicked)
+}
+
+// runVMXOuterShell handles a direct shell into the outer VMX VM (no container).
+// This is useful for debugging the VMX environment.
+func runVMXOuterShell(s ssh.Session, tailscaleUser, isolationName, targetUser string, logErr func(string, ...any)) error {
+	safeTailscaleUser := sanitizeForPath(tailscaleUser)
+	safeIsolationName := sanitizeForPath(isolationName)
+
+	// The user's fs directory (becomes virtiofs root)
+	userFsDir := filepath.Join(*flagFsDir, safeTailscaleUser)
+
+	// Prepare the outer VM's minimal rootfs
+	initPrefix := ".vmx-" + safeIsolationName
+	vmxRootFS := filepath.Join(userFsDir, initPrefix)
+	if err := prepareVMXRootFS(vmxRootFS); err != nil {
+		return fmt.Errorf("prepare VMX rootfs: %w", err)
+	}
+
+	// Create control handler (for outer shell, use the vmx rootfs)
+	controlMux := makeVMXControlHandler(vmxRootFS)
+
+	// Get or create the shared VMX session
+	ms, err := vmxSessions.getOrCreateVMX(safeTailscaleUser, safeIsolationName, userFsDir, initPrefix, *flagVmDir, controlMux)
+	if err != nil {
+		return fmt.Errorf("start VMX: %w", err)
+	}
+	defer vmxSessions.releaseVMX(safeTailscaleUser, safeIsolationName)
+
+	// Connect to vshd in the VM
+	conn, err := connectToVshd(ms.vsockPath, ms.panicked)
+	if err != nil {
+		return fmt.Errorf("connect to vshd: %w", err)
+	}
+	defer conn.Close()
+
+	// Send original vshd protocol (no VMX prefix) - shell directly in VM
+	cmdArgs := s.Command()
+	fmt.Fprintf(conn, "%s\x00", targetUser)
+	fmt.Fprintf(conn, "%d\x00", len(cmdArgs))
+	for _, arg := range cmdArgs {
+		fmt.Fprintf(conn, "%s\x00", arg)
+	}
+
+	// Proxy SSH I/O
+	return proxyVMSession(s, conn, ms.done, ms.panicked)
+}
+
+// makeVMXControlHandler creates the HTTP handler for VMX control requests.
+func makeVMXControlHandler(frameRootFS string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", handlePing)
+	mux.HandleFunc("/snap", makeSnapHandler(frameRootFS))
+	return mux
+}
+
+// proxyVMSession proxies SSH I/O to/from a vshd connection.
+// This is shared between runVMSession and runVMX* functions.
+func proxyVMSession(s ssh.Session, conn net.Conn, done <-chan struct{}, panicked <-chan struct{}) error {
+	copyDone := make(chan struct{}, 2)
+
+	// SSH stdin -> vshd
+	go func() {
+		n, err := io.Copy(conn, s)
+		log.Printf("SSH proxy: stdin->vshd finished: %d bytes, err=%v", n, err)
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+		copyDone <- struct{}{}
+	}()
+
+	// vshd -> SSH stdout
+	go func() {
+		n, err := io.Copy(s, conn)
+		log.Printf("SSH proxy: vshd->stdout finished: %d bytes, err=%v", n, err)
+		copyDone <- struct{}{}
+	}()
+
+	// Wait for session end
+	select {
+	case <-copyDone:
+		log.Printf("SSH proxy: vshd connection closed")
+	case <-done:
+		log.Printf("SSH proxy: VM exited")
+	case <-panicked:
+		log.Printf("SSH proxy: VM kernel panic")
+	case <-s.Context().Done():
+		log.Printf("SSH proxy: SSH session closed by client")
+	}
+
+	conn.Close()
+
+	// Wait briefly for goroutines to finish
+	timeout := time.After(100 * time.Millisecond)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-copyDone:
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+
+	s.Exit(0)
+	return nil
 }
 
 // readStampFile reads the snapshot ID from a .stamp file.

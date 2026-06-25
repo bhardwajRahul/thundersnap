@@ -30,6 +30,11 @@ type VMConfig struct {
 	// Hostname is the hostname to set inside the VM via kernel IP autoconfig.
 	// If empty, defaults to "thundersnap".
 	Hostname string
+	// InitPrefix is an optional path prefix where the init binaries are located
+	// within the virtiofs mount. For VMX mode, this might be ".vmx-<isolation>"
+	// so that /bin/ts is at /.vmx-<isolation>/bin/ts in the virtiofs.
+	// If empty, binaries are expected at the root of the virtiofs mount.
+	InitPrefix string
 }
 
 // VsockPort is the vsock port used for the thunder control socket.
@@ -156,7 +161,20 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	if hostname == "" {
 		hostname = "thundersnap"
 	}
-	cmdline := fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`, hostname)
+	// Build paths to binaries, accounting for optional InitPrefix
+	tsBin := "/bin/ts"
+	shBin := "/bin/sh" // shell used after drop-caps-and-run
+	vshdBin := "/sbin/vshd"
+	if cfg.InitPrefix != "" {
+		// VMX mode: all binaries are in /<InitPrefix>/, vshd runs without chroot
+		// (it needs access to /dev/vsock which is at the virtiofs root)
+		tsBin = "/" + cfg.InitPrefix + "/bin/ts"
+		shBin = "/" + cfg.InitPrefix + "/bin/sh"
+		vshdBin = "/" + cfg.InitPrefix + "/sbin/vshd"
+	}
+	// Note: In VMX mode, we don't chroot the init process. vshd runs at the virtiofs
+	// root so it can access /dev/vsock and spawn containers with chroot into frame paths.
+	cmdline := fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=%s -- -c "exec %s drop-caps-and-run %s -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec %s'"`, hostname, shBin, tsBin, shBin, vshdBin)
 
 	// Create pipe for event monitor - cloud-hypervisor writes events, we read them
 	eventReadPipe, eventWritePipe, err := os.Pipe()
