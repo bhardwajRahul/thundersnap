@@ -547,7 +547,7 @@ func main() {
 			// Formats:
 			//   vmx/<isolation>/<frame>  - container inside named VM
 			//   vmx/<isolation>          - shell into outer VM directly
-			//   vm/<frame>               - legacy: dedicated VM per frame
+			//   vm/<frame>               - sugar for vmx/default/<frame>
 			//   <frame>                  - container (default)
 			// If user@ prefix is present in frame, use that specific Unix user.
 			// Otherwise, auto-detect from [ubuntu, user] or fall back to root.
@@ -566,8 +566,10 @@ func main() {
 					sshUser = "" // direct shell into outer VM
 				}
 			} else if strings.HasPrefix(sshUser, "vm/") {
-				// Legacy support: vm/ prefix overrides isolation to "vm"
-				cap.Isolation = "vm"
+				// Legacy support: vm/<frame> becomes vmx/default/<frame>
+				// This gives the same isolation semantics but uses the VMX infrastructure
+				cap.Isolation = "vmx"
+				vmxIsolation = "default"
 				sshUser = strings.TrimPrefix(sshUser, "vm/")
 			}
 
@@ -599,12 +601,6 @@ func main() {
 						logErr("VMX session failed: %v", err)
 						s.Exit(1)
 					}
-				}
-			case "vm":
-				fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s> (VM)\r\n", tailscaleUser, runAsUser, frameName)
-				if err := runVMSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
-					logErr("VM session failed: %v", err)
-					s.Exit(1)
 				}
 			case "none":
 				// Direct session on host (no isolation)
