@@ -1532,8 +1532,34 @@ func cmdDropCapsAndRun(args []string) {
 	// Find the executable in PATH
 	executable, err := findExecutable(cmdArgs[0])
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		// If "su" isn't found, fall back to /bin/sh for root user.
+		// This allows minimal containers without su to still work.
+		// The fallback preserves the same semantics:
+		//   su - root      -> /bin/sh -l
+		//   su root -c CMD -> /bin/sh -c CMD
+		if cmdArgs[0] == "su" {
+			if sh, shErr := findExecutable("/bin/sh"); shErr == nil {
+				// Check if this is "su - root" (login shell) or "su root -c CMD"
+				if len(cmdArgs) >= 3 && cmdArgs[1] == "-" && cmdArgs[2] == "root" {
+					// su - root -> /bin/sh -l
+					executable = sh
+					cmdArgs = []string{"/bin/sh", "-l"}
+				} else if len(cmdArgs) >= 4 && cmdArgs[1] == "root" && cmdArgs[2] == "-c" {
+					// su root -c CMD -> /bin/sh -c CMD
+					executable = sh
+					cmdArgs = append([]string{"/bin/sh", "-c"}, cmdArgs[3:]...)
+				} else {
+					fmt.Fprintf(os.Stderr, "error: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if ptySlavePath != "" {
