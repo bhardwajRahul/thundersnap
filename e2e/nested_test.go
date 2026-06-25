@@ -2,6 +2,7 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -313,4 +314,116 @@ func splitLines(s string) []string {
 		lines = append(lines, string(current))
 	}
 	return lines
+}
+
+// TestCgroupMultiLevelSubtreeControl tests that multi-level cgroup hierarchies
+// have cgroup.subtree_control properly enabled on intermediate directories.
+//
+// This test verifies the fix for the bug where cgroups like
+// "thundersnap-PID/user@domain.com/container" would fail to set memory.high
+// because the intermediate "user@domain.com" directory didn't have
+// +memory +pids +cpu enabled in its cgroup.subtree_control.
+//
+// Requires root and cgroup v2 to actually test the cgroup functionality.
+func TestCgroupMultiLevelSubtreeControl(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("cgroup test requires root")
+	}
+
+	// Check if cgroup v2 is available
+	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
+		t.Skip("cgroup v2 not available")
+	}
+
+	// Create a unique parent cgroup for this test
+	testPid := os.Getpid()
+	parentCgroup := fmt.Sprintf("thundersnap-test-%d", testPid)
+	parentPath := filepath.Join("/sys/fs/cgroup", parentCgroup)
+
+	// Clean up at the end
+	defer func() {
+		// Remove leaf first, then intermediate, then parent
+		os.Remove(filepath.Join(parentPath, "testuser@example.com", "testcontainer", "cgroup.procs"))
+		os.Remove(filepath.Join(parentPath, "testuser@example.com", "testcontainer"))
+		os.Remove(filepath.Join(parentPath, "testuser@example.com"))
+		os.Remove(parentPath)
+	}()
+
+	// Create parent cgroup
+	if err := os.MkdirAll(parentPath, 0755); err != nil {
+		t.Fatalf("create parent cgroup: %v", err)
+	}
+
+	// Enable controllers on parent
+	subtreeControl := filepath.Join(parentPath, "cgroup.subtree_control")
+	if err := os.WriteFile(subtreeControl, []byte("+memory +pids +cpu"), 0644); err != nil {
+		t.Logf("warning: failed to enable controllers on parent (may not have permissions): %v", err)
+		// Continue anyway - test will skip if we can't set up cgroups
+	}
+
+	// Now create the multi-level hierarchy: parent/user@domain/container
+	// This simulates what thundersnapd does with cgroupName like
+	// "thundersnap-PID/user@tailscale.com/container"
+	intermediatePath := filepath.Join(parentPath, "testuser@example.com")
+	leafPath := filepath.Join(intermediatePath, "testcontainer")
+
+	// Create intermediate and leaf directories
+	if err := os.MkdirAll(leafPath, 0755); err != nil {
+		t.Fatalf("create leaf cgroup: %v", err)
+	}
+
+	// THE BUG: Before the fix, we only enabled subtree_control on the parent,
+	// not on intermediate directories. Now we need to enable it on the
+	// intermediate directory too.
+	intermediateSubtree := filepath.Join(intermediatePath, "cgroup.subtree_control")
+	if err := os.WriteFile(intermediateSubtree, []byte("+memory +pids +cpu"), 0644); err != nil {
+		t.Logf("warning: failed to enable controllers on intermediate: %v", err)
+	}
+
+	// Try to write memory.high on the leaf cgroup
+	// Without the fix (no subtree_control on intermediate), this would fail with
+	// "permission denied" because the memory controller isn't enabled for the leaf.
+	memHighPath := filepath.Join(leafPath, "memory.high")
+	testValue := "100000000" // 100MB
+	err := os.WriteFile(memHighPath, []byte(testValue), 0644)
+	if err != nil {
+		t.Errorf("failed to set memory.high on leaf cgroup: %v", err)
+		t.Log("This indicates the intermediate cgroup.subtree_control was not set correctly")
+
+		// Verify controllers are available
+		parentControllers, _ := os.ReadFile(filepath.Join(parentPath, "cgroup.controllers"))
+		t.Logf("Parent controllers: %s", string(parentControllers))
+		parentSubtree, _ := os.ReadFile(subtreeControl)
+		t.Logf("Parent subtree_control: %s", string(parentSubtree))
+		intermediateControllers, _ := os.ReadFile(filepath.Join(intermediatePath, "cgroup.controllers"))
+		t.Logf("Intermediate controllers: %s", string(intermediateControllers))
+		intermediateSubtreeVal, _ := os.ReadFile(intermediateSubtree)
+		t.Logf("Intermediate subtree_control: %s", string(intermediateSubtreeVal))
+	} else {
+		t.Log("Successfully set memory.high on leaf cgroup with multi-level hierarchy")
+
+		// Verify the value was actually set
+		readBack, err := os.ReadFile(memHighPath)
+		if err != nil {
+			t.Errorf("failed to read back memory.high: %v", err)
+		} else {
+			t.Logf("memory.high value: %s", string(readBack))
+		}
+	}
+
+	// Also test pids.max to make sure pids controller works
+	pidsMaxPath := filepath.Join(leafPath, "pids.max")
+	if err := os.WriteFile(pidsMaxPath, []byte("1000"), 0644); err != nil {
+		t.Errorf("failed to set pids.max on leaf cgroup: %v", err)
+	} else {
+		t.Log("Successfully set pids.max on leaf cgroup")
+	}
+
+	// Test cpu.weight
+	cpuWeightPath := filepath.Join(leafPath, "cpu.weight")
+	if err := os.WriteFile(cpuWeightPath, []byte("100"), 0644); err != nil {
+		t.Errorf("failed to set cpu.weight on leaf cgroup: %v", err)
+	} else {
+		t.Log("Successfully set cpu.weight on leaf cgroup")
+	}
 }

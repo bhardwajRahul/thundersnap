@@ -278,9 +278,14 @@ func downloadFiles(opts downloadFilesOpts) error {
 			return fmt.Errorf("downloading %s: %w", entry.Path, err)
 		}
 
-		// Set permissions
-		if err := os.Chmod(tmpPath, os.FileMode(entry.Mode&0777)); err != nil {
+		// Set permissions (include setuid/setgid/sticky bits)
+		if err := os.Chmod(tmpPath, os.FileMode(entry.Mode&0xFFF)); err != nil {
 			// Non-fatal
+		}
+
+		// Set ownership
+		if err := os.Lchown(tmpPath, int(entry.UID), int(entry.GID)); err != nil {
+			// Non-fatal - may need root
 		}
 
 		// Rename to final location
