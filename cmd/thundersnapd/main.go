@@ -276,13 +276,13 @@ func main() {
 	var err error
 	globalPolicy, err = LoadPolicyFile(*flagPolicyPath)
 	if err != nil {
-		log.Fatalf("Failed to load policy file: %v", err)
+		fatalWithStatus("Failed to load policy file: %v", err)
 	}
 	log.Printf("Loaded policy with %d grants", len(globalPolicy.Grants))
 
 	// Verify both directories are on btrfs and on the same filesystem
 	if err := checkBtrfsFilesystems(*flagFsDir, *flagSnapshotsDir); err != nil {
-		log.Fatalf("%v", err)
+		fatalWithStatus("%v", err)
 	}
 
 	// Set default vm-dir and libexec-dir relative to executable
@@ -303,7 +303,7 @@ func main() {
 	// allowing reflink copies to work even when the original libexec-dir
 	// is on a different filesystem.
 	if err := setupFsDirLibexec(); err != nil {
-		log.Fatalf("Failed to set up fs-dir libexec: %v", err)
+		fatalWithStatus("Failed to set up fs-dir libexec: %v", err)
 	}
 
 	// Set up state directory
@@ -328,11 +328,13 @@ func main() {
 			log.Print(msg)
 			// If the log contains an auth URL, write it to a file so
 			// "thundersnapd --activate" can read and display it.
+			// Also write status file to indicate we're waiting for auth.
 			const prefix = "or go to: "
 			if idx := strings.Index(msg, prefix); idx != -1 {
 				url := strings.TrimSpace(msg[idx+len(prefix):])
 				if url != "" {
 					os.WriteFile(authURLFile, []byte(url+"\n"), 0600)
+					writeStatusWaitingForAuth(url)
 				}
 			}
 		},
@@ -343,7 +345,7 @@ func main() {
 	log.Printf("Starting tsnet server with hostname %q...", *hostname)
 	status, err := srv.Up(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to start tsnet server: %v", err)
+		fatalWithStatus("Failed to start tsnet server: %v", err)
 	}
 	// Auth is complete; remove the auth URL file if it was written.
 	os.Remove(authURLFile)
@@ -360,7 +362,7 @@ func main() {
 	// Listen on port 22 for SSH connections
 	ln, err := srv.Listen("tcp", ":22")
 	if err != nil {
-		log.Fatalf("Failed to listen on :22: %v", err)
+		fatalWithStatus("Failed to listen on :22: %v", err)
 	}
 	defer ln.Close()
 
@@ -761,6 +763,45 @@ func writeStatusFile(status *ipnstate.Status) {
 	if err := os.WriteFile(statusFile, []byte(buf.String()), 0644); err != nil {
 		log.Printf("Warning: failed to write status file: %v", err)
 	}
+}
+
+// writeStatusWaitingForAuth writes a status file indicating auth is needed.
+func writeStatusWaitingForAuth(authURL string) {
+	// Ensure the directory exists
+	if err := os.MkdirAll(filepath.Dir(statusFile), 0755); err != nil {
+		log.Printf("Warning: failed to create status file directory: %v", err)
+		return
+	}
+
+	var buf strings.Builder
+	buf.WriteString("state: waiting_for_auth\n")
+	buf.WriteString(fmt.Sprintf("auth_url: %s\n", authURL))
+
+	if err := os.WriteFile(statusFile, []byte(buf.String()), 0644); err != nil {
+		log.Printf("Warning: failed to write status file: %v", err)
+	}
+}
+
+// writeStatusError writes a fatal error to the status file before exiting.
+func writeStatusError(errMsg string) {
+	// Ensure the directory exists
+	if err := os.MkdirAll(filepath.Dir(statusFile), 0755); err != nil {
+		// Can't even create directory, just log and return
+		log.Printf("Warning: failed to create status file directory: %v", err)
+		return
+	}
+
+	content := fmt.Sprintf("error: %s\n", errMsg)
+	if err := os.WriteFile(statusFile, []byte(content), 0644); err != nil {
+		log.Printf("Warning: failed to write status file: %v", err)
+	}
+}
+
+// fatalWithStatus logs a fatal error, writes it to the status file, and exits.
+func fatalWithStatus(format string, a ...any) {
+	msg := fmt.Sprintf(format, a...)
+	writeStatusError(msg)
+	log.Fatalf(format, a...)
 }
 
 // startAdminControlSocket starts a Unix socket for local admin commands.
