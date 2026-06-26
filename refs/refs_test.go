@@ -302,3 +302,168 @@ func TestExists(t *testing.T) {
 		t.Error("Exists after create = false")
 	}
 }
+
+// TestMoveToSameUUID verifies that moving a ref to the same UUID it already
+// points to still adds a reflog entry (idempotent but tracked).
+func TestMoveToSameUUID(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+
+	uuid := frameid.MustNew()
+
+	if err := store.Create("test-ref", uuid); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	ref, _ := store.Get("test-ref")
+	if len(ref.Reflog) != 1 {
+		t.Fatalf("Initial reflog length = %d, want 1", len(ref.Reflog))
+	}
+
+	// Move to the same UUID.
+	if err := store.Move("test-ref", uuid); err != nil {
+		t.Fatalf("Move to same UUID: %v", err)
+	}
+
+	ref, _ = store.Get("test-ref")
+
+	// Should still be pointing at same UUID.
+	if ref.UUID != uuid {
+		t.Errorf("UUID after same-UUID move = %v, want %v", ref.UUID, uuid)
+	}
+
+	// Reflog should have 2 entries now (tracking the operation).
+	if len(ref.Reflog) != 2 {
+		t.Errorf("Reflog length after same-UUID move = %d, want 2", len(ref.Reflog))
+	}
+
+	// Both entries should have the same UUID.
+	if ref.Reflog[0].UUID != uuid || ref.Reflog[1].UUID != uuid {
+		t.Errorf("Reflog entries should both have UUID %v", uuid)
+	}
+}
+
+// TestPathTraversalInRefName verifies that path traversal attempts are rejected.
+func TestPathTraversalInRefName(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+
+	uuid := frameid.MustNew()
+
+	// These should all be rejected.
+	badNames := []string{
+		"../escape",
+		"foo/../bar",
+		"foo/bar",
+		"..",
+		"foo..bar", // consecutive dots
+	}
+
+	for _, name := range badNames {
+		if err := store.Create(name, uuid); err == nil {
+			t.Errorf("Create(%q) should fail for path traversal", name)
+		}
+	}
+}
+
+// TestConcurrentMoves tests that concurrent move operations don't corrupt state.
+func TestConcurrentMoves(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+
+	uuid1 := frameid.MustNew()
+	uuid2 := frameid.MustNew()
+
+	if err := store.Create("test-ref", uuid1); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Perform many moves sequentially (can't truly race file I/O safely).
+	for i := 0; i < 20; i++ {
+		target := uuid1
+		if i%2 == 1 {
+			target = uuid2
+		}
+		if err := store.Move("test-ref", target); err != nil {
+			t.Fatalf("Move %d: %v", i, err)
+		}
+	}
+
+	ref, err := store.Get("test-ref")
+	if err != nil {
+		t.Fatalf("Get after moves: %v", err)
+	}
+
+	// Should have 21 reflog entries: 1 initial + 20 moves.
+	if len(ref.Reflog) != 21 {
+		t.Errorf("Reflog length = %d, want 21", len(ref.Reflog))
+	}
+
+	// Verify reflog is in correct order (newest first).
+	// The most recent move was i=19 (odd), so should be uuid2.
+	if ref.UUID != uuid2 {
+		t.Errorf("Final UUID = %v, want %v", ref.UUID, uuid2)
+	}
+	if ref.Reflog[0].UUID != uuid2 {
+		t.Errorf("Reflog[0].UUID = %v, want %v", ref.Reflog[0].UUID, uuid2)
+	}
+}
+
+// TestAutorunWithEmptySlice verifies that empty slice clears autorun like nil.
+func TestAutorunWithEmptySlice(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+
+	uuid := frameid.MustNew()
+
+	if err := store.Create("test-ref", uuid); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Set autorun.
+	if err := store.SetAutorun("test-ref", []string{"/bin/sh", "-c", "echo hello"}); err != nil {
+		t.Fatalf("SetAutorun: %v", err)
+	}
+
+	ref, _ := store.Get("test-ref")
+	if len(ref.Autorun) != 3 {
+		t.Fatalf("Autorun length = %d, want 3", len(ref.Autorun))
+	}
+
+	// Clear with empty slice (not nil).
+	if err := store.SetAutorun("test-ref", []string{}); err != nil {
+		t.Fatalf("SetAutorun empty: %v", err)
+	}
+
+	ref, _ = store.Get("test-ref")
+	if len(ref.Autorun) != 0 {
+		t.Errorf("Autorun after empty clear = %v, want empty", ref.Autorun)
+	}
+}
+
+// TestMaxRefNameLength verifies the 128 character limit.
+func TestMaxRefNameLength(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+
+	uuid := frameid.MustNew()
+
+	// 128 chars should be OK.
+	longName := "a"
+	for len(longName) < 128 {
+		longName += "a"
+	}
+	if len(longName) != 128 {
+		t.Fatalf("Setup error: longName length = %d", len(longName))
+	}
+
+	if err := store.Create(longName, uuid); err != nil {
+		t.Errorf("Create 128-char name: %v", err)
+	}
+
+	// 129 chars should fail.
+	tooLong := longName + "a"
+	if err := store.Create(tooLong, uuid); err == nil {
+		t.Error("Create 129-char name should fail")
+	}
+}
