@@ -394,6 +394,12 @@ func main() {
 		log.Fatalf("Failed to create state directory: %v", err)
 	}
 
+	// Initialize ref and frame stores for the new UUID-based API.
+	// These use the fs-dir as the state directory since that's where
+	// frames and refs are stored.
+	initRefStore(*flagFsDir)
+	initFrameStore(*flagFsDir)
+
 	// Create tsnet server
 	srv := &tsnet.Server{
 		Hostname: *hostname,
@@ -2806,6 +2812,14 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux.HandleFunc("/download-snap", handleDownloadSnap)
 	mux.HandleFunc("/who-has", handleWhoHas)
 	mux.HandleFunc("/ts/servers.json", handleServersJSONControl)
+	// Ref and frame UUID-based API handlers
+	mux.HandleFunc("/ref/create", handleRefCreate)
+	mux.HandleFunc("/ref/move", handleRefMove)
+	mux.HandleFunc("/ref/delete", handleRefDelete)
+	mux.HandleFunc("/refs", handleListRefs)
+	mux.HandleFunc("/reflog", handleReflog)
+	mux.HandleFunc("/log", handleLog)
+	mux.HandleFunc("/autorun", handleAutorun)
 	cs.handler = mux
 
 	go cs.serve()
