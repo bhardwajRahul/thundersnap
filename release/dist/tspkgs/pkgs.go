@@ -198,7 +198,7 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 	}
 
 	arch := debArch(t.arch())
-	contents, err := files.PrepareForPackager(files.Contents{
+	fileContents := files.Contents{
 		&files.Content{
 			Type:        files.TypeFile,
 			Source:      ts,
@@ -234,7 +234,23 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 			Source:      filepath.Join(thundersnapdDir, "policy.jsonc"),
 			Destination: "/etc/thundersnap/policy.jsonc",
 		},
-	}, 0, "deb", false, b.Time)
+	}
+	// VM files are only available for amd64 currently.
+	if t.arch() == "amd64" {
+		fileContents = append(fileContents,
+			&files.Content{
+				Type:        files.TypeFile,
+				Source:      filepath.Join(b.Repo, "vm/cloud-hypervisor"),
+				Destination: "/usr/libexec/thundersnap/cloud-hypervisor",
+			},
+			&files.Content{
+				Type:        files.TypeFile,
+				Source:      filepath.Join(b.Repo, "vm/vmlinux"),
+				Destination: "/usr/libexec/thundersnap/vmlinux",
+			},
+		)
+	}
+	contents, err := files.PrepareForPackager(fileContents, 0, "deb", false, b.Time)
 	if err != nil {
 		return nil, err
 	}
@@ -251,6 +267,7 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 		Priority:    "extra",
 		Overridables: nfpm.Overridables{
 			Contents: contents,
+			Depends:  []string{"virtiofsd", "util-linux"},
 			Scripts: nfpm.Scripts{
 				PostInstall: filepath.Join(b.Repo, "release/deb/debian.postinst.sh"),
 				PreRemove:   filepath.Join(b.Repo, "release/deb/debian.prerm.sh"),
@@ -319,7 +336,7 @@ func (t *rpmTarget) Build(b *Build) ([]string, error) {
 	}
 
 	arch := rpmArch(t.arch())
-	contents, err := files.PrepareForPackager(files.Contents{
+	fileContents := files.Contents{
 		&files.Content{
 			Type:        files.TypeFile,
 			Source:      ts,
@@ -359,7 +376,23 @@ func (t *rpmTarget) Build(b *Build) ([]string, error) {
 			Type:        files.TypeDir,
 			Destination: "/var/cache/thundersnap",
 		},
-	}, 0, "rpm", false, b.Time)
+	}
+	// VM files are only available for amd64 currently.
+	if t.arch() == "amd64" {
+		fileContents = append(fileContents,
+			&files.Content{
+				Type:        files.TypeFile,
+				Source:      filepath.Join(b.Repo, "vm/cloud-hypervisor"),
+				Destination: "/usr/libexec/thundersnap/cloud-hypervisor",
+			},
+			&files.Content{
+				Type:        files.TypeFile,
+				Source:      filepath.Join(b.Repo, "vm/vmlinux"),
+				Destination: "/usr/libexec/thundersnap/vmlinux",
+			},
+		)
+	}
+	contents, err := files.PrepareForPackager(fileContents, 0, "rpm", false, b.Time)
 	if err != nil {
 		return nil, err
 	}
@@ -374,6 +407,7 @@ func (t *rpmTarget) Build(b *Build) ([]string, error) {
 		License:     "BSD-3-Clause",
 		Overridables: nfpm.Overridables{
 			Contents: contents,
+			Depends:  []string{"virtiofsd", "util-linux"},
 			Scripts: nfpm.Scripts{
 				PostInstall: filepath.Join(b.Repo, "release/rpm/rpm.postinst.sh"),
 				PreRemove:   filepath.Join(b.Repo, "release/rpm/rpm.prerm.sh"),
