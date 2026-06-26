@@ -1712,8 +1712,12 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		}
 
 		// Now open the container's ptmx via /proc/<pid>/root - this lets us
-		// see the container's mount namespace including the devpts mount
-		ptmx, slavePath, err := openContainerPTY(cmd.Process.Pid)
+		// see the container's mount namespace including the devpts mount.
+		// IMPORTANT: We use initPid (the container-init process) not cmd.Process.Pid
+		// because nsenter forks (we don't use -F), so cmd.Process.Pid is the parent
+		// nsenter process which hasn't chrooted. The container-init has the proper
+		// rootfs and devpts setup.
+		ptmx, slavePath, err := openContainerPTY(initPid)
 		if err != nil {
 			cmd.Process.Kill()
 			cmd.Wait()
@@ -5476,6 +5480,7 @@ func openContainerPTY(pid int) (*os.File, string, error) {
 	// Access the container's filesystem through /proc/<pid>/root
 	// This gives us a view into the container's mount namespace
 	ptmxPath := fmt.Sprintf("/proc/%d/root/dev/pts/ptmx", pid)
+
 	ptmx, err := os.OpenFile(ptmxPath, os.O_RDWR, 0)
 	if err != nil {
 		return nil, "", fmt.Errorf("open %s: %w", ptmxPath, err)
