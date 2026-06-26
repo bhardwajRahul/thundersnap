@@ -52,7 +52,12 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  snaps          list all snapshots with sizes")
 	fmt.Fprintln(os.Stderr, "  frame          create a new frame from root:home:work snaps")
 	fmt.Fprintln(os.Stderr, "  frames         list all frames with status")
+	fmt.Fprintln(os.Stderr, "  ref            manage refs (named pointers to frames)")
+	fmt.Fprintln(os.Stderr, "  refs           list all refs")
+	fmt.Fprintln(os.Stderr, "  reflog         show ref history")
+	fmt.Fprintln(os.Stderr, "  log            show frame snapshot history")
 	fmt.Fprintln(os.Stderr, "  taint          add a taint to the current frame")
+	fmt.Fprintln(os.Stderr, "  autorun        configure a program to run automatically")
 	fmt.Fprintln(os.Stderr, "  download-docker download a Docker image as a snap")
 	fmt.Fprintln(os.Stderr, "  who-has        query peers to find which ones have a snap")
 	fmt.Fprintln(os.Stderr, "  download-snap  download a snap from mesh peers")
@@ -100,6 +105,16 @@ func main() {
 		cmdWhoHas(cmdArgs)
 	case "download-snap":
 		cmdDownloadSnap(cmdArgs)
+	case "ref":
+		cmdRef(cmdArgs)
+	case "refs":
+		cmdRefs(cmdArgs)
+	case "reflog":
+		cmdReflog(cmdArgs)
+	case "log":
+		cmdLog(cmdArgs)
+	case "autorun":
+		cmdAutorun(cmdArgs)
 	case "drop-caps-and-run":
 		// Hidden command - not listed in usage
 		cmdDropCapsAndRun(cmdArgs)
@@ -514,52 +529,59 @@ func doListSnaps(sockPath string) error {
 func cmdFrame(args []string) {
 	opts := getopt.New()
 	opts.SetProgram("ts frame")
-	opts.SetParameters("<frame-name> <snapshot-spec>")
+	opts.SetParameters("<snapshot-spec>")
 	isolation := opts.StringLong("isolation", 0, "", "isolation level: vm, container, none")
-	deleteFlag := opts.BoolLong("delete", 'd', "delete a frame")
+	refName := opts.StringLong("ref", 0, "", "create a ref with this name pointing at the new frame")
+	deleteFlag := opts.BoolLong("delete", 'd', "delete a frame by UUID")
 	// Parse expects first element to be program name (like os.Args)
 	opts.Parse(append([]string{"ts frame"}, args...))
 
 	if *deleteFlag {
 		if opts.NArgs() != 1 {
-			fmt.Fprintln(os.Stderr, "error: --delete requires exactly one frame name argument")
-			fmt.Fprintln(os.Stderr, "usage: ts frame --delete <frame-name>")
+			fmt.Fprintln(os.Stderr, "error: --delete requires exactly one frame UUID argument")
+			fmt.Fprintln(os.Stderr, "usage: ts frame --delete <uuid>")
 			os.Exit(1)
 		}
-		frameName := opts.Arg(0)
-		if err := doDeleteFrame(*sockPath, frameName); err != nil {
+		uuid := opts.Arg(0)
+		if err := doDeleteFrame(*sockPath, uuid); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Deleted frame %s\n", frameName)
+		fmt.Printf("Deleted frame %s\n", uuid)
 		return
 	}
 
-	if opts.NArgs() != 2 {
-		fmt.Fprintln(os.Stderr, "error: frame requires exactly two arguments")
+	if opts.NArgs() != 1 {
+		fmt.Fprintln(os.Stderr, "error: frame requires exactly one argument: snapshot-spec")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "usage: ts frame [--isolation=<level>] <frame-name> <snapshot-spec>")
-		fmt.Fprintln(os.Stderr, "       ts frame --delete <frame-name>")
+		fmt.Fprintln(os.Stderr, "usage: ts frame [--isolation=<level>] [--ref=<name>] <snapshot-spec>")
+		fmt.Fprintln(os.Stderr, "       ts frame --delete <uuid>")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "snapshot-spec can be:")
-		fmt.Fprintln(os.Stderr, "  <snapshot-id>                    single snapshot (legacy)")
-		fmt.Fprintln(os.Stderr, "  <rootfs>:<home>:<work>           frame with three components")
-		fmt.Fprintln(os.Stderr, "  <rootfs>::                       frame with empty home/work")
+		fmt.Fprintln(os.Stderr, "snapshot-spec format: <rootfs>:<home>:<work>")
+		fmt.Fprintln(os.Stderr, "  Use 'nil' for empty components, e.g., abc123:nil:nil")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "options:")
+		fmt.Fprintln(os.Stderr, "  --ref <name>         create a ref pointing at the new frame")
+		fmt.Fprintln(os.Stderr, "  --isolation <level>  vm, container, or none")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "examples:")
-		fmt.Fprintln(os.Stderr, "  ts frame dev abc123             single snapshot")
-		fmt.Fprintln(os.Stderr, "  ts frame dev abc123::           rootfs only, empty home/work")
-		fmt.Fprintln(os.Stderr, "  ts frame dev abc123:def456:     rootfs + home, empty work")
-		fmt.Fprintln(os.Stderr, "  ts frame --delete dev           delete a frame")
+		fmt.Fprintln(os.Stderr, "  ts frame abc123:nil:nil             rootfs only")
+		fmt.Fprintln(os.Stderr, "  ts frame abc123:def456:nil          rootfs + home")
+		fmt.Fprintln(os.Stderr, "  ts frame --ref=prod abc123:def456:ghi789   full frame with ref")
 		os.Exit(1)
 	}
 
-	frameName := opts.Arg(0)
-	snapshotSpec := opts.Arg(1)
+	snapshotSpec := opts.Arg(0)
 
-	if err := doCreate(*sockPath, frameName, snapshotSpec, *isolation); err != nil {
+	uuid, err := doCreate(*sockPath, snapshotSpec, *isolation, *refName)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
+	}
+	if *refName != "" {
+		fmt.Printf("Created frame %s with ref %s\n", uuid, *refName)
+	} else {
+		fmt.Printf("Created frame %s\n", uuid)
 	}
 }
 
@@ -583,15 +605,16 @@ func cmdFrames(args []string) {
 
 // CreateRequest is the request body for /create
 type CreateRequest struct {
-	FrameName  string `json:"frame_name"`
-	SnapshotID string `json:"snapshot_id"`
-	Isolation  string `json:"isolation,omitempty"`
+	SnapshotSpec string `json:"snapshot_spec"` // <root>:<home>:<work>
+	Isolation    string `json:"isolation,omitempty"`
+	RefName      string `json:"ref_name,omitempty"` // optional ref to create
 }
 
 // CreateResponse is the response from /create
 type CreateResponse struct {
 	Status  string `json:"status"`
 	Message string `json:"message,omitempty"`
+	UUID    string `json:"uuid,omitempty"` // the new frame's UUID
 	Path    string `json:"path,omitempty"`
 }
 
@@ -600,10 +623,11 @@ type CreateStreamEvent struct {
 	Type    string `json:"type"`
 	Message string `json:"message,omitempty"`
 	Status  string `json:"status,omitempty"`
+	UUID    string `json:"uuid,omitempty"`
 	Path    string `json:"path,omitempty"`
 }
 
-func doCreate(sockPath, frameName, snapshotID, isolation string) error {
+func doCreate(sockPath, snapshotSpec, isolation, refName string) (string, error) {
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -630,18 +654,18 @@ func doCreate(sockPath, frameName, snapshotID, isolation string) error {
 	}
 
 	req := CreateRequest{
-		FrameName:  frameName,
-		SnapshotID: snapshotID,
-		Isolation:  isolation,
+		SnapshotSpec: snapshotSpec,
+		Isolation:    isolation,
+		RefName:      refName,
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
+		return "", fmt.Errorf("marshal request: %w", err)
 	}
 
 	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		return "", fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -658,7 +682,7 @@ func doCreate(sockPath, frameName, snapshotID, isolation string) error {
 
 		var event CreateStreamEvent
 		if err := json.Unmarshal(line, &event); err != nil {
-			return fmt.Errorf("parse stream event: %w (line: %q)", err, string(line))
+			return "", fmt.Errorf("parse stream event: %w (line: %q)", err, string(line))
 		}
 
 		if event.Type == "progress" {
@@ -691,7 +715,7 @@ func doCreate(sockPath, frameName, snapshotID, isolation string) error {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read stream: %w", err)
+		return "", fmt.Errorf("read stream: %w", err)
 	}
 
 	// Clear the progress line if TTY
@@ -701,20 +725,19 @@ func doCreate(sockPath, frameName, snapshotID, isolation string) error {
 
 	// Check result
 	if lastEvent.Type != "result" {
-		return fmt.Errorf("no result received from server")
+		return "", fmt.Errorf("no result received from server")
 	}
 
 	if lastEvent.Status != "ok" {
-		return fmt.Errorf("%s", lastEvent.Message)
+		return "", fmt.Errorf("%s", lastEvent.Message)
 	}
 
-	fmt.Printf("Created frame at %s\n", lastEvent.Path)
-	return nil
+	return lastEvent.UUID, nil
 }
 
 // DeleteFrameRequest is the request body for /delete-frame
 type DeleteFrameRequest struct {
-	FrameName string `json:"frame_name"`
+	UUID string `json:"uuid"`
 }
 
 // DeleteFrameResponse is the response from /delete-frame
@@ -723,7 +746,7 @@ type DeleteFrameResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-func doDeleteFrame(sockPath, frameName string) error {
+func doDeleteFrame(sockPath, uuid string) error {
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -732,7 +755,7 @@ func doDeleteFrame(sockPath, frameName string) error {
 		},
 	}
 
-	req := DeleteFrameRequest{FrameName: frameName}
+	req := DeleteFrameRequest{UUID: uuid}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
@@ -2225,4 +2248,537 @@ func runShellInteractive(runner *interp.Runner, parser *syntax.Parser, stdin io.
 	}
 
 	return scanner.Err()
+}
+
+// =====================================
+// Ref commands
+// =====================================
+
+func cmdRef(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: ts ref <subcommand> [options]")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "subcommands:")
+		fmt.Fprintln(os.Stderr, "  create <name> <uuid>      create a new ref pointing at a frame UUID")
+		fmt.Fprintln(os.Stderr, "  move <name> <uuid> [-f]   move a ref to point at a different UUID")
+		fmt.Fprintln(os.Stderr, "  delete <name> [-f]        delete a ref")
+		os.Exit(1)
+	}
+
+	subcmd := args[0]
+	subargs := args[1:]
+
+	switch subcmd {
+	case "create":
+		cmdRefCreate(subargs)
+	case "move":
+		cmdRefMove(subargs)
+	case "delete":
+		cmdRefDelete(subargs)
+	default:
+		fmt.Fprintf(os.Stderr, "error: unknown ref subcommand: %s\n", subcmd)
+		os.Exit(1)
+	}
+}
+
+func cmdRefCreate(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts ref create")
+	opts.SetParameters("<name> <uuid>")
+	opts.Parse(append([]string{"ts ref create"}, args...))
+
+	if opts.NArgs() != 2 {
+		fmt.Fprintln(os.Stderr, "error: ref create requires name and uuid")
+		fmt.Fprintln(os.Stderr, "usage: ts ref create <name> <uuid>")
+		os.Exit(1)
+	}
+
+	name := opts.Arg(0)
+	uuid := opts.Arg(1)
+
+	if err := doRefCreate(*sockPath, name, uuid); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Created ref %s -> %s\n", name, uuid)
+}
+
+func cmdRefMove(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts ref move")
+	opts.SetParameters("<name> <uuid>")
+	force := opts.BoolLong("force", 'f', "force move even if frame has running processes")
+	opts.Parse(append([]string{"ts ref move"}, args...))
+
+	if opts.NArgs() != 2 {
+		fmt.Fprintln(os.Stderr, "error: ref move requires name and uuid")
+		fmt.Fprintln(os.Stderr, "usage: ts ref move <name> <uuid> [-f]")
+		os.Exit(1)
+	}
+
+	name := opts.Arg(0)
+	uuid := opts.Arg(1)
+
+	if err := doRefMove(*sockPath, name, uuid, *force); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Moved ref %s -> %s\n", name, uuid)
+}
+
+func cmdRefDelete(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts ref delete")
+	opts.SetParameters("<name>")
+	force := opts.BoolLong("force", 'f', "force delete even if frame has running processes or id dir is non-empty")
+	opts.Parse(append([]string{"ts ref delete"}, args...))
+
+	if opts.NArgs() != 1 {
+		fmt.Fprintln(os.Stderr, "error: ref delete requires name")
+		fmt.Fprintln(os.Stderr, "usage: ts ref delete <name> [-f]")
+		os.Exit(1)
+	}
+
+	name := opts.Arg(0)
+
+	if err := doRefDelete(*sockPath, name, *force); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Deleted ref %s\n", name)
+}
+
+// RefRequest is the request body for ref operations
+type RefRequest struct {
+	Name  string `json:"name"`
+	UUID  string `json:"uuid,omitempty"`
+	Force bool   `json:"force,omitempty"`
+}
+
+// RefResponse is the response from ref operations
+type RefResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+func doRefCreate(sockPath, name, uuid string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	req := RefRequest{Name: name, UUID: uuid}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := client.Post("http://localhost/ref/create", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result RefResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("server error: %s", result.Message)
+	}
+	return nil
+}
+
+func doRefMove(sockPath, name, uuid string, force bool) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	req := RefRequest{Name: name, UUID: uuid, Force: force}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := client.Post("http://localhost/ref/move", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result RefResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("server error: %s", result.Message)
+	}
+	return nil
+}
+
+func doRefDelete(sockPath, name string, force bool) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	req := RefRequest{Name: name, Force: force}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := client.Post("http://localhost/ref/delete", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result RefResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("server error: %s", result.Message)
+	}
+	return nil
+}
+
+func cmdRefs(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts refs")
+	opts.Parse(append([]string{"ts refs"}, args...))
+
+	if opts.NArgs() > 0 {
+		fmt.Fprintln(os.Stderr, "error: refs takes no arguments")
+		fmt.Fprintln(os.Stderr, "usage: ts refs    list all refs")
+		os.Exit(1)
+	}
+
+	if err := doListRefs(*sockPath); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// RefListEntry is a single ref in the list response
+type RefListEntry struct {
+	Name    string   `json:"name"`
+	UUID    string   `json:"uuid"`
+	Autorun []string `json:"autorun,omitempty"`
+}
+
+// RefListResponse is the response from /refs
+type RefListResponse struct {
+	Status string         `json:"status"`
+	Refs   []RefListEntry `json:"refs"`
+}
+
+func doListRefs(sockPath string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	resp, err := client.Get("http://localhost/refs")
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result RefListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("server error")
+	}
+
+	if len(result.Refs) == 0 {
+		fmt.Println("(no refs)")
+		return nil
+	}
+
+	for _, ref := range result.Refs {
+		if len(ref.Autorun) > 0 {
+			fmt.Printf("%s -> %s [autorun: %s]\n", ref.Name, ref.UUID, strings.Join(ref.Autorun, " "))
+		} else {
+			fmt.Printf("%s -> %s\n", ref.Name, ref.UUID)
+		}
+	}
+	return nil
+}
+
+func cmdReflog(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts reflog")
+	opts.SetParameters("<ref-name>")
+	opts.Parse(append([]string{"ts reflog"}, args...))
+
+	if opts.NArgs() != 1 {
+		fmt.Fprintln(os.Stderr, "error: reflog requires ref name")
+		fmt.Fprintln(os.Stderr, "usage: ts reflog <ref-name>")
+		os.Exit(1)
+	}
+
+	name := opts.Arg(0)
+
+	if err := doReflog(*sockPath, name); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// ReflogEntry is a single entry in the reflog
+type ReflogEntry struct {
+	UUID string `json:"uuid"`
+	Time string `json:"time"`
+}
+
+// ReflogResponse is the response from /reflog
+type ReflogResponse struct {
+	Status string        `json:"status"`
+	Name   string        `json:"name"`
+	Reflog []ReflogEntry `json:"reflog"`
+}
+
+func doReflog(sockPath, name string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	resp, err := client.Get("http://localhost/reflog?name=" + name)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result ReflogResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("server error")
+	}
+
+	if len(result.Reflog) == 0 {
+		fmt.Println("(empty reflog)")
+		return nil
+	}
+
+	for _, entry := range result.Reflog {
+		fmt.Printf("%s  %s\n", entry.UUID, entry.Time)
+	}
+	return nil
+}
+
+func cmdLog(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts log")
+	opts.SetParameters("[uuid]")
+	opts.Parse(append([]string{"ts log"}, args...))
+
+	var uuid string
+	if opts.NArgs() > 0 {
+		uuid = opts.Arg(0)
+	}
+
+	if err := doLog(*sockPath, uuid); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// LogEntry is a single entry in the frame history
+type LogEntry struct {
+	Snap    string `json:"snap"`
+	Time    string `json:"time"`
+	Message string `json:"message,omitempty"`
+}
+
+// LogResponse is the response from /log
+type LogResponse struct {
+	Status  string     `json:"status"`
+	UUID    string     `json:"uuid"`
+	History []LogEntry `json:"history"`
+}
+
+func doLog(sockPath, uuid string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	url := "http://localhost/log"
+	if uuid != "" {
+		url += "?uuid=" + uuid
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result LogResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("server error")
+	}
+
+	if len(result.History) == 0 {
+		fmt.Println("(no snapshots)")
+		return nil
+	}
+
+	for _, entry := range result.History {
+		if entry.Message != "" {
+			fmt.Printf("%s  %s  %s\n", entry.Snap, entry.Time, entry.Message)
+		} else {
+			fmt.Printf("%s  %s\n", entry.Snap, entry.Time)
+		}
+	}
+	return nil
+}
+
+func cmdAutorun(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts autorun")
+	opts.SetParameters("<program> [args...]")
+	refName := opts.StringLong("ref", 0, "", "ref name (required)")
+	stop := opts.BoolLong("stop", 0, "clear autorun configuration")
+	opts.Parse(append([]string{"ts autorun"}, args...))
+
+	if *refName == "" {
+		fmt.Fprintln(os.Stderr, "error: --ref is required")
+		fmt.Fprintln(os.Stderr, "usage: ts autorun --ref <ref> <program> [args...]")
+		fmt.Fprintln(os.Stderr, "       ts autorun --ref <ref> --stop")
+		os.Exit(1)
+	}
+
+	if *stop {
+		if err := doAutorunStop(*sockPath, *refName); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Cleared autorun for ref %s\n", *refName)
+		return
+	}
+
+	if opts.NArgs() == 0 {
+		fmt.Fprintln(os.Stderr, "error: autorun requires a program")
+		fmt.Fprintln(os.Stderr, "usage: ts autorun --ref <ref> <program> [args...]")
+		os.Exit(1)
+	}
+
+	argv := opts.Args()
+	if err := doAutorunSet(*sockPath, *refName, argv); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Set autorun for ref %s: %s\n", *refName, strings.Join(argv, " "))
+}
+
+// AutorunRequest is the request body for /autorun
+type AutorunRequest struct {
+	RefName string   `json:"ref_name"`
+	Argv    []string `json:"argv,omitempty"`
+}
+
+// AutorunResponse is the response from /autorun
+type AutorunResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+func doAutorunSet(sockPath, refName string, argv []string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	req := AutorunRequest{RefName: refName, Argv: argv}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := client.Post("http://localhost/autorun", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result AutorunResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("server error: %s", result.Message)
+	}
+	return nil
+}
+
+func doAutorunStop(sockPath, refName string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialThunder(ctx, sockPath)
+			},
+		},
+	}
+
+	req := AutorunRequest{RefName: refName, Argv: nil}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := client.Post("http://localhost/autorun", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result AutorunResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return fmt.Errorf("server error: %s", result.Message)
+	}
+	return nil
 }
