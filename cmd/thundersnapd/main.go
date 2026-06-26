@@ -32,6 +32,9 @@ import (
 	"github.com/gliderlabs/ssh"
 	"github.com/pborman/getopt/v2"
 	"github.com/pkg/sftp"
+	"github.com/tailscale/thundersnap/frameid"
+	"github.com/tailscale/thundersnap/frames"
+	"github.com/tailscale/thundersnap/snaphash"
 	"github.com/tailscale/thundersnap/thundersnap"
 	"github.com/tailscale/thundersnap/tsm"
 	gossh "golang.org/x/crypto/ssh"
@@ -544,6 +547,12 @@ func main() {
 	if err := os.MkdirAll(*stateDir, 0700); err != nil {
 		log.Fatalf("Failed to create state directory: %v", err)
 	}
+
+	// Initialize ref and frame stores for the new UUID-based API.
+	// These use the fs-dir as the state directory since that's where
+	// frames and refs are stored.
+	initRefStore(*flagFsDir)
+	initFrameStore(*flagFsDir)
 
 	// Create tsnet server
 	srv := &tsnet.Server{
@@ -2999,6 +3008,14 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux.HandleFunc("/download-snap", handleDownloadSnap)
 	mux.HandleFunc("/who-has", handleWhoHas)
 	mux.HandleFunc("/ts/servers.json", handleServersJSONControl)
+	// Ref and frame UUID-based API handlers
+	mux.HandleFunc("/ref/create", handleRefCreate)
+	mux.HandleFunc("/ref/move", handleRefMove)
+	mux.HandleFunc("/ref/delete", handleRefDelete)
+	mux.HandleFunc("/refs", handleListRefs)
+	mux.HandleFunc("/reflog", handleReflog)
+	mux.HandleFunc("/log", handleLog)
+	mux.HandleFunc("/autorun", handleAutorun)
 	cs.handler = mux
 
 	go cs.serve()
@@ -3848,10 +3865,15 @@ func handleListFrames(w http.ResponseWriter, r *http.Request) {
 
 // CreateRequest is the request body for /create
 type CreateRequest struct {
-	FrameName  string `json:"frame_name"`
-	SnapshotID string `json:"snapshot_id"` // Can be single ID or frame spec "rootfs:home:work"
+	// New UUID-based API fields
+	SnapshotSpec string `json:"snapshot_spec,omitempty"` // <rootfs>:<home>:<work> format
+	RefName      string `json:"ref_name,omitempty"`      // Optional ref to create pointing at new frame
 
-	// Frame-specific fields (alternative to parsing snapshot_id)
+	// Legacy API fields (for backward compatibility)
+	FrameName  string `json:"frame_name,omitempty"`
+	SnapshotID string `json:"snapshot_id,omitempty"` // Can be single ID or frame spec "rootfs:home:work"
+
+	// Frame-specific fields (alternative to parsing snapshot_id/snapshot_spec)
 	RootfsSnap string `json:"rootfs,omitempty"`    // Rootfs snap ID
 	HomeSnap   string `json:"home,omitempty"`      // Home snap ID (empty = new empty subvolume)
 	WorkSnap   string `json:"work,omitempty"`      // Work snap ID (empty = new empty subvolume)
@@ -3914,6 +3936,7 @@ func hasBlankRootfs(spec string) (isBlank, isExplicitNil bool) {
 type CreateResponse struct {
 	Status  string `json:"status"`
 	Message string `json:"message,omitempty"`
+	UUID    string `json:"uuid,omitempty"` // The new frame's UUID
 	Path    string `json:"path,omitempty"`
 }
 
@@ -3930,6 +3953,20 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if streaming is requested (needed early for error responses)
+	stream := r.URL.Query().Get("stream") == "1"
+	isTTY := r.URL.Query().Get("tty") == "1"
+
+	// Detect new UUID-based API vs legacy API
+	useNewAPI := req.SnapshotSpec != ""
+
+	if useNewAPI {
+		// New UUID-based API: snapshot_spec is provided, frame gets a UUID
+		handleCreateWithUUID(w, r, req, stream, isTTY)
+		return
+	}
+
+	// Legacy API: frame_name and snapshot_id are required
 	// Allow either snapshot_id or rootfs field for specifying the rootfs
 	if req.RootfsSnap != "" && req.SnapshotID == "" {
 		req.SnapshotID = req.RootfsSnap
@@ -3976,10 +4013,6 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-
-	// Check if streaming is requested
-	stream := r.URL.Query().Get("stream") == "1"
-	isTTY := r.URL.Query().Get("tty") == "1"
 
 	if stream {
 		handleCreateStreaming(w, req, framePath, isTTY)
@@ -4040,11 +4073,218 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleCreateWithUUID handles frame creation using the new UUID-based API.
+// Frames are created at fs/<uuid>/ and optionally a ref is created.
+func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequest, stream, isTTY bool) {
+	// Parse the snapshot spec
+	rootfsSpec, homeSpec, workSpec := parseFrameSpec(req.SnapshotSpec)
+
+	// Check if this is a blank container request
+	isBlank, isExplicitNil := hasBlankRootfs(req.SnapshotSpec)
+	if isBlank && !isExplicitNil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(CreateResponse{
+			Status:  "error",
+			Message: "rootfs component is required (use 'nil' for blank container)",
+		})
+		return
+	}
+
+	// For non-blank containers, verify the rootfs snapshot exists
+	if !isBlank {
+		snapshotPath := filepath.Join(*flagSnapsDir, rootfsSpec)
+		if _, err := os.Stat(snapshotPath); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(CreateResponse{
+				Status:  "error",
+				Message: fmt.Sprintf("rootfs snapshot %q not found", rootfsSpec),
+			})
+			return
+		}
+	}
+
+	// If a ref name is provided, validate it and check it doesn't already exist
+	if req.RefName != "" {
+		if refStore.Exists(req.RefName) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(CreateResponse{
+				Status:  "error",
+				Message: fmt.Sprintf("ref %q already exists", req.RefName),
+			})
+			return
+		}
+	}
+
+	// Generate a new UUID for this frame
+	uuid, err := frameid.New()
+	if err != nil {
+		log.Printf("failed to generate UUID: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(CreateResponse{
+			Status:  "error",
+			Message: "failed to generate frame UUID",
+		})
+		return
+	}
+
+	// Build the frame path using UUID
+	framePath := filepath.Join(*flagFsDir, uuid.String())
+
+	// For streaming mode, delegate to the streaming handler
+	if stream {
+		handleCreateStreamingWithUUID(w, req, framePath, uuid, isTTY)
+		return
+	}
+
+	// Create the frame
+	if err := createFrame(framePath, req.SnapshotSpec, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
+		log.Printf("create frame failed: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(CreateResponse{
+			Status:  "error",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	// Parse snap hashes for frame metadata
+	var rootfsHash, homeHash, workHash snaphash.Hash
+	if rootfsSpec != "" {
+		// For now, use the spec string as-is; in a full implementation,
+		// we'd look up the actual content hash from the snap metadata
+		rootfsHash = snaphash.Sum([]byte(rootfsSpec))
+	}
+	if homeSpec != "" {
+		homeHash = snaphash.Sum([]byte(homeSpec))
+	}
+	if workSpec != "" {
+		workHash = snaphash.Sum([]byte(workSpec))
+	}
+
+	// Store frame metadata
+	frameMeta := &frames.Frame{
+		Rootfs:    rootfsHash,
+		Home:      homeHash,
+		Work:      workHash,
+		Isolation: req.Isolation,
+	}
+	if err := frameStore.Create(uuid, frameMeta); err != nil {
+		log.Printf("failed to store frame metadata: %v", err)
+		// Frame was created on disk but metadata failed - log warning but don't fail
+	}
+
+	// Create the ref if requested
+	if req.RefName != "" {
+		if err := refStore.Create(req.RefName, uuid); err != nil {
+			log.Printf("failed to create ref %s: %v", req.RefName, err)
+			// Frame was created but ref failed - log warning
+		} else {
+			log.Printf("Created ref %s -> %s", req.RefName, uuid)
+		}
+	}
+
+	log.Printf("Created frame %s (UUID: %s) from snapshot spec %s", framePath, uuid, req.SnapshotSpec)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(CreateResponse{
+		Status: "ok",
+		UUID:   uuid.String(),
+		Path:   framePath,
+	})
+}
+
+// handleCreateStreamingWithUUID handles streaming create for UUID-based frames.
+func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, framePath string, uuid frameid.ID, isTTY bool) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	pw := &createProgressWriter{w: w, encoder: json.NewEncoder(w)}
+	if f, ok := w.(http.Flusher); ok {
+		pw.flusher = f
+	}
+
+	// Parse frame spec
+	rootfsSpec, homeSpec, workSpec := parseFrameSpec(req.SnapshotSpec)
+
+	// Check if this is a blank container
+	isBlank, _ := hasBlankRootfs(req.SnapshotSpec)
+
+	// For non-blank containers, check/download the rootfs snap
+	if !isBlank {
+		snapshotPath := filepath.Join(*flagSnapsDir, rootfsSpec)
+		if _, err := os.Stat(snapshotPath); err != nil {
+			// Try to download from mesh
+			pw.writeProgress(fmt.Sprintf("Snapshot %s not found locally, downloading from mesh peers...", rootfsSpec))
+			result, err := doDownloadSnap(rootfsSpec, pw, isTTY)
+			if err != nil {
+				log.Printf("create: auto-download of snapshot %s failed: %v", rootfsSpec, err)
+				pw.writeResultWithUUID("error", "", fmt.Sprintf("failed to download snapshot: %v", err), "")
+				return
+			}
+			if !result.AlreadyExists {
+				pw.writeProgress("Downloaded snapshot from mesh peer")
+			}
+		}
+	}
+
+	pw.writeProgress("Creating frame...")
+
+	// Create the frame
+	if err := createFrame(framePath, req.SnapshotSpec, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
+		pw.writeResultWithUUID("error", "", err.Error(), "")
+		return
+	}
+
+	// Parse snap hashes for frame metadata
+	var rootfsHash, homeHash, workHash snaphash.Hash
+	if rootfsSpec != "" {
+		rootfsHash = snaphash.Sum([]byte(rootfsSpec))
+	}
+	if homeSpec != "" {
+		homeHash = snaphash.Sum([]byte(homeSpec))
+	}
+	if workSpec != "" {
+		workHash = snaphash.Sum([]byte(workSpec))
+	}
+
+	// Store frame metadata
+	frameMeta := &frames.Frame{
+		Rootfs:    rootfsHash,
+		Home:      homeHash,
+		Work:      workHash,
+		Isolation: req.Isolation,
+	}
+	if err := frameStore.Create(uuid, frameMeta); err != nil {
+		log.Printf("failed to store frame metadata: %v", err)
+	}
+
+	// Create the ref if requested
+	if req.RefName != "" {
+		if err := refStore.Create(req.RefName, uuid); err != nil {
+			log.Printf("failed to create ref %s: %v", req.RefName, err)
+		} else {
+			log.Printf("Created ref %s -> %s", req.RefName, uuid)
+		}
+	}
+
+	log.Printf("Created frame %s (UUID: %s) from snapshot spec %s", framePath, uuid, req.SnapshotSpec)
+	pw.writeResultWithUUID("ok", uuid.String(), "", framePath)
+}
+
 // CreateStreamEvent is an event in the streaming create response
 type CreateStreamEvent struct {
 	Type    string `json:"type"`              // "progress" or "result"
 	Message string `json:"message,omitempty"` // progress message
 	Status  string `json:"status,omitempty"`  // "ok" or "error" (for result)
+	UUID    string `json:"uuid,omitempty"`    // frame UUID (for result)
 	Path    string `json:"path,omitempty"`    // frame path (for result)
 }
 
@@ -4140,6 +4380,20 @@ func (pw *createProgressWriter) writeResult(status, path, message string) {
 	event := CreateStreamEvent{
 		Type:    "result",
 		Status:  status,
+		Path:    path,
+		Message: message,
+	}
+	pw.encoder.Encode(event)
+	if pw.flusher != nil {
+		pw.flusher.Flush()
+	}
+}
+
+func (pw *createProgressWriter) writeResultWithUUID(status, uuid, message, path string) {
+	event := CreateStreamEvent{
+		Type:    "result",
+		Status:  status,
+		UUID:    uuid,
 		Path:    path,
 		Message: message,
 	}

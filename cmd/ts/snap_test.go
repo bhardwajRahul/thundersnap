@@ -326,12 +326,12 @@ func TestDeleteFrameRequestEncoding(t *testing.T) {
 		request DeleteFrameRequest
 	}{
 		{
-			name:    "simple_name",
-			request: DeleteFrameRequest{FrameName: "dev"},
+			name:    "simple_uuid",
+			request: DeleteFrameRequest{UUID: "01234567-89ab-cdef-0123-456789abcdef"},
 		},
 		{
-			name:    "complex_name",
-			request: DeleteFrameRequest{FrameName: "my-test-frame-123"},
+			name:    "another_uuid",
+			request: DeleteFrameRequest{UUID: "fedcba98-7654-3210-fedc-ba9876543210"},
 		},
 	}
 
@@ -350,8 +350,8 @@ func TestDeleteFrameRequestEncoding(t *testing.T) {
 			}
 
 			// Verify
-			if decoded.FrameName != tt.request.FrameName {
-				t.Errorf("FrameName mismatch: got %q, want %q", decoded.FrameName, tt.request.FrameName)
+			if decoded.UUID != tt.request.UUID {
+				t.Errorf("UUID mismatch: got %q, want %q", decoded.UUID, tt.request.UUID)
 			}
 		})
 	}
