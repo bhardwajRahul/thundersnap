@@ -88,26 +88,28 @@ Packages include two binaries:
 - `thundersnapd` — the main daemon (installed to `/usr/sbin/thundersnapd`)
 - `ts` — the in-container client tool (installed to `/usr/libexec/thundersnap/ts`)
 
-### Setting Up a Base Snapshot
+### Setting Up a Base Snapshot (Optional)
 
-Thundersnap needs at least one base filesystem snapshot named `1` in
-`--snaps-dir` before it can create workspaces. This should be an
-extracted Linux root filesystem (a full directory tree with `/bin`,
-`/etc`, `/usr`, etc.).
+By default, frames start empty and you can install software into them
+using `apt`, `nix`, or other package managers. However, if you want frames
+to start from a pre-configured base OS, you can create a base snapshot.
 
-The easiest way to get one is to export a Docker/OCI container image:
+To create a named base snapshot (e.g., `ubuntu24`), export a Linux root
+filesystem (a full directory tree with `/bin`, `/etc`, `/usr`, etc.):
 
 ```sh
-# Create the snaps directory on your btrfs filesystem
-sudo btrfs subvolume create /var/lib/thundersnap/snaps/1
+# Create a base snapshot subvolume
+sudo btrfs subvolume create /var/lib/thundersnap/snaps/ubuntu24
 
 # Export an Ubuntu image (or Debian, Alpine, etc.)
 docker export $(docker create ubuntu:24.04) | \
-  sudo tar -xf - -C /var/lib/thundersnap/snaps/1
+  sudo tar -xf - -C /var/lib/thundersnap/snaps/ubuntu24
 
 # Or use debootstrap directly:
-sudo debootstrap noble /var/lib/thundersnap/snaps/1
+sudo debootstrap noble /var/lib/thundersnap/snaps/ubuntu24
 ```
+
+Then create a frame from this base: `ts frame ubuntu24:nil:nil --ref mydev`
 
 Good sources for base images:
 - **Docker Hub**: `docker pull ubuntu:24.04`, `docker pull debian:bookworm`

@@ -37,6 +37,10 @@ type SnapSource struct {
 // FrameMeta represents the metadata for a frame (fs/$user/$frame.jsonc).
 // A frame is a named instance that combines rootfs, home, and work components.
 type FrameMeta struct {
+	// UUID is the unique identifier for this frame.
+	// Used to track the frame's identity across its lifetime.
+	UUID string `json:"uuid,omitempty"`
+
 	// Rootfs is the snap ID for the rootfs component.
 	// This is the base OS, packages, /var, /usr, /etc, system state.
 	Rootfs string `json:"rootfs"`
