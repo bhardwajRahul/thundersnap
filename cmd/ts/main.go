@@ -103,6 +103,9 @@ func main() {
 	case "drop-caps-and-run":
 		// Hidden command - not listed in usage
 		cmdDropCapsAndRun(cmdArgs)
+	case "container-init":
+		// Hidden command - starts a minimal init process for container namespaces
+		cmdContainerInit(cmdArgs)
 	case "check-dev":
 		// Hidden command for e2e testing - outputs /dev state
 		cmdCheckDev()
@@ -1371,6 +1374,7 @@ func doDownloadSnap(sockPath, snapshotID string) error {
 func cmdDropCapsAndRun(args []string) {
 	// Parse our flags manually since we need to pass remaining args to exec
 	var hostname, domainname, chrootPath string
+	var skipMountSetup bool
 	var usePty bool
 	var ptyHandshakeFd int = -1 // fd for PTY handshake with thundersnapd
 	var cmdArgs []string
@@ -1391,6 +1395,10 @@ func cmdDropCapsAndRun(args []string) {
 			i++
 		} else if strings.HasPrefix(args[i], "--chroot=") {
 			chrootPath = strings.TrimPrefix(args[i], "--chroot=")
+		} else if args[i] == "--skip-mount-setup" {
+			// Used when nsenter has already joined existing namespaces where
+			// container-init has set up mounts. We just need to chroot and drop caps.
+			skipMountSetup = true
 		} else if args[i] == "--pty" {
 			usePty = true
 		} else if strings.HasPrefix(args[i], "--pty-handshake-fd=") {
@@ -1416,21 +1424,25 @@ func cmdDropCapsAndRun(args []string) {
 		os.Exit(1)
 	}
 
-	// Make all mounts private so mounts inside the container don't propagate
-	// to the host. This must be done BEFORE chroot while "/" is still a real
-	// mount point. After CLONE_NEWNS, we have our own copy of the mount table
-	// but it still has "shared" propagation. Making it private here only
-	// affects our namespace, not the parent.
-	//
-	// In VM mode (running as init), this may fail because the root filesystem
-	// (virtiofs) doesn't support propagation changes. That's fine - VMs don't
-	// have mount propagation concerns anyway.
-	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
-		// Only log, don't exit - this is expected to fail in VM mode
-		fmt.Fprintf(os.Stderr, "warning: failed to make mounts private: %v (ok in VM mode)\n", err)
+	if !skipMountSetup {
+		// Make all mounts private so mounts inside the container don't propagate
+		// to the host. This must be done BEFORE chroot while "/" is still a real
+		// mount point. After CLONE_NEWNS, we have our own copy of the mount table
+		// but it still has "shared" propagation. Making it private here only
+		// affects our namespace, not the parent.
+		//
+		// In VM mode (running as init), this may fail because the root filesystem
+		// (virtiofs) doesn't support propagation changes. That's fine - VMs don't
+		// have mount propagation concerns anyway.
+		if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+			// Only log, don't exit - this is expected to fail in VM mode
+			fmt.Fprintf(os.Stderr, "warning: failed to make mounts private: %v (ok in VM mode)\n", err)
+		}
 	}
 
-	// Chroot into the container rootfs if specified
+	// Chroot into the container rootfs if specified.
+	// This is needed both when creating new namespaces and when joining existing ones,
+	// because even after setns(CLONE_NEWNS), our root is still the host's "/".
 	if chrootPath != "" {
 		if err := unix.Chroot(chrootPath); err != nil {
 			fmt.Fprintf(os.Stderr, "error: failed to chroot to %s: %v\n", chrootPath, err)
@@ -1442,29 +1454,47 @@ func cmdDropCapsAndRun(args []string) {
 		}
 	}
 
-	// Ensure mount points exist (blank containers may not have them)
-	os.MkdirAll("/proc", 0555)
-	os.MkdirAll("/sys", 0555)
+	if !skipMountSetup {
+		// Ensure mount points exist (blank containers may not have them)
+		os.MkdirAll("/proc", 0555)
+		os.MkdirAll("/sys", 0555)
 
-	// Mount /proc filesystem
-	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		// Ignore errors - /proc might already be mounted
-		_ = err
+		// Mount /proc filesystem
+		if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+			// Ignore errors - /proc might already be mounted
+			_ = err
+		}
+
+		// Mount /sys filesystem
+		if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
+			// Ignore errors - /sys might already be mounted
+			_ = err
+		}
+
+		// Set up /dev like Docker/containerd do:
+		// - tmpfs at /dev
+		// - Essential device nodes (null, zero, full, random, urandom, tty)
+		// - Symlinks for stdin/stdout/stderr and /dev/fd
+		// - /dev/pts for pseudoterminals
+		// - /dev/shm for shared memory
+		setupDev()
+
+		// Set hostname if provided (only when creating namespace, not joining)
+		if hostname != "" {
+			if err := unix.Sethostname([]byte(hostname)); err != nil {
+				fmt.Fprintf(os.Stderr, "error: failed to set hostname: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		// Set domainname if provided (only when creating namespace, not joining)
+		if domainname != "" {
+			if err := unix.Setdomainname([]byte(domainname)); err != nil {
+				fmt.Fprintf(os.Stderr, "error: failed to set domainname: %v\n", err)
+				os.Exit(1)
+			}
+		}
 	}
-
-	// Mount /sys filesystem
-	if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
-		// Ignore errors - /sys might already be mounted
-		_ = err
-	}
-
-	// Set up /dev like Docker/containerd do:
-	// - tmpfs at /dev
-	// - Essential device nodes (null, zero, full, random, urandom, tty)
-	// - Symlinks for stdin/stdout/stderr and /dev/fd
-	// - /dev/pts for pseudoterminals
-	// - /dev/shm for shared memory
-	setupDev()
 
 	// If thundersnapd requested a PTY handshake, signal that devpts is ready
 	// and wait for the PTY slave path. This allows thundersnapd to allocate
@@ -1486,22 +1516,6 @@ func cmdDropCapsAndRun(args []string) {
 		}
 		ptySlavePath = strings.TrimSpace(string(buf[:n]))
 		handshakeFile.Close()
-	}
-
-	// Set hostname if provided
-	if hostname != "" {
-		if err := unix.Sethostname([]byte(hostname)); err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to set hostname: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	// Set domainname if provided
-	if domainname != "" {
-		if err := unix.Setdomainname([]byte(domainname)); err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to set domainname: %v\n", err)
-			os.Exit(1)
-		}
 	}
 
 	// Capabilities to drop from the bounding set
@@ -1865,6 +1879,144 @@ func setupDev() {
 		// Clean up the temporary devtmpfs mount
 		unix.Unmount("/tmp/.devtmpfs", 0)
 		os.Remove("/tmp/.devtmpfs")
+	}
+}
+
+// cmdContainerInit is a minimal init process for container PID namespaces.
+// It performs namespace setup (mounts, /dev, etc.) and then sits idle, acting
+// as PID 1 to anchor the namespace. All actual sessions join this namespace
+// via setns() and run their own processes.
+//
+// Usage: ts container-init --chroot=/path/to/rootfs [--hostname=X] [--domainname=Y]
+//
+// The process:
+// 1. Sets up mount namespace (private propagation, /proc, /sys, /dev)
+// 2. Chroots into the container rootfs
+// 3. Writes "READY\n" to stdout to signal setup is complete
+// 4. Sits idle, waiting for stdin to close (which signals shutdown)
+// 5. As PID 1, reaps any orphaned zombie processes
+func cmdContainerInit(args []string) {
+	var hostname, domainname, chrootPath string
+
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--hostname" && i+1 < len(args) {
+			hostname = args[i+1]
+			i++
+		} else if strings.HasPrefix(args[i], "--hostname=") {
+			hostname = strings.TrimPrefix(args[i], "--hostname=")
+		} else if args[i] == "--domainname" && i+1 < len(args) {
+			domainname = args[i+1]
+			i++
+		} else if strings.HasPrefix(args[i], "--domainname=") {
+			domainname = strings.TrimPrefix(args[i], "--domainname=")
+		} else if args[i] == "--chroot" && i+1 < len(args) {
+			chrootPath = args[i+1]
+			i++
+		} else if strings.HasPrefix(args[i], "--chroot=") {
+			chrootPath = strings.TrimPrefix(args[i], "--chroot=")
+		}
+	}
+
+	if chrootPath == "" {
+		fmt.Fprintln(os.Stderr, "error: container-init requires --chroot")
+		os.Exit(1)
+	}
+
+	// Make all mounts private so mounts inside the container don't propagate
+	// to the host. This must be done BEFORE chroot while "/" is still a real
+	// mount point.
+	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+		// Only log, don't exit - this is expected to fail in VM mode
+		fmt.Fprintf(os.Stderr, "warning: failed to make mounts private: %v (ok in VM mode)\n", err)
+	}
+
+	// Chroot into the container rootfs
+	if err := unix.Chroot(chrootPath); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to chroot to %s: %v\n", chrootPath, err)
+		os.Exit(1)
+	}
+	if err := unix.Chdir("/"); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to chdir to /: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Ensure mount points exist (blank containers may not have them)
+	os.MkdirAll("/proc", 0555)
+	os.MkdirAll("/sys", 0555)
+
+	// Mount /proc filesystem
+	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+		_ = err // Ignore - /proc might already be mounted
+	}
+
+	// Mount /sys filesystem
+	if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
+		_ = err // Ignore - /sys might already be mounted
+	}
+
+	// Set up /dev (tmpfs with device nodes, devpts, etc.)
+	setupDev()
+
+	// Set hostname if provided
+	if hostname != "" {
+		if err := unix.Sethostname([]byte(hostname)); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to set hostname: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Set domainname if provided
+	if domainname != "" {
+		if err := unix.Setdomainname([]byte(domainname)); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to set domainname: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Signal that setup is complete
+	fmt.Println("READY")
+
+	// Set up SIGCHLD handler to reap zombies. As PID 1, orphaned processes
+	// get reparented to us, and we need to wait() on them or they become zombies.
+	sigchld := make(chan os.Signal, 16)
+	signal.Notify(sigchld, syscall.SIGCHLD)
+
+	// Also handle SIGTERM for graceful shutdown
+	sigterm := make(chan os.Signal, 1)
+	signal.Notify(sigterm, syscall.SIGTERM)
+
+	// Wait for stdin to close (shutdown signal) while reaping zombies
+	stdinClosed := make(chan struct{})
+	go func() {
+		// Read until EOF
+		buf := make([]byte, 1)
+		for {
+			_, err := os.Stdin.Read(buf)
+			if err != nil {
+				break
+			}
+		}
+		close(stdinClosed)
+	}()
+
+	for {
+		select {
+		case <-sigchld:
+			// Reap all zombies
+			for {
+				var status syscall.WaitStatus
+				pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
+				if err != nil || pid <= 0 {
+					break
+				}
+			}
+		case <-sigterm:
+			// Graceful shutdown requested
+			os.Exit(0)
+		case <-stdinClosed:
+			// Parent closed our stdin - time to exit
+			os.Exit(0)
+		}
 	}
 }
 

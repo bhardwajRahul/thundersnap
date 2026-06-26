@@ -2,6 +2,7 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -333,6 +334,12 @@ func parseIsolationOutput(output string) isolationCheckResult {
 // This is the expected behavior: when you SSH into a container twice, both sessions
 // should see each other's processes. This is how Docker exec works - you're joining
 // an existing container's namespace, not creating a new one each time.
+//
+// The architecture:
+// 1. A "container-init" process creates and anchors the namespaces (PID/mount/UTS)
+// 2. Session 1 joins these namespaces via setns() and runs a sleep process
+// 3. Session 2 joins the same namespaces and lists /proc
+// 4. Session 2 should see session 1's process in /proc
 func TestContainerSharedPIDNamespace(t *testing.T) {
 	env := newTestEnv(t)
 
@@ -362,21 +369,76 @@ func TestContainerSharedPIDNamespace(t *testing.T) {
 
 	tsBinary := filepath.Join(absFramePath, "bin", "ts")
 
-	// Start a background process in "session 1" that writes its PID to a file
-	// and then sleeps for a while. This simulates a long-running process.
-	session1Cmd := exec.Command(tsBinary, "drop-caps-and-run",
+	// Step 1: Start container-init to create and anchor the namespaces
+	// container-init creates PID/mount/UTS namespaces, sets up /dev, /proc, /sys,
+	// and waits on stdin (closing stdin signals shutdown).
+	initCmd := exec.Command(tsBinary, "container-init", "--chroot="+absFramePath)
+	initCmd.Dir = "/"
+	initCmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
+	}
+
+	// Create pipe for stdin - we'll close it to signal shutdown
+	initStdin, err := initCmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("create stdin pipe: %v", err)
+	}
+
+	// Create pipe for stdout to read READY signal
+	initStdout, err := initCmd.StdoutPipe()
+	if err != nil {
+		initStdin.Close()
+		t.Fatalf("create stdout pipe: %v", err)
+	}
+	initCmd.Stderr = os.Stderr
+
+	if err := initCmd.Start(); err != nil {
+		initStdin.Close()
+		t.Fatalf("start container-init: %v", err)
+	}
+	defer func() {
+		initStdin.Close()
+		initCmd.Wait()
+	}()
+
+	initPid := initCmd.Process.Pid
+	t.Logf("container-init started with PID %d", initPid)
+
+	// Wait for READY signal from container-init
+	readyBuf := make([]byte, 64)
+	n, err := initStdout.Read(readyBuf)
+	if err != nil {
+		t.Fatalf("read READY from init: %v", err)
+	}
+	if !strings.HasPrefix(string(readyBuf[:n]), "READY") {
+		t.Fatalf("unexpected init response: %q", string(readyBuf[:n]))
+	}
+	t.Log("container-init is ready")
+
+	// Step 2: Start session 1 - uses nsenter to join namespaces, then ts to run a sleep process
+	// We use nsenter because setns(CLONE_NEWNS) fails on multithreaded processes (Go).
+	// nsenter is a single-threaded C program that handles namespace joining correctly.
+	// Note: We must NOT use -F (--no-fork) because Go programs fail to start
+	// in a joined PID namespace without the fork that properly places them in
+	// the namespace. The fork also means the child will see itself with a new PID.
+	// We use the HOST path to ts binary (not from inside the container) since
+	// we haven't chrooted yet. drop-caps-and-run handles the chroot.
+	session1Cmd := exec.Command("nsenter",
+		"-t", fmt.Sprintf("%d", initPid),
+		"-p", "-m", "-u",
+		"--",
+		tsBinary, "drop-caps-and-run",
 		"--chroot="+absFramePath,
+		"--skip-mount-setup",
 		"--", "/bin/sh", "-c",
 		"echo $$ > /tmp/session1.pid && sleep 30")
 	session1Cmd.Dir = "/"
-	session1Cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
-	}
 
 	if err := session1Cmd.Start(); err != nil {
 		t.Fatalf("start session 1: %v", err)
 	}
 	defer session1Cmd.Process.Kill()
+	t.Logf("Session 1 started with host PID %d", session1Cmd.Process.Pid)
 
 	// Wait for session 1 to write its PID file
 	pidFile := filepath.Join(framePath, "tmp", "session1.pid")
@@ -391,24 +453,21 @@ func TestContainerSharedPIDNamespace(t *testing.T) {
 	if session1PID == "" {
 		t.Fatal("session 1 did not write PID file")
 	}
-	t.Logf("Session 1 reports PID %s in its namespace", session1PID)
+	t.Logf("Session 1 reports PID %s in the container namespace", session1PID)
 
-	// Now start "session 2" and count how many PIDs it can see in /proc
-	// If PID namespaces are shared, session 2 should see more than just itself (PID 1)
-	// - it should see session 1's processes too.
-	// If they're not shared, session 2 will have its own namespace and only see PID 1 (itself).
-	//
-	// The mvdan.cc/sh shell supports glob expansion, so "echo /proc/[0-9]*" will expand
-	// to list all numeric directories in /proc, which are PIDs.
-	session2Cmd := exec.Command(tsBinary, "drop-caps-and-run",
+	// Step 3: Start session 2 - joins the same namespaces and lists /proc
+	// If namespaces are shared, session 2 should see session 1's sleep process.
+	session2Cmd := exec.Command("nsenter",
+		"-t", fmt.Sprintf("%d", initPid),
+		"-p", "-m", "-u",
+		"--",
+		tsBinary, "drop-caps-and-run",
 		"--chroot="+absFramePath,
+		"--skip-mount-setup",
 		"--", "/bin/sh", "-c",
 		// Echo with glob expansion - each numeric dir in /proc is a PID
 		"echo /proc/[0-9]*")
 	session2Cmd.Dir = "/"
-	session2Cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
-	}
 
 	output, err := session2Cmd.CombinedOutput()
 	if err != nil {
@@ -421,13 +480,15 @@ func TestContainerSharedPIDNamespace(t *testing.T) {
 	pids := strings.Fields(outputStr)
 	t.Logf("Session 2 sees %d PIDs: %v", len(pids), pids)
 
-	// In a shared namespace, session 2 should see session 1's sleep process
-	// plus itself, so at least 2 PIDs. In a fresh namespace, just 1.
+	// In a shared namespace, session 2 should see:
+	// - PID 1 (container-init)
+	// - Session 1's shell + sleep processes
+	// - Session 2's own shell process
+	// So at least 3+ PIDs. In separate namespaces, just 1 (itself as PID 1).
 	if len(pids) <= 1 {
-		t.Error("Session 2 only sees 1 PID - PID namespaces are NOT shared")
-		t.Log("This test verifies that multiple sessions to the same container share the same PID namespace.")
-		t.Log("Currently, each session gets its own PID namespace, which is the bug we're trying to fix.")
+		t.Errorf("Session 2 only sees %d PID(s) - PID namespaces are NOT shared", len(pids))
+		t.Log("This test verifies that multiple sessions share the same PID namespace.")
 	} else {
-		t.Logf("Verified: Session 2 sees %d PIDs - PID namespaces are shared", len(pids))
+		t.Logf("Verified: Session 2 sees %d PIDs - PID namespaces are shared correctly", len(pids))
 	}
 }

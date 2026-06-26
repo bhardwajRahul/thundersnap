@@ -186,6 +186,157 @@ func getActiveFrameCount(framePath string) int {
 	return activeFrames.count[framePath]
 }
 
+// containerNsManager manages shared PID/mount/UTS namespaces for container sessions.
+// Each rootFS gets a single "init" process that creates and anchors the namespaces.
+// All sessions join these existing namespaces rather than creating their own.
+type containerNsManager struct {
+	mu      sync.Mutex
+	entries map[string]*containerNsEntry // key: rootFS path
+}
+
+type containerNsEntry struct {
+	initPid   int            // host PID of the container-init process
+	initStdin io.WriteCloser // write end of pipe - close to signal shutdown
+	initCmd   *exec.Cmd      // the container-init command (for Wait)
+	refCount  int
+}
+
+var containerNs = &containerNsManager{
+	entries: make(map[string]*containerNsEntry),
+}
+
+// getOrCreateContainerNs returns an existing namespace entry or creates a new one
+// by spawning "ts container-init". Returns the init process PID that sessions
+// should use to join namespaces via /proc/<pid>/ns/*.
+func (m *containerNsManager) getOrCreateContainerNs(rootFS, hostname, domainname string) (initPid int, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check for existing entry
+	if entry, ok := m.entries[rootFS]; ok {
+		// Verify init is still alive
+		if err := syscall.Kill(entry.initPid, 0); err == nil {
+			entry.refCount++
+			log.Printf("Reusing container namespace for %s (initPid=%d, refCount=%d)",
+				rootFS, entry.initPid, entry.refCount)
+			return entry.initPid, nil
+		}
+		// Init died - clean up stale entry
+		log.Printf("Container init for %s died (pid %d), cleaning up", rootFS, entry.initPid)
+		entry.initStdin.Close()
+		entry.initCmd.Wait()
+		delete(m.entries, rootFS)
+	}
+
+	// Create new container-init process
+	absRootFS, err := filepath.Abs(rootFS)
+	if err != nil {
+		return 0, fmt.Errorf("abs path: %w", err)
+	}
+
+	tsBinary := filepath.Join(absRootFS, "bin", "ts")
+	args := []string{"container-init", "--chroot=" + absRootFS}
+	if hostname != "" {
+		args = append(args, "--hostname="+hostname)
+	}
+	if domainname != "" {
+		args = append(args, "--domainname="+domainname)
+	}
+
+	cmd := exec.Command(tsBinary, args...)
+	cmd.Dir = "/"
+
+	// Create pipe for stdin - closing it signals shutdown
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return 0, fmt.Errorf("create stdin pipe: %w", err)
+	}
+
+	// Create pipe for stdout to read READY signal
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		stdinPipe.Close()
+		return 0, fmt.Errorf("create stdout pipe: %w", err)
+	}
+	cmd.Stderr = os.Stderr
+
+	// Start in new PID, mount, and UTS namespaces
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
+	}
+
+	if err := cmd.Start(); err != nil {
+		stdinPipe.Close()
+		return 0, fmt.Errorf("start container-init: %w", err)
+	}
+
+	// Wait for READY signal
+	readyCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, err := stdoutPipe.Read(buf)
+		if err != nil {
+			readyCh <- fmt.Errorf("read ready: %w", err)
+			return
+		}
+		if !strings.HasPrefix(string(buf[:n]), "READY") {
+			readyCh <- fmt.Errorf("unexpected init response: %q", string(buf[:n]))
+			return
+		}
+		readyCh <- nil
+	}()
+
+	select {
+	case err := <-readyCh:
+		if err != nil {
+			stdinPipe.Close()
+			cmd.Process.Kill()
+			cmd.Wait()
+			return 0, err
+		}
+	case <-time.After(10 * time.Second):
+		stdinPipe.Close()
+		cmd.Process.Kill()
+		cmd.Wait()
+		return 0, fmt.Errorf("container-init timeout")
+	}
+
+	entry := &containerNsEntry{
+		initPid:   cmd.Process.Pid,
+		initStdin: stdinPipe,
+		initCmd:   cmd,
+		refCount:  1,
+	}
+	m.entries[rootFS] = entry
+	log.Printf("Created container namespace for %s (initPid=%d)", rootFS, entry.initPid)
+
+	return entry.initPid, nil
+}
+
+// releaseContainerNs decrements the reference count and shuts down init if zero.
+func (m *containerNsManager) releaseContainerNs(rootFS string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.entries[rootFS]
+	if !ok {
+		return
+	}
+
+	entry.refCount--
+	log.Printf("Released container namespace for %s (initPid=%d, refCount=%d)",
+		rootFS, entry.initPid, entry.refCount)
+
+	if entry.refCount <= 0 {
+		// Close stdin to signal init to exit
+		entry.initStdin.Close()
+		// Wait for init to exit
+		entry.initCmd.Wait()
+		delete(m.entries, rootFS)
+		log.Printf("Closed container namespace for %s", rootFS)
+	}
+}
+
 // getTsnetHostname returns the current tsnet hostname (FQDN).
 func getTsnetHostname() string {
 	globalTsnetHostnameMu.RLock()
@@ -1387,63 +1538,86 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	runAsUser := selectTargetUser(rootFS, targetUser)
 	log.Printf("Container session: running as user %q (requested: %q)", runAsUser, targetUser)
 
-	// Prepare the command to execute using su to switch to the target user.
-	// For interactive sessions (no command): su - <user> (login shell)
-	// For command execution: su <user> -c '<command>' (non-login shell)
-
-	// Build arguments for "ts drop-caps-and-run" which handles all container
-	// initialization via syscalls (no external commands needed):
-	//   - Makes mounts private (prevents propagation to host)
-	//   - Chroots into the container rootfs
-	//   - Mounts /proc and /sys
-	//   - Sets hostname/domainname
-	//   - Drops dangerous capabilities
-	//
-	// The chroot is done by ts rather than via SysProcAttr so that we can
-	// make mounts private BEFORE the chroot (while / is still a mount point).
-	// The ts binary path must be absolute since we exec it from the host.
+	// Get absolute path for the rootFS
 	absRootFS, err := filepath.Abs(rootFS)
 	if err != nil {
 		return fmt.Errorf("get absolute path for rootFS: %w", err)
 	}
-	tsBinary := filepath.Join(absRootFS, "bin", "ts")
-	tsArgs := []string{"--chroot=" + absRootFS}
 
-	// Set hostname and domainname in the new UTS namespace based on tsnet FQDN.
-	// e.g., "hotdog.corp.ts.net" -> hostname "hotdog", domainname "corp.ts.net"
+	// Determine hostname and domainname for the container namespace
+	var hostname, domainname string
 	if globalMeshState != nil && globalMeshState.myFQDN != "" {
 		fqdn := globalMeshState.myFQDN
 		if idx := strings.Index(fqdn, "."); idx > 0 {
-			tsArgs = append(tsArgs, "--hostname="+fqdn[:idx])
-			tsArgs = append(tsArgs, "--domainname="+fqdn[idx+1:])
+			hostname = fqdn[:idx]
+			domainname = fqdn[idx+1:]
 		} else {
-			tsArgs = append(tsArgs, "--hostname="+fqdn)
+			hostname = fqdn
 		}
 	}
 
-	var cmd *exec.Cmd
+	// Get or create shared PID/mount/UTS namespaces for this container.
+	// A single "init" process per rootFS creates and anchors the namespaces;
+	// all sessions join these existing namespaces rather than creating new ones.
+	// This allows processes from different sessions to see each other via /proc.
+	initPid, err := containerNs.getOrCreateContainerNs(rootFS, hostname, domainname)
+	if err != nil {
+		return fmt.Errorf("create container namespace: %w", err)
+	}
+	defer containerNs.releaseContainerNs(rootFS)
+
+	// Use nsenter to join the existing namespaces, then exec ts drop-caps-and-run.
+	// We use nsenter instead of trying to do setns() in Go because:
+	// - setns(CLONE_NEWNS) fails on multithreaded processes (EINVAL)
+	// - Go programs are always multithreaded due to the runtime
+	// - nsenter is a single-threaded C program that handles this correctly
+	//
+	// After nsenter joins the namespaces, ts drop-caps-and-run does:
+	// - Chroot into the container rootfs (needed because joining mount ns doesn't change root)
+	// - Drop dangerous capabilities
+	// - Exec the final command
+	tsBinary := filepath.Join(absRootFS, "bin", "ts")
+
+	// Build the command that nsenter will exec
+	var tsArgs []string
 	if rawCmd != "" {
-		// Execute the requested command as the target user (non-login shell).
-		// The SSH protocol sends a raw command string that the user expects to
-		// be interpreted by a shell, so we pass it directly to su -c without
-		// any re-quoting. This avoids shell quoting bugs and matches standard
-		// SSH server behavior.
-		tsArgs = append(tsArgs, "--", "su", runAsUser, "-c", rawCmd)
-		cmd = exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgs...)...)
+		// Execute the requested command as the target user (non-login shell)
+		tsArgs = []string{
+			tsBinary, "drop-caps-and-run",
+			"--chroot=" + absRootFS,
+			"--", "su", runAsUser, "-c", rawCmd,
+		}
 	} else {
 		// Launch interactive login shell as the target user
-		tsArgs = append(tsArgs, "--", "su", "-", runAsUser)
-		cmd = exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgs...)...)
+		tsArgs = []string{
+			tsBinary, "drop-caps-and-run",
+			"--chroot=" + absRootFS,
+			"--", "su", "-", runAsUser,
+		}
 	}
 
+	// nsenter joins the PID, mount, and UTS namespaces of the init process.
+	// IMPORTANT: We do NOT use -F (--no-fork) because Go programs fail to start
+	// in a joined PID namespace without the fork that properly places them in
+	// the namespace. Without the fork, Go's runtime fails with EINVAL when
+	// trying to create OS threads.
+	// -t: target process to get namespaces from
+	// -p: join PID namespace
+	// -m: join mount namespace
+	// -u: join UTS namespace
+	nsenterArgs := []string{
+		"-t", fmt.Sprintf("%d", initPid),
+		"-p", "-m", "-u",
+		"--",
+	}
+	nsenterArgs = append(nsenterArgs, tsArgs...)
+
+	cmd := exec.Command("nsenter", nsenterArgs...)
 	cmd.Dir = "/"
 	cmd.Env = []string{
 		"SSH_USER=" + sshUser,
 		"TAILSCALE_USER=" + tailscaleUser,
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
 	}
 
 	// Build cgroup name for this container (used for OOM group killing)
@@ -1458,8 +1632,9 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		//
 		// The handshake protocol:
 		// 1. We create a pipe and pass the write end to ts as --pty-handshake-fd
-		// 2. ts sets up devpts, writes "READY\n" to the pipe
-		// 3. We open <rootfs>/dev/pts/ptmx, get the slave path
+		// 2. nsenter joins namespaces, execs ts which does chroot and writes "READY\n"
+		// 3. We open /proc/<pid>/root/dev/pts/ptmx, get the slave path
+		//    (works because nsenter joined the mount namespace)
 		// 4. We write the slave path back to ts via the pipe
 		// 5. ts opens the slave as its controlling terminal and execs the shell
 
@@ -1472,26 +1647,40 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		handshakeTheirs := os.NewFile(uintptr(fds[1]), "handshake-theirs")
 		defer handshakeOurs.Close()
 
-		// Build command with --pty-handshake-fd flag
+		// Build ts command with --pty-handshake-fd flag
 		// The fd number will be 3 (after stdin=0, stdout=1, stderr=2)
-		tsArgsWithPty := make([]string, 0, len(tsArgs)+1)
-		for _, arg := range tsArgs {
-			if arg == "--" {
-				tsArgsWithPty = append(tsArgsWithPty, "--pty-handshake-fd=3", "--")
-			} else {
-				tsArgsWithPty = append(tsArgsWithPty, arg)
+		var ptyTsArgs []string
+		if rawCmd != "" {
+			ptyTsArgs = []string{
+				tsBinary, "drop-caps-and-run",
+				"--chroot=" + absRootFS,
+				"--pty-handshake-fd=3",
+				"--", "su", runAsUser, "-c", rawCmd,
+			}
+		} else {
+			ptyTsArgs = []string{
+				tsBinary, "drop-caps-and-run",
+				"--chroot=" + absRootFS,
+				"--pty-handshake-fd=3",
+				"--", "su", "-", runAsUser,
 			}
 		}
-		cmd = exec.Command(tsBinary, append([]string{"drop-caps-and-run"}, tsArgsWithPty...)...)
+
+		// Build nsenter command (no -F flag - see comment above)
+		ptyNsenterArgs := []string{
+			"-t", fmt.Sprintf("%d", initPid),
+			"-p", "-m", "-u",
+			"--",
+		}
+		ptyNsenterArgs = append(ptyNsenterArgs, ptyTsArgs...)
+
+		cmd = exec.Command("nsenter", ptyNsenterArgs...)
 		cmd.Dir = "/"
 		cmd.Env = []string{
 			"SSH_USER=" + sshUser,
 			"TAILSCALE_USER=" + tailscaleUser,
 			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 			"TERM=" + ptyReq.Term,
-		}
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
 		}
 
 		// Pass their end of the socket as extra fd (fd 3)
