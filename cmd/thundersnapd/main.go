@@ -549,10 +549,12 @@ func main() {
 	}
 
 	// Initialize ref and frame stores for the new UUID-based API.
-	// These use the fs-dir as the state directory since that's where
-	// frames and refs are stored.
-	initRefStore(*flagFsDir)
-	initFrameStore(*flagFsDir)
+	// The stores treat their stateDir as the PARENT of fs/ (they Join
+	// stateDir+"fs"). --fs-dir IS the fs/ directory, so the correct state
+	// dir is its parent; otherwise we'd create a nested fs/fs/ tree.
+	storeStateDir := filepath.Dir(*flagFsDir)
+	initRefStore(storeStateDir)
+	initFrameStore(storeStateDir)
 
 	// Create tsnet server
 	srv := &tsnet.Server{
@@ -743,12 +745,24 @@ func main() {
 				safeContainerName := sanitizeForPath(containerName)
 				homeUser := stripDomain(safeTailscaleUser)
 
-				// Set up the root filesystem (same setup as container sessions)
-				rootFS := filepath.Join(*flagFsDir, safeTailscaleUser, safeContainerName)
-				baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
-				if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
-					log.Printf("SFTP session failed: %v", err)
-					return
+				// Set up the root filesystem (same setup as container sessions).
+				// Resolve a named frame through the per-user ref store so SFTP
+				// targets the same frame an interactive SSH session would.
+				var rootFS string
+				if containerName != "" {
+					var err error
+					rootFS, err = resolveFrameRootFS(tailscaleUser, containerName)
+					if err != nil {
+						log.Printf("SFTP session failed: %v", err)
+						return
+					}
+				} else {
+					rootFS = filepath.Join(*flagFsDir, safeTailscaleUser, safeContainerName)
+					baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
+					if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
+						log.Printf("SFTP session failed: %v", err)
+						return
+					}
 				}
 
 				if err := runSFTPSession(s, rootFS, targetUser); err != nil {
@@ -1523,13 +1537,28 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	// For home directory, strip @host from username for a cleaner look
 	homeUser := stripDomain(safeTailscaleUser)
 
-	// Set up the root filesystem for this user
-	// If this is not the "base" user (stripped username), try to clone from
-	// the base user's filesystem first, falling back to the clean snapshot
-	rootFS := filepath.Join(*flagFsDir, safeTailscaleUser, safeSSHUser)
-	baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
-	if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
-		return err
+	// Set up the root filesystem for this user.
+	//
+	// When a frame name is given (e.g. `ssh root@deb@host`), resolve it through
+	// the per-user ref store: an existing ref reuses the frame UUID it points
+	// at (fs/<user>/<uuid>), and a missing ref auto-creates an empty frame+ref.
+	// This avoids creating a stray fs/<user>/<frameName> directory.
+	//
+	// When no frame name is given, fall back to the legacy per-user clone
+	// behavior (clone from the base user's filesystem or the clean snapshot).
+	var rootFS string
+	if sshUser != "" {
+		var err error
+		rootFS, err = resolveFrameRootFS(tailscaleUser, sshUser)
+		if err != nil {
+			return err
+		}
+	} else {
+		rootFS = filepath.Join(*flagFsDir, safeTailscaleUser, safeSSHUser)
+		baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
+		if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
+			return err
+		}
 	}
 
 	// Get or create shared control socket server for this container
@@ -3961,8 +3990,9 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	useNewAPI := req.SnapshotSpec != ""
 
 	if useNewAPI {
-		// New UUID-based API: snapshot_spec is provided, frame gets a UUID
-		handleCreateWithUUID(w, r, req, stream, isTTY)
+		// New UUID-based API: snapshot_spec is provided, frame gets a UUID.
+		// Frames are isolated per tailscale user at fs/<user>/<uuid>.
+		c.handleCreateWithUUID(w, r, req, stream, isTTY)
 		return
 	}
 
@@ -4074,8 +4104,22 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCreateWithUUID handles frame creation using the new UUID-based API.
-// Frames are created at fs/<uuid>/ and optionally a ref is created.
-func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequest, stream, isTTY bool) {
+// Frames are created at fs/<tailscale-user>/<uuid>/ (per-user isolation) and
+// optionally a per-user ref is created pointing at the new UUID.
+func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequest, stream, isTTY bool) {
+	// Determine the tailscale user owning this control socket so the frame
+	// is created under fs/<user>/, preserving per-user isolation.
+	safeTailscaleUser, err := c.safeTailscaleUser()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(CreateResponse{
+			Status:  "error",
+			Message: err.Error(),
+		})
+		return
+	}
+
 	// Parse the snapshot spec
 	rootfsSpec, homeSpec, workSpec := parseFrameSpec(req.SnapshotSpec)
 
@@ -4105,9 +4149,12 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 		}
 	}
 
-	// If a ref name is provided, validate it and check it doesn't already exist
+	// If a ref name is provided, validate it and check it doesn't already
+	// exist for this user. Refs are namespaced per tailscale user.
+	var refKey string
 	if req.RefName != "" {
-		if refStore.Exists(req.RefName) {
+		refKey = refKeyForUser(safeTailscaleUser, req.RefName)
+		if refStore.Exists(refKey) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(CreateResponse{
@@ -4131,12 +4178,13 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 		return
 	}
 
-	// Build the frame path using UUID
-	framePath := filepath.Join(*flagFsDir, uuid.String())
+	// Build the frame path using UUID, isolated under the tailscale user:
+	// fs/<tailscale-user>/<uuid>.
+	framePath := filepath.Join(*flagFsDir, safeTailscaleUser, uuid.String())
 
 	// For streaming mode, delegate to the streaming handler
 	if stream {
-		handleCreateStreamingWithUUID(w, req, framePath, uuid, isTTY)
+		handleCreateStreamingWithUUID(w, req, framePath, uuid, refKey, isTTY)
 		return
 	}
 
@@ -4179,12 +4227,12 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 	}
 
 	// Create the ref if requested
-	if req.RefName != "" {
-		if err := refStore.Create(req.RefName, uuid); err != nil {
-			log.Printf("failed to create ref %s: %v", req.RefName, err)
+	if refKey != "" {
+		if err := refStore.Create(refKey, uuid); err != nil {
+			log.Printf("failed to create ref %s: %v", refKey, err)
 			// Frame was created but ref failed - log warning
 		} else {
-			log.Printf("Created ref %s -> %s", req.RefName, uuid)
+			log.Printf("Created ref %s -> %s", refKey, uuid)
 		}
 	}
 
@@ -4199,7 +4247,7 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 }
 
 // handleCreateStreamingWithUUID handles streaming create for UUID-based frames.
-func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, framePath string, uuid frameid.ID, isTTY bool) {
+func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, framePath string, uuid frameid.ID, refKey string, isTTY bool) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 
 	if f, ok := w.(http.Flusher); ok {
@@ -4266,12 +4314,12 @@ func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, fra
 		log.Printf("failed to store frame metadata: %v", err)
 	}
 
-	// Create the ref if requested
-	if req.RefName != "" {
-		if err := refStore.Create(req.RefName, uuid); err != nil {
-			log.Printf("failed to create ref %s: %v", req.RefName, err)
+	// Create the ref if requested (per-user namespaced key)
+	if refKey != "" {
+		if err := refStore.Create(refKey, uuid); err != nil {
+			log.Printf("failed to create ref %s: %v", refKey, err)
 		} else {
-			log.Printf("Created ref %s -> %s", req.RefName, uuid)
+			log.Printf("Created ref %s -> %s", refKey, uuid)
 		}
 	}
 
@@ -4429,6 +4477,11 @@ func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) er
 			Home:      homeSnap,
 			Work:      workSnap,
 			Isolation: isolation,
+		}
+		// Ensure the parent directory (e.g. fs/<user>/) exists before writing
+		// the frame.jsonc sidecar next to the frame subvolume.
+		if err := os.MkdirAll(filepath.Dir(framePath), 0755); err != nil {
+			return fmt.Errorf("creating parent directory: %w", err)
 		}
 		// Write the frame.jsonc first so ensureFrameFS can find it
 		if err := writeFrameMeta(framePath, meta); err != nil {
@@ -5094,7 +5147,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		cleanupTmp()
 		return "", fmt.Errorf("read tsm for checksum: %w", err)
 	}
-	snapshotID := hex.EncodeToString(tsmReader.SHA256[:])
+	snapshotID := snaphash.Encode(snaphash.FromBytes(tsmReader.SHA256[:]))
 
 	finalPath := filepath.Join(*flagSnapsDir, snapshotID)
 	finalTSMPath := finalPath + ".tsm"

@@ -7,6 +7,7 @@ require (
 	github.com/gliderlabs/ssh v0.3.8
 	github.com/go-git/go-billy/v5 v5.7.0
 	github.com/google/go-containerregistry v0.21.5
+	github.com/google/uuid v1.6.0
 	github.com/goreleaser/nfpm/v2 v2.45.0
 	github.com/mdlayher/vsock v1.2.1
 	github.com/pborman/getopt/v2 v2.1.0
@@ -68,7 +69,6 @@ require (
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/rpmpack v0.7.1 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/goreleaser/chglog v0.7.4 // indirect
 	github.com/goreleaser/fileglob v1.4.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
