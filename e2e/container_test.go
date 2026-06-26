@@ -2,7 +2,6 @@
 package e2e
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +9,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/tailscale/thundersnap/thundersnap"
 )
 
 // TestContainerIsolationBasic tests the basic container isolation via drop-caps-and-run.
@@ -331,15 +332,16 @@ func parseIsolationOutput(output string) isolationCheckResult {
 // share the same PID namespace, so processes started by one session are visible
 // to another session via /proc.
 //
+// This test uses the same ContainerNsManager that thundersnapd uses, exercising
+// the exact production code path:
+// 1. ContainerNsManager spawns container-init to create and anchor the namespaces
+// 2. Session 1 runs via ContainerNsManager.StartInContainerNs (writes PID file, sleeps)
+// 3. Session 2 runs via ContainerNsManager.RunInContainerNs (lists /proc)
+// 4. Session 2 should see session 1's process in /proc
+//
 // This is the expected behavior: when you SSH into a container twice, both sessions
 // should see each other's processes. This is how Docker exec works - you're joining
 // an existing container's namespace, not creating a new one each time.
-//
-// The architecture:
-// 1. A "container-init" process creates and anchors the namespaces (PID/mount/UTS)
-// 2. Session 1 joins these namespaces via setns() and runs a sleep process
-// 3. Session 2 joins the same namespaces and lists /proc
-// 4. Session 2 should see session 1's process in /proc
 func TestContainerSharedPIDNamespace(t *testing.T) {
 	env := newTestEnv(t)
 
@@ -367,77 +369,23 @@ func TestContainerSharedPIDNamespace(t *testing.T) {
 		t.Fatalf("abs path: %v", err)
 	}
 
-	tsBinary := filepath.Join(absFramePath, "bin", "ts")
+	// Create a ContainerNsManager - this is the same code thundersnapd uses
+	// to manage shared namespaces across SSH sessions
+	nsManager := thundersnap.NewContainerNsManager()
 
-	// Step 1: Start container-init to create and anchor the namespaces
-	// container-init creates PID/mount/UTS namespaces, sets up /dev, /proc, /sys,
-	// and waits on stdin (closing stdin signals shutdown).
-	initCmd := exec.Command(tsBinary, "container-init", "--chroot="+absFramePath)
-	initCmd.Dir = "/"
-	initCmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
-	}
-
-	// Create pipe for stdin - we'll close it to signal shutdown
-	initStdin, err := initCmd.StdinPipe()
+	// Session 1: Start a long-running process that writes its PID
+	// This uses the production code path: container-init + nsenter + drop-caps-and-run
+	session1Cmd, _, err := nsManager.StartInContainerNs(
+		absFramePath, "", "", "",
+		"/bin/sh", "-c", "echo $$ > /tmp/session1.pid && sleep 30")
 	if err != nil {
-		t.Fatalf("create stdin pipe: %v", err)
-	}
-
-	// Create pipe for stdout to read READY signal
-	initStdout, err := initCmd.StdoutPipe()
-	if err != nil {
-		initStdin.Close()
-		t.Fatalf("create stdout pipe: %v", err)
-	}
-	initCmd.Stderr = os.Stderr
-
-	if err := initCmd.Start(); err != nil {
-		initStdin.Close()
-		t.Fatalf("start container-init: %v", err)
-	}
-	defer func() {
-		initStdin.Close()
-		initCmd.Wait()
-	}()
-
-	initPid := initCmd.Process.Pid
-	t.Logf("container-init started with PID %d", initPid)
-
-	// Wait for READY signal from container-init
-	readyBuf := make([]byte, 64)
-	n, err := initStdout.Read(readyBuf)
-	if err != nil {
-		t.Fatalf("read READY from init: %v", err)
-	}
-	if !strings.HasPrefix(string(readyBuf[:n]), "READY") {
-		t.Fatalf("unexpected init response: %q", string(readyBuf[:n]))
-	}
-	t.Log("container-init is ready")
-
-	// Step 2: Start session 1 - uses nsenter to join namespaces, then ts to run a sleep process
-	// We use nsenter because setns(CLONE_NEWNS) fails on multithreaded processes (Go).
-	// nsenter is a single-threaded C program that handles namespace joining correctly.
-	// Note: We must NOT use -F (--no-fork) because Go programs fail to start
-	// in a joined PID namespace without the fork that properly places them in
-	// the namespace. The fork also means the child will see itself with a new PID.
-	// We use the HOST path to ts binary (not from inside the container) since
-	// we haven't chrooted yet. drop-caps-and-run handles the chroot.
-	session1Cmd := exec.Command("nsenter",
-		"-t", fmt.Sprintf("%d", initPid),
-		"-p", "-m", "-u",
-		"--",
-		tsBinary, "drop-caps-and-run",
-		"--chroot="+absFramePath,
-		"--skip-mount-setup",
-		"--", "/bin/sh", "-c",
-		"echo $$ > /tmp/session1.pid && sleep 30")
-	session1Cmd.Dir = "/"
-
-	if err := session1Cmd.Start(); err != nil {
 		t.Fatalf("start session 1: %v", err)
 	}
-	defer session1Cmd.Process.Kill()
+	defer func() {
+		session1Cmd.Process.Kill()
+		session1Cmd.Wait()
+		nsManager.ReleaseContainerNs(absFramePath)
+	}()
 	t.Logf("Session 1 started with host PID %d", session1Cmd.Process.Pid)
 
 	// Wait for session 1 to write its PID file
@@ -455,21 +403,11 @@ func TestContainerSharedPIDNamespace(t *testing.T) {
 	}
 	t.Logf("Session 1 reports PID %s in the container namespace", session1PID)
 
-	// Step 3: Start session 2 - joins the same namespaces and lists /proc
-	// If namespaces are shared, session 2 should see session 1's sleep process.
-	session2Cmd := exec.Command("nsenter",
-		"-t", fmt.Sprintf("%d", initPid),
-		"-p", "-m", "-u",
-		"--",
-		tsBinary, "drop-caps-and-run",
-		"--chroot="+absFramePath,
-		"--skip-mount-setup",
-		"--", "/bin/sh", "-c",
-		// Echo with glob expansion - each numeric dir in /proc is a PID
-		"echo /proc/[0-9]*")
-	session2Cmd.Dir = "/"
-
-	output, err := session2Cmd.CombinedOutput()
+	// Session 2: List /proc to see what PIDs are visible
+	// This uses the same ContainerNsManager, which will reuse the same namespace
+	output, err := nsManager.RunInContainerNs(
+		absFramePath, "", "", "",
+		"/bin/sh", "-c", "echo /proc/[0-9]*")
 	if err != nil {
 		t.Logf("proc scan output: %s", output)
 		t.Fatalf("session 2 proc scan failed: %v", err)
