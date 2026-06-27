@@ -1611,11 +1611,14 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	// Build the command that nsenter will exec
 	var tsArgs []string
 	if rawCmd != "" {
-		// Execute the requested command as the target user (non-login shell)
+		// Execute the requested command as the target user via a login shell
+		// ("su -") so that HOME and the working directory are set to the user's
+		// home. Without the login shell the command would run from "/" with the
+		// wrong HOME, which breaks tools like rsync that start in $HOME.
 		tsArgs = []string{
 			tsBinary, "drop-caps-and-run",
 			"--chroot=" + absRootFS,
-			"--", "su", runAsUser, "-c", rawCmd,
+			"--", "su", "-", runAsUser, "-c", rawCmd,
 		}
 	} else {
 		// Launch interactive login shell as the target user
@@ -1681,11 +1684,13 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		// The fd number will be 3 (after stdin=0, stdout=1, stderr=2)
 		var ptyTsArgs []string
 		if rawCmd != "" {
+			// Login shell ("su -") so HOME and cwd are the user's home; see the
+			// non-PTY branch above for rationale (rsync/cwd correctness).
 			ptyTsArgs = []string{
 				tsBinary, "drop-caps-and-run",
 				"--chroot=" + absRootFS,
 				"--pty-handshake-fd=3",
-				"--", "su", runAsUser, "-c", rawCmd,
+				"--", "su", "-", runAsUser, "-c", rawCmd,
 			}
 		} else {
 			ptyTsArgs = []string{
