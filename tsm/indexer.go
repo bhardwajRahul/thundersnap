@@ -165,7 +165,7 @@ func (idx *Indexer) Index(rootPath, outBase string) error {
 		return fmt.Errorf("writing tsm: %w", err)
 	}
 
-	idx.logProgress("Indexed %d files (%d reused from parent), %d unique chunks, %d MB\n",
+	idx.logProgress("Indexed %d files (%d already indexed), %d unique chunks, %d MB\n",
 		idx.tsm.EntryCount(), idx.reusedFiles, idx.tsc.ChunkCount(), idx.totalBytes/(1024*1024))
 
 	return nil
@@ -350,27 +350,36 @@ func (idx *Indexer) logProgress(format string, args ...interface{}) {
 	}
 }
 
-// updateProgress updates the progress display
+// updateProgress updates the progress display roughly every 250ms, reporting
+// the total files indexed, how many of those were reused (already indexed,
+// based on the parent .tsm), and total bytes indexed so far. The message is
+// emitted for both TTY and non-TTY consumers: on a TTY it is prefixed with a
+// carriage return and includes the current path so it overwrites in place; on
+// a non-TTY (e.g. an NDJSON progress stream) it is a plain line.
 func (idx *Indexer) updateProgress(path string) {
 	if !idx.opts.Progress || idx.opts.ProgressWriter == nil {
 		return
 	}
 
-	// Rate limit to 10 updates per second
+	// Rate limit to about 4 updates per second (~250ms).
 	now := time.Now()
-	if now.Sub(idx.lastUpdate) < 100*time.Millisecond {
+	if now.Sub(idx.lastUpdate) < 250*time.Millisecond {
 		return
 	}
 	idx.lastUpdate = now
 
+	msg := fmt.Sprintf("Indexing: %d files (%d already indexed), %d MB",
+		idx.fileCount, idx.reusedFiles, idx.totalBytes/(1024*1024))
+
 	if idx.opts.IsTTY {
-		// Truncate path for display
+		// Append the current path and overwrite the line in place.
 		displayPath := path
 		if len(displayPath) > 60 {
 			displayPath = "..." + displayPath[len(displayPath)-57:]
 		}
-		fmt.Fprintf(idx.opts.ProgressWriter, "\r[%d files] [%dM] %s",
-			idx.fileCount, idx.totalBytes/(1024*1024), displayPath)
+		fmt.Fprintf(idx.opts.ProgressWriter, "\r%s %s", msg, displayPath)
+	} else {
+		fmt.Fprintln(idx.opts.ProgressWriter, msg)
 	}
 }
 

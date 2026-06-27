@@ -5192,7 +5192,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 	// re-reading and re-hashing every file. This makes a second consecutive
 	// snap of an unchanged tree do essentially no file I/O.
 	tsmOpts := tsm.IndexerOptions{
-		Progress:       false,
+		Progress:       progressWriter != nil,
 		ProgressWriter: progressWriter,
 		IsTTY:          isTTY,
 	}
