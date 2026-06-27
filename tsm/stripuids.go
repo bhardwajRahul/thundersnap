@@ -108,7 +108,74 @@ func EnsureUserInPasswd(rootfs string) (home string, err error) {
 		return "", err
 	}
 
+	// Also ensure a matching "user" group (GID 7575) exists in /etc/group.
+	// Without this, the user's primary GID 7575 has no name, which breaks
+	// tools that look up group names (e.g. `id`, `ls -l`).
+	if err := ensureUserInGroup(rootfs); err != nil {
+		return "", err
+	}
+
 	return "/home", nil
+}
+
+// ensureUserInGroup adds a "user" group with GID ThundersnapGID to /etc/group
+// if the file exists and neither the "user" group name nor GID 7575 is already
+// present. This matches the "user" account added to /etc/passwd, which uses
+// GID 7575 as its primary group.
+func ensureUserInGroup(rootfs string) error {
+	groupPath := filepath.Join(rootfs, "etc", "group")
+	in, err := os.ReadFile(groupPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // No group file, nothing to do
+		}
+		return err
+	}
+
+	// Check whether a group named "user" or with GID 7575 already exists.
+	// Group format: name:password:GID:member-list
+	var lines []string
+	var exists bool
+	scanner := bufio.NewScanner(strings.NewReader(string(in)))
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		lines = append(lines, line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 3 {
+			continue
+		}
+		if fields[0] == "user" {
+			exists = true
+		}
+		if gid, err := strconv.ParseUint(fields[2], 10, 32); err == nil && uint32(gid) == ThundersnapGID {
+			exists = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan group: %w", err)
+	}
+
+	if exists {
+		return nil
+	}
+
+	newGroupEntry := fmt.Sprintf("user:x:%d:", ThundersnapGID)
+
+	// Append the new group entry. Group ordering does not matter, so just add
+	// it at the end (preserving the original trailing newline behavior).
+	var out strings.Builder
+	for _, line := range lines {
+		out.WriteString(line)
+		out.WriteByte('\n')
+	}
+	out.WriteString(newGroupEntry)
+	out.WriteByte('\n')
+
+	return atomicWriteFile(groupPath, []byte(out.String()), 0644)
 }
 
 // EnsureSudoers creates a sudoers.d drop-in file that grants passwordless

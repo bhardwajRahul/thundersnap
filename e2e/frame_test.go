@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/tailscale/thundersnap/tsm"
 )
 
 // TestFrameLifecycleBasic tests the basic frame lifecycle:
@@ -450,6 +453,15 @@ func (s *testControlServer) handleCreate(w http.ResponseWriter, r *http.Request)
 	os.RemoveAll(idPath)
 	exec.Command("btrfs", "subvolume", "create", idPath).CombinedOutput()
 	os.Chmod(idPath, 0700)
+
+	// Mirror production ensureFrameFS: ensure a "user" account (and matching
+	// group/shadow entries) exists in the frame rootfs, plus passwordless sudo.
+	if _, err := tsm.EnsureUserInPasswd(framePath); err != nil {
+		log.Printf("Warning: EnsureUserInPasswd on %s: %v", framePath, err)
+	}
+	if err := tsm.EnsureSudoers(framePath); err != nil {
+		log.Printf("Warning: EnsureSudoers on %s: %v", framePath, err)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1006,6 +1018,74 @@ func TestFrameWithAllThreeSpecs(t *testing.T) {
 	}
 
 	t.Log("Verified home and work content from snapshots present in frame")
+}
+
+// TestFrameUserGroupCreated verifies that when a frame is created from a base
+// snapshot that has no "user" account, the frame's /etc/passwd gains a "user"
+// account with UID 7575 AND /etc/group gains a matching "user" group with GID
+// 7575. Without the matching group the user's primary GID 7575 is nameless,
+// which breaks tools like `id` and `ls -l`.
+func TestFrameUserGroupCreated(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	// Create a base snapshot, then strip the pre-existing "user" account from
+	// /etc/passwd, /etc/shadow and /etc/group so that frame creation is forced
+	// to add the thundersnap "user" (UID/GID 7575) from scratch.
+	baseSnap := env.createBaseSnapshot()
+	snapPath := filepath.Join(env.snapshotsDir, baseSnap)
+
+	rewrite := func(name, content string) {
+		p := filepath.Join(snapPath, "etc", name)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatalf("rewrite %s: %v", name, err)
+		}
+	}
+	// passwd/group/shadow with root only (no "user").
+	rewrite("passwd", "root:x:0:0:root:/root:/bin/sh\n"+
+		"daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n")
+	rewrite("group", "root:x:0:\ndaemon:x:1:\n")
+	rewrite("shadow", "root:*:19000:0:99999:7:::\n")
+
+	// Create a frame (rootfs-only) from the stripped base snapshot.
+	frameName := "usergroupframe"
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": baseSnap + "::",
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+
+	framePath := filepath.Join(env.fsDir, "testuser", frameName)
+
+	// /etc/passwd should now contain the user account at UID/GID 7575.
+	passwd, err := os.ReadFile(filepath.Join(framePath, "etc", "passwd"))
+	if err != nil {
+		t.Fatalf("read frame passwd: %v", err)
+	}
+	if !strings.Contains(string(passwd), "user:x:7575:7575:") {
+		t.Fatalf("frame passwd missing user:x:7575:7575:\n%s", passwd)
+	}
+
+	// /etc/group MUST contain a matching "user" group with GID 7575. This is
+	// the actual bug being guarded: previously only passwd was updated.
+	group, err := os.ReadFile(filepath.Join(framePath, "etc", "group"))
+	if err != nil {
+		t.Fatalf("read frame group: %v", err)
+	}
+	if !strings.Contains(string(group), "user:x:7575:") {
+		t.Fatalf("frame group missing matching user:x:7575: entry\n%s", group)
+	}
+	t.Logf("Verified user account and matching group 7575 created in frame")
 }
 
 // TestFrameFromNonExistentSnapshot tests error handling for creating a frame from non-existent snapshot.

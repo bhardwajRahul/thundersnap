@@ -254,6 +254,124 @@ func TestEnsureUserInPasswd(t *testing.T) {
 		}
 	})
 
+	t.Run("adds user group when group file exists", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootfs := filepath.Join(tmpDir, "rootfs")
+		etcDir := filepath.Join(rootfs, "etc")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		passwd := "root::0:0:root:/root:/bin/bash\n"
+		group := "root:x:0:\ndaemon:x:1:\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(etcDir, "group"), []byte(group), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := EnsureUserInPasswd(rootfs); err != nil {
+			t.Fatalf("EnsureUserInPasswd: %v", err)
+		}
+
+		gotGroup, _ := os.ReadFile(filepath.Join(etcDir, "group"))
+		if !strings.Contains(string(gotGroup), "user:x:7575:") {
+			t.Errorf("user group not added (expected user:x:7575:):\n%s", gotGroup)
+		}
+	})
+
+	t.Run("does not add group when name already exists", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootfs := filepath.Join(tmpDir, "rootfs")
+		etcDir := filepath.Join(rootfs, "etc")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		passwd := "root::0:0:root:/root:/bin/bash\n"
+		// A pre-existing "user" group with a different GID must not be duplicated.
+		group := "root:x:0:\nuser:x:1000:\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(etcDir, "group"), []byte(group), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := EnsureUserInPasswd(rootfs); err != nil {
+			t.Fatalf("EnsureUserInPasswd: %v", err)
+		}
+
+		gotGroup, _ := os.ReadFile(filepath.Join(etcDir, "group"))
+		if string(gotGroup) != group {
+			t.Errorf("group file modified unexpectedly:\n%s", gotGroup)
+		}
+		if strings.Count(string(gotGroup), "user:") != 1 {
+			t.Errorf("expected exactly one user group entry:\n%s", gotGroup)
+		}
+	})
+
+	t.Run("does not add group when GID 7575 already taken", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootfs := filepath.Join(tmpDir, "rootfs")
+		etcDir := filepath.Join(rootfs, "etc")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		passwd := "root::0:0:root:/root:/bin/bash\n"
+		// Some other group already owns GID 7575; do not create a conflicting one.
+		group := "root:x:0:\nexisting:x:7575:\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(etcDir, "group"), []byte(group), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := EnsureUserInPasswd(rootfs); err != nil {
+			t.Fatalf("EnsureUserInPasswd: %v", err)
+		}
+
+		gotGroup, _ := os.ReadFile(filepath.Join(etcDir, "group"))
+		if string(gotGroup) != group {
+			t.Errorf("group file modified unexpectedly:\n%s", gotGroup)
+		}
+	})
+
+	t.Run("group idempotent", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		rootfs := filepath.Join(tmpDir, "rootfs")
+		etcDir := filepath.Join(rootfs, "etc")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		passwd := "root::0:0:root:/root:/bin/bash\n"
+		group := "root:x:0:\n"
+		if err := os.WriteFile(filepath.Join(etcDir, "passwd"), []byte(passwd), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(etcDir, "group"), []byte(group), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := EnsureUserInPasswd(rootfs); err != nil {
+			t.Fatalf("first EnsureUserInPasswd: %v", err)
+		}
+		first, _ := os.ReadFile(filepath.Join(etcDir, "group"))
+
+		if _, err := EnsureUserInPasswd(rootfs); err != nil {
+			t.Fatalf("second EnsureUserInPasswd: %v", err)
+		}
+		second, _ := os.ReadFile(filepath.Join(etcDir, "group"))
+
+		if string(first) != string(second) {
+			t.Errorf("group changed between calls:\n1st: %s\n2nd: %s", first, second)
+		}
+	})
+
 	t.Run("shadow idempotent", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		rootfs := filepath.Join(tmpDir, "rootfs")
