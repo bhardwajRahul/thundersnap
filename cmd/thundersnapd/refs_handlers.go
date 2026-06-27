@@ -5,10 +5,22 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"path/filepath"
 
 	"github.com/tailscale/thundersnap/frameid"
+	"github.com/tailscale/thundersnap/refid"
 	"github.com/tailscale/thundersnap/refs"
 )
+
+// framePathForUUID returns the on-disk frame path for a frame UUID. Frames live
+// at <fs-dir>/<uuid>/. It returns "" when the fs dir is not configured (e.g. in
+// unit tests that exercise the ref store without a running daemon).
+func framePathForUUID(uuid frameid.ID) string {
+	if flagFsDir == nil || *flagFsDir == "" {
+		return ""
+	}
+	return filepath.Join(*flagFsDir, uuid.String())
+}
 
 // refStore is the global ref store, initialized in main().
 var refStore *refs.Store
@@ -73,6 +85,13 @@ func handleRefCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Initialize the ref's identity subvolume inside the target frame's /id.
+	if framePath := framePathForUUID(uuid); framePath != "" {
+		if err := refid.Ensure(framePath, req.Name); err != nil {
+			log.Printf("Warning: ensure id subvolume for ref %s in frame %s: %v", req.Name, uuid, err)
+		}
+	}
+
 	log.Printf("Created ref %s -> %s", req.Name, req.UUID)
 	jsonResponse(w, RefResponse{Status: "ok"})
 }
@@ -117,14 +136,24 @@ func handleRefMove(w http.ResponseWriter, r *http.Request) {
 	if !req.Force {
 		// TODO: Check activeFrames for the current UUID
 		// For now, we'll allow the move
-		_ = currentRef
 	}
+
+	oldUUID := currentRef.UUID
 
 	// Move the ref
 	if err := refStore.Move(req.Name, uuid); err != nil {
 		log.Printf("ref move failed: %v", err)
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Move the ref's identity subvolume from the old frame's /id to the new
+	// frame's /id so its private state follows the ref.
+	srcFrame, dstFrame := framePathForUUID(oldUUID), framePathForUUID(uuid)
+	if oldUUID != uuid && srcFrame != "" && dstFrame != "" {
+		if err := refid.Move(srcFrame, dstFrame, req.Name); err != nil {
+			log.Printf("Warning: move id subvolume for ref %s (%s -> %s): %v", req.Name, oldUUID, uuid, err)
+		}
 	}
 
 	log.Printf("Moved ref %s -> %s", req.Name, req.UUID)
