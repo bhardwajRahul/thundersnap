@@ -162,6 +162,15 @@ thundersnapd --mesh --data-dir=/var/lib/thundersnap
 Mesh nodes discover each other via Tailscale and can transfer snapshots
 using content-defined chunking — only changed chunks are transferred.
 
+### Metrics
+
+thundersnapd exports Prometheus metrics at `/metrics` on its tsnet web
+server (port `:7575`, reachable only over the tailnet). Alongside the
+standard Go runtime and process collectors, it reports thundersnap-specific
+gauges: `thundersnap_frames_total`, `thundersnap_snaps_total`,
+`thundersnap_refs_total`, `thundersnap_running_sessions`, and
+`thundersnap_running_vms`.
+
 ## Architecture
 
 ```

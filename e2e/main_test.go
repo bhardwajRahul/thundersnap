@@ -62,7 +62,7 @@ func TestMain(m *testing.M) {
 		{"container", `^Test(BlankContainer|Container|NestedThundersnap|Cgroup).*$`},
 
 		// Tier 5: frames, taints, integration, mesh, streaming, uid, docker.
-		{"frames", `^Test(Frame|MultipleTaintsOnFrame|Taint|Integration|Workflow|CrossFrame|Mesh|Streaming|NDJSON|HTTPRange|Vsock|UID|Id|Docker|MultipleConcurrentSessions|LongRunningProgressUpdates|QueryFrameTaints|DeleteRunningFrame).*$`},
+		{"frames", `^Test(Frame|MultipleTaintsOnFrame|Taint|Integration|Workflow|CrossFrame|Mesh|Metrics|Streaming|NDJSON|HTTPRange|Vsock|UID|Id|Docker|MultipleConcurrentSessions|LongRunningProgressUpdates|QueryFrameTaints|DeleteRunningFrame).*$`},
 
 		// Tier 6: SSH/shell scenarios.
 		{"shell", `^Test(SSH|MinimalShell).*$`},

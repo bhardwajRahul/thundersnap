@@ -815,6 +815,9 @@ func main() {
 	bupdateServer := &bupdateFileServer{root: *flagSnapsDir}
 	httpMux.Handle("/bupdate/", http.StripPrefix("/bupdate", bupdateServer))
 
+	// Prometheus metrics endpoint (OS-level + thundersnap counts).
+	registerMetrics(httpMux, *flagFsDir, *flagSnapsDir)
+
 	httpServer := &http.Server{Handler: httpMux}
 	go func() {
 		log.Printf("HTTP server listening on port 7575")
