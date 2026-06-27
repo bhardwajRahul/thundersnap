@@ -40,7 +40,7 @@ type Indexer struct {
 	lastUpdate time.Time
 
 	// Track hardlinks: device+inode -> entry index
-	hardlinks  map[uint64]uint32
+	hardlinks map[uint64]uint32
 }
 
 // NewIndexer creates a new filesystem indexer
@@ -320,9 +320,9 @@ func Create(rootPath, outBase string, opts IndexerOptions) error {
 
 // IndexerStats returns statistics about the indexing
 type IndexerStats struct {
-	FileCount   int
-	ChunkCount  uint64
-	TotalBytes  int64
+	FileCount  int
+	ChunkCount uint64
+	TotalBytes int64
 }
 
 // Stats returns current indexing statistics

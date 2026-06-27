@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e contains end-to-end tests for thundersnap ref edge cases.
 //
 // These tests exercise the refs package functionality with edge cases that

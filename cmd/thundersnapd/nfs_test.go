@@ -13,9 +13,9 @@ import (
 
 	"github.com/go-git/go-billy/v5/osfs"
 	nfs "github.com/willscott/go-nfs"
-	nfshelper "github.com/willscott/go-nfs/helpers"
 	nfsc "github.com/willscott/go-nfs-client/nfs"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
+	nfshelper "github.com/willscott/go-nfs/helpers"
 )
 
 // findFreePort finds an available TCP port.
@@ -140,7 +140,7 @@ func setupNFSTest(t *testing.T) *testNFSSetup {
 		t.Fatalf("reading fh length: %v", err)
 	}
 	// Convert from network byte order
-	fhLen = (fhLen>>24) | ((fhLen>>8)&0xff00) | ((fhLen<<8)&0xff0000) | (fhLen<<24)
+	fhLen = (fhLen >> 24) | ((fhLen >> 8) & 0xff00) | ((fhLen << 8) & 0xff0000) | (fhLen << 24)
 
 	fh := make([]byte, fhLen)
 	if _, err := io.ReadFull(res, fh); err != nil {
@@ -402,7 +402,7 @@ func TestNFSConcurrentAccess(t *testing.T) {
 			var buf [8]byte
 			res.Read(buf[:4]) // status
 			res.Read(buf[:4]) // fh len
-			fhLen := (uint32(buf[0])<<24) | (uint32(buf[1])<<16) | (uint32(buf[2])<<8) | uint32(buf[3])
+			fhLen := (uint32(buf[0]) << 24) | (uint32(buf[1]) << 16) | (uint32(buf[2]) << 8) | uint32(buf[3])
 			fh := make([]byte, fhLen)
 			io.ReadFull(res, fh)
 
@@ -548,7 +548,7 @@ func BenchmarkNFSRead(b *testing.B) {
 	var buf [8]byte
 	res.Read(buf[:4])
 	res.Read(buf[:4])
-	fhLen := (uint32(buf[0])<<24) | (uint32(buf[1])<<16) | (uint32(buf[2])<<8) | uint32(buf[3])
+	fhLen := (uint32(buf[0]) << 24) | (uint32(buf[1]) << 16) | (uint32(buf[2]) << 8) | uint32(buf[3])
 	fh := make([]byte, fhLen)
 	io.ReadFull(res, fh)
 
@@ -628,7 +628,7 @@ func BenchmarkNFSWrite(b *testing.B) {
 	var buf [8]byte
 	res.Read(buf[:4])
 	res.Read(buf[:4])
-	fhLen := (uint32(buf[0])<<24) | (uint32(buf[1])<<16) | (uint32(buf[2])<<8) | uint32(buf[3])
+	fhLen := (uint32(buf[0]) << 24) | (uint32(buf[1]) << 16) | (uint32(buf[2]) << 8) | uint32(buf[3])
 	fh := make([]byte, fhLen)
 	io.ReadFull(res, fh)
 

@@ -27,9 +27,19 @@ BIN ?= ./bin
 
 all: build
 
-# Run all tests (requires CGO_ENABLED=0 for cmd/ts tests)
+# Run all tests (requires CGO_ENABLED=0 for cmd/ts tests).
+# If the tests pass, also verify all Go files are gofmt-formatted; fail if not.
 test:
 	CGO_ENABLED=0 go test ./...
+	@echo "checking gofmt..."
+	@unformatted=$$(gofmt -l $$(find . -name '*.go' -not -path './.tmp-e2e/*' -not -path './vendor/*' 2>/dev/null)); \
+	if [ -n "$$unformatted" ]; then \
+		echo "ERROR: the following files are not gofmt-formatted:"; \
+		echo "$$unformatted"; \
+		echo "run 'gofmt -w .' to fix"; \
+		exit 1; \
+	fi
+	@echo "gofmt OK"
 
 # Run e2e tests (requires root and btrfs)
 # Compiles the test binary and dependencies as the current user, then runs with sudo.
@@ -37,13 +47,13 @@ test:
 E2E_TMPDIR ?= $(CURDIR)/.tmp-e2e
 e2e: ts vshd thundersnapd
 	@mkdir -p $(E2E_TMPDIR)
-	CGO_ENABLED=0 go test -c -o $(BIN)/e2e.test ./e2e
+	CGO_ENABLED=0 go test -tags e2e -c -o $(BIN)/e2e.test ./e2e
 	sudo -E env \
 		TMPDIR="$(E2E_TMPDIR)" \
 		TS_BINARY="$(CURDIR)/$(BIN)/ts" \
 		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
 		THUNDERSNAPD_BINARY="$(CURDIR)/$(BIN)/thundersnapd" \
-		$(BIN)/e2e.test -test.v
+		$(BIN)/e2e.test -test.v -test.failfast
 
 # Build all binaries for local development
 binaries: ts vsh vshd thundersnapd bupdate tsm fidx slab

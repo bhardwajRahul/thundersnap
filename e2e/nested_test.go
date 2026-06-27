@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e contains end-to-end tests for thundersnap nested execution.
 package e2e
 
@@ -327,12 +329,12 @@ func splitLines(s string) []string {
 // Requires root and cgroup v2 to actually test the cgroup functionality.
 func TestCgroupMultiLevelSubtreeControl(t *testing.T) {
 	if os.Getuid() != 0 {
-		t.Skip("cgroup test requires root")
+		t.Fatal("cgroup test requires root")
 	}
 
 	// Check if cgroup v2 is available
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
-		t.Skip("cgroup v2 not available")
+		t.Fatal("cgroup v2 not available")
 	}
 
 	// Create a unique parent cgroup for this test

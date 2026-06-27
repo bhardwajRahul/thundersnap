@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e contains end-to-end tests for thundersnap.
 //
 // These tests run the actual binaries (thundersnapd, ts) and interact with
@@ -7,9 +9,9 @@
 //   - root access (for btrfs subvolume operations)
 //   - btrfs filesystem for temp directory
 //   - pre-built binaries specified via environment variables:
-//     - TS_BINARY: path to pre-built ts binary
-//     - VSHD_BINARY: path to pre-built vshd binary
-//     - THUNDERSNAPD_BINARY: path to pre-built thundersnapd binary
+//   - TS_BINARY: path to pre-built ts binary
+//   - VSHD_BINARY: path to pre-built vshd binary
+//   - THUNDERSNAPD_BINARY: path to pre-built thundersnapd binary
 //
 // Use "make e2e" to build binaries and run tests with the correct environment.
 package e2e
@@ -46,25 +48,27 @@ type testEnv struct {
 	daemonBinary string
 }
 
-// requireBtrfsRoot skips if not root or not on btrfs.
+// requireBtrfsRoot fails the test if the e2e environment is not set up
+// correctly (not root or not on btrfs). e2e tests must never skip: if the
+// environment is misconfigured we want a hard failure, not a silent skip.
 func requireBtrfsRoot(t *testing.T) string {
 	t.Helper()
 
 	if os.Getuid() != 0 {
-		t.Skip("e2e test requires root for btrfs and container ops")
+		t.Fatal("e2e test requires root for btrfs and container ops")
 	}
 	if _, err := exec.LookPath("btrfs"); err != nil {
-		t.Skip("btrfs not on PATH")
+		t.Fatal("btrfs not on PATH")
 	}
 
 	root := t.TempDir()
 	cmd := exec.Command("stat", "-f", "-c", "%T", root)
 	out, err := cmd.Output()
 	if err != nil {
-		t.Skipf("stat -f failed: %v", err)
+		t.Fatalf("stat -f failed: %v", err)
 	}
 	if strings.TrimSpace(string(out)) != "btrfs" {
-		t.Skipf("test dir %s not on btrfs (got %q)", root, strings.TrimSpace(string(out)))
+		t.Fatalf("test dir %s not on btrfs (got %q)", root, strings.TrimSpace(string(out)))
 	}
 
 	return root
@@ -453,14 +457,14 @@ func verifyDevSetup(t *testing.T, result devCheckResult) {
 	// These would indicate we're using the kernel's devtmpfs instead of our controlled tmpfs
 	devtmpfsEntries := []string{
 		"loop0", "loop1", "loop2", // loop devices
-		"sda", "sdb", "vda",       // disk devices
-		"dri",                     // GPU
-		"kvm",                     // KVM
-		"btrfs-control",          // btrfs
-		"autofs",                 // autofs
-		"console",                // console (we don't create this)
-		"kmsg",                   // kernel messages
-		"mem",                    // memory device
+		"sda", "sdb", "vda", // disk devices
+		"dri",           // GPU
+		"kvm",           // KVM
+		"btrfs-control", // btrfs
+		"autofs",        // autofs
+		"console",       // console (we don't create this)
+		"kmsg",          // kernel messages
+		"mem",           // memory device
 	}
 
 	// Build set of allowed entries
@@ -580,8 +584,8 @@ func vmDir() string {
 	// Check common locations for cloud-hypervisor
 	// Also check repo's vm/ directory relative to where we're running
 	candidates := []string{
-		"vm",     // repo's vm/ directory (when running from repo root)
-		"../vm",  // when running from e2e/
+		"vm",    // repo's vm/ directory (when running from repo root)
+		"../vm", // when running from e2e/
 		"/usr/local/lib/thundersnap",
 		"/usr/lib/thundersnap",
 		"/opt/thundersnap",
@@ -598,23 +602,25 @@ func vmDir() string {
 	return ""
 }
 
-// requireVMDeps skips the test if VM dependencies are not available.
+// requireVMDeps fails the test if VM dependencies are not available. e2e
+// tests must never skip: a missing VM dependency is a misconfigured
+// environment and should be a hard failure.
 func requireVMDeps(t *testing.T) string {
 	t.Helper()
 
 	dir := vmDir()
 	if dir == "" {
-		t.Skip("VM test requires cloud-hypervisor and vmlinux (not found in standard locations)")
+		t.Fatal("VM test requires cloud-hypervisor and vmlinux (not found in standard locations)")
 	}
 
 	// Also need virtiofsd and passt
 	if _, err := exec.LookPath("virtiofsd"); err != nil {
 		if _, err := os.Stat("/usr/libexec/virtiofsd"); err != nil {
-			t.Skip("VM test requires virtiofsd")
+			t.Fatal("VM test requires virtiofsd")
 		}
 	}
 	if _, err := exec.LookPath("passt"); err != nil {
-		t.Skip("VM test requires passt")
+		t.Fatal("VM test requires passt")
 	}
 
 	return dir

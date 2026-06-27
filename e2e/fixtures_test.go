@@ -1,3 +1,5 @@
+//go:build e2e
+
 package e2e
 
 import (
@@ -12,7 +14,7 @@ import (
 // and device nodes.
 func TestFixtureCreatesAllFileTypes(t *testing.T) {
 	if os.Getuid() != 0 {
-		t.Skip("fixture test requires root for device nodes")
+		t.Fatal("fixture test requires root for device nodes")
 	}
 
 	dir := t.TempDir()

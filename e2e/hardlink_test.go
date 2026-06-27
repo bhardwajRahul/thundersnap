@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e contains end-to-end tests for thundersnap hardlink handling.
 package e2e
 

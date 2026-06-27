@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e contains integration/workflow end-to-end tests for thundersnap.
 package e2e
 

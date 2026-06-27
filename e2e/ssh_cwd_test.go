@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e tests vshd SSH working directory behavior.
 package e2e
 

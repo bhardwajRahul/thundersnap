@@ -86,8 +86,8 @@ func TestPolicyFileMatchGrant(t *testing.T) {
 				Dst: []string{"tag:thundersnap"},
 				App: map[string][]ThundersnapCap{
 					ThundersnapCapName: {{
-						Role:          "admin",
-						Isolation:     "none",
+						Role:      "admin",
+						Isolation: "none",
 						MaxFrames: -1,
 					}},
 				},
@@ -97,10 +97,10 @@ func TestPolicyFileMatchGrant(t *testing.T) {
 				Dst: []string{"tag:thundersnap"},
 				App: map[string][]ThundersnapCap{
 					ThundersnapCapName: {{
-						Role:          "ephemeral",
-						Isolation:     "container",
+						Role:      "ephemeral",
+						Isolation: "container",
 						MaxFrames: 50,
-						Ephemeral:     true,
+						Ephemeral: true,
 					}},
 				},
 			},
@@ -109,8 +109,8 @@ func TestPolicyFileMatchGrant(t *testing.T) {
 				Dst: []string{"tag:thundersnap"},
 				App: map[string][]ThundersnapCap{
 					ThundersnapCapName: {{
-						Role:          "developer",
-						Isolation:     "vm",
+						Role:      "developer",
+						Isolation: "vm",
 						MaxFrames: 10,
 					}},
 				},
@@ -233,11 +233,11 @@ func TestResolveCap(t *testing.T) {
 	}
 
 	tests := []struct {
-		name      string
-		who       *apitype.WhoIsResponse
-		policy    *PolicyFile
-		wantRole  string
-		wantIso   string
+		name     string
+		who      *apitype.WhoIsResponse
+		policy   *PolicyFile
+		wantRole string
+		wantIso  string
 	}{
 		{
 			name:     "nil who uses default",

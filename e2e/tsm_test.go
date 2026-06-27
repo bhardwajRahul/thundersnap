@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e contains end-to-end tests for thundersnap TSM/TSC format.
 package e2e
 
@@ -279,9 +281,9 @@ func TestTSCSortedSHA256(t *testing.T) {
 		t.Fatalf("open TSC: %v", err)
 	}
 
-	if len(tscReader.Entries) < 2 {
-		t.Skip("not enough chunks to verify sorting")
-	}
+	// With fewer than 2 entries the ordering check below is a no-op, but we do
+	// not skip: e2e tests must never skip. A single/empty chunk list is still a
+	// valid (trivially sorted) result.
 
 	// Verify each entry's SHA is >= the previous
 	for i := 1; i < len(tscReader.Entries); i++ {

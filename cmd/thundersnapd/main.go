@@ -6,12 +6,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -55,14 +55,14 @@ func init() {
 }
 
 var (
-	flagFsDir        *string
-	flagSnapsDir *string
-	flagVmDir        *string
-	flagLibexecDir   *string
-	flagPolicyPath   *string
-	flagMesh         *bool
-	flagNfsd         *bool
-	flagNfsPort      *int
+	flagFsDir      *string
+	flagSnapsDir   *string
+	flagVmDir      *string
+	flagLibexecDir *string
+	flagPolicyPath *string
+	flagMesh       *bool
+	flagNfsd       *bool
+	flagNfsPort    *int
 
 	// globalPolicy holds the loaded policy file for grant matching
 	globalPolicy *PolicyFile
@@ -3547,10 +3547,10 @@ func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Delete associated files
-	os.Remove(snapPath + ".jsonc")  // metadata
-	os.Remove(snapPath + ".stamp")  // stamp file
-	os.Remove(snapPath + ".tsm")    // tsm manifest
-	os.Remove(snapPath + ".tsc")    // tsc manifest
+	os.Remove(snapPath + ".jsonc") // metadata
+	os.Remove(snapPath + ".stamp") // stamp file
+	os.Remove(snapPath + ".tsm")   // tsm manifest
+	os.Remove(snapPath + ".tsc")   // tsc manifest
 
 	log.Printf("Deleted snapshot %s", req.SnapshotID)
 
@@ -5177,10 +5177,10 @@ type meshPeer struct {
 
 // meshState tracks mesh discovery state
 type meshState struct {
-	mu      sync.Mutex
-	myURL   string
-	myFQDN  string
-	peers   map[string]*meshPeer // keyed by hostname
+	mu     sync.Mutex
+	myURL  string
+	myFQDN string
+	peers  map[string]*meshPeer // keyed by hostname
 }
 
 func newMeshState(myFQDN string) *meshState {

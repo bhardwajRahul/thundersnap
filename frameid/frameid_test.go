@@ -48,7 +48,7 @@ func TestParseInvalid(t *testing.T) {
 	invalidUUIDs := []string{
 		"",
 		"not-a-uuid",
-		"12345678-1234-1234-1234-12345678901",  // too short
+		"12345678-1234-1234-1234-12345678901",   // too short
 		"12345678-1234-1234-1234-1234567890123", // too long
 	}
 
