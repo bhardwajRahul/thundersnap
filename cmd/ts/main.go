@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -290,12 +291,26 @@ func cmdSnap(args []string) {
 		return
 	}
 
-	if opts.NArgs() > 0 {
-		fmt.Fprintln(os.Stderr, "error: snap takes no arguments (use --delete to delete a snapshot)")
+	if opts.NArgs() > 1 {
+		fmt.Fprintln(os.Stderr, "error: snap takes at most one path argument")
+		fmt.Fprintln(os.Stderr, "usage: ts snap [<path>]    snapshot the whole frame, or just <path>'s subtree")
 		os.Exit(1)
 	}
 
-	snapshotID, err := doSnap(*sockPath)
+	// Optional subdir argument: snapshot just that subtree of the frame.
+	// Resolve it to a path that is absolute within the container so the
+	// daemon can map it onto the frame's rootfs.
+	subdir := ""
+	if opts.NArgs() == 1 {
+		resolved, err := resolveSnapSubdir(opts.Arg(0))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		subdir = resolved
+	}
+
+	snapshotID, err := doSnap(*sockPath, subdir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -303,6 +318,36 @@ func cmdSnap(args []string) {
 
 	// Print just the snapshot ID to stdout
 	fmt.Println(snapshotID)
+}
+
+// resolveSnapSubdir turns a user-supplied path (absolute or relative to the
+// current working directory inside the container) into a clean container-
+// absolute path with the leading slash stripped, suitable for the daemon's
+// "subdir" parameter. It rejects paths that don't exist or aren't directories.
+func resolveSnapSubdir(arg string) (string, error) {
+	abs := arg
+	if !filepath.IsAbs(abs) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("get working directory: %w", err)
+		}
+		abs = filepath.Join(cwd, arg)
+	}
+	abs = filepath.Clean(abs)
+
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("path %q: %w", arg, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("path %q is not a directory", arg)
+	}
+
+	rel := strings.TrimPrefix(abs, "/")
+	if rel == "" {
+		return "", fmt.Errorf("cannot snap the container root as a subdir; run 'ts snap' with no argument")
+	}
+	return rel, nil
 }
 
 func cmdSnaps(args []string) {
@@ -338,7 +383,7 @@ type SnapStreamEvent struct {
 	SnapshotID string `json:"snapshot_id,omitempty"` // snapshot ID (for result)
 }
 
-func doSnap(sockPath string) (string, error) {
+func doSnap(sockPath, subdir string) (string, error) {
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -362,6 +407,9 @@ func doSnap(sockPath string) (string, error) {
 	url := "http://localhost/snap?stream=1"
 	if isTTY {
 		url += "&tty=1"
+	}
+	if subdir != "" {
+		url += "&subdir=" + neturl.QueryEscape(subdir)
 	}
 
 	resp, err := client.Post(url, "application/json", nil)

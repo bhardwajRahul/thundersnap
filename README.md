@@ -145,6 +145,7 @@ Once inside a thundersnap workspace, use the `ts` tool:
 ```sh
 ts ping                              # health check
 ts snap                              # snapshot current workspace
+ts snap <path>                       # snapshot just <path>'s subtree, re-rooted
 ts frame newname <snapshot-id>       # fork a new workspace from a snapshot
 ts who-has <snapshot-id>             # find which mesh peers have a snapshot
 ts download-snap <snapshot-id>       # download a snapshot from the mesh

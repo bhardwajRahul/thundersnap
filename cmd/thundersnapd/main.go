@@ -35,6 +35,7 @@ import (
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/frames"
 	"github.com/tailscale/thundersnap/snaphash"
+	"github.com/tailscale/thundersnap/snapsubdir"
 	"github.com/tailscale/thundersnap/thundersnap"
 	"github.com/tailscale/thundersnap/tsm"
 	gossh "golang.org/x/crypto/ssh"
@@ -3408,14 +3409,15 @@ func makeSnapHandler(rootFS string) http.HandlerFunc {
 		// Check if client wants streaming progress
 		stream := r.URL.Query().Get("stream") == "1"
 		isTTY := r.URL.Query().Get("tty") == "1"
+		subdir := r.URL.Query().Get("subdir")
 
 		if stream {
-			handleSnapStreaming(w, rootFS, isTTY)
+			handleSnapStreaming(w, rootFS, subdir, isTTY)
 			return
 		}
 
 		// Non-streaming: original behavior
-		snapshotID, err := createSnapshot(rootFS, nil, false)
+		snapshotID, err := createSnapshotSubdir(rootFS, subdir, nil, false)
 		if err != nil {
 			log.Printf("snap failed for %s: %v", rootFS, err)
 			w.Header().Set("Content-Type", "application/json")
@@ -3438,7 +3440,7 @@ func makeSnapHandler(rootFS string) http.HandlerFunc {
 }
 
 // handleSnapStreaming handles the streaming version of /snap
-func handleSnapStreaming(w http.ResponseWriter, rootFS string, isTTY bool) {
+func handleSnapStreaming(w http.ResponseWriter, rootFS, subdir string, isTTY bool) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 
 	// Enable streaming mode immediately by flushing
@@ -3449,7 +3451,7 @@ func handleSnapStreaming(w http.ResponseWriter, rootFS string, isTTY bool) {
 	pw := newSnapProgressWriter(w)
 	encoder := json.NewEncoder(w)
 
-	snapshotID, err := createSnapshot(rootFS, pw, isTTY)
+	snapshotID, err := createSnapshotSubdir(rootFS, subdir, pw, isTTY)
 	if err != nil {
 		log.Printf("snap failed for %s: %v", rootFS, err)
 		encoder.Encode(SnapStreamEvent{
@@ -5029,6 +5031,30 @@ func prepareDownloadDir(targetDir string, fileList []string, progress io.Writer)
 // Returns the snapshot ID (based on the fidx checksum).
 // If progressWriter is non-nil, progress updates are written to it.
 func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string, error) {
+	return createSnapshotSubdir(rootFS, "", progressWriter, isTTY)
+}
+
+// createSnapshotSubdir is createSnapshot with optional subdir support. When
+// subdir is non-empty, only that subtree (re-rooted) is snapshotted and a
+// single snapshot ID is returned; the frame's own stamp/metadata are left
+// untouched, so this can be used to assemble a snap from a portion of a
+// container's filesystem.
+func createSnapshotSubdir(rootFS, subdir string, progressWriter io.Writer, isTTY bool) (string, error) {
+	if subdir != "" {
+		clean, err := snapsubdir.Validate(subdir)
+		if err != nil {
+			return "", err
+		}
+		// Inherit the frame's taints, but index the subtree in full (no
+		// parent stamp, since the re-rooted paths don't match any parent).
+		frameMeta, _ := readFrameMeta(rootFS)
+		var frameTaints []string
+		if frameMeta != nil {
+			frameTaints = frameMeta.Taints
+		}
+		return createSnapshotWithTaintsSubdir(rootFS, clean, "", frameTaints, progressWriter, isTTY)
+	}
+
 	// Check if this is a three-component frame (has nested home/work subvolumes)
 	homePath := filepath.Join(rootFS, "home")
 	workPath := filepath.Join(rootFS, "work")
@@ -5155,6 +5181,18 @@ func loadParentManifest(parentStampID string) (*tsm.TSMReader, *tsm.TSCReader) {
 // createSnapshotWithTaints is like createSnapshotWithFidx but accepts explicit taints.
 // If taints is nil, taints are inherited from the parent snap.
 func createSnapshotWithTaints(source, parentStampID string, taints []string, progressWriter io.Writer, isTTY bool) (string, error) {
+	return createSnapshotWithTaintsSubdir(source, "", parentStampID, taints, progressWriter, isTTY)
+}
+
+// createSnapshotWithTaintsSubdir is createSnapshotWithTaints with optional
+// subdir support. When subdir is non-empty (a slash-relative path within the
+// source subvolume), only that subtree is snapshotted: for atomicity the whole
+// subvolume is still snapshotted first, then everything outside subdir is
+// deleted and subdir's contents are promoted to the snapshot root before the
+// subvolume is made read-only and indexed. The resulting snapshot ID is the
+// content hash of just that subtree, so it can be dropped into a frame on its
+// own.
+func createSnapshotWithTaintsSubdir(source, subdir, parentStampID string, taints []string, progressWriter io.Writer, isTTY bool) (string, error) {
 	// Generate a random temporary ID for the work-in-progress snapshot
 	tmpID, err := generateRandomID()
 	if err != nil {
@@ -5173,11 +5211,21 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		os.Remove(tmpTSCPath)
 	}
 
-	// Step 1: Create read-only btrfs snapshot to tmp path
-	cmd := exec.Command("btrfs", "subvolume", "snapshot", "-r", source, tmpPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("btrfs snapshot failed: %w\noutput: %s", err, string(output))
+	if subdir == "" {
+		// Step 1: Create read-only btrfs snapshot to tmp path
+		cmd := exec.Command("btrfs", "subvolume", "snapshot", "-r", source, tmpPath)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("btrfs snapshot failed: %w\noutput: %s", err, string(output))
+		}
+	} else {
+		// Subdir snap: take a WRITABLE snapshot (so we can prune/promote),
+		// then reduce it to just the requested subtree before making it
+		// read-only.
+		if err := snapsubdir.Snapshot(source, subdir, tmpPath); err != nil {
+			cleanupTmp()
+			return "", err
+		}
 	}
 
 	// Write stamp file for the snapshot (in tmp location)
@@ -5196,9 +5244,14 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		ProgressWriter: progressWriter,
 		IsTTY:          isTTY,
 	}
-	if parentTSM, parentTSC := loadParentManifest(parentStampID); parentTSM != nil && parentTSC != nil {
-		tsmOpts.ParentTSM = parentTSM
-		tsmOpts.ParentTSC = parentTSC
+	// Incremental reuse only applies to a full-root snap, where the parent
+	// manifest's paths line up with this tree. A subdir snap re-roots the
+	// tree, so the parent's paths no longer match; index it in full.
+	if subdir == "" {
+		if parentTSM, parentTSC := loadParentManifest(parentStampID); parentTSM != nil && parentTSC != nil {
+			tsmOpts.ParentTSM = parentTSM
+			tsmOpts.ParentTSC = parentTSC
+		}
 	}
 	if err := tsm.Create(tmpPath, tmpPath, tsmOpts); err != nil {
 		cleanupTmp()
