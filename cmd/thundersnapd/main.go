@@ -1842,14 +1842,25 @@ func runSFTPSession(s ssh.Session, rootFS, targetUser string) error {
 
 	// Default to /home/user if we can't look up the user
 	homeDir := "/home/user"
-	if userInfo != nil && userInfo.Home != "" {
-		homeDir = userInfo.Home
+	// Files created over SFTP are created by the thundersnapd process (root),
+	// so without an explicit chown they would all be owned by root. Chown new
+	// files/dirs to the target user so that scp/sftp uploads land with the
+	// correct ownership rather than as root.
+	uid, gid := -1, -1
+	if userInfo != nil {
+		if userInfo.Home != "" {
+			homeDir = userInfo.Home
+		}
+		uid = int(userInfo.UID)
+		gid = int(userInfo.GID)
 	}
 
 	// Create the SFTP handler that maps paths through the container rootFS
 	handler := &sftpHandler{
 		rootFS:  absRootFS,
 		homeDir: homeDir,
+		uid:     uid,
+		gid:     gid,
 	}
 
 	server := sftp.NewRequestServer(s, sftp.Handlers{
@@ -1873,6 +1884,19 @@ func runSFTPSession(s ssh.Session, rootFS, targetUser string) error {
 type sftpHandler struct {
 	rootFS  string // absolute path to container root
 	homeDir string // user's home directory (container-relative, e.g., "/home/user")
+	uid     int    // target user UID for newly-created files, or -1 to leave as-is
+	gid     int    // target user GID for newly-created files, or -1 to leave as-is
+}
+
+// chownNew sets ownership of a path newly created over SFTP to the target user.
+// It is a no-op when no target uid/gid is configured (uid < 0).
+func (h *sftpHandler) chownNew(hostPath string) {
+	if h.uid < 0 || h.gid < 0 {
+		return
+	}
+	if err := os.Lchown(hostPath, h.uid, h.gid); err != nil {
+		log.Printf("Warning: failed to chown %s to %d:%d: %v", hostPath, h.uid, h.gid, err)
+	}
 }
 
 // toHostPath converts a container-relative path to an absolute host path.
@@ -1924,7 +1948,16 @@ func (h *sftpHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		flags |= os.O_EXCL
 	}
 
-	return os.OpenFile(hostPath, flags, 0644)
+	f, err := os.OpenFile(hostPath, flags, 0644)
+	if err != nil {
+		return nil, err
+	}
+	// New uploads should be owned by the target user, not by root (the
+	// thundersnapd process). Only chown when we actually created the file.
+	if pflags.Creat {
+		h.chownNew(hostPath)
+	}
+	return f, nil
 }
 
 // Filecmd implements sftp.FileCmder
@@ -1966,7 +1999,11 @@ func (h *sftpHandler) Filecmd(r *sftp.Request) error {
 		if r.AttrFlags().Permissions {
 			mode = r.Attributes().FileMode()
 		}
-		return os.Mkdir(hostPath, mode)
+		if err := os.Mkdir(hostPath, mode); err != nil {
+			return err
+		}
+		h.chownNew(hostPath)
+		return nil
 
 	case "Symlink":
 		// r.Filepath is the link name, r.Target is what it points to
@@ -1974,7 +2011,11 @@ func (h *sftpHandler) Filecmd(r *sftp.Request) error {
 		if err != nil {
 			return err
 		}
-		return os.Symlink(targetPath, hostPath)
+		if err := os.Symlink(targetPath, hostPath); err != nil {
+			return err
+		}
+		h.chownNew(hostPath)
+		return nil
 
 	default:
 		return fmt.Errorf("unsupported command: %s", r.Method)
