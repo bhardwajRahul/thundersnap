@@ -2600,6 +2600,16 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 		}
 	}
 
+	// Step 3b: Ensure /home/work is a convenient symlink to /work. If nothing
+	// named "work" already exists in the home subvolume, create the symlink so
+	// users landing in /home can reach the work tree at ~/work.
+	homeWorkPath := filepath.Join(homePath, "work")
+	if _, err := os.Lstat(homeWorkPath); errors.Is(err, os.ErrNotExist) {
+		if err := os.Symlink("/work", homeWorkPath); err != nil {
+			log.Printf("Warning: failed to create /home/work symlink: %v", err)
+		}
+	}
+
 	// Step 4: Compute taints as union of all component snaps' taints
 	rootfsTaints := getSnapTaints(*flagSnapsDir, meta.Rootfs)
 	homeTaints := getSnapTaints(*flagSnapsDir, meta.Home)

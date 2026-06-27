@@ -454,6 +454,15 @@ func (s *testControlServer) handleCreate(w http.ResponseWriter, r *http.Request)
 	exec.Command("btrfs", "subvolume", "create", idPath).CombinedOutput()
 	os.Chmod(idPath, 0700)
 
+	// Mirror production ensureFrameFS: if nothing named "work" exists in the
+	// home subvolume, create a /home/work -> /work convenience symlink.
+	homeWorkPath := filepath.Join(homePath, "work")
+	if _, err := os.Lstat(homeWorkPath); os.IsNotExist(err) {
+		if err := os.Symlink("/work", homeWorkPath); err != nil {
+			log.Printf("Warning: failed to create /home/work symlink: %v", err)
+		}
+	}
+
 	// Mirror production ensureFrameFS: ensure a "user" account (and matching
 	// group/shadow entries) exists in the frame rootfs, plus passwordless sudo.
 	if _, err := tsm.EnsureUserInPasswd(framePath); err != nil {
@@ -1086,6 +1095,110 @@ func TestFrameUserGroupCreated(t *testing.T) {
 		t.Fatalf("frame group missing matching user:x:7575: entry\n%s", group)
 	}
 	t.Logf("Verified user account and matching group 7575 created in frame")
+}
+
+// TestFrameHomeWorkSymlink verifies that creating a frame produces a
+// /home/work symlink pointing at /work, so a user landing in /home can reach
+// the work tree at ~/work.
+func TestFrameHomeWorkSymlink(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	baseSnap := env.createBaseSnapshot()
+
+	frameName := "homeworkframe"
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": baseSnap + "::",
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+
+	framePath := filepath.Join(env.fsDir, "testuser", frameName)
+	homeWork := filepath.Join(framePath, "home", "work")
+
+	fi, err := os.Lstat(homeWork)
+	if err != nil {
+		t.Fatalf("stat /home/work: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("/home/work is not a symlink (mode %v)", fi.Mode())
+	}
+	target, err := os.Readlink(homeWork)
+	if err != nil {
+		t.Fatalf("readlink /home/work: %v", err)
+	}
+	if target != "/work" {
+		t.Fatalf("/home/work points to %q, want /work", target)
+	}
+	t.Logf("Verified /home/work -> /work symlink")
+}
+
+// TestFrameHomeWorkSymlinkNotOverwritten verifies that an existing "work" entry
+// in the home subvolume (from a home snapshot) is not clobbered by the
+// /home/work symlink logic.
+func TestFrameHomeWorkSymlinkNotOverwritten(t *testing.T) {
+	env := newTestEnv(t)
+
+	sockPath := filepath.Join(env.root, "ctrl.sock")
+	ctrl := startTestControlServer(t, env, sockPath)
+	defer ctrl.Close()
+
+	client := newTestHTTPClient(sockPath)
+
+	baseSnap := env.createBaseSnapshot()
+
+	// Create a home snapshot that already contains a real "work" directory.
+	homeSnapPath := filepath.Join(env.snapshotsDir, "home-with-work")
+	if out, err := exec.Command("btrfs", "subvolume", "create", homeSnapPath).CombinedOutput(); err != nil {
+		t.Fatalf("create home snap: %v\n%s", err, out)
+	}
+	realWork := filepath.Join(homeSnapPath, "work")
+	if err := os.MkdirAll(realWork, 0755); err != nil {
+		t.Fatalf("mkdir home/work: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realWork, "keep.txt"), []byte("keep\n"), 0644); err != nil {
+		t.Fatalf("write keep.txt: %v", err)
+	}
+
+	frameName := "homeworkkeepframe"
+	createResp, err := client.postJSON("/create", map[string]string{
+		"frame_name":  frameName,
+		"snapshot_id": baseSnap + ":home-with-work:",
+	})
+	if err != nil {
+		t.Fatalf("create frame: %v", err)
+	}
+	if createResp["status"] != "ok" {
+		t.Fatalf("create frame failed: %v", createResp["message"])
+	}
+
+	framePath := filepath.Join(env.fsDir, "testuser", frameName)
+	homeWork := filepath.Join(framePath, "home", "work")
+
+	fi, err := os.Lstat(homeWork)
+	if err != nil {
+		t.Fatalf("stat /home/work: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("/home/work was replaced by a symlink, clobbering existing dir")
+	}
+	if !fi.IsDir() {
+		t.Fatalf("/home/work is not a directory (mode %v)", fi.Mode())
+	}
+	if _, err := os.Stat(filepath.Join(homeWork, "keep.txt")); err != nil {
+		t.Fatalf("existing /home/work content lost: %v", err)
+	}
+	t.Logf("Verified existing /home/work directory preserved")
 }
 
 // TestFrameFromNonExistentSnapshot tests error handling for creating a frame from non-existent snapshot.
