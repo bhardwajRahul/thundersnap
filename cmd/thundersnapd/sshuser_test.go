@@ -129,3 +129,27 @@ func TestParseSSHUser(t *testing.T) {
 		})
 	}
 }
+
+// TestIsInteractiveSession verifies that the greeting banner is only shown for
+// interactive login shells, not for subcommand invocations (ssh cmd, scp,
+// rsync), where the banner would corrupt the program's output.
+func TestIsInteractiveSession(t *testing.T) {
+	tests := []struct {
+		name       string
+		rawCommand string
+		want       bool
+	}{
+		{"interactive shell", "", true},
+		{"explicit command", "ls -l", false},
+		{"scp sink", "scp -t /home/user", false},
+		{"rsync server", "rsync --server -vlogDtpre.iLsfxC . /home/user/", false},
+		{"sftp subsystem", "sftp", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isInteractiveSession(tt.rawCommand); got != tt.want {
+				t.Errorf("isInteractiveSession(%q) = %v, want %v", tt.rawCommand, got, tt.want)
+			}
+		})
+	}
+}

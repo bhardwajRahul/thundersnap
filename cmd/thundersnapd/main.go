@@ -671,19 +671,29 @@ func main() {
 			rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(frameName))
 			runAsUser := selectTargetUser(rootFS, targetUser)
 
+			// Only greet the user in interactive mode. When a subcommand is
+			// supplied (e.g. `ssh host -- some-cmd`, scp, rsync) the greeting
+			// would corrupt the program's output, so suppress it.
+			interactive := isInteractiveSession(s.RawCommand())
+			greet := func(format string, args ...any) {
+				if interactive {
+					fmt.Fprintf(s.Stderr(), format, args...)
+				}
+			}
+
 			// Route based on isolation level
 			switch cap.Isolation {
 			case "vmx":
 				if frameName == "" {
 					// Direct shell into outer VM
-					fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to outer VM <%s>\r\n", tailscaleUser, vmxIsolation)
+					greet("* Hello <%s>, connecting you to outer VM <%s>\r\n", tailscaleUser, vmxIsolation)
 					if err := runVMXOuterShell(s, tailscaleUser, vmxIsolation, targetUser, logErr); err != nil {
 						logErr("VMX outer shell failed: %v", err)
 						s.Exit(1)
 					}
 				} else {
 					// Container inside VM
-					fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s> (VMX/%s)\r\n", tailscaleUser, runAsUser, frameName, vmxIsolation)
+					greet("* Hello <%s>, connecting you to <%s> in <%s> (VMX/%s)\r\n", tailscaleUser, runAsUser, frameName, vmxIsolation)
 					if err := runVMXSession(s, tailscaleUser, vmxIsolation, frameName, targetUser, logErr); err != nil {
 						logErr("VMX session failed: %v", err)
 						s.Exit(1)
@@ -691,13 +701,13 @@ func main() {
 				}
 			case "none":
 				// Direct session on host (no isolation)
-				fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s> (no isolation)\r\n", tailscaleUser, runAsUser, frameName)
+				greet("* Hello <%s>, connecting you to <%s> in <%s> (no isolation)\r\n", tailscaleUser, runAsUser, frameName)
 				if err := runContainerSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
 					logErr("Session failed: %v", err)
 					s.Exit(1)
 				}
 			default: // "container" is the default
-				fmt.Fprintf(s.Stderr(), "* Hello <%s>, connecting you to <%s> in <%s>\r\n", tailscaleUser, runAsUser, frameName)
+				greet("* Hello <%s>, connecting you to <%s> in <%s>\r\n", tailscaleUser, runAsUser, frameName)
 				if err := runContainerSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
 					logErr("Container session failed: %v", err)
 					s.Exit(1)
@@ -1427,6 +1437,17 @@ func stripDomain(s string) string {
 //   - vm/<frame>                      - sugar for vmx/default/<frame>
 //   - <user>@<frame>                  - container as user
 //   - <frame>                         - container (default)
+//
+// isInteractiveSession reports whether an SSH session is interactive (a login
+// shell) rather than a subcommand invocation. rawCommand is the raw command
+// string from the SSH session (ssh.Session.RawCommand): it is empty for an
+// interactive shell and non-empty when a command was supplied (e.g.
+// `ssh host -- cmd`, scp, or rsync). The greeting banner is only shown for
+// interactive sessions, since printing it would corrupt subcommand output.
+func isInteractiveSession(rawCommand string) bool {
+	return rawCommand == ""
+}
+
 func parseSSHUser(sshUser string) (isolation, vmxIsolation, targetUser, frameName string) {
 	isolation = "container"
 
