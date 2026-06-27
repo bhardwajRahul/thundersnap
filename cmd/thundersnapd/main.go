@@ -1618,6 +1618,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		tsArgs = []string{
 			tsBinary, "drop-caps-and-run",
 			"--chroot=" + absRootFS,
+			"--skip-mount-setup",
 			"--", "su", "-", runAsUser, "-c", rawCmd,
 		}
 	} else {
@@ -1625,6 +1626,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		tsArgs = []string{
 			tsBinary, "drop-caps-and-run",
 			"--chroot=" + absRootFS,
+			"--skip-mount-setup",
 			"--", "su", "-", runAsUser,
 		}
 	}
@@ -1689,6 +1691,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 			ptyTsArgs = []string{
 				tsBinary, "drop-caps-and-run",
 				"--chroot=" + absRootFS,
+				"--skip-mount-setup",
 				"--pty-handshake-fd=3",
 				"--", "su", "-", runAsUser, "-c", rawCmd,
 			}
@@ -1696,6 +1699,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 			ptyTsArgs = []string{
 				tsBinary, "drop-caps-and-run",
 				"--chroot=" + absRootFS,
+				"--skip-mount-setup",
 				"--pty-handshake-fd=3",
 				"--", "su", "-", runAsUser,
 			}
