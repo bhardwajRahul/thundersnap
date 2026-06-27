@@ -5131,6 +5131,27 @@ func createSnapshotWithFidx(source, parentStampID string, progressWriter io.Writ
 	return createSnapshotWithTaints(source, parentStampID, nil, progressWriter, isTTY)
 }
 
+// loadParentManifest loads the TSM and TSC manifests for the given parent
+// snapshot ID from the snaps directory, for use as the incremental-indexing
+// baseline. It returns (nil, nil) when the parent has no usable manifest
+// (e.g. an empty/base stamp or a snapshot that predates manifests); callers
+// then fall back to a full re-index.
+func loadParentManifest(parentStampID string) (*tsm.TSMReader, *tsm.TSCReader) {
+	if parentStampID == "" {
+		return nil, nil
+	}
+	base := filepath.Join(*flagSnapsDir, parentStampID)
+	parentTSM, err := tsm.ReadTSM(base + ".tsm")
+	if err != nil {
+		return nil, nil
+	}
+	parentTSC, err := tsm.ReadTSC(base + ".tsc")
+	if err != nil {
+		return nil, nil
+	}
+	return parentTSM, parentTSC
+}
+
 // createSnapshotWithTaints is like createSnapshotWithFidx but accepts explicit taints.
 // If taints is nil, taints are inherited from the parent snap.
 func createSnapshotWithTaints(source, parentStampID string, taints []string, progressWriter io.Writer, isTTY bool) (string, error) {
@@ -5165,11 +5186,19 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		return "", fmt.Errorf("write stamp file: %w", err)
 	}
 
-	// Step 2: Create TSM/TSC manifests in tmp location
+	// Step 2: Create TSM/TSC manifests in tmp location.
+	// Load the parent snapshot's manifest (if any) so the indexer can reuse
+	// chunk hashes for files that are unchanged since the parent, instead of
+	// re-reading and re-hashing every file. This makes a second consecutive
+	// snap of an unchanged tree do essentially no file I/O.
 	tsmOpts := tsm.IndexerOptions{
 		Progress:       false,
 		ProgressWriter: progressWriter,
 		IsTTY:          isTTY,
+	}
+	if parentTSM, parentTSC := loadParentManifest(parentStampID); parentTSM != nil && parentTSC != nil {
+		tsmOpts.ParentTSM = parentTSM
+		tsmOpts.ParentTSC = parentTSC
 	}
 	if err := tsm.Create(tmpPath, tmpPath, tsmOpts); err != nil {
 		cleanupTmp()

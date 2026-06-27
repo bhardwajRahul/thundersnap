@@ -26,6 +26,14 @@ type IndexerOptions struct {
 
 	// CrossDevice allows indexing across filesystem boundaries
 	CrossDevice bool
+
+	// ParentTSM and ParentTSC, if both non-nil, enable incremental indexing:
+	// a regular file whose path, size and mtime match the parent snapshot is
+	// assumed unchanged, so its chunk hashes are reused from the parent
+	// instead of re-reading and re-hashing the file content. This makes a
+	// second consecutive snap of an unchanged tree avoid all file I/O.
+	ParentTSM *TSMReader
+	ParentTSC *TSCReader
 }
 
 // Indexer creates TSM and TSC files from a filesystem
@@ -38,6 +46,10 @@ type Indexer struct {
 	fileCount  int
 	totalBytes int64
 	lastUpdate time.Time
+
+	// reusedFiles counts files whose chunks were reused from the parent
+	// snapshot (i.e. not re-hashed) during incremental indexing.
+	reusedFiles int
 
 	// Track hardlinks: device+inode -> entry index
 	hardlinks map[uint64]uint32
@@ -153,8 +165,8 @@ func (idx *Indexer) Index(rootPath, outBase string) error {
 		return fmt.Errorf("writing tsm: %w", err)
 	}
 
-	idx.logProgress("Indexed %d files, %d unique chunks, %d MB\n",
-		idx.tsm.EntryCount(), idx.tsc.ChunkCount(), idx.totalBytes/(1024*1024))
+	idx.logProgress("Indexed %d files (%d reused from parent), %d unique chunks, %d MB\n",
+		idx.tsm.EntryCount(), idx.reusedFiles, idx.tsc.ChunkCount(), idx.totalBytes/(1024*1024))
 
 	return nil
 }
@@ -207,13 +219,22 @@ func (idx *Indexer) processEntry(path, relPath string, info os.FileInfo, entryIn
 			idx.hardlinks[key] = entryIndex
 		}
 
-		// Process file chunks
-		chunkRefs, err := idx.processFileChunks(path, info.Size())
-		if err != nil {
-			return nil, err
+		// Incremental fast path: if the parent snapshot has an identical
+		// (path, size, mtime) regular file, reuse its chunks instead of
+		// re-reading and re-hashing the content.
+		if chunkRefs, ok := idx.reuseParentChunks(entry); ok {
+			entry.ChunkRefs = chunkRefs
+			entry.ChunkCount = uint32(len(chunkRefs))
+			idx.reusedFiles++
+		} else {
+			// Process file chunks
+			chunkRefs, err := idx.processFileChunks(path, info.Size())
+			if err != nil {
+				return nil, err
+			}
+			entry.ChunkRefs = chunkRefs
+			entry.ChunkCount = uint32(len(chunkRefs))
 		}
-		entry.ChunkRefs = chunkRefs
-		entry.ChunkCount = uint32(len(chunkRefs))
 
 	case mode&os.ModeSymlink != 0:
 		entry.Type = EntryTypeSymlink
@@ -281,6 +302,47 @@ func (idx *Indexer) processFileChunks(path string, size int64) ([]uint32, error)
 	return chunkRefs, nil
 }
 
+// reuseParentChunks checks whether the given regular-file entry is unchanged
+// since the parent snapshot (same path, size and mtime). If so, it copies the
+// parent's chunks into this indexer's TSC and returns the new chunk refs,
+// avoiding any read/hash of the file content. The second return value reports
+// whether the fast path was taken.
+//
+// Reusing chunks is safe for snapshot-ID reproducibility: the reused chunks
+// have identical SHA/size/level, and the entry's mtime is taken from the
+// filesystem (which equals the parent's mtime precisely because the file is
+// unchanged), so the resulting TSM hash is identical to a full re-index.
+func (idx *Indexer) reuseParentChunks(entry *TSMEntry) ([]uint32, bool) {
+	if idx.opts.ParentTSM == nil || idx.opts.ParentTSC == nil {
+		return nil, false
+	}
+	parent, ok := idx.opts.ParentTSM.LookupPath(entry.Path)
+	if !ok {
+		return nil, false
+	}
+	// Only reuse when nothing observable about the file content has changed.
+	// btrfs preserves nanosecond mtime, so an exact match means the file was
+	// not rewritten since the parent snapshot was taken.
+	if parent.Type != EntryTypeFile ||
+		parent.Size != entry.Size ||
+		parent.Mtime != entry.Mtime {
+		return nil, false
+	}
+
+	chunkRefs := make([]uint32, 0, len(parent.ChunkRefs))
+	for _, tscIdx := range parent.ChunkRefs {
+		if int(tscIdx) >= len(idx.opts.ParentTSC.Entries) {
+			// Parent index out of range: bail out and re-hash to be safe.
+			return nil, false
+		}
+		c := idx.opts.ParentTSC.Entries[tscIdx]
+		newIdx := idx.tsc.AddChunk(c.SHA256, c.Size, c.Level, c.Flags)
+		chunkRefs = append(chunkRefs, newIdx)
+		idx.totalBytes += int64(c.Size)
+	}
+	return chunkRefs, true
+}
+
 // logProgress writes a progress message if progress is enabled
 func (idx *Indexer) logProgress(format string, args ...interface{}) {
 	if idx.opts.Progress && idx.opts.ProgressWriter != nil {
@@ -320,17 +382,19 @@ func Create(rootPath, outBase string, opts IndexerOptions) error {
 
 // IndexerStats returns statistics about the indexing
 type IndexerStats struct {
-	FileCount  int
-	ChunkCount uint64
-	TotalBytes int64
+	FileCount   int
+	ReusedFiles int
+	ChunkCount  uint64
+	TotalBytes  int64
 }
 
 // Stats returns current indexing statistics
 func (idx *Indexer) Stats() IndexerStats {
 	return IndexerStats{
-		FileCount:  idx.fileCount,
-		ChunkCount: idx.tsc.ChunkCount(),
-		TotalBytes: idx.totalBytes,
+		FileCount:   idx.fileCount,
+		ReusedFiles: idx.reusedFiles,
+		ChunkCount:  idx.tsc.ChunkCount(),
+		TotalBytes:  idx.totalBytes,
 	}
 }
 
