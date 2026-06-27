@@ -7,9 +7,9 @@
 //   - root access (for btrfs subvolume operations)
 //   - btrfs filesystem for temp directory
 //   - pre-built binaries specified via environment variables:
-//     - TS_BINARY: path to pre-built ts binary
-//     - VSHD_BINARY: path to pre-built vshd binary
-//     - THUNDERSNAPD_BINARY: path to pre-built thundersnapd binary
+//   - TS_BINARY: path to pre-built ts binary
+//   - VSHD_BINARY: path to pre-built vshd binary
+//   - THUNDERSNAPD_BINARY: path to pre-built thundersnapd binary
 //
 // Use "make e2e" to build binaries and run tests with the correct environment.
 package e2e
@@ -453,14 +453,14 @@ func verifyDevSetup(t *testing.T, result devCheckResult) {
 	// These would indicate we're using the kernel's devtmpfs instead of our controlled tmpfs
 	devtmpfsEntries := []string{
 		"loop0", "loop1", "loop2", // loop devices
-		"sda", "sdb", "vda",       // disk devices
-		"dri",                     // GPU
-		"kvm",                     // KVM
-		"btrfs-control",          // btrfs
-		"autofs",                 // autofs
-		"console",                // console (we don't create this)
-		"kmsg",                   // kernel messages
-		"mem",                    // memory device
+		"sda", "sdb", "vda", // disk devices
+		"dri",           // GPU
+		"kvm",           // KVM
+		"btrfs-control", // btrfs
+		"autofs",        // autofs
+		"console",       // console (we don't create this)
+		"kmsg",          // kernel messages
+		"mem",           // memory device
 	}
 
 	// Build set of allowed entries
@@ -580,8 +580,8 @@ func vmDir() string {
 	// Check common locations for cloud-hypervisor
 	// Also check repo's vm/ directory relative to where we're running
 	candidates := []string{
-		"vm",     // repo's vm/ directory (when running from repo root)
-		"../vm",  // when running from e2e/
+		"vm",    // repo's vm/ directory (when running from repo root)
+		"../vm", // when running from e2e/
 		"/usr/local/lib/thundersnap",
 		"/usr/lib/thundersnap",
 		"/opt/thundersnap",

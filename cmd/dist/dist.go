@@ -107,4 +107,3 @@ func runBuild(args []string) error {
 	fmt.Printf("\nDone! Took %s\n", time.Since(st).Round(time.Millisecond))
 	return nil
 }
-

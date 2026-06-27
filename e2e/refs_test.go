@@ -310,11 +310,11 @@ func TestRefNameValidation(t *testing.T) {
 
 	invalid := []string{
 		"",
-		"-foo",    // starts with dash
-		"_foo",    // starts with underscore
-		".foo",    // starts with dot
+		"-foo",     // starts with dash
+		"_foo",     // starts with underscore
+		".foo",     // starts with dot
 		"foo..bar", // consecutive dots
-		"foo/bar", // contains slash
+		"foo/bar",  // contains slash
 	}
 
 	for _, name := range invalid {

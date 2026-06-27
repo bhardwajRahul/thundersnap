@@ -178,12 +178,12 @@ type mockConn struct {
 	bytes.Buffer
 }
 
-func (m *mockConn) Close() error                       { return nil }
-func (m *mockConn) LocalAddr() net.Addr                { return nil }
-func (m *mockConn) RemoteAddr() net.Addr               { return nil }
-func (m *mockConn) SetDeadline(t any) error            { return nil }
-func (m *mockConn) SetReadDeadline(t any) error        { return nil }
-func (m *mockConn) SetWriteDeadline(t any) error       { return nil }
+func (m *mockConn) Close() error                 { return nil }
+func (m *mockConn) LocalAddr() net.Addr          { return nil }
+func (m *mockConn) RemoteAddr() net.Addr         { return nil }
+func (m *mockConn) SetDeadline(t any) error      { return nil }
+func (m *mockConn) SetReadDeadline(t any) error  { return nil }
+func (m *mockConn) SetWriteDeadline(t any) error { return nil }
 
 // TestFullSnapProtocol tests the complete protocol including handshake.
 func TestFullSnapProtocol(t *testing.T) {

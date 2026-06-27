@@ -462,15 +462,15 @@ func (p *portmapServer) makeNLMCallback(vers, proc uint32, cookie []byte) []byte
 	// Use a random-ish XID for the callback
 	xid := uint32(0x12345678) // Could use time or random, but doesn't matter much
 	binary.BigEndian.PutUint32(call[0:4], xid)
-	binary.BigEndian.PutUint32(call[4:8], 0)        // CALL
-	binary.BigEndian.PutUint32(call[8:12], 2)       // RPC version 2
+	binary.BigEndian.PutUint32(call[4:8], 0)         // CALL
+	binary.BigEndian.PutUint32(call[8:12], 2)        // RPC version 2
 	binary.BigEndian.PutUint32(call[12:16], nlmProg) // NLM program
-	binary.BigEndian.PutUint32(call[16:20], vers)   // NLM version
-	binary.BigEndian.PutUint32(call[20:24], proc)   // Procedure (e.g., NLM_LOCK_RES)
-	binary.BigEndian.PutUint32(call[24:28], 0)      // AUTH_NULL
-	binary.BigEndian.PutUint32(call[28:32], 0)      // cred length 0
-	binary.BigEndian.PutUint32(call[32:36], 0)      // AUTH_NULL verifier
-	binary.BigEndian.PutUint32(call[36:40], 0)      // verf length 0
+	binary.BigEndian.PutUint32(call[16:20], vers)    // NLM version
+	binary.BigEndian.PutUint32(call[20:24], proc)    // Procedure (e.g., NLM_LOCK_RES)
+	binary.BigEndian.PutUint32(call[24:28], 0)       // AUTH_NULL
+	binary.BigEndian.PutUint32(call[28:32], 0)       // cred length 0
+	binary.BigEndian.PutUint32(call[32:36], 0)       // AUTH_NULL verifier
+	binary.BigEndian.PutUint32(call[36:40], 0)       // verf length 0
 
 	// Cookie
 	binary.BigEndian.PutUint32(call[40:44], uint32(len(cookie)))

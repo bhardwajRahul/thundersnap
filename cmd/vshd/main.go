@@ -89,7 +89,7 @@ func initTsBinaryPath() {
 		return
 	}
 	// vshd is at <prefix>/sbin/vshd, ts is at <prefix>/bin/ts
-	dir := filepath.Dir(exe) // <prefix>/sbin
+	dir := filepath.Dir(exe)    // <prefix>/sbin
 	prefix := filepath.Dir(dir) // <prefix>
 	tsPath := filepath.Join(prefix, "bin", "ts")
 	if _, err := os.Stat(tsPath); err == nil {

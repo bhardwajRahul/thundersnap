@@ -46,7 +46,7 @@ const VshPort = 5222
 // VMSession represents a running VM session.
 type VMSession struct {
 	virtiofsdCmd   *exec.Cmd
-	passtCmd       *exec.Cmd    // passt process for user-space networking
+	passtCmd       *exec.Cmd // passt process for user-space networking
 	chvCmd         *exec.Cmd
 	virtiofsSock   string
 	vsockSock      string       // cloud-hypervisor vsock unix socket path
@@ -104,12 +104,12 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	log.Printf("Starting passt for user-space networking")
 	passtCmd := exec.Command("passt",
 		"--socket", passtSock,
-		"--vhost-user",       // vhost-user mode for cloud-hypervisor
-		"--foreground",       // stay in foreground for process management
-		"--quiet",            // reduce log noise
-		"-a", "10.0.2.15",    // guest address (QEMU-style NAT)
-		"-g", "10.0.2.2",     // gateway address
-		"-D", "none",         // don't intercept DNS
+		"--vhost-user",    // vhost-user mode for cloud-hypervisor
+		"--foreground",    // stay in foreground for process management
+		"--quiet",         // reduce log noise
+		"-a", "10.0.2.15", // guest address (QEMU-style NAT)
+		"-g", "10.0.2.2", // gateway address
+		"-D", "none", // don't intercept DNS
 	)
 	passtCmd.Stderr = os.Stderr
 	if err := passtCmd.Start(); err != nil {

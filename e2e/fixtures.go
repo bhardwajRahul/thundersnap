@@ -212,9 +212,9 @@ func (spec *TestContainerSpec) CreateDockerTarball(t *testing.T, w io.Writer) {
 	// Write layer tarball
 	layerPath := layerDigest + "/layer.tar"
 	if err := tw.WriteHeader(&tar.Header{
-		Name: layerDigest + "/",
-		Mode: 0755,
-		Size: 0,
+		Name:     layerDigest + "/",
+		Mode:     0755,
+		Size:     0,
 		Typeflag: tar.TypeDir,
 	}); err != nil {
 		t.Fatalf("write layer dir header: %v", err)

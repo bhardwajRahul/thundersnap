@@ -9,9 +9,9 @@ import (
 
 func TestUnionTaints(t *testing.T) {
 	tests := []struct {
-		name   string
-		sets   [][]string
-		want   []string
+		name string
+		sets [][]string
+		want []string
 	}{
 		{
 			name: "empty",

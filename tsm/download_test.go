@@ -49,8 +49,8 @@ func TestFetchRanges(t *testing.T) {
 	defer server.Close()
 
 	ranges := []rangeSpec{
-		{offset: 0, size: 5},  // "Hello"
-		{offset: 7, size: 6},  // "World!"
+		{offset: 0, size: 5}, // "Hello"
+		{offset: 7, size: 6}, // "World!"
 	}
 
 	results, err := fetchRanges(http.DefaultClient, server.URL, ranges)
@@ -147,9 +147,9 @@ func TestDownloadIntegration(t *testing.T) {
 	localDir := t.TempDir()
 
 	result, err := Download(DownloadOptions{
-		SnapshotID:   snapName,
-		SnapsDir: localDir,
-		BaseURL:      server.URL,
+		SnapshotID: snapName,
+		SnapsDir:   localDir,
+		BaseURL:    server.URL,
 	})
 	if err != nil {
 		t.Fatalf("Download: %v", err)
@@ -213,9 +213,9 @@ func TestDownloadAlreadyExists(t *testing.T) {
 	}
 
 	result, err := Download(DownloadOptions{
-		SnapshotID:   snapName,
-		SnapsDir: tmpDir,
-		BaseURL:      "http://localhost:9999", // Won't be used
+		SnapshotID: snapName,
+		SnapsDir:   tmpDir,
+		BaseURL:    "http://localhost:9999", // Won't be used
 	})
 	if err != nil {
 		t.Fatalf("Download: %v", err)

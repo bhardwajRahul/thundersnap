@@ -18,11 +18,11 @@ import (
 // incrementally during a long operation, not all buffered until the end.
 //
 // This test:
-// 1. Starts a test server with a /stream-test endpoint that sends multiple
-//    progress messages with controlled timing
-// 2. Connects a client and reads responses line-by-line
-// 3. Verifies that messages are received incrementally by checking that
-//    the first message arrives before the last message is sent
+//  1. Starts a test server with a /stream-test endpoint that sends multiple
+//     progress messages with controlled timing
+//  2. Connects a client and reads responses line-by-line
+//  3. Verifies that messages are received incrementally by checking that
+//     the first message arrives before the last message is sent
 func TestStreamingProgressBasic(t *testing.T) {
 	env := newTestEnv(t)
 

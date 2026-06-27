@@ -109,14 +109,14 @@ func TestTSMWriteRead(t *testing.T) {
 	writer := NewTSMWriter()
 
 	writer.AddEntry(TSMEntry{
-		Path:       "dir",
-		Type:       EntryTypeDir,
-		Mode:       0755 | uint32(os.ModeDir),
-		UID:        1000,
-		GID:        1000,
-		Mtime:      1234567890000000000,
-		Ctime:      1234567890000000000,
-		Atime:      1234567890000000000,
+		Path:  "dir",
+		Type:  EntryTypeDir,
+		Mode:  0755 | uint32(os.ModeDir),
+		UID:   1000,
+		GID:   1000,
+		Mtime: 1234567890000000000,
+		Ctime: 1234567890000000000,
+		Atime: 1234567890000000000,
 	})
 
 	writer.AddEntry(TSMEntry{
