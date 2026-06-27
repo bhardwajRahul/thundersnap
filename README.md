@@ -91,7 +91,7 @@ Packages include two binaries:
 ### Setting Up a Base Snapshot
 
 Thundersnap needs at least one base filesystem snapshot named `1` in
-`--snaps-dir` before it can create workspaces. This should be an
+`<data-dir>/snaps` before it can create workspaces. This should be an
 extracted Linux root filesystem (a full directory tree with `/bin`,
 `/etc`, `/usr`, etc.).
 
@@ -122,10 +122,8 @@ Good sources for base images:
 # Create the required btrfs directories
 sudo mkdir -p /var/lib/thundersnap/fs /var/lib/thundersnap/snaps
 
-# Run directly:
-sudo thundersnapd \
-  --fs-dir=/var/lib/thundersnap/fs \
-  --snaps-dir=/var/lib/thundersnap/snaps
+# Run directly (--data-dir defaults to /var/lib/thundersnap):
+sudo thundersnapd --data-dir=/var/lib/thundersnap
 
 # Or install the .deb and use systemd:
 sudo dpkg -i dist/thundersnap_*_amd64.deb
@@ -157,7 +155,7 @@ ts download-snap <snapshot-id>       # download a snapshot from the mesh
 Enable mesh discovery to share snapshots across multiple thundersnap nodes:
 
 ```sh
-thundersnapd --mesh --fs-dir=... --snaps-dir=...
+thundersnapd --mesh --data-dir=/var/lib/thundersnap
 ```
 
 Mesh nodes discover each other via Tailscale and can transfer snapshots
@@ -176,7 +174,7 @@ using content-defined chunking — only changed chunks are transferred.
 │  drop-caps)  │  passt)      │   chunking)               │
 ├──────────────┴──────────────┴───────────────────────────┤
 │                    btrfs filesystem                      │
-│  snaps-dir/          fs-dir/<tailscale-user>/<name>/ │
+│  data-dir/snaps/     data-dir/fs/<tailscale-user>/<name>/ │
 │    1/  (base)              (live workspaces)             │
 │    <snap-hash>/                                         │
 └─────────────────────────────────────────────────────────┘

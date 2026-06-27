@@ -1,3 +1,5 @@
-# Flags for thundersnapd. Both directories must be on the same btrfs filesystem.
-# Populate --snaps-dir with at least one base snapshot named "1" before starting.
-FLAGS="--fs-dir=/var/lib/thundersnap/fs --snaps-dir=/var/lib/thundersnap/snaps --mesh --policy=/etc/thundersnap/policy.jsonc"
+# Flags for thundersnapd. --data-dir holds all thundersnap data on one btrfs
+# filesystem: live filesystems in <data-dir>/fs and base snapshots in
+# <data-dir>/snaps. Populate <data-dir>/snaps with at least one base snapshot
+# named "1" before starting.
+FLAGS="--data-dir=/var/lib/thundersnap --policy=/etc/thundersnap/policy.jsonc --mesh"

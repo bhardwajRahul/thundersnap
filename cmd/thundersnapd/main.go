@@ -55,6 +55,9 @@ func init() {
 }
 
 var (
+	flagDataDir *string
+	// flagFsDir and flagSnapsDir are derived from --data-dir
+	// (<data-dir>/fs and <data-dir>/snaps) rather than being flags themselves.
 	flagFsDir      *string
 	flagSnapsDir   *string
 	flagVmDir      *string
@@ -466,13 +469,12 @@ func main() {
 	forceReauth := getopt.BoolLong("force-reauth", 0, "Force re-authentication with Tailscale")
 	hostname := getopt.StringLong("hostname", 0, "thundersnap", "Tailscale hostname for this server")
 	stateDir := getopt.StringLong("state-dir", 0, "", "Directory to store Tailscale state (default: ~/.config/thundersnapd)")
-	flagFsDir = getopt.StringLong("fs-dir", 0, "", "Directory to store per-user live filesystems (required)")
-	flagSnapsDir = getopt.StringLong("snaps-dir", 0, "", "Directory to store base snapshots for cloning (required)")
+	flagDataDir = getopt.StringLong("data-dir", 0, "/var/lib/thundersnap", "Directory holding all thundersnap data (live filesystems in <data-dir>/fs and base snapshots in <data-dir>/snaps)")
 	flagVmDir = getopt.StringLong("vm-dir", 0, "", "Directory containing cloud-hypervisor and vmlinux (default: <exe-dir>/vm)")
 	flagLibexecDir = getopt.StringLong("libexec-dir", 0, "", "Directory containing helper binaries like ts and vshd (default: <exe-dir>)")
 	flagPolicyPath = getopt.StringLong("policy", 0, "", "Path to policy file (required)")
 	flagMesh = getopt.BoolLong("mesh", 0, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
-	flagNfsd = getopt.BoolLong("nfsd", 0, "Enable NFSv4 server to export -snaps-dir")
+	flagNfsd = getopt.BoolLong("nfsd", 0, "Enable NFSv4 server to export the snaps directory")
 	flagNfsPort = getopt.IntLong("nfs-port", 0, 2049, "Port for NFSv4 server")
 	getopt.Parse()
 
@@ -491,12 +493,17 @@ func main() {
 		return
 	}
 
-	if *flagFsDir == "" {
-		log.Fatalf("-fs-dir is required")
+	if *flagDataDir == "" {
+		log.Fatalf("-data-dir is required")
 	}
-	if *flagSnapsDir == "" {
-		log.Fatalf("-snaps-dir is required")
-	}
+	// Derive the live-filesystem and snapshot directories from the single
+	// --data-dir. Keeping them as separate internal variables avoids touching
+	// the many call sites that already use fs-dir/snaps-dir paths, and
+	// guarantees both live on the same btrfs filesystem.
+	fsDir := filepath.Join(*flagDataDir, "fs")
+	snapsDir := filepath.Join(*flagDataDir, "snaps")
+	flagFsDir = &fsDir
+	flagSnapsDir = &snapsDir
 	if *flagPolicyPath == "" {
 		log.Fatalf("-policy is required")
 	}
@@ -5703,7 +5710,7 @@ func checkBtrfsFilesystems(fsDir, snapsDir string) error {
 		return fmt.Errorf("statfs on fs-dir %s: %w", fsDir, err)
 	}
 	if fsDirStatfs.Type != btrfsMagic {
-		return fmt.Errorf("-fs-dir %s is not on a btrfs filesystem (type=0x%x, need btrfs=0x%x)", fsDir, fsDirStatfs.Type, btrfsMagic)
+		return fmt.Errorf("data-dir fs %s is not on a btrfs filesystem (type=0x%x, need btrfs=0x%x)", fsDir, fsDirStatfs.Type, btrfsMagic)
 	}
 
 	// Check that snaps-dir is on btrfs
@@ -5712,7 +5719,7 @@ func checkBtrfsFilesystems(fsDir, snapsDir string) error {
 		return fmt.Errorf("statfs on snaps-dir %s: %w", snapsDir, err)
 	}
 	if snapsDirStatfs.Type != btrfsMagic {
-		return fmt.Errorf("-snaps-dir %s is not on a btrfs filesystem (type=0x%x, need btrfs=0x%x)", snapsDir, snapsDirStatfs.Type, btrfsMagic)
+		return fmt.Errorf("data-dir snaps %s is not on a btrfs filesystem (type=0x%x, need btrfs=0x%x)", snapsDir, snapsDirStatfs.Type, btrfsMagic)
 	}
 
 	// Check that both are on the same filesystem by comparing device IDs
@@ -5727,7 +5734,7 @@ func checkBtrfsFilesystems(fsDir, snapsDir string) error {
 	}
 
 	if fsDirStat.Dev != snapsDirStat.Dev {
-		return fmt.Errorf("-fs-dir and -snaps-dir must be on the same btrfs filesystem for subvolume snapshots; fs-dir device=%d, snaps-dir device=%d", fsDirStat.Dev, snapsDirStat.Dev)
+		return fmt.Errorf("data-dir fs and snaps must be on the same btrfs filesystem for subvolume snapshots; fs device=%d, snaps device=%d", fsDirStat.Dev, snapsDirStat.Dev)
 	}
 
 	return nil
