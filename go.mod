@@ -125,4 +125,4 @@ require (
 	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8 // indirect
 )
 
-replace tailscale.com => ../tailscale
+replace tailscale.com => github.com/tailscale/tailscale v1.99.0-pre.0.20260519223028-2a2df99ca399
