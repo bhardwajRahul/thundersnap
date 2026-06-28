@@ -86,7 +86,7 @@ A short "Highest-value items" list closes the big modules.
 
 ---
 
-## snaphash/
+## snaphash/  [DONE]
 
 ### 1. Edge cases for unit tests
 - **The prepended/padding bits are never validated on decode.** `Decode` ignores bit 0
@@ -112,6 +112,11 @@ A short "Highest-value items" list closes the big modules.
   the package already defines the standard base64url alphabet (line 50). Could likely use
   `encoding/base64` RawURLEncoding over a shifted 33-byte buffer. The hand-rolled bit loop
   is the most convoluted code in the small modules; strong refactor candidate.
+  - RESOLUTION: the stdlib approach is NOT viable — the format packs exactly 258 bits
+    (43*6), which is not a whole number of bytes. RawURLEncoding over 33 bytes (264 bits)
+    yields 44 chars, changing the on-disk snap-ID wire format. Kept the bit loop but
+    factored the shared bit-addressing (getHashBit/setHashBit/encBitToHashBit) and the
+    char alphabet/decode into helpers so Encode and Decode can no longer drift.
 - The inner three-way special-casing in `Encode` (`if bitPos==0 continue`, `if hashBit<256`,
   implicit ≥257-contributes-0) would be eliminated by the stdlib approach.
 - `Decode` (128-138) likewise hand-rolls bit extraction.

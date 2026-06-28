@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -137,12 +138,35 @@ func TestFromBytes(t *testing.T) {
 }
 
 func TestFromBytesPanic(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("FromBytes with wrong size should panic")
-		}
-	}()
-	FromBytes([]byte{1, 2, 3})
+	for _, n := range []int{0, 3, 31, 33} {
+		t.Run("", func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("FromBytes(%d bytes) should panic", n)
+				}
+			}()
+			FromBytes(make([]byte, n))
+		})
+	}
+}
+
+func TestUnmarshalTextInvalid(t *testing.T) {
+	var h Hash
+	if err := h.UnmarshalText([]byte("too short")); err == nil {
+		t.Error("UnmarshalText of invalid input should fail")
+	}
+	// A non-canonical but length-valid string should also surface an error.
+	if err := h.UnmarshalText([]byte("___________________________________________")); !errors.Is(err, ErrNonCanonical) {
+		t.Errorf("UnmarshalText of non-canonical input = %v, want ErrNonCanonical", err)
+	}
+	// A valid canonical string should populate the hash.
+	want := Sum([]byte("text"))
+	if err := h.UnmarshalText([]byte(Encode(want))); err != nil {
+		t.Fatalf("UnmarshalText of valid input: %v", err)
+	}
+	if h != want {
+		t.Errorf("UnmarshalText result = %x, want %x", h, want)
+	}
 }
 
 func TestSum(t *testing.T) {
@@ -215,19 +239,6 @@ func TestURLSafe(t *testing.T) {
 	}
 }
 
-func TestParseHash(t *testing.T) {
-	h := Sum([]byte("test"))
-	encoded := Encode(h)
-
-	parsed, err := ParseHash(encoded)
-	if err != nil {
-		t.Fatalf("ParseHash error: %v", err)
-	}
-	if parsed != h {
-		t.Errorf("ParseHash mismatch")
-	}
-}
-
 func TestFirstCharRange(t *testing.T) {
 	// Verify that first character is always in the range A-Z or a-f (values 0-31).
 	// base64url alphabet: A-Z (0-25), a-z (26-51), 0-9 (52-61), - (62), _ (63)
@@ -272,22 +283,47 @@ func TestDecodeAdversarialInput(t *testing.T) {
 	}
 }
 
-// TestDecodeValidButCrafted tests decoding valid-looking strings that might
-// attempt to exploit edge cases.
-func TestDecodeValidButCrafted(t *testing.T) {
-	// Valid 43-char base64url strings.
-	valid := []string{
-		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-		"___________________________________________", // all underscores (valid base64url)
-		"-------------------------------------------", // all dashes (valid base64url)
-		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-		"0000000000000000000000000000000000000000000",
+// TestDecodeRejectsNonCanonical pins the canonical-encoding requirement: the
+// prepended bit (bit 0) and the trailing padding bit (bit 257) must both be 0.
+// Strings whose first char has its top bit set (value >= 32) or whose last char
+// has its low bit set are non-canonical and rejected, even though they are
+// otherwise valid base64url.
+func TestDecodeRejectsNonCanonical(t *testing.T) {
+	nonCanonical := []string{
+		"___________________________________________", // first char '_' (63) → bit 0 set
+		"-------------------------------------------", // first char '-' (62) → bit 0 set
+		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", // first char 'z' (51) → bit 0 set
+		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB", // last char 'B' (1) → padding bit set
+	}
+	for _, s := range nonCanonical {
+		_, err := Decode(s)
+		if !errors.Is(err, ErrNonCanonical) {
+			t.Errorf("Decode(%q) = %v, want ErrNonCanonical", s, err)
+		}
 	}
 
-	for _, s := range valid {
-		_, err := Decode(s)
-		if err != nil {
+	// Canonical strings (first char in 0-31, last char even) still decode.
+	// Use Encode's own output to guarantee canonicality.
+	for _, seed := range []string{"", "a", "thundersnap"} {
+		s := Encode(Sum([]byte(seed)))
+		if _, err := Decode(s); err != nil {
 			t.Errorf("Decode(%q) should succeed: %v", s, err)
+		}
+	}
+}
+
+// TestDecodeIsInjective verifies Encode(Decode(s)) == s for every canonical
+// string Encode can produce: round-tripping a hash and re-encoding is stable.
+func TestDecodeIsInjective(t *testing.T) {
+	for i := 0; i < 2000; i++ {
+		h := Sum([]byte{byte(i), byte(i >> 8), byte(i >> 16)})
+		s := Encode(h)
+		got, err := Decode(s)
+		if err != nil {
+			t.Fatalf("Decode(%q) error: %v", s, err)
+		}
+		if re := Encode(got); re != s {
+			t.Errorf("canonicalization not stable: Encode(Decode(%q)) = %q", s, re)
 		}
 	}
 }

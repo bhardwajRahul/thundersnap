@@ -35,61 +35,88 @@ var (
 	ErrInvalidLength = errors.New("snaphash: invalid encoded length")
 	// ErrInvalidEncoding is returned when base64url decoding fails.
 	ErrInvalidEncoding = errors.New("snaphash: invalid base64url encoding")
+	// ErrNonCanonical is returned when an otherwise-valid encoded string is not
+	// the canonical encoding of its hash: its prepended bit or trailing padding
+	// bit is set. Such a string would decode to the same hash as the canonical
+	// form, so accepting it would make Decode non-injective.
+	ErrNonCanonical = errors.New("snaphash: non-canonical encoding")
 )
+
+// getHashBit reports whether bit hashBit (0 = MSB of byte 0) of h is set.
+func getHashBit(h *Hash, hashBit int) bool {
+	byteIdx := hashBit / 8
+	bitInByte := 7 - (hashBit % 8) // big-endian: bit 0 is the MSB
+	return (h[byteIdx]>>bitInByte)&1 == 1
+}
+
+// setHashBit sets bit hashBit (0 = MSB of byte 0) of h.
+func setHashBit(h *Hash, hashBit int) {
+	byteIdx := hashBit / 8
+	bitInByte := 7 - (hashBit % 8)
+	h[byteIdx] |= 1 << bitInByte
+}
+
+// alphabet is the base64url (RFC 4648) alphabet. Index = 6-bit value.
+const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// The encoded value is a 258-bit stream packed 6 bits per char (43 chars):
+//
+//	bit 0        : prepended 0 (keeps the first char in 0-31, never '-'/'_')
+//	bits 1..256  : the 256 hash bits, big-endian
+//	bit 257      : trailing padding (0)
+//
+// encBitToHashBit maps an encoded-stream bit position to a hash bit index, or
+// returns ok=false for the prepended bit (0) and the padding bit (257).
+func encBitToHashBit(encBit int) (hashBit int, ok bool) {
+	if encBit == 0 || encBit >= 257 {
+		return 0, false
+	}
+	return encBit - 1, true
+}
 
 // Encode encodes a 256-bit hash to a 43-character base64url string.
 // The encoding prepends a 0 bit to ensure the result never starts with '-' or '_'.
 func Encode(h Hash) string {
-	// We need to encode 256 bits with a prepended 0 bit = 257 bits.
-	// 257 bits / 6 bits per char = 42.83, rounds up to 43 chars.
-	// 43 chars * 6 bits = 258 bits, so we have 1 bit of padding at the end.
-	//
-	// We'll encode directly to base64url characters rather than going through
-	// bytes, to avoid the extra padding issues.
-
-	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-
 	var result [EncodedSize]byte
-
-	// We have 257 bits to encode: 1 zero bit + 256 hash bits.
-	// Each output char encodes 6 bits.
-	// Char 0: bits 0-5 of the 257-bit value = 0 + bits 0-4 of hash
-	// Char 1: bits 6-11 = bits 5-10 of hash
-	// ... and so on
-
-	// Treat the hash as a big-endian bit stream.
-	// For char i, we need bits [i*6-1, i*6+4] of the original hash (with -1 meaning the prepended 0).
-
 	for i := 0; i < EncodedSize; i++ {
-		// Bit position in the 257-bit value (0 is the prepended zero, 1-256 are the hash bits).
-		startBit := i * 6
-
-		// Extract 6 bits starting at startBit.
 		var val byte
 		for b := 0; b < 6; b++ {
-			bitPos := startBit + b
-			if bitPos == 0 {
-				// The prepended zero bit - contributes 0.
-				continue
+			encBit := i*6 + b
+			if hashBit, ok := encBitToHashBit(encBit); ok && getHashBit(&h, hashBit) {
+				val |= 1 << (5 - b)
 			}
-			// bitPos 1-256 corresponds to hash bit 0-255.
-			hashBit := bitPos - 1
-			if hashBit < 256 {
-				byteIdx := hashBit / 8
-				bitInByte := 7 - (hashBit % 8) // MSB first
-				if (h[byteIdx]>>bitInByte)&1 == 1 {
-					val |= 1 << (5 - b)
-				}
-			}
-			// bitPos >= 257 contributes 0 (padding).
+			// The prepended and padding bits contribute 0.
 		}
 		result[i] = alphabet[val]
 	}
-
 	return string(result[:])
 }
 
+// decodeChar maps a base64url character to its 6-bit value.
+func decodeChar(c byte) (byte, bool) {
+	switch {
+	case c >= 'A' && c <= 'Z':
+		return c - 'A', true
+	case c >= 'a' && c <= 'z':
+		return c - 'a' + 26, true
+	case c >= '0' && c <= '9':
+		return c - '0' + 52, true
+	case c == '-':
+		return 62, true
+	case c == '_':
+		return 63, true
+	default:
+		return 0, false
+	}
+}
+
 // Decode decodes a 43-character base64url string to a 256-bit hash.
+//
+// Decode is canonical: it rejects strings whose prepended bit or trailing
+// padding bit is set (ErrNonCanonical). Without that check, four distinct
+// 43-char strings would decode to the same hash, making the round trip
+// Encode(Decode(s)) lossy. With it, Decode is injective and Encode/Decode are
+// exact inverses on the set of valid snap hashes.
 func Decode(s string) (Hash, error) {
 	var h Hash
 
@@ -97,43 +124,32 @@ func Decode(s string) (Hash, error) {
 		return h, fmt.Errorf("%w: got %d, want %d", ErrInvalidLength, len(s), EncodedSize)
 	}
 
-	// Decode each base64url character to its 6-bit value.
 	var vals [EncodedSize]byte
 	for i := 0; i < EncodedSize; i++ {
-		c := s[i]
-		var v byte
-		switch {
-		case c >= 'A' && c <= 'Z':
-			v = c - 'A'
-		case c >= 'a' && c <= 'z':
-			v = c - 'a' + 26
-		case c >= '0' && c <= '9':
-			v = c - '0' + 52
-		case c == '-':
-			v = 62
-		case c == '_':
-			v = 63
-		default:
-			return h, fmt.Errorf("%w: invalid character %q at position %d", ErrInvalidEncoding, c, i)
+		v, ok := decodeChar(s[i])
+		if !ok {
+			return h, fmt.Errorf("%w: invalid character %q at position %d", ErrInvalidEncoding, s[i], i)
 		}
 		vals[i] = v
 	}
 
-	// We have 43 chars * 6 bits = 258 bits.
-	// Bit 0 is the prepended zero (should be 0).
-	// Bits 1-256 are the hash.
-	// Bits 257 is padding (ignored).
+	encBitSet := func(encBit int) bool {
+		return (vals[encBit/6]>>(5-encBit%6))&1 == 1
+	}
 
-	// Extract hash bits 0-255 from position 1-256 of the encoded value.
-	for hashBit := 0; hashBit < 256; hashBit++ {
-		// This corresponds to bit position hashBit+1 in the 258-bit encoded value.
-		encBit := hashBit + 1
-		charIdx := encBit / 6
-		bitInChar := encBit % 6
-		if (vals[charIdx]>>(5-bitInChar))&1 == 1 {
-			byteIdx := hashBit / 8
-			bitInByte := 7 - (hashBit % 8)
-			h[byteIdx] |= 1 << bitInByte
+	// The prepended bit (0) and padding bit (257) must both be 0 for a
+	// canonical encoding.
+	if encBitSet(0) {
+		return h, fmt.Errorf("%w: prepended bit is set", ErrNonCanonical)
+	}
+	if encBitSet(257) {
+		return h, fmt.Errorf("%w: padding bit is set", ErrNonCanonical)
+	}
+
+	for encBit := 1; encBit <= 256; encBit++ {
+		if encBitSet(encBit) {
+			hashBit, _ := encBitToHashBit(encBit)
+			setHashBit(&h, hashBit)
 		}
 	}
 
@@ -179,9 +195,4 @@ func (h *Hash) UnmarshalText(text []byte) error {
 	}
 	*h = decoded
 	return nil
-}
-
-// ParseHash parses an encoded snap hash string.
-func ParseHash(s string) (Hash, error) {
-	return Decode(s)
 }
