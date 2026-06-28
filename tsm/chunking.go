@@ -5,15 +5,17 @@ import (
 	"os"
 )
 
-// Rollsum implements the rolling checksum used for content-defined chunking
-type Rollsum struct {
+// rollsum implements the bup rolling checksum used for content-defined
+// chunking. It is an internal primitive; callers use ChunkFile/ChunkReader.
+type rollsum struct {
 	s1     uint32
 	s2     uint32
 	window [BUP_WINDOWSIZE]byte
 	wofs   int
 }
 
-func (r *Rollsum) Init() {
+// reset initializes the rolling checksum to its zero-window starting state.
+func (r *rollsum) reset() {
 	r.s1 = BUP_WINDOWSIZE * ROLLSUM_CHAR_OFFSET
 	r.s2 = BUP_WINDOWSIZE * (BUP_WINDOWSIZE - 1) * ROLLSUM_CHAR_OFFSET
 	r.wofs = 0
@@ -22,33 +24,41 @@ func (r *Rollsum) Init() {
 	}
 }
 
-func (r *Rollsum) add(drop, add byte) {
+func (r *rollsum) add(drop, add byte) {
 	r.s1 += uint32(add) - uint32(drop)
 	r.s2 += r.s1 - (BUP_WINDOWSIZE * (uint32(drop) + ROLLSUM_CHAR_OFFSET))
 }
 
-func (r *Rollsum) Roll(ch byte) {
+// roll advances the window by one byte, dropping the oldest byte.
+func (r *rollsum) roll(ch byte) {
 	r.add(r.window[r.wofs], ch)
 	r.window[r.wofs] = ch
 	r.wofs = (r.wofs + 1) % BUP_WINDOWSIZE
 }
 
-func (r *Rollsum) Digest() uint32 {
+// digest returns the current rolling-checksum value.
+func (r *rollsum) digest() uint32 {
 	return (r.s1 << 16) | (r.s2 & 0xffff)
 }
 
-// FindSplitPoint finds a content-defined split point in the buffer
-// Returns (offset, bits) where offset is the split position (0 if no split found)
-// and bits is the number of matching bits in the rollsum
-func FindSplitPoint(buf []byte) (int, int) {
-	var r Rollsum
-	r.Init()
+// findSplitPoint finds a content-defined split point in buf. It returns
+// (offset, bits): offset is the split position (0 if no split found) and bits
+// is the number of trailing one-bits in the rollsum at the split, which sets
+// the hierarchical chunk level.
+//
+// A split is declared when the low BUP_BLOBBITS bits of s2 are all ones — that
+// is, (s2 & (BUP_BLOBSIZE-1)) equals (^0 & (BUP_BLOBSIZE-1)). Requiring an
+// all-ones low pattern makes the boundary depend only on content, so identical
+// data always splits at the same places (the determinism the format relies on).
+func findSplitPoint(buf []byte) (int, int) {
+	var r rollsum
+	r.reset()
 
 	for count := 0; count < len(buf); count++ {
-		r.Roll(buf[count])
+		r.roll(buf[count])
 		if (r.s2 & (BUP_BLOBSIZE - 1)) == ((^uint32(0)) & (BUP_BLOBSIZE - 1)) {
 			// Found a split point
-			rsum := r.Digest()
+			rsum := r.digest()
 			bits := BUP_BLOBBITS
 			rsum >>= BUP_BLOBBITS
 			for (rsum>>1)&1 != 0 {
@@ -101,7 +111,7 @@ func ChunkReader(r io.Reader, fileSize int64, callback ChunkCallback, progress f
 			offset := 0
 			for {
 				remaining := len(data) - offset
-				ofs, bits := FindSplitPoint(data[offset:])
+				ofs, bits := findSplitPoint(data[offset:])
 
 				var chunkSize int
 				var level int
@@ -112,7 +122,9 @@ func ChunkReader(r io.Reader, fileSize int64, callback ChunkCallback, progress f
 						chunkSize = BLOB_MAX
 						level = 0
 					} else {
-						// Calculate hierarchical level
+						// Hierarchical level from the number of extra trailing
+						// one-bits; bounded by the rollsum width, so the later
+						// uint16(level) cast at the callback can never truncate.
 						level = (bits - BUP_BLOBBITS) / FANOUT_BITS
 					}
 				} else {
@@ -181,7 +193,7 @@ func ChunkData(data []byte, callback ChunkCallback) error {
 	offset := 0
 	for offset < len(data) {
 		remaining := len(data) - offset
-		ofs, bits := FindSplitPoint(data[offset:])
+		ofs, bits := findSplitPoint(data[offset:])
 
 		var chunkSize int
 		var level int
