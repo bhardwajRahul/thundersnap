@@ -51,7 +51,15 @@ func (m *ContainerNsManager) GetOrCreateContainerNs(rootFS, hostname, domainname
 
 	// Check for existing entry
 	if entry, ok := m.entries[rootFS]; ok {
-		// Verify init is still alive
+		// Verify init is still alive. Signal 0 performs only the existence
+		// /permission check without delivering a signal.
+		//
+		// CAVEAT (PID reuse): if the original init exited and the kernel
+		// recycled its PID for an unrelated process, this probe succeeds and
+		// we would wrongly reuse a foreign PID. We do not verify start-time or
+		// cmdline here; this is acceptable in practice because init lives for
+		// the lifetime of the refcounted namespace and is shut down explicitly
+		// in ReleaseContainerNs, but it is a known hazard.
 		if err := syscall.Kill(entry.initPid, 0); err == nil {
 			entry.refCount++
 			log.Printf("Reusing container namespace for %s (initPid=%d, refCount=%d)",
@@ -174,26 +182,11 @@ func (m *ContainerNsManager) ReleaseContainerNs(rootFS string) {
 	}
 }
 
-// RunInContainerNs runs a command in the container namespace for rootFS.
-// It handles:
-// 1. Getting or creating the shared namespace for rootFS
-// 2. Using nsenter to join the namespace
-// 3. Running the command via ts drop-caps-and-run
-//
-// The command output is returned. If tsBinary is empty, it defaults to
-// <rootFS>/bin/ts.
-func (m *ContainerNsManager) RunInContainerNs(rootFS, hostname, domainname, tsBinary string, args ...string) ([]byte, error) {
-	initPid, err := m.GetOrCreateContainerNs(rootFS, hostname, domainname)
-	if err != nil {
-		return nil, fmt.Errorf("get container namespace: %w", err)
-	}
-	defer m.ReleaseContainerNs(rootFS)
-
-	absRootFS, err := filepath.Abs(rootFS)
-	if err != nil {
-		return nil, fmt.Errorf("abs path: %w", err)
-	}
-
+// buildNsenterCmd builds the `nsenter ... ts drop-caps-and-run` command that
+// joins the shared namespaces of initPid and runs args inside the chroot. It is
+// the single source of truth shared by RunInContainerNs and StartInContainerNs
+// so the two cannot drift. If tsBinary is empty it defaults to <absRootFS>/bin/ts.
+func buildNsenterCmd(absRootFS, tsBinary string, initPid int, args ...string) *exec.Cmd {
 	if tsBinary == "" {
 		tsBinary = filepath.Join(absRootFS, "bin", "ts")
 	}
@@ -220,8 +213,30 @@ func (m *ContainerNsManager) RunInContainerNs(rootFS, hostname, domainname, tsBi
 
 	cmd := exec.Command("nsenter", nsenterArgs...)
 	cmd.Dir = "/"
+	return cmd
+}
 
-	return cmd.CombinedOutput()
+// RunInContainerNs runs a command in the container namespace for rootFS.
+// It handles:
+// 1. Getting or creating the shared namespace for rootFS
+// 2. Using nsenter to join the namespace
+// 3. Running the command via ts drop-caps-and-run
+//
+// The command output is returned. If tsBinary is empty, it defaults to
+// <rootFS>/bin/ts.
+func (m *ContainerNsManager) RunInContainerNs(rootFS, hostname, domainname, tsBinary string, args ...string) ([]byte, error) {
+	initPid, err := m.GetOrCreateContainerNs(rootFS, hostname, domainname)
+	if err != nil {
+		return nil, fmt.Errorf("get container namespace: %w", err)
+	}
+	defer m.ReleaseContainerNs(rootFS)
+
+	absRootFS, err := filepath.Abs(rootFS)
+	if err != nil {
+		return nil, fmt.Errorf("abs path: %w", err)
+	}
+
+	return buildNsenterCmd(absRootFS, tsBinary, initPid, args...).CombinedOutput()
 }
 
 // StartInContainerNs starts a command in the container namespace for rootFS
@@ -242,29 +257,7 @@ func (m *ContainerNsManager) StartInContainerNs(rootFS, hostname, domainname, ts
 		return nil, 0, fmt.Errorf("abs path: %w", err)
 	}
 
-	if tsBinary == "" {
-		tsBinary = filepath.Join(absRootFS, "bin", "ts")
-	}
-
-	// Build the command: ts drop-caps-and-run --chroot=<rootFS> -- <args>
-	tsArgs := []string{
-		tsBinary, "drop-caps-and-run",
-		"--chroot=" + absRootFS,
-		"--",
-	}
-	tsArgs = append(tsArgs, args...)
-
-	// nsenter joins the PID, mount, and UTS namespaces of the init process.
-	nsenterArgs := []string{
-		"-t", fmt.Sprintf("%d", initPid),
-		"-p", "-m", "-u",
-		"--",
-	}
-	nsenterArgs = append(nsenterArgs, tsArgs...)
-
-	cmd := exec.Command("nsenter", nsenterArgs...)
-	cmd.Dir = "/"
-
+	cmd := buildNsenterCmd(absRootFS, tsBinary, initPid, args...)
 	if err := cmd.Start(); err != nil {
 		m.ReleaseContainerNs(rootFS)
 		return nil, 0, fmt.Errorf("start command: %w", err)

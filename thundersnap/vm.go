@@ -62,9 +62,31 @@ func (s *VMSession) SetControlHandler(h http.Handler) {
 	s.controlHandler = h
 }
 
+// waitForSocket polls for the named unix socket to appear, up to attempts
+// times with delay between checks. It returns nil as soon as the socket exists
+// and an error if it never appears. The helper (a process started by us creates
+// the socket asynchronously) is shared by the virtiofsd and passt startup
+// paths, which previously duplicated this loop verbatim.
+func waitForSocket(path string, attempts int, delay time.Duration) error {
+	for i := 0; i < attempts; i++ {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		time.Sleep(delay)
+	}
+	if _, err := os.Stat(path); err != nil {
+		return err
+	}
+	return nil
+}
+
 // StartVM starts a new VM session with the given configuration.
 func StartVM(cfg VMConfig) (*VMSession, error) {
-	// Create unique socket paths for this session
+	// Create unique socket paths for this session. The ID is the daemon PID
+	// concatenated with the current time in nanoseconds, which is unique enough
+	// to avoid collisions between concurrent VM sessions in the same process;
+	// it is only ever used to name per-session /tmp sockets, not as a security
+	// or correctness boundary.
 	sessionID := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
 	virtiofsSock := filepath.Join("/tmp", fmt.Sprintf("virtiofs-%s.sock", sessionID))
 	vsockSock := filepath.Join("/tmp", fmt.Sprintf("vsock-%s.sock", sessionID))
@@ -82,17 +104,25 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		return nil, fmt.Errorf("start virtiofsd: %w", err)
 	}
 
-	// Wait for virtiofsd socket to be created
-	for i := 0; i < 50; i++ {
-		if _, err := os.Stat(virtiofsSock); err == nil {
-			break
+	// cleanup tears down everything started so far, in reverse order. Each
+	// startup failure path below appends its just-started resource and calls
+	// cleanup(), replacing the five copy-pasted teardown ladders that this
+	// function previously grew incrementally (a prime source of leaks).
+	var passtCmd *exec.Cmd
+	cleanup := func() {
+		if passtCmd != nil {
+			passtCmd.Process.Kill()
+			passtCmd.Wait()
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if _, err := os.Stat(virtiofsSock); err != nil {
 		virtiofsdCmd.Process.Kill()
 		virtiofsdCmd.Wait()
 		os.Remove(virtiofsSock)
+		os.Remove(passtSock)
+	}
+
+	// Wait for virtiofsd socket to be created
+	if err := waitForSocket(virtiofsSock, 50, 100*time.Millisecond); err != nil {
+		cleanup()
 		return nil, fmt.Errorf("virtiofsd socket not created: %w", err)
 	}
 	log.Printf("virtiofsd socket ready at %s", virtiofsSock)
@@ -102,7 +132,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// Configure NAT-style addressing (like QEMU user networking) so DHCP clients
 	// get predictable private addresses instead of the host's addresses.
 	log.Printf("Starting passt for user-space networking")
-	passtCmd := exec.Command("passt",
+	passtCmd = exec.Command("passt",
 		"--socket", passtSock,
 		"--vhost-user",    // vhost-user mode for cloud-hypervisor
 		"--foreground",    // stay in foreground for process management
@@ -113,26 +143,14 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	)
 	passtCmd.Stderr = os.Stderr
 	if err := passtCmd.Start(); err != nil {
-		virtiofsdCmd.Process.Kill()
-		virtiofsdCmd.Wait()
-		os.Remove(virtiofsSock)
+		passtCmd = nil // not started; don't let cleanup deref a nil Process
+		cleanup()
 		return nil, fmt.Errorf("start passt: %w", err)
 	}
 
 	// Wait for passt socket to be created
-	for i := 0; i < 50; i++ {
-		if _, err := os.Stat(passtSock); err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if _, err := os.Stat(passtSock); err != nil {
-		passtCmd.Process.Kill()
-		passtCmd.Wait()
-		virtiofsdCmd.Process.Kill()
-		virtiofsdCmd.Wait()
-		os.Remove(virtiofsSock)
-		os.Remove(passtSock)
+	if err := waitForSocket(passtSock, 50, 100*time.Millisecond); err != nil {
+		cleanup()
 		return nil, fmt.Errorf("passt socket not created: %w", err)
 	}
 	log.Printf("passt socket ready at %s", passtSock)
@@ -179,12 +197,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// Create pipe for event monitor - cloud-hypervisor writes events, we read them
 	eventReadPipe, eventWritePipe, err := os.Pipe()
 	if err != nil {
-		passtCmd.Process.Kill()
-		passtCmd.Wait()
-		virtiofsdCmd.Process.Kill()
-		virtiofsdCmd.Wait()
-		os.Remove(virtiofsSock)
-		os.Remove(passtSock)
+		cleanup()
 		return nil, fmt.Errorf("create event monitor pipe: %w", err)
 	}
 
@@ -206,12 +219,16 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		"--pvpanic",
 		"--event-monitor", fmt.Sprintf("fd=%d", eventMonitorFd),
 	}
-	// Add vsock if we have a control handler
+	// Add vsock if we have a control handler. cid=3 is the guest's context ID
+	// (the host is always CID 2); the guest dials the host at CID 2 and
+	// cloud-hypervisor maps that to the per-port unix socket we listen on below.
 	if cfg.ControlHandler != nil {
 		chvArgs = append(chvArgs, "--vsock", fmt.Sprintf("cid=3,socket=%s", vsockSock))
 	}
 	chvCmd := exec.Command(chvPath, chvArgs...)
-	// Pass the event write pipe to cloud-hypervisor as fd 3
+	// Pass the event write pipe to cloud-hypervisor as fd 3. ExtraFiles[0] maps
+	// to fd 3 in the child (after stdin/stdout/stderr = 0/1/2), which must match
+	// eventMonitorFd above: keep this slice exactly one element long.
 	chvCmd.ExtraFiles = []*os.File{eventWritePipe}
 
 	session := &VMSession{
@@ -231,12 +248,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	if err != nil {
 		eventReadPipe.Close()
 		eventWritePipe.Close()
-		passtCmd.Process.Kill()
-		passtCmd.Wait()
-		virtiofsdCmd.Process.Kill()
-		virtiofsdCmd.Wait()
-		os.Remove(virtiofsSock)
-		os.Remove(passtSock)
+		cleanup()
 		return nil, fmt.Errorf("start cloud-hypervisor with pty: %w", err)
 	}
 	log.Printf("cloud-hypervisor started with PID %d", chvCmd.Process.Pid)
@@ -286,7 +298,9 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	return session, nil
 }
 
-// Wait blocks until the VM exits.
+// Wait blocks until the VM exits. It always returns a nil error; the return
+// type is kept for API symmetry with other session types. Callers that only
+// need to wait may prefer ranging over Done().
 func (s *VMSession) Wait() error {
 	<-s.done
 	return nil
@@ -310,7 +324,13 @@ type chvEvent struct {
 
 // monitorEvents reads the cloud-hypervisor event stream and detects panics.
 // Cloud-hypervisor outputs pretty-printed JSON objects, so we use a JSON decoder
-// which handles multi-line JSON correctly.
+// which handles multi-line JSON correctly. It returns when the stream reaches
+// EOF (VM exited) or a panic event is seen.
+//
+// NOTE (robustness): a single decode error currently stops panic monitoring for
+// the rest of the VM's life. That is acceptable because the stream is produced
+// by cloud-hypervisor itself (well-formed in practice) and a missed panic only
+// loses the fast-path notification, not correctness; the VM still exits via done.
 func (s *VMSession) monitorEvents(r io.Reader) {
 	decoder := json.NewDecoder(r)
 	for {
@@ -386,41 +406,34 @@ func (s *VMSession) serveVsock() {
 }
 
 // handleVsockConnection handles a single vsock connection from the guest.
-// The guest opens a raw TCP-like connection, and we serve HTTP over it.
+// The guest opens a raw TCP-like connection, and we serve exactly one HTTP
+// request over it (HTTP/1.0 style), then close — there is intentionally no
+// keep-alive loop.
 func (s *VMSession) handleVsockConnection(conn net.Conn) {
 	defer conn.Close()
 
-	// Read the HTTP request line and headers
+	// Parse the single HTTP request (request line + headers).
 	reader := bufio.NewReader(conn)
-	for {
-		// Parse HTTP request
-		req, err := http.ReadRequest(reader)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("vsock: failed to read request: %v", err)
-			}
-			return
+	req, err := http.ReadRequest(reader)
+	if err != nil {
+		if err != io.EOF {
+			log.Printf("vsock: failed to read request: %v", err)
 		}
-
-		// Create a response writer that writes to the connection
-		rw := &vsockResponseWriter{
-			conn:    conn,
-			headers: make(http.Header),
-		}
-
-		log.Printf("vsock: handling request %s %s", req.Method, req.URL.Path)
-
-		// Serve the request
-		s.controlHandler.ServeHTTP(rw, req)
-
-		// Flush the response
-		if err := rw.finish(); err != nil {
-			log.Printf("vsock: failed to write response: %v", err)
-			return
-		}
-
-		// Close after handling one request (HTTP/1.0 style)
 		return
+	}
+
+	// Create a response writer that buffers and writes to the connection.
+	rw := &vsockResponseWriter{
+		conn:    conn,
+		headers: make(http.Header),
+	}
+
+	log.Printf("vsock: handling request %s %s", req.Method, req.URL.Path)
+
+	s.controlHandler.ServeHTTP(rw, req)
+
+	if err := rw.finish(); err != nil {
+		log.Printf("vsock: failed to write response: %v", err)
 	}
 }
 
@@ -473,9 +486,11 @@ func (w *vsockResponseWriter) finish() error {
 		return err
 	}
 
-	// Write body
-	if _, err := w.conn.Write(w.body); err != nil {
-		return err
+	// Write body (skip a zero-length write, which is a no-op on the wire).
+	if len(w.body) > 0 {
+		if _, err := w.conn.Write(w.body); err != nil {
+			return err
+		}
 	}
 
 	return nil

@@ -522,9 +522,40 @@ untrusted downloaded data):**
 
 ---
 
-## thundersnap/  (container.go, vm.go)
+## thundersnap/  (container.go, vm.go)  [DONE]
 
-**No `_test.go` files exist — the package has zero unit tests** (only indirect e2e coverage).
+RESOLUTION (committed):
+- **First unit tests for the package** (`vm_test.go`, `container_test.go`):
+  - `monitorEvents`: guest-panic closes `panicked` and returns; clean EOF returns without
+    closing it; malformed JSON returns without panicking.
+  - `vsockResponseWriter.finish` (against `net.Pipe`): default status 0→200, custom
+    status+headers, multi-`Write` body accumulation, Content-Length, and empty body.
+  - `Wait()` returns nil once `done` closes.
+  - `buildNsenterCmd` arg-building (incl. tsBinary default + override); `ReleaseContainerNs`
+    on an unknown rootFS is a no-op; refcount lifecycle (release twice → shutdown+delete),
+    using a real `cat` child that exits on stdin EOF like the real init.
+- **Dedup:** `RunInContainerNs`/`StartInContainerNs` now share one `buildNsenterCmd` helper
+  (single source of truth for the `nsenter ... ts drop-caps-and-run` invocation). The five
+  copy-pasted VM teardown ladders in `StartVM` collapsed into one `cleanup()` closure, and the
+  two identical socket-wait loops into `waitForSocket(path, attempts, delay)`.
+- **`finish` no longer issues a zero-length body write** (a no-op on the wire that also
+  dead-locked an unbuffered pipe with no body reader).
+- **`handleVsockConnection`** rewritten from a `for { ... return }` (dead loop) to a clear
+  single-request handler with a comment that there is intentionally no keep-alive.
+- **Docs:** PID-reuse caveat on the `Kill(pid,0)` liveness probe; `sessionID` format intent;
+  `eventMonitorFd`/`ExtraFiles[0]` coupling; guest-CID-3-vs-host-CID-2 note; `Wait()` always-nil
+  return; `monitorEvents` single-decode-error-stops-monitoring robustness note.
+
+DELIBERATELY NOT CHANGED (with rationale):
+- **`RunInContainerNs`/`StartInContainerNs` kept (NOT deleted).** The review called them dead,
+  but `e2e/container_test.go` (`TestContainerSharedPIDNamespace`) drives both through the real
+  production path. They are not the daemon's session path, but they are a live, tested API; the
+  `--skip-mount-setup` divergence is not a bug for their single-shot/long-running use (they do
+  not stack per-session devpts the way concurrent SSH sessions did). Left as-is, deduped.
+- `SetControlHandler` kept — it has a real consumer (cmd/thundersnapd/main.go).
+- PID-reuse hardening (start-time/cmdline verification) and SIGTERM/orphan handling for
+  virtiofsd/passt/cloud-hypervisor are documented as known gaps but not implemented (no observed
+  failure; out of scope for a cleanup pass).
 
 ### 1. Edge cases for unit tests
 - **Refcount lifecycle / concurrency** (`ContainerNsManager`): concurrent get/release races,
