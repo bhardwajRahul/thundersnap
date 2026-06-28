@@ -234,7 +234,16 @@ Coverage is fairly strong already. Gaps:
 
 ---
 
-## metrics/
+## metrics/  [DONE]
+
+RESOLUTION: Added metrics/metrics_test.go covering CountSnaps (missing/empty
+dir, .tsc/.txt noise ignored, and the documented foo.tsm/ directory match),
+CountFrames (missing/empty fsDir, bare dir without .jsonc, .jsonc whose <name>
+is a file, loose non-dir at user level), CountRefs (nil store, empty, populated),
+the collector via a registry with nil RunningSessions/RunningVMs closures
+yielding 0 and with closures read on scrape, NewRegistry double-registration
+error, and NewHandler. Added one-line comments to CountSnaps/CountFrames/CountRefs
+documenting the deliberate error->0 swallowing (a scrape never fails).
 
 ### 1. Edge cases for unit tests
 - **No unit tests at all** in `metrics/` (only e2e, root+btrfs), yet `CountSnaps`,

@@ -19,7 +19,8 @@ import (
 )
 
 // CountSnaps returns the number of snapshots in snapsDir, identified by their
-// .tsm manifest files.
+// .tsm manifest files. A missing or unreadable directory is reported as zero
+// rather than an error so a metrics scrape never fails.
 func CountSnaps(snapsDir string) int {
 	entries, err := os.ReadDir(snapsDir)
 	if err != nil {
@@ -37,6 +38,7 @@ func CountSnaps(snapsDir string) int {
 // CountFrames returns the number of frames stored under fsDir. Frames live at
 // fsDir/<user>/<name>/ alongside a <name>.jsonc metadata file; the metadata
 // file is what distinguishes a frame directory from an ordinary subdirectory.
+// A missing or unreadable directory is reported as zero so a scrape never fails.
 func CountFrames(fsDir string) int {
 	userEntries, err := os.ReadDir(fsDir)
 	if err != nil {
@@ -63,7 +65,8 @@ func CountFrames(fsDir string) int {
 	return n
 }
 
-// CountRefs returns the number of refs in store. A nil store counts as zero.
+// CountRefs returns the number of refs in store. A nil store, or a List error
+// (e.g. an unreadable refs dir), counts as zero so a scrape never fails.
 func CountRefs(store *refs.Store) int {
 	if store == nil {
 		return 0
