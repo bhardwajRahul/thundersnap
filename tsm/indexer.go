@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"syscall"
 	"time"
 
@@ -405,17 +404,4 @@ func (idx *Indexer) Stats() IndexerStats {
 		ChunkCount:  idx.tsc.ChunkCount(),
 		TotalBytes:  idx.totalBytes,
 	}
-}
-
-// stripPathPrefix returns path with the prefix stripped
-func stripPathPrefix(basePath, fullPath string) string {
-	rel, err := filepath.Rel(basePath, fullPath)
-	if err != nil {
-		return fullPath
-	}
-	// Ensure we don't return ".."
-	if strings.HasPrefix(rel, "..") {
-		return fullPath
-	}
-	return rel
 }
