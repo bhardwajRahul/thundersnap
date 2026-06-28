@@ -901,7 +901,31 @@ regression. Untested pure, root-free functions:
 
 ---
 
-## cmd/vshd/  (VM/container shell daemon — largest of the small binaries)
+## cmd/vshd/  (VM/container shell daemon — largest of the small binaries) [DONE]
+
+RESOLUTION:
+- Deduped /etc/passwd parsing: lookupUserHome+lookupContainerUserHome collapse
+  into one lookupUserHome(rootPrefix, username) over a pure
+  parsePasswdHome(content, username); the old container variant is deleted.
+- Deduped user selection: selectTargetUser+selectContainerUser collapse into one
+  selectUser(rootPrefix, targetUser) ("" prefix = host VM).
+- Deduped shell-quoting into quoteArgsForSh(args), used by runCommand and
+  runContainerCommand.
+- Deduped null-delimited protocol reads into readField(reader) and
+  readArgs(reader); readArgs now validates the count (non-numeric and negative
+  counts are rejected up front instead of blocking on ReadString), addressing
+  the unhandled-wire-protocol edge.
+- Added package doc comment describing the vsock protocol/purpose; documented
+  the SIGHUP-after-one-copy teardown and the CLONE_NEWPID|NEWNS|NEWUTS rationale.
+- Added cmd/vshd/main_test.go: TestParsePasswdHome (comments/blanks/short lines/
+  exact-not-substring), TestQuoteArgsForSh (spaces/quotes/empty/$),
+  TestSelectUserExplicit, TestReadArgs (valid/zero/non-numeric/negative/truncated).
+- Deliberate non-changes: the four run*/runContainer* functions are NOT merged
+  into a single parametrized path — the PTY vs pipe and VM vs chroot differences
+  make a unified version less readable than the duplication saves; the literal
+  "VMX" first-field sentinel colliding with a real username "VMX" is noted but
+  unchanged (the host never sends "VMX" as a user); initTsBinaryPath's silent
+  /bin/ts fallback is intended (best-effort) and kept.
 
 ### 1. Edge cases for unit tests
 The only test (`TestSuLoginChangesWorkingDirectory`) tests `su`, not vshd's logic, and
@@ -954,7 +978,16 @@ The only test (`TestSuLoginChangesWorkingDirectory`) tests `su`, not vshd's logi
 
 ---
 
-## cmd/vsh/
+## cmd/vsh/ [DONE]
+
+RESOLUTION:
+- Removed the dead SIGWINCH handler (it consumed the signal but never acted; the
+  vsock protocol carries no window-size message) along with its now-unused
+  os/signal and syscall imports.
+- Added a package doc comment describing the CONNECT handshake + bidirectional
+  bridge.
+- Documented the single-Read handshake assumption and that the stdin->vsock
+  goroutine is intentionally not awaited (buffered stdin discarded on exit).
 
 ### 1. Edge cases for unit tests
 - Essentially all I/O glue; only the `"OK"` prefix check (43) is extractable. Low value.
@@ -978,7 +1011,17 @@ The only test (`TestSuLoginChangesWorkingDirectory`) tests `su`, not vshd's logi
 
 ---
 
-## cmd/tsm/
+## cmd/tsm/ [DONE]
+
+RESOLUTION:
+- Replaced the redundant TrimRight-after-Clean with a testable
+  defaultOutBase(cleanedInputDir) that maps the root "/" edge to "root" (so the
+  output is root.tsm/root.tsc, not the empty ".tsm"); dropped the now-unused
+  strings import.
+- IsTTY is now term.IsTerminal(stderr) instead of hardcoded true, so a non-TTY
+  invocation gets plain line progress; commented.
+- Added cmd/tsm/main_test.go: TestDefaultOutBase (incl. root edge) and
+  TestPrintFileUnknownExtension (case-sensitive .TSM/.TSC rejected).
 
 ### 1. Edge cases for unit tests
 - `printFile` extension dispatch (101-111): unknown-extension error and case-sensitivity
@@ -1002,14 +1045,21 @@ The only test (`TestSuLoginChangesWorkingDirectory`) tests `su`, not vshd's logi
 
 ---
 
-## cmd/tsvm/
+## cmd/tsvm/ [DONE]
+
+RESOLUTION: Reviewed — no issues found (pure glue, has a package doc). No change.
 
 - Pure glue (flag parse + `StartVM` + signal select). Nothing meaningfully unit-testable; no
   duplication; clean and minimal; self-explanatory `select`. Has a package doc. No issues.
 
 ---
 
-## cmd/dist/
+## cmd/dist/ [DONE]
+
+RESOLUTION:
+- Fixed the help-vs-behavior mismatch: the -out flag help now reads
+  "default: <cwd>/dist", matching the absolute filepath.Join(wd, "dist") the
+  code actually uses. No behavioral change.
 
 ### 3. Overly complicated / redundant
 - `out := filepath.Join(wd, "dist")` computed then overwritten if `*outPath != ""` (86-89); the

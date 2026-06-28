@@ -1,12 +1,116 @@
 package main
 
 import (
+	"bufio"
 	"os"
 	"os/exec"
 	"os/user"
 	"strings"
 	"testing"
 )
+
+func TestParsePasswdHome(t *testing.T) {
+	const passwd = `# a comment
+root:x:0:0:root:/root:/bin/bash
+
+user:x:1000:1000:User:/home/user:/bin/sh
+ubuntu:x:1001:1001::/home/ubuntu:/bin/bash
+short:x:1:1:/nope
+prefix:x:2:2::/home/prefix
+prefixmatch:x:3:3::/home/prefixmatch
+`
+	tests := []struct {
+		name     string
+		username string
+		want     string
+	}{
+		{name: "found", username: "user", want: "/home/user"},
+		{name: "found ubuntu empty gecos", username: "ubuntu", want: "/home/ubuntu"},
+		{name: "not found", username: "missing", want: ""},
+		{name: "comment not matched", username: "#", want: ""},
+		{name: "too few fields ignored", username: "short", want: ""},
+		{name: "exact match not substring", username: "prefix", want: "/home/prefix"},
+		{name: "no substring false positive", username: "prefixmat", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parsePasswdHome(passwd, tt.username); got != tt.want {
+				t.Errorf("parsePasswdHome(_, %q) = %q, want %q", tt.username, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQuoteArgsForSh(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "empty", args: nil, want: ""},
+		{name: "simple", args: []string{"ls", "-l"}, want: "'ls' '-l'"},
+		{name: "space", args: []string{"echo", "a b"}, want: "'echo' 'a b'"},
+		{name: "single quote", args: []string{"echo", "it's"}, want: `'echo' 'it'\''s'`},
+		{name: "empty arg", args: []string{""}, want: "''"},
+		{name: "dollar untouched", args: []string{"echo", "$HOME"}, want: "'echo' '$HOME'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := quoteArgsForSh(tt.args); got != tt.want {
+				t.Errorf("quoteArgsForSh(%q) = %q, want %q", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSelectUserExplicit(t *testing.T) {
+	// A caller-specified user is returned verbatim regardless of filesystem.
+	if got := selectUser("", "alice"); got != "alice" {
+		t.Errorf("selectUser(_, \"alice\") = %q, want alice", got)
+	}
+	if got := selectUser("/some/root", "bob"); got != "bob" {
+		t.Errorf("selectUser(_, \"bob\") = %q, want bob", got)
+	}
+}
+
+func TestReadArgs(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		r := bufio.NewReader(strings.NewReader("2\x00ls\x00-l\x00"))
+		got, err := readArgs(r)
+		if err != nil {
+			t.Fatalf("readArgs: %v", err)
+		}
+		if len(got) != 2 || got[0] != "ls" || got[1] != "-l" {
+			t.Errorf("readArgs = %q, want [ls -l]", got)
+		}
+	})
+	t.Run("zero args", func(t *testing.T) {
+		r := bufio.NewReader(strings.NewReader("0\x00"))
+		got, err := readArgs(r)
+		if err != nil || len(got) != 0 {
+			t.Errorf("readArgs = (%q, %v), want ([], nil)", got, err)
+		}
+	})
+	t.Run("non-numeric count", func(t *testing.T) {
+		r := bufio.NewReader(strings.NewReader("abc\x00"))
+		if _, err := readArgs(r); err == nil {
+			t.Error("readArgs: expected error for non-numeric count")
+		}
+	})
+	t.Run("negative count", func(t *testing.T) {
+		r := bufio.NewReader(strings.NewReader("-1\x00"))
+		if _, err := readArgs(r); err == nil {
+			t.Error("readArgs: expected error for negative count")
+		}
+	})
+	t.Run("truncated args", func(t *testing.T) {
+		// Count claims 2 args but only one (unterminated) follows.
+		r := bufio.NewReader(strings.NewReader("2\x00onlyone"))
+		if _, err := readArgs(r); err == nil {
+			t.Error("readArgs: expected error for truncated args")
+		}
+	})
+}
 
 // TestSuLoginChangesWorkingDirectory tests that "su - user -c 'pwd'" changes
 // to the user's home directory, not just sets $HOME.

@@ -64,7 +64,7 @@ func runBuild(args []string) error {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
 	var (
 		verbose = fs.Bool("verbose", false, "verbose build output")
-		outPath = fs.String("out", "", "output directory (default: ./dist)")
+		outPath = fs.String("out", "", "output directory (default: <cwd>/dist)")
 	)
 	fs.Parse(args)
 	filters := fs.Args()

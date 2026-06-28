@@ -1,3 +1,8 @@
+// vsh connects to a VM's vsh daemon over a cloud-hypervisor vsock unix socket
+// and bridges the local terminal to the guest shell. It dials the socket given
+// as argv[1], performs the cloud-hypervisor "CONNECT <port>" handshake, puts the
+// local terminal into raw mode (when stdin is a TTY), and then copies bytes in
+// both directions until the guest side closes.
 package main
 
 import (
@@ -6,9 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 
 	"golang.org/x/term"
 )
@@ -33,7 +36,10 @@ func main() {
 		log.Fatalf("failed to send CONNECT: %v", err)
 	}
 
-	// Read response - should be "OK <port>\n"
+	// Read the "OK <port>\n" handshake reply. We assume the whole line arrives
+	// in a single read (true in practice: cloud-hypervisor writes it as one
+	// short message before any shell output) and that no shell bytes are
+	// consumed here prematurely.
 	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
 	if err != nil {
@@ -44,28 +50,20 @@ func main() {
 		log.Fatalf("vsock connection failed: %s", response)
 	}
 
-	// Put terminal in raw mode if stdin is a tty
-	var oldState *term.State
+	// Put terminal in raw mode if stdin is a tty.
 	if term.IsTerminal(int(os.Stdin.Fd())) {
-		oldState, err = term.MakeRaw(int(os.Stdin.Fd()))
+		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 		if err != nil {
 			log.Fatalf("failed to set raw mode: %v", err)
 		}
 		defer term.Restore(int(os.Stdin.Fd()), oldState)
-
-		// Handle window size changes
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGWINCH)
-		go func() {
-			for range sigCh {
-				// Could send window size to guest here
-			}
-		}()
 	}
 
 	done := make(chan struct{})
 
-	// stdin -> vsock
+	// stdin -> vsock. This goroutine is intentionally not awaited: when the
+	// guest side closes (the vsock->stdout copy below returns), we exit
+	// immediately and any stdin still buffered here is discarded.
 	go func() {
 		io.Copy(conn, os.Stdin)
 	}()

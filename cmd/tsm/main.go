@@ -13,10 +13,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/tsm"
+	"golang.org/x/term"
 )
 
 var (
@@ -72,15 +72,16 @@ func main() {
 	// Determine output basename
 	outBase := *outfile
 	if outBase == "" {
-		// Strip trailing slash and use the directory path
-		outBase = strings.TrimRight(inputDir, "/")
+		outBase = defaultOutBase(inputDir)
 	}
 
 	fmt.Printf("Indexing %s -> %s.tsm + %s.tsc\n", inputDir, outBase, outBase)
 
+	// Only emit \r-style progress when stderr is a real terminal; a non-TTY
+	// (pipe/file) invocation gets plain line-oriented progress instead.
 	opts := tsm.IndexerOptions{
 		ProgressWriter: os.Stderr,
-		IsTTY:          true,
+		IsTTY:          term.IsTerminal(int(os.Stderr.Fd())),
 	}
 
 	if err := tsm.Create(inputDir, outBase, opts); err != nil {
@@ -95,6 +96,17 @@ func main() {
 			fmt.Printf("Wrote %s (%d bytes)\n", path, info.Size())
 		}
 	}
+}
+
+// defaultOutBase derives the output basename from a filepath.Clean'd input
+// directory. Clean has already removed any trailing slash for every path except
+// the filesystem root "/", which it leaves as "/"; we map that to "root" so the
+// output is "root.tsm"/"root.tsc" rather than the empty, dotfile-like ".tsm".
+func defaultOutBase(cleanedInputDir string) string {
+	if cleanedInputDir == "/" {
+		return "root"
+	}
+	return cleanedInputDir
 }
 
 func printFile(path string) error {

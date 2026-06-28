@@ -1,3 +1,9 @@
+// vshd is the in-guest shell daemon. It listens on a vsock port and serves a
+// simple null-delimited request protocol over each connection, spawning either
+// an interactive PTY shell or a one-shot command. Two protocol variants are
+// supported (see handleConnection): the original "run on this VM" form and the
+// extended "VMX" form that chroots into a container rootfs via
+// `ts drop-caps-and-run` before exec'ing.
 package main
 
 import (
@@ -17,26 +23,24 @@ import (
 	"github.com/mdlayher/vsock"
 )
 
-// selectTargetUser determines which Unix user to run as.
-// If targetUser is non-empty, it's used directly (caller specified it).
-// Otherwise, auto-detect:
-//  1. Check if "ubuntu" user's home exists -> use ubuntu
-//  2. Look up "user" in /etc/passwd and check if their home exists -> use user
-//  3. Fall back to root
-func selectTargetUser(targetUser string) string {
+// selectUser determines which Unix user to run as, auto-detecting when the
+// caller did not request one. rootPrefix is "" for the host VM filesystem or a
+// container rootfs path for VMX mode; all lookups are resolved beneath it.
+// Detection order: explicit targetUser -> "ubuntu" (if /home/ubuntu exists) ->
+// "user" (if its /etc/passwd home exists) -> "root".
+func selectUser(rootPrefix, targetUser string) string {
 	if targetUser != "" {
 		return targetUser
 	}
 
-	// First check for ubuntu user (legacy behavior)
-	if info, err := os.Stat("/home/ubuntu"); err == nil && info.IsDir() {
+	// First check for ubuntu user (legacy behavior).
+	if info, err := os.Stat(filepath.Join(rootPrefix, "home/ubuntu")); err == nil && info.IsDir() {
 		return "ubuntu"
 	}
 
-	// Look up "user" in /etc/passwd to find their home directory
-	userHome := lookupUserHome("user")
-	if userHome != "" {
-		if info, err := os.Stat(userHome); err == nil && info.IsDir() {
+	// Look up "user" in /etc/passwd and confirm their home exists.
+	if userHome := lookupUserHome(rootPrefix, "user"); userHome != "" {
+		if info, err := os.Stat(filepath.Join(rootPrefix, userHome)); err == nil && info.IsDir() {
 			return "user"
 		}
 	}
@@ -44,14 +48,23 @@ func selectTargetUser(targetUser string) string {
 	return "root"
 }
 
-// lookupUserHome reads /etc/passwd and returns the home directory for username.
-// Returns empty string if the file doesn't exist or user is not found.
-func lookupUserHome(username string) string {
-	data, err := os.ReadFile("/etc/passwd")
+// lookupUserHome reads <rootPrefix>/etc/passwd and returns the home directory
+// for username. rootPrefix is "" for the host filesystem. Returns "" if the
+// file doesn't exist or the user is not found.
+func lookupUserHome(rootPrefix, username string) string {
+	data, err := os.ReadFile(filepath.Join(rootPrefix, "etc/passwd"))
 	if err != nil {
 		return ""
 	}
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	return parsePasswdHome(string(data), username)
+}
+
+// parsePasswdHome scans /etc/passwd-formatted content and returns the home
+// directory (field 6) for the first line whose first field equals username.
+// Blank and comment (#) lines are skipped; lines with fewer than 6 colon-
+// separated fields are ignored. Returns "" when not found.
+func parsePasswdHome(passwd, username string) string {
+	scanner := bufio.NewScanner(strings.NewReader(passwd))
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -63,6 +76,28 @@ func lookupUserHome(username string) string {
 		}
 	}
 	return ""
+}
+
+// quoteArgsForSh single-quotes each argument for safe interpolation into a
+// `su - <user> -c '<cmd>'` string, escaping embedded single quotes via the
+// standard '\” idiom, and joins them with spaces.
+func quoteArgsForSh(args []string) string {
+	quoted := make([]string, len(args))
+	for i, arg := range args {
+		quoted[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
+	}
+	return strings.Join(quoted, " ")
+}
+
+// readField reads one null-terminated field from the protocol stream and
+// returns it with the trailing '\x00' stripped. ReadString only returns a nil
+// error when the delimiter was found, so slicing off the last byte is safe.
+func readField(reader *bufio.Reader) (string, error) {
+	s, err := reader.ReadString('\x00')
+	if err != nil {
+		return "", err
+	}
+	return s[:len(s)-1], nil
 }
 
 const vsockPort = 5222
@@ -115,12 +150,11 @@ func handleConnection(conn *vsock.Conn) {
 	//   VMX\0framePath\0targetUser\0argCount\0arg1\0...argN\0
 	reader := bufio.NewReader(conn)
 
-	firstField, err := reader.ReadString('\x00')
+	firstField, err := readField(reader)
 	if err != nil {
 		log.Printf("[conn %d] failed to read first field: %v", id, err)
 		return
 	}
-	firstField = firstField[:len(firstField)-1]
 
 	// Check if this is the VMX protocol
 	if firstField == "VMX" {
@@ -131,32 +165,17 @@ func handleConnection(conn *vsock.Conn) {
 	// Original protocol: firstField is targetUser
 	targetUser := firstField
 
-	countStr, err := reader.ReadString('\x00')
+	cmdArgs, err := readArgs(reader)
 	if err != nil {
-		log.Printf("[conn %d] failed to read arg count: %v", id, err)
+		log.Printf("[conn %d] failed to read args: %v", id, err)
 		return
-	}
-	argCount, err := strconv.Atoi(countStr[:len(countStr)-1])
-	if err != nil {
-		log.Printf("[conn %d] invalid arg count %q: %v", id, countStr, err)
-		return
-	}
-
-	var cmdArgs []string
-	for i := 0; i < argCount; i++ {
-		arg, err := reader.ReadString('\x00')
-		if err != nil {
-			log.Printf("[conn %d] failed to read arg %d: %v", id, i, err)
-			return
-		}
-		cmdArgs = append(cmdArgs, arg[:len(arg)-1])
 	}
 
 	// Determine which user to run as
-	runAsUser := selectTargetUser(targetUser)
+	runAsUser := selectUser("", targetUser)
 	log.Printf("[conn %d] running as user %q (requested: %q)", id, runAsUser, targetUser)
 
-	if argCount > 0 {
+	if len(cmdArgs) > 0 {
 		log.Printf("[conn %d] running command: %v", id, cmdArgs)
 		runCommand(id, conn, reader, runAsUser, cmdArgs)
 	} else {
@@ -165,46 +184,55 @@ func handleConnection(conn *vsock.Conn) {
 	}
 }
 
+// readArgs reads a null-delimited "argCount\0arg1\0...argN\0" sequence shared by
+// both protocol variants. A non-numeric or negative count is rejected up front
+// so a malformed request fails fast instead of blocking on a never-arriving
+// field.
+func readArgs(reader *bufio.Reader) ([]string, error) {
+	countStr, err := readField(reader)
+	if err != nil {
+		return nil, fmt.Errorf("read arg count: %w", err)
+	}
+	argCount, err := strconv.Atoi(countStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid arg count %q: %w", countStr, err)
+	}
+	if argCount < 0 {
+		return nil, fmt.Errorf("negative arg count %d", argCount)
+	}
+	cmdArgs := make([]string, 0, argCount)
+	for i := 0; i < argCount; i++ {
+		arg, err := readField(reader)
+		if err != nil {
+			return nil, fmt.Errorf("read arg %d: %w", i, err)
+		}
+		cmdArgs = append(cmdArgs, arg)
+	}
+	return cmdArgs, nil
+}
+
 // handleVMXConnection handles the VMX protocol for spawning containers inside the VM.
 // Protocol: VMX\0framePath\0targetUser\0argCount\0arg1\0...argN\0
 func handleVMXConnection(id uint64, conn *vsock.Conn, reader *bufio.Reader) {
 	// Read framePath (path to container rootfs relative to virtiofs root)
-	framePathStr, err := reader.ReadString('\x00')
+	framePath, err := readField(reader)
 	if err != nil {
 		log.Printf("[conn %d] VMX: failed to read frame path: %v", id, err)
 		return
 	}
-	framePath := framePathStr[:len(framePathStr)-1]
 
 	// Read target user
-	targetUserStr, err := reader.ReadString('\x00')
+	targetUser, err := readField(reader)
 	if err != nil {
 		log.Printf("[conn %d] VMX: failed to read target user: %v", id, err)
 		return
 	}
-	targetUser := targetUserStr[:len(targetUserStr)-1]
 
-	// Read arg count
-	countStr, err := reader.ReadString('\x00')
+	// Read arg count + arguments
+	cmdArgs, err := readArgs(reader)
 	if err != nil {
-		log.Printf("[conn %d] VMX: failed to read arg count: %v", id, err)
+		log.Printf("[conn %d] VMX: failed to read args: %v", id, err)
 		return
-	}
-	argCount, err := strconv.Atoi(countStr[:len(countStr)-1])
-	if err != nil {
-		log.Printf("[conn %d] VMX: invalid arg count %q: %v", id, countStr, err)
-		return
-	}
-
-	// Read arguments
-	var cmdArgs []string
-	for i := 0; i < argCount; i++ {
-		arg, err := reader.ReadString('\x00')
-		if err != nil {
-			log.Printf("[conn %d] VMX: failed to read arg %d: %v", id, i, err)
-			return
-		}
-		cmdArgs = append(cmdArgs, arg[:len(arg)-1])
 	}
 
 	// The frame rootfs is at /<framePath> from the virtiofs root
@@ -212,7 +240,7 @@ func handleVMXConnection(id uint64, conn *vsock.Conn, reader *bufio.Reader) {
 	containerRootFS := filepath.Clean("/" + framePath)
 	log.Printf("[conn %d] VMX: spawning container at %s (user: %q, args: %v)", id, containerRootFS, targetUser, cmdArgs)
 
-	if argCount > 0 {
+	if len(cmdArgs) > 0 {
 		runContainerCommand(id, conn, reader, containerRootFS, targetUser, cmdArgs)
 	} else {
 		runContainerShell(id, conn, reader, containerRootFS, targetUser)
@@ -223,7 +251,7 @@ func handleVMXConnection(id uint64, conn *vsock.Conn, reader *bufio.Reader) {
 // Uses ts drop-caps-and-run to set up namespaces and chroot.
 func runContainerShell(id uint64, conn *vsock.Conn, reader *bufio.Reader, containerRootFS, targetUser string) {
 	// Determine which user to run as (may auto-detect from container's /etc/passwd)
-	runAsUser := selectContainerUser(containerRootFS, targetUser)
+	runAsUser := selectUser(containerRootFS, targetUser)
 
 	// Build ts command
 	// ts drop-caps-and-run --chroot=<path> -- su - <user>
@@ -235,6 +263,9 @@ func runContainerShell(id uint64, conn *vsock.Conn, reader *bufio.Reader, contai
 	}
 
 	cmd := exec.Command(tsBinaryPath, tsArgs...)
+	// New PID/mount/UTS namespaces give the container its own process tree,
+	// mount table, and hostname; `ts drop-caps-and-run` then performs the
+	// chroot and drops capabilities inside them.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
 	}
@@ -264,6 +295,10 @@ func runContainerShell(id uint64, conn *vsock.Conn, reader *bufio.Reader, contai
 		done <- struct{}{}
 	}()
 
+	// One copy goroutine returning means the session is ending (the guest shell
+	// exited, closing the pty, or the vsock peer went away). SIGHUP tells the
+	// shell its controlling terminal hung up so it tears down its job-control
+	// children before we reap it with Wait.
 	<-done
 	log.Printf("[conn %d] VMX: signaling container to exit", id)
 	cmd.Process.Signal(syscall.SIGHUP)
@@ -274,7 +309,7 @@ func runContainerShell(id uint64, conn *vsock.Conn, reader *bufio.Reader, contai
 // runContainerCommand runs a command inside a container.
 func runContainerCommand(id uint64, conn *vsock.Conn, reader *bufio.Reader, containerRootFS, targetUser string, cmdArgs []string) {
 	// Determine which user to run as
-	runAsUser := selectContainerUser(containerRootFS, targetUser)
+	runAsUser := selectUser(containerRootFS, targetUser)
 
 	// Build ts command
 	// ts drop-caps-and-run --chroot=<path> -- su - <user> -c '<command>'
@@ -284,15 +319,12 @@ func runContainerCommand(id uint64, conn *vsock.Conn, reader *bufio.Reader, cont
 		tsArgs = append([]string{"drop-caps-and-run", "--chroot=" + containerRootFS, "--"}, cmdArgs...)
 	} else {
 		// For non-root, use su -c
-		quotedArgs := make([]string, len(cmdArgs))
-		for i, arg := range cmdArgs {
-			quotedArgs[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
-		}
-		cmdStr := strings.Join(quotedArgs, " ")
+		cmdStr := quoteArgsForSh(cmdArgs)
 		tsArgs = []string{"drop-caps-and-run", "--chroot=" + containerRootFS, "--", "su", "-", runAsUser, "-c", cmdStr}
 	}
 
 	cmd := exec.Command(tsBinaryPath, tsArgs...)
+	// See runContainerShell for why these three namespaces.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
 	}
@@ -328,49 +360,6 @@ func runContainerCommand(id uint64, conn *vsock.Conn, reader *bufio.Reader, cont
 	} else {
 		log.Printf("[conn %d] VMX: container command exited successfully", id)
 	}
-}
-
-// selectContainerUser determines which user to run as inside the container.
-// Similar to selectTargetUser but checks within the container's filesystem.
-func selectContainerUser(containerRootFS, targetUser string) string {
-	if targetUser != "" {
-		return targetUser
-	}
-
-	// Check for ubuntu user
-	if info, err := os.Stat(filepath.Join(containerRootFS, "home/ubuntu")); err == nil && info.IsDir() {
-		return "ubuntu"
-	}
-
-	// Check for "user" in the container's /etc/passwd
-	userHome := lookupContainerUserHome(containerRootFS, "user")
-	if userHome != "" {
-		if info, err := os.Stat(filepath.Join(containerRootFS, userHome)); err == nil && info.IsDir() {
-			return "user"
-		}
-	}
-
-	return "root"
-}
-
-// lookupContainerUserHome reads the container's /etc/passwd and returns the home directory.
-func lookupContainerUserHome(containerRootFS, username string) string {
-	data, err := os.ReadFile(filepath.Join(containerRootFS, "etc/passwd"))
-	if err != nil {
-		return ""
-	}
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Split(line, ":")
-		if len(fields) >= 6 && fields[0] == username {
-			return fields[5] // home directory field
-		}
-	}
-	return ""
 }
 
 // runInteractiveShell spawns an interactive login shell as the specified user with PTY.
@@ -411,6 +400,8 @@ func runInteractiveShell(id uint64, conn *vsock.Conn, reader *bufio.Reader, runA
 		done <- struct{}{}
 	}()
 
+	// See runContainerShell: one copy ending means the session is over; SIGHUP
+	// hangs up the shell's controlling terminal before we reap it.
 	<-done
 	log.Printf("[conn %d] signaling shell to exit", id)
 	cmd.Process.Signal(syscall.SIGHUP)
@@ -431,13 +422,7 @@ func runCommand(id uint64, conn *vsock.Conn, reader *bufio.Reader, runAsUser str
 	} else {
 		// For non-root users, use su - to switch users with a login shell.
 		// The login shell changes to the home directory, sets HOME, reads profile, etc.
-		// Build the command string with proper quoting for su -c
-		// We use single quotes and escape any single quotes in the arguments
-		quotedArgs := make([]string, len(cmdArgs))
-		for i, arg := range cmdArgs {
-			quotedArgs[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
-		}
-		cmdStr := strings.Join(quotedArgs, " ")
+		cmdStr := quoteArgsForSh(cmdArgs)
 		cmd = exec.Command("su", "-", runAsUser, "-c", cmdStr)
 	}
 	cmd.Env = os.Environ()
