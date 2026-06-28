@@ -1,5 +1,5 @@
-// Package tsm download.go provides functionality for downloading snapshots
-// using the TSM/TSC format from mesh peers.
+// download.go provides functionality for downloading snapshots using the
+// TSM/TSC format from mesh peers. (See types.go for the package doc.)
 package tsm
 
 import (
@@ -278,15 +278,10 @@ func downloadFiles(opts downloadFilesOpts) error {
 			return fmt.Errorf("downloading %s: %w", entry.Path, err)
 		}
 
-		// Set permissions (include setuid/setgid/sticky bits)
-		if err := os.Chmod(tmpPath, os.FileMode(entry.Mode&0xFFF)); err != nil {
-			// Non-fatal
-		}
-
-		// Set ownership
-		if err := os.Lchown(tmpPath, int(entry.UID), int(entry.GID)); err != nil {
-			// Non-fatal - may need root
-		}
+		// Set permissions (include setuid/setgid/sticky bits). Best-effort:
+		// permission/ownership may legitimately fail without root.
+		_ = os.Chmod(tmpPath, os.FileMode(entry.Mode&0xFFF))
+		_ = os.Lchown(tmpPath, int(entry.UID), int(entry.GID))
 
 		// Rename to final location
 		if err := os.Rename(tmpPath, outputPath); err != nil {
@@ -450,9 +445,14 @@ func downloadFile(opts downloadFileOpts) error {
 	return nil
 }
 
-// createNonFileEntries creates directories, symlinks, and device nodes.
+// createNonFileEntries creates directories and symlinks. Device nodes are NOT
+// created (see the CharDev/BlockDev case below); regular files are handled
+// separately by downloadFiles.
 func createNonFileEntries(targetDir string, tsm *TSMReader) error {
-	// Sort entries by path length to create parents before children
+	// Sort by path length so a parent is always created before its children.
+	// Path length is a valid stand-in for depth here because any child path is
+	// strictly longer than its own parent ("a" < "a/b" < "a/b/c"); it is not a
+	// general topological sort, but it does not need to be.
 	entries := make([]TSMEntry, len(tsm.Entries))
 	copy(entries, tsm.Entries)
 	sort.Slice(entries, func(i, j int) bool {
@@ -480,8 +480,10 @@ func createNonFileEntries(targetDir string, tsm *TSMReader) error {
 			os.Lchown(fullPath, int(entry.UID), int(entry.GID))
 
 		case EntryTypeCharDev, EntryTypeBlockDev:
-			// Device nodes require CAP_MKNOD, skip if not running as root
-			// (the actual mknod call is in a helper)
+			// Device nodes are intentionally not recreated on download: mknod
+			// requires CAP_MKNOD and downloads are not assumed to run as root.
+			// The entry's metadata is preserved in the manifest, but no device
+			// node is materialized.
 
 		case EntryTypeFile:
 			// Already handled in downloadFiles

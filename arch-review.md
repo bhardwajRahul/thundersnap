@@ -341,7 +341,42 @@ RESOLUTION:
 
 ---
 
-## tsm/  (largest, most important module)
+## tsm/  (largest, most important module)  [DONE]
+
+RESOLUTION (committed across several jj changes):
+- **Dead code deleted:** `checkURLExistsRaw` (peers.go), `stripPathPrefix` (indexer.go) —
+  both verified unused (tree still compiles), removed along with their now-unused imports.
+- **download.go honesty fixes:** the empty `CharDev/BlockDev` branch in
+  `createNonFileEntries` is now documented as an intentional no-op (mknod needs CAP_MKNOD,
+  downloads are not assumed root); the silent `os.Chmod`/`os.Lchown` error-swallowing
+  `if err := ...{}` blocks became explicit `_ = os.Chmod(...)` / `_ = os.Lchown(...)`; the
+  path-length sort assumption and the file-level (not package) comment were clarified.
+- **Redundant exported field removed:** `IndexerOptions.Progress` is gone; progress is now
+  gated solely on `ProgressWriter != nil` (callers in cmd/thundersnapd, cmd/tsm, and the
+  progress tests updated).
+- **Unexported internal chunking primitives:** `rollsum`+`reset`/`add`/`roll`/`digest` and
+  `findSplitPoint` are now lowercase with godoc (only used in-package). The all-ones split
+  test and the bounded `uint16(level)` cast are now explained.
+- **Godoc / stale-comment fixes (types.go):** constant blocks converted to godoc form; stale
+  `\x02` magic/version comments corrected to `\x03`; `EntryType` + `String()` documented; the
+  reserved TSM/TSC flag bits annotated (kept, since they are on-disk-format placeholders) with
+  the type/flags nibble-packing explained; `BlobSHA256`/`ZeroBlockSHA` git-blob framing noted.
+- **New tests:** `tsm_corrupt_test.go` — corrupt/truncated `ParseTSM`/`ParseTSC` cases (short
+  buffer, bad magic, checksum mismatch, count mismatch, truncated entries) plus
+  `TestChunkDataReaderParity` asserting `ChunkData` and `ChunkReader` produce identical chunk
+  boundaries/hashes across sizes spanning buffer boundaries.
+
+DELIBERATELY NOT CHANGED (with rationale):
+- **`ChunkData` vs `ChunkReader` NOT collapsed.** The parity test proves they agree today; both
+  feed the on-disk chunk hashes, so merging them risks a silent wire-format change for no
+  functional gain. Kept as two impls guarded by the parity test against drift.
+- **Exported reserved flag constants kept** (annotated, not deleted): they pin bit positions in
+  the on-disk format even though the current writer never sets them.
+- **`uint16` path-length / `uint32` chunk-count casts:** documented as practically bounded
+  rather than adding guards/errors for inputs (>64KB paths, >4G chunks/file) that cannot arise
+  from a real filesystem snapshot; revisit only if a concrete overflow path appears.
+- `isConnRefused` string-match, the hardlink-map key truncation, and the two-pass `Index`
+  re-stat are left as-is (pre-existing behavior, no observed bug); noted here for future work.
 
 ### 1. Edge cases for unit tests
 **Corrupt / truncated parsing (highest value — pure functions, easy to test, and this parses

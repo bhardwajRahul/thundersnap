@@ -50,7 +50,6 @@ func TestSnapshotProgressReporting(t *testing.T) {
 	var prog1 bytes.Buffer
 	snap1Base := filepath.Join(env.snapshotsDir, "prog-snap1")
 	idx1 := tsm.NewIndexer(tsm.IndexerOptions{
-		Progress:       true,
 		ProgressWriter: &prog1,
 		IsTTY:          false,
 	})
@@ -101,7 +100,6 @@ func TestSnapshotProgressReporting(t *testing.T) {
 	var prog2 bytes.Buffer
 	snap2Base := filepath.Join(env.snapshotsDir, "prog-snap2")
 	idx2 := tsm.NewIndexer(tsm.IndexerOptions{
-		Progress:       true,
 		ProgressWriter: &prog2,
 		IsTTY:          false,
 		ParentTSM:      parentTSM,

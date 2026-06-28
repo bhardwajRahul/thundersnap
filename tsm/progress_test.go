@@ -19,7 +19,6 @@ func TestProgressReportsCountsAndBytes(t *testing.T) {
 	out := t.TempDir()
 	var buf bytes.Buffer
 	idx := NewIndexer(IndexerOptions{
-		Progress:       true,
 		ProgressWriter: &buf,
 		IsTTY:          false,
 	})

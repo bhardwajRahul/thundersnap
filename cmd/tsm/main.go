@@ -79,7 +79,6 @@ func main() {
 	fmt.Printf("Indexing %s -> %s.tsm + %s.tsc\n", inputDir, outBase, outBase)
 
 	opts := tsm.IndexerOptions{
-		Progress:       true,
 		ProgressWriter: os.Stderr,
 		IsTTY:          true,
 	}

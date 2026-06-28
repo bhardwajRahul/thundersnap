@@ -14,10 +14,8 @@ import (
 
 // IndexerOptions configures the TSM indexer
 type IndexerOptions struct {
-	// Progress enables progress reporting
-	Progress bool
-
-	// ProgressWriter receives progress updates
+	// ProgressWriter receives progress updates. Progress reporting is enabled
+	// exactly when this is non-nil.
 	ProgressWriter io.Writer
 
 	// IsTTY indicates whether progress writer is a terminal
@@ -342,9 +340,9 @@ func (idx *Indexer) reuseParentChunks(entry *TSMEntry) ([]uint32, bool) {
 	return chunkRefs, true
 }
 
-// logProgress writes a progress message if progress is enabled
+// logProgress writes a progress message if a ProgressWriter is configured.
 func (idx *Indexer) logProgress(format string, args ...interface{}) {
-	if idx.opts.Progress && idx.opts.ProgressWriter != nil {
+	if idx.opts.ProgressWriter != nil {
 		fmt.Fprintf(idx.opts.ProgressWriter, format, args...)
 	}
 }
@@ -356,7 +354,7 @@ func (idx *Indexer) logProgress(format string, args ...interface{}) {
 // carriage return and includes the current path so it overwrites in place; on
 // a non-TTY (e.g. an NDJSON progress stream) it is a plain line.
 func (idx *Indexer) updateProgress(path string) {
-	if !idx.opts.Progress || idx.opts.ProgressWriter == nil {
+	if idx.opts.ProgressWriter == nil {
 		return
 	}
 
