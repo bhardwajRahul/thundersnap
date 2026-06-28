@@ -1021,7 +1021,27 @@ unexported. No significant issues.
 
 ---
 
-## cmd/trivial-httpd/
+## cmd/trivial-httpd/ [DONE]
+
+RESOLUTION:
+- Added cmd/trivial-httpd/main_test.go: TestParseRangeHeader (table-driven, ~19
+  cases covering simple/mid/open-ended/suffix/clamps/single-byte/whitespace plus
+  all error paths incl. fileSize==0) and TestServeHTTPTraversal.
+- Unified the symlink + regular-file range branches through a shared
+  writePartialHeaders(w, start, end, fileSize) helper (sets Content-Range/
+  Content-Length/Accept-Ranges + 206); regular-file branch uses io.CopyN.
+- Hardened the traversal guard to a separator-boundary check:
+  fullPath != root && !HasPrefix(fullPath, root+Separator), defeating the
+  sibling "<root>-evil" prefix escape.
+- Documented (and the test pins) the true behavior: a *rooted* "/../x" is
+  collapsed by filepath.Clean to "/x" and neutralized (served from root), while
+  a *non-rooted* "../x" keeps its leading ".." and is rejected with 400. The old
+  comment claiming "/../x" cleans to "/../x" was wrong and is fixed.
+- Documented the redundant-but-harmless `IsRegular && symlink==0` disjointness
+  and the O_NOFOLLOW (TOCTOU) / O_NONBLOCK (FIFO/device guard) rationale inline.
+- Deliberate non-change: the leading-".." guard is effectively dead for
+  well-formed rooted HTTP requests, but kept as cheap defense-in-depth for
+  non-rooted URL paths; the separator-boundary check is the real backstop.
 
 ### 1. Edge cases for unit tests
 - **`parseRangeHeader` (179-246)** — highest-value untested function in this set: missing

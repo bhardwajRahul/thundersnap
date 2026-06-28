@@ -51,7 +51,11 @@ type fileServer struct {
 }
 
 func (fs *fileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Clean the path to prevent directory traversal
+	// Clean the URL path to prevent directory traversal. For a rooted path,
+	// Clean collapses ".." back to the root ("/../x" -> "/x"), neutralizing the
+	// escape. A leading ".." survives only for a non-rooted path ("../x" stays
+	// "../x"); that means an attempt to escape above the root, so reject it.
+	// (filepath.Join below would otherwise resolve it against fs.root.)
 	cleanPath := filepath.Clean(r.URL.Path)
 	if strings.HasPrefix(cleanPath, "..") {
 		http.Error(w, "invalid path", http.StatusBadRequest)
@@ -60,8 +64,10 @@ func (fs *fileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	fullPath := filepath.Join(fs.root, cleanPath)
 
-	// Ensure the path is within root
-	if !strings.HasPrefix(fullPath, fs.root) {
+	// Ensure the resolved path is within root. Compare on a path-separator
+	// boundary (root itself, or root+"/") so a sibling like "/srv/root-evil"
+	// does not pass a naive prefix test when root is "/srv/root".
+	if fullPath != fs.root && !strings.HasPrefix(fullPath, fs.root+string(filepath.Separator)) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
@@ -79,7 +85,8 @@ func (fs *fileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	mode := stat.Mode()
 
-	// Only allow regular files and symlinks
+	// Only allow regular files and symlinks. (A symlink is never IsRegular, so
+	// the two checks are disjoint.)
 	if !mode.IsRegular() && mode&os.ModeSymlink == 0 {
 		http.Error(w, "not a regular file or symlink", http.StatusForbidden)
 		return
@@ -112,16 +119,15 @@ func (fs *fileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		contentLength := end - start + 1
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileSize))
-		w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
-		w.Header().Set("Accept-Ranges", "bytes")
-		w.WriteHeader(http.StatusPartialContent)
+		writePartialHeaders(w, start, end, fileSize)
 		w.Write(content[start : end+1])
 		return
 	}
 
-	// Regular file: open with O_NOFOLLOW and O_NONBLOCK
+	// Regular file: open with O_NOFOLLOW (refuse if fullPath is a symlink that
+	// was swapped in after the Lstat above — TOCTOU defense; returns ELOOP) and
+	// O_NONBLOCK (a no-op for regular files, but guards against blocking on open
+	// if the path were ever a FIFO/device, which IsRegular above already excludes).
 	fd, err := syscall.Open(fullPath, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if err == syscall.ELOOP {
@@ -162,17 +168,19 @@ func (fs *fileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Calculate content length
-	contentLength := end - start + 1
+	// Set partial-content headers and copy the requested range.
+	writePartialHeaders(w, start, end, fileSize)
+	io.CopyN(w, f, end-start+1)
+}
 
-	// Set headers for partial content
+// writePartialHeaders sets the Content-Range/Content-Length/Accept-Ranges
+// headers for a 206 partial-content response and writes the 206 status line.
+// It is shared by the symlink and regular-file range branches.
+func writePartialHeaders(w http.ResponseWriter, start, end, fileSize int64) {
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileSize))
-	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.WriteHeader(http.StatusPartialContent)
-
-	// Copy the requested range
-	io.CopyN(w, f, contentLength)
 }
 
 // parseRangeHeader parses a Range header like "bytes=0-99" and returns start and end positions.
