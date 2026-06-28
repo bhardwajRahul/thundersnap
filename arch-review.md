@@ -181,7 +181,7 @@ A short "Highest-value items" list closes the big modules.
 
 ---
 
-## refs/
+## refs/  [DONE]
 
 ### 1. Edge cases for unit tests
 Coverage is fairly strong already. Gaps:
@@ -196,6 +196,9 @@ Coverage is fairly strong already. Gaps:
   `RemoveIDDir` on a nonexistent dir (should be nil) untested.
 - `Delete` does not remove the id dir → `id/<name>/` orphaned. Latent leak; no test documents
   whether intentional.
+  - RESOLUTION: intentional. The daemon's handleRefDelete refuses to delete a ref with a
+    non-empty id dir unless --force; the id dir is identity state owned by refid, not the
+    ref-config store, so refs.Delete deliberately leaves it. Left as-is.
 - Symlink edge case: if `id/<name>` is a symlink, `RemoveIDDir`'s `RemoveAll` vs
   `IDDirExists`'s `ReadDir` differ; untested.
 - **Concurrency:** `TestConcurrentMoves` runs sequentially by design; same non-atomic `write`

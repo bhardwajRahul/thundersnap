@@ -1,6 +1,7 @@
 package refs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,10 +34,18 @@ func TestValidateName(t *testing.T) {
 		"foo/bar",
 		"foo\nbar",
 		"foo bar",
+		"foo.", // trailing dot: documented as not allowed
 	}
 	for _, name := range invalid {
 		if err := ValidateName(name); err == nil {
 			t.Errorf("ValidateName(%q) = nil, want error", name)
+		}
+	}
+
+	// Trailing dash/underscore remain valid (only trailing dots are barred).
+	for _, name := range []string{"foo-", "foo_"} {
+		if err := ValidateName(name); err != nil {
+			t.Errorf("ValidateName(%q) = %v, want nil", name, err)
 		}
 	}
 }
@@ -465,5 +474,104 @@ func TestMaxRefNameLength(t *testing.T) {
 	tooLong := longName + "a"
 	if err := store.Create(tooLong, uuid); err == nil {
 		t.Error("Create 129-char name should fail")
+	}
+}
+
+// TestMoveInvalidName confirms Move/SetAutorun surface ErrInvalidRefName (not
+// ErrRefNotFound) when handed a malformed name.
+func TestMoveInvalidName(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.Move("bad name", frameid.MustNew()); !errors.Is(err, ErrInvalidRefName) {
+		t.Errorf("Move(invalid) = %v, want ErrInvalidRefName", err)
+	}
+	if err := store.SetAutorun("bad/name", []string{"x"}); !errors.Is(err, ErrInvalidRefName) {
+		t.Errorf("SetAutorun(invalid) = %v, want ErrInvalidRefName", err)
+	}
+}
+
+func TestGetMalformedJSONC(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := os.MkdirAll(store.refsDir(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.refPath("broken"), []byte("{not valid"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Get("broken"); err == nil {
+		t.Error("Get of malformed JSONC should fail")
+	} else if err == ErrRefNotFound {
+		t.Error("Get of malformed JSONC should not report ErrRefNotFound")
+	}
+}
+
+func TestListSkipsNonRefs(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.Create("real", frameid.MustNew()); err != nil {
+		t.Fatal(err)
+	}
+	// A subdirectory and a non-.jsonc file alongside the refs.
+	if err := os.MkdirAll(filepath.Join(store.refsDir(), "subdir"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.refsDir(), "notes.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	names, err := store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(names) != 1 || names[0] != "real" {
+		t.Errorf("List = %v, want [real]", names)
+	}
+}
+
+func TestIDDirHelpersInvalidName(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if _, err := store.IDDirExists("bad/name"); !errors.Is(err, ErrInvalidRefName) {
+		t.Errorf("IDDirExists(invalid) = %v, want ErrInvalidRefName", err)
+	}
+	if err := store.EnsureIDDir(".."); !errors.Is(err, ErrInvalidRefName) {
+		t.Errorf("EnsureIDDir(invalid) = %v, want ErrInvalidRefName", err)
+	}
+	if err := store.RemoveIDDir("bad name"); !errors.Is(err, ErrInvalidRefName) {
+		t.Errorf("RemoveIDDir(invalid) = %v, want ErrInvalidRefName", err)
+	}
+}
+
+func TestRemoveIDDirNonexistent(t *testing.T) {
+	store := NewStore(t.TempDir())
+	// Valid name but the id dir was never created: should be a no-op nil.
+	if err := store.RemoveIDDir("never-made"); err != nil {
+		t.Errorf("RemoveIDDir of nonexistent = %v, want nil", err)
+	}
+}
+
+func TestEnsureAndRemoveIDDir(t *testing.T) {
+	store := NewStore(t.TempDir())
+	const name = "withid"
+	if exists, err := store.IDDirExists(name); err != nil || exists {
+		t.Fatalf("IDDirExists before create = (%v, %v), want (false, nil)", exists, err)
+	}
+	if err := store.EnsureIDDir(name); err != nil {
+		t.Fatalf("EnsureIDDir: %v", err)
+	}
+	// Empty dir still reports false (exists-and-non-empty semantic).
+	if exists, err := store.IDDirExists(name); err != nil || exists {
+		t.Errorf("IDDirExists of empty dir = (%v, %v), want (false, nil)", exists, err)
+	}
+	// Put something in it; now it reports true.
+	if err := os.WriteFile(filepath.Join(store.idDir(name), "key"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := store.IDDirExists(name); err != nil || !exists {
+		t.Errorf("IDDirExists of non-empty dir = (%v, %v), want (true, nil)", exists, err)
+	}
+	if err := store.RemoveIDDir(name); err != nil {
+		t.Fatalf("RemoveIDDir: %v", err)
+	}
+	if exists, _ := store.IDDirExists(name); exists {
+		t.Error("IDDirExists after remove = true, want false")
 	}
 }

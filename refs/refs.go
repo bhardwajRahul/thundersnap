@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/tailscale/hujson"
@@ -36,13 +37,21 @@ var (
 )
 
 // validRefName matches valid ref names: alphanumeric, dash, underscore, dot.
-// Must start with alphanumeric. No consecutive dots or leading/trailing dots.
+// Must start with alphanumeric. Consecutive dots and trailing dots are
+// rejected separately in ValidateName (a regexp alone can't express "no `..`
+// anywhere" cleanly alongside the character-class rule).
 var validRefName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+// consecutiveDots matches a "../"-style path-traversal sequence within a ref
+// name. Compiled once at package load rather than on every ValidateName call.
+var consecutiveDots = regexp.MustCompile(`\.\.`)
 
 // ReflogEntry records when a ref pointed to a particular UUID.
 type ReflogEntry struct {
+	// UUID is the frame this ref pointed to at Time.
 	UUID frameid.ID `json:"uuid"`
-	Time time.Time  `json:"time"`
+	// Time is when the ref started pointing at UUID.
+	Time time.Time `json:"time"`
 }
 
 // Ref represents a named pointer to a frame UUID.
@@ -84,9 +93,16 @@ func (s *Store) idDir(name string) string {
 	return filepath.Join(s.stateDir, "id", name)
 }
 
-// fsDir returns the path to a frame's filesystem directory.
-func (s *Store) fsDir(uuid frameid.ID) string {
-	return filepath.Join(s.stateDir, "fs", uuid.String())
+// notFoundOr maps a not-exist error to ErrRefNotFound and wraps any other
+// error with context. It returns nil when err is nil.
+func notFoundOr(name, what string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if os.IsNotExist(err) {
+		return ErrRefNotFound
+	}
+	return fmt.Errorf("%s ref %s: %w", what, name, err)
 }
 
 // ValidateName checks if a ref name is valid.
@@ -100,9 +116,16 @@ func ValidateName(name string) error {
 	if !validRefName.MatchString(name) {
 		return fmt.Errorf("%w: must start with alphanumeric, contain only alphanumeric/dash/underscore/dot", ErrInvalidRefName)
 	}
-	// No consecutive dots (prevents path traversal tricks).
-	if regexp.MustCompile(`\.\.`).MatchString(name) {
+	// The character-class regex permits a single ".", so "foo.." would pass it;
+	// reject any "../"-style sequence explicitly to block path-traversal tricks.
+	if consecutiveDots.MatchString(name) {
 		return fmt.Errorf("%w: consecutive dots not allowed", ErrInvalidRefName)
+	}
+	// The regex also permits a trailing dot ("foo."), but the package promises
+	// no trailing dots (a trailing "." is confusing as a filename stem and on
+	// some filesystems is stripped). Reject it to match the documented rule.
+	if name[len(name)-1] == '.' {
+		return fmt.Errorf("%w: trailing dot not allowed", ErrInvalidRefName)
 	}
 	return nil
 }
@@ -146,10 +169,7 @@ func (s *Store) Get(name string) (*Ref, error) {
 	path := s.refPath(name)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrRefNotFound
-		}
-		return nil, fmt.Errorf("read ref %s: %w", name, err)
+		return nil, notFoundOr(name, "read", err)
 	}
 
 	// Standardize hujson to JSON.
@@ -174,7 +194,7 @@ func (s *Store) Move(name string, newUUID frameid.ID) error {
 		return err
 	}
 
-	// Add to reflog.
+	// Prepend so Reflog stays newest-first (mirrors frames' History).
 	ref.Reflog = append([]ReflogEntry{{UUID: newUUID, Time: time.Now()}}, ref.Reflog...)
 	ref.UUID = newUUID
 
@@ -188,12 +208,8 @@ func (s *Store) Delete(name string) error {
 		return err
 	}
 
-	path := s.refPath(name)
-	if err := os.Remove(path); err != nil {
-		if os.IsNotExist(err) {
-			return ErrRefNotFound
-		}
-		return fmt.Errorf("delete ref %s: %w", name, err)
+	if err := os.Remove(s.refPath(name)); err != nil {
+		return notFoundOr(name, "delete", err)
 	}
 
 	return nil
@@ -223,12 +239,14 @@ func (s *Store) List() ([]string, error) {
 
 	var names []string
 	for _, e := range entries {
+		// refs/ holds one <name>.jsonc per ref; ignore any directories or
+		// non-.jsonc files that may appear alongside them.
 		if e.IsDir() {
 			continue
 		}
 		name := e.Name()
 		if filepath.Ext(name) == ".jsonc" {
-			names = append(names, name[:len(name)-6]) // strip .jsonc
+			names = append(names, strings.TrimSuffix(name, ".jsonc"))
 		}
 	}
 	return names, nil
@@ -257,6 +275,8 @@ func (s *Store) IDDirExists(name string) (bool, error) {
 		}
 		return false, err
 	}
+	// "Exists" means exists AND is non-empty: an empty id dir carries no
+	// identity state, so callers treat it the same as absent.
 	return len(entries) > 0, nil
 }
 
@@ -280,7 +300,8 @@ func (s *Store) RemoveIDDir(name string) error {
 	return nil
 }
 
-// write writes a ref to disk.
+// write writes a ref to disk atomically (temp file + rename) so a reader never
+// observes a partially written ref.
 func (s *Store) write(name string, ref *Ref) error {
 	path := s.refPath(name)
 
@@ -289,7 +310,25 @@ func (s *Store) write(name string, ref *Ref) error {
 		return fmt.Errorf("marshal ref %s: %w", name, err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+name+".jsonc.*")
+	if err != nil {
+		return fmt.Errorf("write ref %s: %w", name, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeds
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write ref %s: %w", name, err)
+	}
+	if err := tmp.Chmod(0644); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write ref %s: %w", name, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("write ref %s: %w", name, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("write ref %s: %w", name, err)
 	}
 	return nil
