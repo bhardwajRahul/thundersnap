@@ -45,7 +45,7 @@ A short "Highest-value items" list closes the big modules.
 
 ---
 
-## refid/
+## refid/  [DONE]
 
 ### 1. Edge cases for unit tests
 - **No unit test file at all** — only `refid.go`; all coverage is the single e2e test
