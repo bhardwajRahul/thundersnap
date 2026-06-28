@@ -1,6 +1,8 @@
 package frames
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/tailscale/thundersnap/frameid"
@@ -292,5 +294,141 @@ func TestUnionTaintsEmpty(t *testing.T) {
 	result := UnionTaints(nil, nil)
 	if result != nil {
 		t.Errorf("UnionTaints empty = %v, want nil", result)
+	}
+}
+
+func TestUnionTaintsDuplicatesAndEmpty(t *testing.T) {
+	// Duplicate entries within one set, plus an empty-string taint, are
+	// deduplicated and sorted (empty string sorts first).
+	result := UnionTaints([]string{"b", "b", ""}, []string{"a", ""})
+	want := []string{"", "a", "b"}
+	if len(result) != len(want) {
+		t.Fatalf("UnionTaints = %v, want %v", result, want)
+	}
+	for i := range want {
+		if result[i] != want[i] {
+			t.Errorf("UnionTaints[%d] = %q, want %q", i, result[i], want[i])
+		}
+	}
+}
+
+func TestCreateNilUUID(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.Create(frameid.Nil, &Frame{}); err == nil {
+		t.Error("Create with nil UUID should fail")
+	}
+}
+
+func TestGetMalformedJSONC(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	uuid := frameid.MustNew()
+	// Write a metadata file that is not valid JSONC.
+	if err := os.MkdirAll(filepath.Join(dir, "fs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.metaPath(uuid), []byte("{not valid"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Get(uuid); err == nil {
+		t.Error("Get of malformed JSONC should fail")
+	} else if err == ErrFrameNotFound {
+		t.Error("Get of malformed JSONC should not report ErrFrameNotFound")
+	}
+}
+
+func TestListSkipsNonFrames(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	fs := filepath.Join(dir, "fs")
+	if err := os.MkdirAll(fs, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// One real frame.
+	uuid := frameid.MustNew()
+	if err := store.Create(uuid, &Frame{Rootfs: snaphash.Sum([]byte("r"))}); err != nil {
+		t.Fatal(err)
+	}
+	// A directory that looks like a frame's subvolume (should be skipped).
+	if err := os.MkdirAll(filepath.Join(fs, uuid.String()), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// A non-.jsonc file (should be ignored).
+	if err := os.WriteFile(filepath.Join(fs, "notes.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// A .jsonc whose stem is not a UUID (should be skipped).
+	if err := os.WriteFile(filepath.Join(fs, "not-a-uuid.jsonc"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	uuids, err := store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(uuids) != 1 || uuids[0] != uuid {
+		t.Errorf("List = %v, want [%v]", uuids, uuid)
+	}
+}
+
+func TestAddTaintNotFound(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.AddTaint(frameid.MustNew(), "x"); err != ErrFrameNotFound {
+		t.Errorf("AddTaint on missing frame = %v, want ErrFrameNotFound", err)
+	}
+}
+
+func TestAddHistoryEntryNotFound(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.AddHistoryEntry(frameid.MustNew(), snaphash.Sum([]byte("s")), ""); err != ErrFrameNotFound {
+		t.Errorf("AddHistoryEntry on missing frame = %v, want ErrFrameNotFound", err)
+	}
+}
+
+func TestAddTaintReSortsExisting(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	uuid := frameid.MustNew()
+	// Seed an already-unsorted taint list directly.
+	if err := store.Create(uuid, &Frame{Taints: []string{"z", "m"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddTaint(uuid, "a"); err != nil {
+		t.Fatalf("AddTaint: %v", err)
+	}
+	got, _ := store.Get(uuid)
+	want := []string{"a", "m", "z"}
+	if len(got.Taints) != len(want) {
+		t.Fatalf("Taints = %v, want %v", got.Taints, want)
+	}
+	for i := range want {
+		if got.Taints[i] != want[i] {
+			t.Errorf("Taints[%d] = %q, want %q", i, got.Taints[i], want[i])
+		}
+	}
+}
+
+func TestUpdateDoesNotPreserveCreatedAt(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	uuid := frameid.MustNew()
+	if err := store.Create(uuid, &Frame{Rootfs: snaphash.Sum([]byte("r"))}); err != nil {
+		t.Fatal(err)
+	}
+	orig, _ := store.Get(uuid)
+	if orig.CreatedAt.IsZero() {
+		t.Fatal("CreatedAt should be set after Create")
+	}
+
+	// A caller that constructs a fresh Frame (zero CreatedAt) and Updates will
+	// zero out CreatedAt — Update does not re-derive or preserve it. This test
+	// documents that behavior so a future change is deliberate.
+	if err := store.Update(uuid, &Frame{Rootfs: orig.Rootfs}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	got, _ := store.Get(uuid)
+	if !got.CreatedAt.IsZero() {
+		t.Errorf("CreatedAt after Update with fresh Frame = %v, want zero", got.CreatedAt)
 	}
 }

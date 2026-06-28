@@ -136,7 +136,7 @@ A short "Highest-value items" list closes the big modules.
 
 ---
 
-## frames/
+## frames/  [DONE]
 
 ### 1. Edge cases for unit tests
 - `Create` with zero/nil UUID (`frames.go:102-104`) — the "cannot create frame with nil
