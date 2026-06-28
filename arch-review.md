@@ -13,7 +13,7 @@ A short "Highest-value items" list closes the big modules.
 
 ---
 
-## frameid/
+## frameid/  [DONE]
 
 ### 1. Edge cases for unit tests
 - `MustNew` panic path is never exercised (acknowledged hard to trigger, but no test

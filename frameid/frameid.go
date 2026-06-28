@@ -12,6 +12,12 @@ import (
 )
 
 // ID represents a frame identity as a UUIDv7.
+//
+// ID is a type alias (not a defined type) for uuid.UUID so that callers can use
+// frameid.ID and uuid.UUID interchangeably without conversions. This keeps the
+// package a thin convenience wrapper: any value or method from the underlying
+// google/uuid type is available directly, at the cost of not being able to
+// attach frameid-specific methods to ID.
 type ID = uuid.UUID
 
 // New generates a new frame ID using UUIDv7.

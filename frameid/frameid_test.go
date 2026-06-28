@@ -3,6 +3,8 @@ package frameid
 import (
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func TestNew(t *testing.T) {
@@ -86,6 +88,49 @@ func TestIsZero(t *testing.T) {
 	id := MustNew()
 	if IsZero(id) {
 		t.Error("IsZero(new ID) should be false")
+	}
+}
+
+func TestNewDistinct(t *testing.T) {
+	// Two consecutive New() calls must produce distinct IDs even with no
+	// delay between them (UUIDv7 mixes in random bits beyond the timestamp).
+	a := MustNew()
+	b := MustNew()
+	if a == b {
+		t.Errorf("consecutive New() calls produced identical IDs: %v", a)
+	}
+}
+
+func TestParseAcceptsNonV7(t *testing.T) {
+	// Parse delegates to uuid.Parse, which accepts any UUID version. Despite
+	// the package being documented around UUIDv7, Parse does NOT enforce the
+	// version; this test pins that intentional leniency so a future change to
+	// reject non-v7 input is a conscious decision.
+	v4 := uuid.New() // random (version 4)
+	if got := v4.Version(); got != 4 {
+		t.Fatalf("uuid.New() version = %d, want 4", got)
+	}
+	parsed, err := Parse(v4.String())
+	if err != nil {
+		t.Errorf("Parse of a v4 UUID should succeed, got error: %v", err)
+	}
+	if parsed != v4 {
+		t.Errorf("Parse(%q) = %v, want %v", v4.String(), parsed, v4)
+	}
+}
+
+func TestParseNilRoundTrip(t *testing.T) {
+	// Parsing the all-zero UUID yields a value for which IsZero is true.
+	const nilStr = "00000000-0000-0000-0000-000000000000"
+	parsed, err := Parse(nilStr)
+	if err != nil {
+		t.Fatalf("Parse(%q) error: %v", nilStr, err)
+	}
+	if !IsZero(parsed) {
+		t.Errorf("IsZero(Parse(%q)) = false, want true", nilStr)
+	}
+	if parsed != Nil {
+		t.Errorf("Parse(%q) = %v, want Nil", nilStr, parsed)
 	}
 }
 
