@@ -20,22 +20,50 @@ const promoteDirName = ".ts-subdir-promote"
 
 // Validate cleans and validates a caller-supplied subdir path. It returns the
 // cleaned slash-relative path (no leading slash, no "." or "..") or an error if
-// the path is empty, the root, or escapes the subvolume.
+// the path is empty or the root.
+//
+// Anchoring with filepath.Clean("/"+subdir) means any ".." segments collapse
+// against the leading "/" and can never escape: an escaping input like ".." or
+// "a/../.." resolves to "/" and, after TrimPrefix, to "" — caught by the
+// root-error branch below. The cleaned path therefore can never retain a
+// leading "..", so no separate traversal check is needed.
 func Validate(subdir string) (string, error) {
 	clean := filepath.Clean("/" + subdir) // anchor at root, collapse .. that would escape
 	clean = strings.TrimPrefix(clean, "/")
 	if clean == "" || clean == "." {
 		return "", fmt.Errorf("subdir resolves to the subvolume root; snap the whole frame instead")
 	}
-	if clean == ".." || strings.HasPrefix(clean, "../") {
-		return "", fmt.Errorf("invalid subdir %q", subdir)
-	}
 	return clean, nil
+}
+
+// btrfsCmd runs a btrfs subcommand, wrapping any failure with the combined
+// output for diagnosis.
+func btrfsCmd(args ...string) error {
+	out, err := exec.Command("btrfs", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("btrfs %s: %w\n%s", strings.Join(args, " "), err, out)
+	}
+	return nil
 }
 
 // isSubvolume reports whether path is a btrfs subvolume.
 func isSubvolume(path string) bool {
 	return exec.Command("btrfs", "subvolume", "show", path).Run() == nil
+}
+
+// removeChildren recursively removes every entry within dir (handling nested
+// subvolumes). It does not remove dir itself.
+func removeChildren(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := removePathRecursive(filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // removePathRecursive removes path, deleting any nested btrfs subvolumes it
@@ -50,34 +78,13 @@ func removePathRecursive(path string) error {
 		return err
 	}
 	if info.IsDir() {
-		if isSubvolume(path) {
-			// A subvolume may contain further nested subvolumes; remove its
-			// children first, then delete the subvolume itself.
-			entries, err := os.ReadDir(path)
-			if err != nil {
-				return err
-			}
-			for _, e := range entries {
-				if err := removePathRecursive(filepath.Join(path, e.Name())); err != nil {
-					return err
-				}
-			}
-			out, err := exec.Command("btrfs", "subvolume", "delete", path).CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("btrfs subvolume delete %s: %w\n%s", path, err, out)
-			}
-			return nil
-		}
-		// Plain directory: recurse so nested subvolumes are handled, then
-		// remove the (now-empty) directory.
-		entries, err := os.ReadDir(path)
-		if err != nil {
+		// Both branches remove all children first (handling nested subvolumes);
+		// they differ only in how the now-empty directory itself is removed.
+		if err := removeChildren(path); err != nil {
 			return err
 		}
-		for _, e := range entries {
-			if err := removePathRecursive(filepath.Join(path, e.Name())); err != nil {
-				return err
-			}
+		if isSubvolume(path) {
+			return btrfsCmd("subvolume", "delete", path)
 		}
 		return os.Remove(path)
 	}
@@ -96,8 +103,8 @@ func Snapshot(source, subdir, dstPath string) error {
 	}
 
 	// Writable snapshot of the whole subvolume for atomicity.
-	if out, err := exec.Command("btrfs", "subvolume", "snapshot", source, dstPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("btrfs snapshot failed: %w\noutput: %s", err, string(out))
+	if err := btrfsCmd("subvolume", "snapshot", source, dstPath); err != nil {
+		return err
 	}
 
 	srcSub := filepath.Join(dstPath, clean)
@@ -110,11 +117,15 @@ func Snapshot(source, subdir, dstPath string) error {
 	}
 
 	// Promote the subtree to a unique name at the snapshot root so it can't
-	// collide with sibling entries we are about to delete.
+	// collide with sibling entries we are about to delete. Clear any stale
+	// promote dir first: it can only exist if the source frame itself happened
+	// to contain a ".ts-subdir-promote" entry, which the snapshot copied in.
 	promote := filepath.Join(dstPath, promoteDirName)
 	if err := os.RemoveAll(promote); err != nil {
 		return fmt.Errorf("clear promote dir: %w", err)
 	}
+	// srcSub and promote are both inside dstPath (the same btrfs subvolume), so
+	// this rename is a cheap in-fs move, not a copy.
 	if err := os.Rename(srcSub, promote); err != nil {
 		return fmt.Errorf("promote subdir: %w", err)
 	}
@@ -150,8 +161,8 @@ func Snapshot(source, subdir, dstPath string) error {
 	}
 
 	// Make the resulting subvolume read-only before indexing.
-	if out, err := exec.Command("btrfs", "property", "set", dstPath, "ro", "true").CombinedOutput(); err != nil {
-		return fmt.Errorf("btrfs set ro: %w\n%s", err, out)
+	if err := btrfsCmd("property", "set", dstPath, "ro", "true"); err != nil {
+		return err
 	}
 	return nil
 }

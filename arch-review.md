@@ -284,7 +284,24 @@ documenting the deliberate error->0 swallowing (a scrape never fails).
 
 ---
 
-## snapsubdir/
+## snapsubdir/  [DONE]
+
+RESOLUTION:
+- Added snapsubdir/snapsubdir_test.go with table-driven Validate tests covering
+  "", "/", ".", "..", "../x", "a/../..", "/..", "keep", "/keep", "keep/",
+  "a/b/c", "a/../b", "a//b", "./keep". These confirm the previously-suspected
+  dead branch (clean == ".." || HasPrefix(clean, "../")) was unreachable:
+  escaping inputs collapse against the anchored "/" to the root and hit the
+  root-error branch. Removed that dead branch and documented why no traversal
+  check is needed.
+- §2 dedup: extracted btrfsCmd(args...) wrapping CombinedOutput + error (now
+  used by snapshot, subvolume delete, and property set ro), and removeChildren
+  to collapse the two near-identical ReadDir+recurse blocks in
+  removePathRecursive.
+- §4 comments: noted the srcSub->promote rename is a same-subvolume in-fs move,
+  and that a stale promote dir can only exist if the source frame contained one.
+- The btrfs-level Snapshot/removePathRecursive paths remain covered by
+  e2e/snap_subdir_test.go (full e2e suite passes).
 
 ### 1. Edge cases for unit tests
 - **`Validate` is pure string logic, needs no btrfs, and has zero unit tests** despite being
