@@ -1231,7 +1231,31 @@ RESOLUTION:
 
 ---
 
-# Cross-module architecture review
+# Cross-module architecture review  [partially DONE — todo #13 in progress]
+
+> RESOLUTION (todo #13, in progress): the smaller, well-bounded extractions are
+> done, each in its own commit with unit tests, make test + make e2e green:
+>   - **btrfsutil** DONE — `Run/IsSubvolume/CreateSubvol/DeleteSubvol/Snapshot`;
+>     snapsubdir, refid, docker.go, and the daemon's wrappers all delegate to it;
+>     the three private `isSubvolume` copies are gone.
+>   - **cgroup** DONE — `Manager` (New/ParentName/ConfigureContainer); the daemon
+>     holds a package-level `cgroupManager` built from its PID.
+>   - **thunderproto** DONE — shared `Port` (5223) + `WriteClientHandshake`/
+>     `ReadServerHandshake`; daemon control server and ts client both use it, so
+>     the two halves of the CONNECT/OK handshake can no longer drift.
+>   - **sftpfs** DONE — `Handler` (NewHandler/Handlers/HomeDir) with the rootFS
+>     path-confinement, chown-on-create, and listerat/linkInfo adapters; the
+>     upload-ownership integration test moved into the package.
+>   - **thunderclient** DONE — `Dial`/`NewHTTPClient`/generic `PostJSON`; the ~20
+>     cmd/ts call sites now use it.
+> Still DEFERRED within #13 (larger, higher-risk structural lifts): the **session**
+> package (item 2 — the container/VM entry layer, which also absorbs the dead
+> `thundersnap.RunInContainerNs`/`StartInContainerNs` third copy and the deferred
+> §2c/§3a/§3b/§3e items), the **rootfs** package (item 4), and the file splits of
+> the two `main.go` files. The `controlvsock` server (item 6) is intentionally NOT
+> being extracted whole: its mux wires ~20 daemon handlers, so it is the daemon's
+> HTTP surface, not a reusable unit; only its reusable handshake/port (the
+> thunderproto piece above) was lifted.
 
 This section steps back from individual modules and looks at file sizes, package boundaries,
 and the overall dependency shape. Grounding facts:
@@ -1305,7 +1329,7 @@ these need no root/btrfs once isolated behind an interface).
 
 Highest-value extractions, roughly in priority order:
 
-1. **A `btrfsutil` (or `btrfs`) package.** `exec.Command("btrfs", "subvolume", …)` with the
+1. **[DONE] A `btrfsutil` (or `btrfs`) package.** `exec.Command("btrfs", "subvolume", …)` with the
    identical `CombinedOutput()`+error-wrap is open-coded in `cmd/thundersnapd/main.go` (≥8×),
    `snapsubdir`, `refid`, and `tsm` paths. A single package with `Snapshot/CreateSubvol/
    DeleteSubvol/IsSubvolume(path)` + one error-formatting convention would (a) remove the
@@ -1313,7 +1337,7 @@ Highest-value extractions, roughly in priority order:
    `snapsubdir`/`refid` drop their private `isSubvolume` copies. `isSubvolume` literally exists
    3× (snapsubdir, refid, thundersnapd) today.
 
-2. **A `session` package for the container/VM entry layer.** This directly addresses the
+2. **[DEFERRED→#13 session work] A `session` package for the container/VM entry layer.** This directly addresses the
    user's session-redundancy question at the architectural level: pull `runContainerSession`,
    the 4 command-form builders, the nsenter/drop-caps arg construction, the PTY-vs-pipe I/O
    plumbing, and the VMX `connectToVshd`/`proxyVMSession`/`writeVshdRequest` logic out of
@@ -1323,31 +1347,46 @@ Highest-value extractions, roughly in priority order:
    container ns", shared by the daemon and any other caller. Most of the arg-building becomes
    pure and unit-testable once it's not entangled with `ssh.Session` I/O.
 
-3. **An `sftp` (or `sftpserver`) package.** The entire `sftpHandler` + `listerat` + `linkInfo`
+3. **[DONE — package named `sftpfs`] An `sftp` (or `sftpserver`) package.** The entire `sftpHandler` + `listerat` + `linkInfo`
    implementation (~270 lines in `main.go`) is a self-contained `sftp.Handlers` implementation
    with no daemon-specific state beyond a root path. It belongs in its own package and is
    independently testable.
 
-4. **A `rootfs` package.** `prepareContainerRootFS`, `ensureRootFS`, `ensureFrameFS`,
+4. **[DEFERRED→#13 rootfs work] A `rootfs` package.** `prepareContainerRootFS`, `ensureRootFS`, `ensureFrameFS`,
    `setupMinimalRootfs`, `copy*Binary`, `ensureResolvConf`, `ensureTmpDir`, and the
    `finalizeFrameRootfs` helper proposed in the per-module review form a coherent "build/prepare
    a frame's root filesystem" unit. Extracting it untangles rootfs construction from HTTP
    handling and gives the snapshot/create paths a clean dependency.
 
-5. **A `cgroup` package.** The cgroup/OOM/memory block (~lines 1249-1410) is pure Linux
+5. **[DONE] A `cgroup` package.** The cgroup/OOM/memory block (~lines 1249-1410) is pure Linux
    resource-control plumbing with zero coupling to the rest of the daemon. Easy, clean lift.
+   RESOLUTION: extracted to `cgroup/` as a `Manager` (New/ParentName/ConfigureContainer); the
+   daemon holds one package-level `cgroupManager` and calls `ConfigureContainer(pid, name)` at
+   both session-launch sites. Unit-tested in cgroup/cgroup_test.go.
 
-6. **A `controlvsock` package.** The control-server + CONNECT/OK vsock-emulation handshake
+6. **[NOT extracted whole — only the reusable handshake/port lifted to thunderproto] A `controlvsock` package.** The control-server + CONNECT/OK vsock-emulation handshake
    (`controlServer`, `controlResponseWriter`, the `CONNECT <port>`/`OK <port>` protocol) is a
    protocol unit shared in spirit with the VM-side vsock code in `thundersnap/vm.go` and the
    `cmd/vsh` client. Co-locating the wire-protocol constants (`thunderPort`, the CONNECT format)
    in one importable package would stop `cmd/vsh`, `cmd/vshd`, the daemon, and `thundersnap/vm.go`
    from each hardcoding their own copy of the same handshake.
+   RESOLUTION: the control *server* is NOT a reusable unit — its mux wires ~20 daemon-specific
+   handlers (handleSnap, handlePing, handleRefCreate, …); it is the daemon's HTTP surface, not a
+   library. What WAS genuinely duplicated — the vsock `CONNECT <port>`/`OK <port>` handshake and
+   the `Port` (5223) constant — is now in `thunderproto/` (`Port`, `WriteClientHandshake`,
+   `ReadServerHandshake`), eliminating the daemon↔client duplication. The daemon's handleConn and
+   the thunderclient dialer both call into it. (e2e fixtures still write the CONNECT literal by
+   hand — out of scope.)
 
-7. **A shared `thunderclient` package for the HTTP-over-unix client.** `cmd/ts` builds the
+7. **[DONE] A shared `thunderclient` package for the HTTP-over-unix client.** `cmd/ts` builds the
    `dialThunder`-backed `http.Client` ~19× and re-implements POST+decode ~8×; the daemon-side
    and any future tooling would benefit from one client package (it could live under `tsm`-style
    leaf, importable by `cmd/ts` and tests).
+   RESOLUTION: extracted to `thunderclient/` (`Dial`/`NewHTTPClient`/generic `PostJSON[Req,Resp]`);
+   it dials vsock inside a VM or the unix socket (via thunderproto handshake) in a container. All
+   ~20 `cmd/ts` client builds + POST/decode sites now route through it; the duplicated
+   inVM/dialThunder/bufferedConn/postJSON block was deleted from cmd/ts/main.go. Unit-tested in
+   thunderclient/thunderclient_test.go (dialUnix path, since /dev/vsock exists in CI).
 
 ## 3. Suggested target layout (illustrative, not prescriptive)
 
