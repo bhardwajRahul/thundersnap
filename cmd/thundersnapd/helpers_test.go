@@ -2,6 +2,47 @@ package main
 
 import "testing"
 
+func TestSelectTargetUserExplicit(t *testing.T) {
+	// A non-empty targetUser is returned verbatim without touching the
+	// filesystem, so this branch is safe to unit test.
+	if got := selectTargetUser("/nonexistent/rootfs", "alice"); got != "alice" {
+		t.Errorf("selectTargetUser(_, \"alice\") = %q, want \"alice\"", got)
+	}
+}
+
+func TestTailscaleUserFromRootFS(t *testing.T) {
+	fsDir := "/var/lib/thundersnap/fs"
+	old := flagFsDir
+	flagFsDir = &fsDir
+	defer func() { flagFsDir = old }()
+
+	tests := []struct {
+		rootFS  string
+		want    string
+		wantErr bool
+	}{
+		{"/var/lib/thundersnap/fs/alice/work", "alice", false},
+		{"/var/lib/thundersnap/fs/bob@example.com/main", "bob@example.com", false},
+		{"/var/lib/thundersnap/fs/alice", "", true}, // only one component
+	}
+	for _, tt := range tests {
+		got, err := tailscaleUserFromRootFS(tt.rootFS)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("tailscaleUserFromRootFS(%q) = (%q,nil), want error", tt.rootFS, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("tailscaleUserFromRootFS(%q): %v", tt.rootFS, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("tailscaleUserFromRootFS(%q) = %q, want %q", tt.rootFS, got, tt.want)
+		}
+	}
+}
+
 func TestSanitizeForPath(t *testing.T) {
 	tests := []struct {
 		in   string
