@@ -1248,14 +1248,30 @@ RESOLUTION:
 >     upload-ownership integration test moved into the package.
 >   - **thunderclient** DONE — `Dial`/`NewHTTPClient`/generic `PostJSON`; the ~20
 >     cmd/ts call sites now use it.
-> Still DEFERRED within #13 (larger, higher-risk structural lifts): the **session**
-> package (item 2 — the container/VM entry layer, which also absorbs the dead
-> `thundersnap.RunInContainerNs`/`StartInContainerNs` third copy and the deferred
-> §2c/§3a/§3b/§3e items), the **rootfs** package (item 4), and the file splits of
-> the two `main.go` files. The `controlvsock` server (item 6) is intentionally NOT
-> being extracted whole: its mux wires ~20 daemon handlers, so it is the daemon's
-> HTTP surface, not a reusable unit; only its reusable handshake/port (the
-> thunderproto piece above) was lifted.
+> Then, as the right-sized next step toward the two big structural lifts (session,
+> rootfs), the two oversized `main.go` files were **physically split into focused
+> files within their existing `package main`** — pure code movement, zero API or
+> behavior change, make test + make e2e green at each commit:
+>   - **cmd/thundersnapd/rootfs.go** — the ~570-line frame-rootfs build/prepare
+>     block (item 4) out of main.go.
+>   - **cmd/thundersnapd/session.go** — the 14-function container/VM session entry
+>     layer (item 2) out of main.go; a stranded `runContainerSession` doc comment
+>     was reattached in passing.
+>   - **cmd/ts/shell.go** — the `runAsShell`/`runShell*` POSIX-shell mode out of
+>     cmd/ts/main.go.
+> Still DEFERRED within #13 (behavior-bearing refactors, not mechanical lifts): the
+> *true importable* **session** package (the `sessionSpec`/`enterSession`
+> unification, which also absorbs the dead `thundersnap.RunInContainerNs`/
+> `StartInContainerNs` third copy and the deferred §2c/§3a/§3b/§3e items) and the
+> *true importable* **rootfs** package (item 4) — both are deferred because they
+> require redesigning `ssh.Session` I/O coupling and the daemon globals
+> (`*flagFsDir`/`*flagSnapsDir`/`*flagVMDir`/`activeFrames`/`vmxSessions`,
+> snapshot+frame-meta core) those blocks touch, plus the §5 `apitypes` DTO
+> unexporting. The file splits above isolate exactly those surfaces for that later
+> work. The `controlvsock` server (item 6) is intentionally NOT being extracted
+> whole: its mux wires ~20 daemon handlers, so it is the daemon's HTTP surface, not
+> a reusable unit; only its reusable handshake/port (the thunderproto piece above)
+> was lifted.
 
 This section steps back from individual modules and looks at file sizes, package boundaries,
 and the overall dependency shape. Grounding facts:
