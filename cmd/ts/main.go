@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -26,18 +25,14 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/mdlayher/vsock"
 	"github.com/pborman/getopt/v2"
-	"github.com/tailscale/thundersnap/thunderproto"
+	"github.com/tailscale/thundersnap/thunderclient"
 	"github.com/tailscale/thundersnap/tsm"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
 )
-
-// hostCID is the vsock CID for the host (used in VMs).
-const hostCID = 2
 
 var sockPath = getopt.StringLong("sock", 0, "/thunder.sock", "path to control socket")
 var help = getopt.BoolLong("help", 'h', "show help")
@@ -164,96 +159,6 @@ type ControlResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-// inVM returns true if we're running inside a VM with vsock support.
-func inVM() bool {
-	_, err := os.Stat("/dev/vsock")
-	return err == nil
-}
-
-// dialThunder connects to thundersnapd and performs the vsock handshake.
-// In VMs (when /dev/vsock exists), it connects directly via vsock to the host.
-// In containers, it connects to the Unix socket at sockPath.
-func dialThunder(ctx context.Context, sockPath string) (net.Conn, error) {
-	var conn net.Conn
-	var err error
-
-	if inVM() {
-		// In a VM: connect directly via vsock to host
-		conn, err = vsock.Dial(hostCID, thunderproto.Port, nil)
-		if err != nil {
-			return nil, fmt.Errorf("vsock dial: %w", err)
-		}
-		// vsock connections don't need the CONNECT handshake - they're already
-		// connected to the right port. The host side receives this as a direct
-		// connection on the port-specific Unix socket.
-		return conn, nil
-	}
-
-	// In a container: connect to Unix socket with CONNECT handshake
-	conn, err = net.Dial("unix", sockPath)
-	if err != nil {
-		return nil, err
-	}
-
-	// Emulate the vsock CONNECT/OK handshake over the Unix socket.
-	reader := bufio.NewReader(conn)
-	if err := thunderproto.WriteClientHandshake(conn, reader); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	// Return a conn that uses the buffered reader (in case there's buffered data)
-	return &bufferedConn{Conn: conn, reader: reader}, nil
-}
-
-// bufferedConn wraps a net.Conn with a buffered reader for the handshake.
-type bufferedConn struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (c *bufferedConn) Read(p []byte) (int, error) {
-	return c.reader.Read(p)
-}
-
-// newThunderClient returns an *http.Client whose transport dials thundersnapd's
-// control socket via dialThunder (vsock in a VM, the unix socket otherwise).
-// The host part of any request URL is ignored; use "http://localhost/<path>".
-func newThunderClient(sockPath string) *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
-}
-
-// postJSON marshals req as JSON, POSTs it to path on the thunder control socket,
-// and decodes the JSON response into a value of type Resp. path is the URL path
-// only (e.g. "/delete-snap"); the localhost host is supplied here. Status/error
-// fields are response-specific, so callers inspect the returned Resp themselves.
-func postJSON[Req any, Resp any](sockPath, path string, req Req) (Resp, error) {
-	var result Resp
-
-	body, err := json.Marshal(req)
-	if err != nil {
-		return result, fmt.Errorf("marshal request: %w", err)
-	}
-
-	client := newThunderClient(sockPath)
-	resp, err := client.Post("http://localhost"+path, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return result, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return result, fmt.Errorf("parse response: %w", err)
-	}
-	return result, nil
-}
-
 // progressRenderer renders NDJSON "progress" events to stderr for the four
 // streaming subcommands (snap, create, download-docker, download-snap). On a
 // TTY it overwrites a single line (truncating to the terminal width and padding
@@ -305,7 +210,7 @@ func (r *progressRenderer) finish() {
 }
 
 func doPing(sockPath string) error {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 
 	req := ControlRequest{Command: "ping"}
 	body, err := json.Marshal(req)
@@ -457,7 +362,7 @@ type SnapStreamEvent struct {
 }
 
 func doSnap(sockPath, subdir string) (string, error) {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 	render := newProgressRenderer()
 
 	// Build URL with streaming enabled
@@ -540,7 +445,7 @@ type DeleteSnapResponse struct {
 }
 
 func doDeleteSnap(sockPath, snapshotID string) error {
-	result, err := postJSON[DeleteSnapRequest, DeleteSnapResponse](sockPath, "/delete-snap",
+	result, err := thunderclient.PostJSON[DeleteSnapRequest, DeleteSnapResponse](sockPath, "/delete-snap",
 		DeleteSnapRequest{SnapshotID: snapshotID})
 	if err != nil {
 		return err
@@ -565,7 +470,7 @@ type SnapInfo struct {
 }
 
 func doListSnaps(sockPath string) error {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 
 	resp, err := client.Get("http://localhost/list-snaps")
 	if err != nil {
@@ -698,7 +603,7 @@ type CreateStreamEvent struct {
 }
 
 func doCreate(sockPath, snapshotSpec, isolation, refName string) (string, error) {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 	render := newProgressRenderer()
 
 	// Build URL with streaming enabled
@@ -781,7 +686,7 @@ type DeleteFrameResponse struct {
 }
 
 func doDeleteFrame(sockPath, uuid string) error {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 
 	req := DeleteFrameRequest{UUID: uuid}
 	body, err := json.Marshal(req)
@@ -821,7 +726,7 @@ type FrameInfo struct {
 }
 
 func doListFrames(sockPath string) error {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 
 	resp, err := client.Get("http://localhost/list-frames")
 	if err != nil {
@@ -924,7 +829,7 @@ type WhoHasPeerInfo struct {
 }
 
 func doWhoHas(sockPath, snapshotID string) ([]tsm.PeerResult, error) {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 
 	req := WhoHasRequest{SnapshotID: snapshotID}
 	body, err := json.Marshal(req)
@@ -1000,7 +905,7 @@ type TaintResponse struct {
 }
 
 func doTaint(sockPath, taintName string) error {
-	result, err := postJSON[TaintRequest, TaintResponse](sockPath, "/taint",
+	result, err := thunderclient.PostJSON[TaintRequest, TaintResponse](sockPath, "/taint",
 		TaintRequest{TaintName: taintName})
 	if err != nil {
 		return err
@@ -1066,7 +971,7 @@ type DownloadDockerStreamEvent struct {
 }
 
 func doDownloadDocker(sockPath, imageRef string) error {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 	client.Timeout = 30 * time.Minute // Docker downloads can be slow
 	render := newProgressRenderer()
 
@@ -1220,7 +1125,7 @@ type DownloadSnapStreamEvent struct {
 }
 
 func doDownloadSnap(sockPath, snapshotID string) error {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 	render := newProgressRenderer()
 
 	// Build URL with streaming enabled
@@ -2440,7 +2345,7 @@ type RefResponse struct {
 // standard {status,message} response. It backs doRefCreate/Move/Delete, which
 // differ only in the endpoint path and which RefRequest fields they populate.
 func doRefRequest(sockPath, path string, req RefRequest) error {
-	result, err := postJSON[RefRequest, RefResponse](sockPath, path, req)
+	result, err := thunderclient.PostJSON[RefRequest, RefResponse](sockPath, path, req)
 	if err != nil {
 		return err
 	}
@@ -2493,7 +2398,7 @@ type RefListResponse struct {
 }
 
 func doListRefs(sockPath string) error {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 
 	resp, err := client.Get("http://localhost/refs")
 	if err != nil {
@@ -2559,7 +2464,7 @@ type ReflogResponse struct {
 }
 
 func doReflog(sockPath, name string) error {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 
 	resp, err := client.Get("http://localhost/reflog?name=" + name)
 	if err != nil {
@@ -2619,7 +2524,7 @@ type LogResponse struct {
 }
 
 func doLog(sockPath, uuid string) error {
-	client := newThunderClient(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
 
 	url := "http://localhost/log"
 	if uuid != "" {
@@ -2709,7 +2614,7 @@ type AutorunResponse struct {
 // doAutorun POSTs an AutorunRequest to /autorun and checks the standard
 // {status,message} response. A nil argv clears the ref's autorun.
 func doAutorun(sockPath, refName string, argv []string) error {
-	result, err := postJSON[AutorunRequest, AutorunResponse](sockPath, "/autorun",
+	result, err := thunderclient.PostJSON[AutorunRequest, AutorunResponse](sockPath, "/autorun",
 		AutorunRequest{RefName: refName, Argv: argv})
 	if err != nil {
 		return err
