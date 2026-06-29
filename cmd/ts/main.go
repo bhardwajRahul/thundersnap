@@ -111,6 +111,15 @@ func main() {
 	case "container-init":
 		// Hidden command - starts a minimal init process for container namespaces
 		cmdContainerInit(cmdArgs)
+	case "nsenter":
+		// Hidden command - CGO-free in-binary nsenter(1) used by vshd to join a
+		// shared container namespace identically on the host and inside a VM.
+		// The two-stage reexec marks its second stage with --stage2.
+		if len(cmdArgs) > 0 && cmdArgs[0] == "--stage2" {
+			cmdNsenterStage2(cmdArgs)
+		} else {
+			cmdNsenter(cmdArgs)
+		}
 	case "check-dev":
 		// Hidden command for e2e testing - outputs /dev state
 		cmdCheckDev()

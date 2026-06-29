@@ -1,16 +1,26 @@
-// vshd is the in-guest shell daemon. It listens on a vsock port and serves a
-// simple null-delimited request protocol over each connection, spawning either
-// an interactive PTY shell or a one-shot command. Two protocol variants are
-// supported (see handleConnection): the original "run on this VM" form and the
-// extended "VMX" form that chroots into a container rootfs via
-// `ts drop-caps-and-run` before exec'ing.
+// vshd is the shell daemon used by thundersnap to run sessions inside a
+// container, both on the host (over a Unix socket, --unix) and inside a VM
+// (over vsock). It serves a simple null-delimited request protocol over each
+// connection, spawning either an interactive PTY shell or a one-shot command.
+// Two protocol variants are supported (see handleConnection): the original
+// "run on this VM/host" form and the extended "VMX" form that runs inside a
+// container rootfs.
+//
+// For container sessions vshd uses the shared-init/nsenter model
+// (containerns.Manager): one "ts container-init" process anchors the
+// PID/mount/UTS namespaces per container rootfs, and each session joins those
+// namespaces via the CGO-free in-binary `ts nsenter` before chrooting and
+// dropping caps with `ts drop-caps-and-run`. This is byte-identical on the host
+// and inside a VM, so sessions sharing a container see each other's PIDs.
 package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,8 +32,20 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/mdlayher/vsock"
+	"github.com/tailscale/thundersnap/cgroup"
+	"github.com/tailscale/thundersnap/containerns"
 	"github.com/tailscale/thundersnap/vshdproto"
 )
+
+// containerNs anchors the shared PID/mount/UTS namespaces for container
+// sessions, keyed by container rootfs path. Sessions join via `ts nsenter`.
+var containerNs = containerns.New()
+
+// cgroupMgr applies per-session resource limits (memory/pids/cpu + OOM bias) to
+// each container session's child process. It is nil unless --cgroup-parent is
+// passed (host mode); in a VM, resource limits come from the VM itself so vshd
+// leaves cgroups alone.
+var cgroupMgr *cgroup.Manager
 
 // selectUser determines which Unix user to run as, auto-detecting when the
 // caller did not request one. rootPrefix is "" for the host VM filesystem or a
@@ -200,16 +222,47 @@ func handleConnection(conn io.ReadWriteCloser) {
 	log.Printf("[conn %d] running as user %q (requested: %q, rootPrefix: %q, pty: %v, args: %v)",
 		id, runAsUser, targetUser, rootPrefix, wantPTY, cmdArgs)
 
-	cmd := buildSessionCmd(rootPrefix, runAsUser, cmdArgs, wantPTY)
-	serveSession(id, conn, reader, cmd, wantPTY)
+	cmd, release, err := buildSessionCmd(rootPrefix, runAsUser, cmdArgs, wantPTY)
+	if err != nil {
+		log.Printf("[conn %d] failed to build session command: %v", id, err)
+		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: %v\n", err)))
+		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
+		return
+	}
+	if release != nil {
+		defer release()
+	}
+
+	// For container sessions (rootPrefix != "") in host mode (cgroupMgr set),
+	// apply per-session cgroup limits to the started child. The leaf name is
+	// <parent>/<rootfs-base>/<conn-id> so sessions sharing a container land
+	// under the same intermediate dir while each gets its own leaf. VM sessions
+	// (cgroupMgr nil) and outer/non-container sessions skip this entirely.
+	var postStart func(pid int)
+	if cgroupMgr != nil && rootPrefix != "" {
+		leaf := fmt.Sprintf("%s/%s/%d", cgroupMgr.ParentName(), filepath.Base(rootPrefix), id)
+		postStart = func(pid int) {
+			cgroupMgr.ConfigureContainer(pid, leaf)
+		}
+	}
+
+	serveSession(id, conn, reader, cmd, wantPTY, postStart)
 }
 
-// buildSessionCmd constructs the *exec.Cmd for a session. rootPrefix is "" for a
-// direct VM/host shell or a container rootfs path for VMX mode (in which case
-// the command is wrapped in `ts drop-caps-and-run --chroot` and a fresh
-// PID/mount/UTS namespace). When cmdArgs is empty an interactive login shell is
+// buildSessionCmd constructs the *exec.Cmd for a session and, for container
+// sessions, a release func that drops the caller's reference on the shared
+// namespace (nil otherwise). rootPrefix is "" for a direct VM/host shell or a
+// container rootfs path (the container rootfs for the VMX protocol, or a frame
+// rootfs in host mode). When cmdArgs is empty an interactive login shell is
 // started; otherwise the command is run (via `su - user -c` for non-root).
-func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY bool) *exec.Cmd {
+//
+// For a container session the command joins the shared PID/mount/UTS namespaces
+// anchored by `ts container-init` (containerNs.GetOrCreate) via the in-binary
+// `ts nsenter`, then chroots and drops caps with `ts drop-caps-and-run
+// --skip-mount-setup`. This is byte-identical to the daemon's host per-session
+// form, so host and VM sessions sharing a container rootfs see each other's
+// PIDs.
+func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY bool) (*exec.Cmd, func(), error) {
 	// argv is what we ultimately exec (before any container wrapper).
 	var argv []string
 	switch {
@@ -228,21 +281,40 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 	}
 
 	if rootPrefix == "" {
-		// Direct shell/command in this filesystem (VM host or host mode).
+		// Direct shell/command in this filesystem (outer VM or host, no
+		// container).
 		cmd := exec.Command(argv[0], argv[1:]...)
 		cmd.Env = sessionEnv(wantPTY)
-		return cmd
+		return cmd, nil, nil
 	}
 
-	// VMX container mode: wrap in ts drop-caps-and-run to chroot + drop caps,
-	// in a fresh PID/mount/UTS namespace.
-	tsArgs := append([]string{"drop-caps-and-run", "--chroot=" + rootPrefix, "--"}, argv...)
-	cmd := exec.Command(tsBinaryPath, tsArgs...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
+	// Container session (VMX or host): join the shared namespaces anchored by
+	// container-init, then chroot + drop caps. GetOrCreate refcounts the init
+	// per rootfs; release drops our reference when the session ends.
+	initPid, err := containerNs.GetOrCreate(rootPrefix, "", "")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create container namespace: %w", err)
 	}
+	release := func() { containerNs.Release(rootPrefix) }
+
+	// The inner ts lives in the frame rootfs; nsenter is run by the outer ts
+	// (tsBinaryPath) which is always present on the host/outer-VM filesystem.
+	innerTs := filepath.Join(rootPrefix, "bin", "ts")
+	dropCapsArgs := append([]string{
+		"drop-caps-and-run",
+		"--chroot=" + rootPrefix,
+		"--skip-mount-setup",
+		"--",
+	}, argv...)
+	nsenterArgs := append([]string{
+		"nsenter",
+		"-t", strconv.Itoa(initPid), "-p", "-m", "-u", "--",
+		innerTs,
+	}, dropCapsArgs...)
+
+	cmd := exec.Command(tsBinaryPath, nsenterArgs...)
 	cmd.Env = sessionEnv(wantPTY)
-	return cmd
+	return cmd, release, nil
 }
 
 // sessionEnv returns the environment for a session command, adding TERM for PTY
@@ -297,17 +369,19 @@ func readArgs(reader *bufio.Reader) ([]string, error) {
 // is fed from FrameStdin frames and stdout/stderr are framed separately. In both
 // cases the child's exit code is sent as a FrameExit frame before the connection
 // is closed.
-func serveSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, wantPTY bool) {
+// postStart, when non-nil, is invoked with the started child's PID immediately
+// after the command starts (used to apply cgroup limits in host mode).
+func serveSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, wantPTY bool, postStart func(pid int)) {
 	if wantPTY {
-		servePTYSession(id, conn, reader, cmd)
+		servePTYSession(id, conn, reader, cmd, postStart)
 	} else {
-		servePipeSession(id, conn, reader, cmd)
+		servePipeSession(id, conn, reader, cmd, postStart)
 	}
 }
 
 // servePTYSession starts cmd on a pty and bridges it to the TLV stream:
 // FrameStdin -> pty, FrameWinsize -> pty.Setsize, pty output -> FrameStdout.
-func servePTYSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd) {
+func servePTYSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int)) {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		log.Printf("[conn %d] failed to start pty: %v", id, err)
@@ -316,6 +390,9 @@ func servePTYSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd)
 		return
 	}
 	defer ptmx.Close()
+	if postStart != nil {
+		postStart(cmd.Process.Pid)
+	}
 	log.Printf("[conn %d] pty session started with PID %d", id, cmd.Process.Pid)
 
 	// Client -> child: decode TLV frames, route stdin to the pty and winsize to
@@ -374,7 +451,7 @@ func servePTYSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd)
 // servePipeSession runs cmd without a pty, feeding FrameStdin frames to the
 // child's stdin and framing its stdout/stderr separately (FrameStdout/
 // FrameStderr), then sending FrameExit.
-func servePipeSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd) {
+func servePipeSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int)) {
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		log.Printf("[conn %d] stdin pipe: %v", id, err)
@@ -393,6 +470,9 @@ func servePipeSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd
 		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: %v\n", err)))
 		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
 		return
+	}
+	if postStart != nil {
+		postStart(cmd.Process.Pid)
 	}
 	log.Printf("[conn %d] command started with PID %d", id, cmd.Process.Pid)
 
@@ -457,18 +537,51 @@ func (fw *frameWriter) Write(p []byte) (int, error) {
 }
 
 func main() {
+	unixPath := flag.String("unix", "", "listen on this Unix socket path (host mode) instead of vsock (VM mode)")
+	tsPath := flag.String("ts", "", "path to the ts binary used for nsenter (default: derived from vshd's location)")
+	cgroupParent := flag.String("cgroup-parent", "", "parent cgroup name for per-session resource limits (host mode; empty disables)")
+	flag.Parse()
+
 	log.Printf("vshd starting up")
 
-	// Determine ts binary path based on vshd's location
-	initTsBinaryPath()
+	// In host mode the daemon passes its cgroup parent name so vshd can apply
+	// per-session memory/pids/cpu limits to each container child. In a VM the
+	// flag is unset and resource limits come from the VM itself.
+	if *cgroupParent != "" {
+		cgroupMgr = cgroup.New(*cgroupParent)
+		log.Printf("per-session cgroups enabled under parent %q", *cgroupParent)
+	}
 
-	l, err := vsock.Listen(vsockPort, nil)
-	if err != nil {
-		log.Fatalf("failed to listen on vsock port %d: %v", vsockPort, err)
+	// Determine ts binary path. An explicit --ts wins (host mode, where vshd is
+	// not laid out as <prefix>/sbin/vshd); otherwise derive it from vshd's own
+	// location (VM/VMX mode).
+	if *tsPath != "" {
+		tsBinaryPath = *tsPath
+		log.Printf("using ts binary at %s (from --ts)", tsBinaryPath)
+	} else {
+		initTsBinaryPath()
+	}
+
+	var l net.Listener
+	if *unixPath != "" {
+		// Host mode: listen on a Unix socket. Remove any stale socket first.
+		os.Remove(*unixPath)
+		ul, err := net.Listen("unix", *unixPath)
+		if err != nil {
+			log.Fatalf("failed to listen on unix socket %s: %v", *unixPath, err)
+		}
+		l = ul
+		log.Printf("vshd listening on unix socket %s", *unixPath)
+	} else {
+		// VM mode: listen on vsock.
+		vl, err := vsock.Listen(vsockPort, nil)
+		if err != nil {
+			log.Fatalf("failed to listen on vsock port %d: %v", vsockPort, err)
+		}
+		l = vl
+		log.Printf("vshd listening on vsock port %d", vsockPort)
 	}
 	defer l.Close()
-
-	log.Printf("vshd listening on vsock port %d", vsockPort)
 
 	for {
 		conn, err := l.Accept()
@@ -477,6 +590,6 @@ func main() {
 			continue
 		}
 
-		go handleConnection(conn.(*vsock.Conn))
+		go handleConnection(conn)
 	}
 }

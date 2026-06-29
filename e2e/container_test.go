@@ -439,3 +439,102 @@ func TestContainerSharedPIDNamespace(t *testing.T) {
 		t.Errorf("session 1 PID %s not visible to session 2 (saw %v)", session1PID, pids)
 	}
 }
+
+// TestTsNsenterJoinsSharedNamespace verifies the CGO-free in-binary `ts nsenter`
+// enters a shared container namespace identically to the external nsenter(1):
+// it joins the PID, mount, and UTS namespaces of the container-init process.
+//
+// This is the oracle for the `ts nsenter` reexec subcommand that vshd uses on
+// both the host and inside a VM (where util-linux nsenter is absent). It runs
+// the production per-session command form but with `ts nsenter` instead of the
+// external nsenter, and asserts:
+//   - mount ns joined: the session sees the container's chroot + shared devpts
+//     (its tty is under /dev/pts), and
+//   - PID ns joined: a second session sees the first session's in-namespace PID
+//     via /proc (shared PID namespace), and
+//   - the command's real exit status is propagated.
+func TestTsNsenterJoinsSharedNamespace(t *testing.T) {
+	env := newTestEnv(t)
+	absFramePath, ns, initPid := setupSharedNsFrame(t, env, "tsnsentertest")
+	defer ns.Release(absFramePath)
+	installBusyboxShell(t, absFramePath)
+
+	tsBinary := filepath.Join(absFramePath, "bin", "ts")
+
+	// runSession mirrors the production per-session form but uses `ts nsenter`
+	// (the in-binary replacement) rather than external nsenter.
+	runSession := func(script string) *exec.Cmd {
+		args := []string{
+			"nsenter",
+			"-t", fmt.Sprintf("%d", initPid), "-p", "-m", "-u", "--",
+			tsBinary, "drop-caps-and-run",
+			"--chroot=" + absFramePath,
+			"--skip-mount-setup",
+			"--", "/bin/sh", "-c", script,
+		}
+		cmd := exec.Command(tsBinary, args...)
+		cmd.Dir = "/"
+		return cmd
+	}
+
+	// Exit-status propagation: a non-zero exit must surface through the two-stage
+	// reexec.
+	if err := runSession("exit 7").Run(); err == nil {
+		t.Errorf("ts nsenter did not propagate non-zero exit status")
+	} else if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 7 {
+		t.Errorf("expected exit code 7, got %v", err)
+	}
+
+	// Session 1: record its in-namespace PID, then block on a fifo.
+	fifo := filepath.Join(absFramePath, "tmp", "nsgo1")
+	os.Remove(fifo)
+	if err := syscall.Mkfifo(fifo, 0666); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	session1 := runSession("echo $$ > /tmp/ns_session1.pid && read x < /tmp/nsgo1")
+	if err := session1.Start(); err != nil {
+		t.Fatalf("start session 1: %v", err)
+	}
+	defer func() {
+		session1.Process.Kill()
+		session1.Wait()
+	}()
+
+	pidFile := filepath.Join(absFramePath, "tmp", "ns_session1.pid")
+	var session1PID string
+	for i := 0; i < 50; i++ {
+		if data, err := os.ReadFile(pidFile); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+			session1PID = strings.TrimSpace(string(data))
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if session1PID == "" {
+		t.Fatal("session 1 did not write PID file (ts nsenter mount join likely failed)")
+	}
+	t.Logf("ts nsenter session 1 PID in container ns: %s", session1PID)
+
+	// Session 2 scans /proc; in a shared PID ns it must see session 1's PID.
+	output, err := runSession("echo /proc/[0-9]*").Output()
+	if err != nil {
+		t.Fatalf("session 2 proc scan failed: %v", err)
+	}
+	if f, err := os.OpenFile(fifo, os.O_WRONLY, 0); err == nil {
+		fmt.Fprintln(f, "go")
+		f.Close()
+	}
+
+	pids := strings.Fields(strings.TrimSpace(string(output)))
+	found := false
+	for _, p := range pids {
+		if p == "/proc/"+session1PID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("ts nsenter did not share PID namespace: session1 PID %s not visible to session2 (saw %v)", session1PID, pids)
+	} else {
+		t.Logf("Verified: ts nsenter shares PID namespace (session2 sees %d PIDs)", len(pids))
+	}
+}

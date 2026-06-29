@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -32,7 +33,6 @@ import (
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/btrfsutil"
 	"github.com/tailscale/thundersnap/cgroup"
-	"github.com/tailscale/thundersnap/containerns"
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/frames"
 	"github.com/tailscale/thundersnap/refs"
@@ -195,11 +195,6 @@ func getActiveFrameCount(framePath string) int {
 	return activeFrames.count[framePath]
 }
 
-// containerNs manages shared PID/mount/UTS namespaces for container sessions.
-// Each rootFS gets a single "ts container-init" process; sessions join its
-// namespaces via /proc/<pid>/ns/*. See the containerns package.
-var containerNs = containerns.New()
-
 // getTsnetHostname returns the current tsnet hostname (FQDN).
 func getTsnetHostname() string {
 	globalTsnetHostnameMu.RLock()
@@ -318,6 +313,79 @@ func (m *vmxSessionManager) releaseVMX(tailscaleUser, isolationName string) {
 		ms.session.Close()
 		delete(m.sessions, key)
 	}
+}
+
+// hostVshdManager runs a single host-mode vshd process listening on a Unix
+// socket. Host container sessions dial this socket and speak the same vshd wire
+// protocol as VM sessions, so runContainerSession and runVMXSession share one
+// transport (proxyVshdSession). The vshd process itself anchors the shared
+// PID/mount/UTS namespaces per container rootfs via containerns.Manager, exactly
+// as the in-VM vshd does, keeping host and VM enter-container-ns code identical.
+//
+// One vshd serves every frame: per-session the daemon sends the frame rootfs in
+// the VMX request header, and vshd's buildSessionCmd joins/creates that frame's
+// namespace. The process is started lazily on first session and reused.
+type hostVshdManager struct {
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	sockPath string
+}
+
+var hostVshd = &hostVshdManager{}
+
+// ensure starts the host vshd process (idempotently) and returns the Unix
+// socket path that sessions should dial.
+func (m *hostVshdManager) ensure() (sockPath string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cmd != nil && m.cmd.Process != nil {
+		// Verify it is still alive (signal 0 is an existence probe).
+		if perr := m.cmd.Process.Signal(syscall.Signal(0)); perr == nil {
+			return m.sockPath, nil
+		}
+		// Died - reap and restart below.
+		log.Printf("host vshd died, restarting")
+		m.cmd.Wait()
+		m.cmd = nil
+	}
+
+	vshdBin := filepath.Join(fsDirLibexec, "vshd")
+	tsBin := filepath.Join(fsDirLibexec, "ts")
+	sockDir := filepath.Dir(controlSocket) // /run/thundersnap
+	if err := os.MkdirAll(sockDir, 0755); err != nil {
+		return "", fmt.Errorf("create host vshd socket dir: %w", err)
+	}
+	sockPath = filepath.Join(sockDir, "host-vshd.sock")
+	os.Remove(sockPath)
+
+	// Pass the daemon's cgroup parent so host vshd applies the same per-session
+	// memory/pids/cpu limits the daemon used to apply itself, preserving
+	// fork-bomb/OOM protection now that the session child is spawned by vshd.
+	cmd := exec.Command(vshdBin,
+		"--unix="+sockPath,
+		"--ts="+tsBin,
+		"--cgroup-parent="+cgroupManager.ParentName(),
+	)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("start host vshd: %w", err)
+	}
+
+	// Wait for the socket to appear (up to ~5s) so the first dial does not race
+	// vshd's listen.
+	for i := 0; i < 50; i++ {
+		if _, statErr := os.Stat(sockPath); statErr == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	m.cmd = cmd
+	m.sockPath = sockPath
+	log.Printf("host vshd started (pid %d) listening on %s", cmd.Process.Pid, sockPath)
+	return sockPath, nil
 }
 
 func main() {
