@@ -4,7 +4,11 @@
 // Each `ts snap` adds a new snapshot entry to that frame's history. The UUID is
 // the "content lineage" - the same filesystem evolving over time.
 //
-// Frame filesystems are stored at fs/<uuid>/ with metadata at fs/<uuid>.jsonc.
+// Frame filesystems are stored at fs/<uuid>/ with metadata at fs/<uuid>.jsonc
+// for a flat (legacy) Store created with NewStore. A per-user Store created with
+// NewUserStore(stateDir, user) namespaces frames under the owning user at
+// fs/<user>/<uuid>/ with metadata at fs/<user>/<uuid>.jsonc, so a user only ever
+// sees their own frames.
 package frames
 
 import (
@@ -78,18 +82,30 @@ type Frame struct {
 	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
-// Store manages frames in a state directory.
+// Store manages frames in a state directory. When user is non-empty, frames are
+// namespaced under that user (fs/<user>/<uuid>) so a user only ever sees their
+// own frames; when user is empty the flat legacy layout (fs/<uuid>) is used.
 type Store struct {
 	stateDir string
+	user     string
 }
 
-// NewStore creates a new frame store rooted at stateDir.
+// NewStore creates a new frame store rooted at stateDir using the flat layout.
 func NewStore(stateDir string) *Store {
 	return &Store{stateDir: stateDir}
 }
 
+// NewUserStore creates a frame store namespaced under user (fs/<user>/<uuid>).
+// A user only ever sees their own frames.
+func NewUserStore(stateDir, user string) *Store {
+	return &Store{stateDir: stateDir, user: user}
+}
+
 // fsDir returns the path to the fs directory.
 func (s *Store) fsDir() string {
+	if s.user != "" {
+		return filepath.Join(s.stateDir, "fs", s.user)
+	}
 	return filepath.Join(s.stateDir, "fs")
 }
 

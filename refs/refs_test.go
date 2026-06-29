@@ -50,6 +50,64 @@ func TestValidateName(t *testing.T) {
 	}
 }
 
+func TestUserStoreIsolation(t *testing.T) {
+	dir := t.TempDir()
+	alice := NewUserStore(dir, "alice")
+	bob := NewUserStore(dir, "bob")
+
+	aliceUUID := frameid.MustNew()
+	bobUUID := frameid.MustNew()
+
+	// Both users create a ref with the same name pointing at different frames.
+	if err := alice.Create("deb", aliceUUID); err != nil {
+		t.Fatalf("alice create: %v", err)
+	}
+	if err := bob.Create("deb", bobUUID); err != nil {
+		t.Fatalf("bob create: %v", err)
+	}
+
+	// Each user resolves their own ref, not the other's.
+	got, err := alice.Get("deb")
+	if err != nil {
+		t.Fatalf("alice get: %v", err)
+	}
+	if got.UUID != aliceUUID {
+		t.Errorf("alice deb = %s, want %s", got.UUID, aliceUUID)
+	}
+	got, err = bob.Get("deb")
+	if err != nil {
+		t.Fatalf("bob get: %v", err)
+	}
+	if got.UUID != bobUUID {
+		t.Errorf("bob deb = %s, want %s", got.UUID, bobUUID)
+	}
+
+	// Refs land under the per-user directory, not the flat one.
+	if _, err := os.Stat(filepath.Join(dir, "refs", "alice", "deb.jsonc")); err != nil {
+		t.Errorf("alice ref not at refs/alice/deb.jsonc: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "refs", "deb.jsonc")); !os.IsNotExist(err) {
+		t.Errorf("per-user store wrote a flat ref at refs/deb.jsonc (err=%v)", err)
+	}
+
+	// A user only lists their own refs.
+	names, err := alice.List()
+	if err != nil {
+		t.Fatalf("alice list: %v", err)
+	}
+	if len(names) != 1 || names[0] != "deb" {
+		t.Errorf("alice list = %v, want [deb]", names)
+	}
+
+	// Deleting alice's ref leaves bob's intact.
+	if err := alice.Delete("deb"); err != nil {
+		t.Fatalf("alice delete: %v", err)
+	}
+	if _, err := bob.Get("deb"); err != nil {
+		t.Errorf("bob deb gone after alice delete: %v", err)
+	}
+}
+
 func TestCreateAndGet(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)

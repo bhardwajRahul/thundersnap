@@ -4,13 +4,21 @@
 // Refs can be created, moved to point at different UUIDs, and deleted. Each ref
 // maintains a reflog of which UUIDs it has pointed to over time.
 //
-// State directory structure:
+// State directory structure (flat, legacy: a Store created with NewStore):
 //
 //	<state-dir>/
 //	  fs/<uuid>/             # frame filesystems
 //	  snaps/                 # snap storage
 //	  refs/<refname>.jsonc   # ref config, autorun, reflog
 //	  id/<refname>/          # private state per ref (keys, tsnet, etc.)
+//
+// Per-user structure (a Store created with NewUserStore(stateDir, user)): refs
+// and identity state are namespaced under the owning user so a user only ever
+// sees their own refs:
+//
+//	<state-dir>/
+//	  refs/<user>/<refname>.jsonc
+//	  id/<user>/<refname>/
 package refs
 
 import (
@@ -68,18 +76,31 @@ type Ref struct {
 	Reflog []ReflogEntry `json:"reflog,omitempty"`
 }
 
-// Store manages refs in a state directory.
+// Store manages refs in a state directory. When user is non-empty, refs and
+// identity state are namespaced under that user (refs/<user>/, id/<user>/) so a
+// user only ever sees their own refs; when user is empty the flat legacy layout
+// (refs/, id/) is used.
 type Store struct {
 	stateDir string
+	user     string
 }
 
-// NewStore creates a new ref store rooted at stateDir.
+// NewStore creates a new ref store rooted at stateDir using the flat layout.
 func NewStore(stateDir string) *Store {
 	return &Store{stateDir: stateDir}
 }
 
+// NewUserStore creates a ref store namespaced under user (refs/<user>/,
+// id/<user>/). A user only ever sees their own refs.
+func NewUserStore(stateDir, user string) *Store {
+	return &Store{stateDir: stateDir, user: user}
+}
+
 // refsDir returns the path to the refs directory.
 func (s *Store) refsDir() string {
+	if s.user != "" {
+		return filepath.Join(s.stateDir, "refs", s.user)
+	}
 	return filepath.Join(s.stateDir, "refs")
 }
 
@@ -90,6 +111,9 @@ func (s *Store) refPath(name string) string {
 
 // idDir returns the path to a ref's private identity directory.
 func (s *Store) idDir(name string) string {
+	if s.user != "" {
+		return filepath.Join(s.stateDir, "id", s.user, name)
+	}
 	return filepath.Join(s.stateDir, "id", name)
 }
 

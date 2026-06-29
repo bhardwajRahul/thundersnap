@@ -9,6 +9,43 @@ import (
 	"github.com/tailscale/thundersnap/snaphash"
 )
 
+func TestUserStoreIsolation(t *testing.T) {
+	dir := t.TempDir()
+	alice := NewUserStore(dir, "alice")
+	bob := NewUserStore(dir, "bob")
+
+	aliceUUID := frameid.MustNew()
+	bobUUID := frameid.MustNew()
+
+	if err := alice.Create(aliceUUID, &Frame{Isolation: "container"}); err != nil {
+		t.Fatalf("alice create: %v", err)
+	}
+	if err := bob.Create(bobUUID, &Frame{Isolation: "container"}); err != nil {
+		t.Fatalf("bob create: %v", err)
+	}
+
+	// Metadata lands under the per-user fs/<user> dir, and Path resolves there.
+	wantPath := filepath.Join(dir, "fs", "alice", aliceUUID.String())
+	if alice.Path(aliceUUID) != wantPath {
+		t.Errorf("alice Path = %s, want %s", alice.Path(aliceUUID), wantPath)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "fs", "alice", aliceUUID.String()+".jsonc")); err != nil {
+		t.Errorf("alice metadata not at fs/alice/<uuid>.jsonc: %v", err)
+	}
+
+	// A user only sees their own frames.
+	if !alice.Exists(aliceUUID) || alice.Exists(bobUUID) {
+		t.Errorf("alice sees aliceUUID=%v bobUUID=%v, want true/false", alice.Exists(aliceUUID), alice.Exists(bobUUID))
+	}
+	uuids, err := alice.List()
+	if err != nil {
+		t.Fatalf("alice list: %v", err)
+	}
+	if len(uuids) != 1 || uuids[0] != aliceUUID {
+		t.Errorf("alice list = %v, want [%s]", uuids, aliceUUID)
+	}
+}
+
 func TestCreateAndGet(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)
