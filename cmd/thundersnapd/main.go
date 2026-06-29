@@ -2568,7 +2568,7 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 	// Step 1: Create intermediate snapshot in snaps-dir with fidx
 	// (no progress reporting for ensureRootFS - happens at SSH login time)
 	// The snapshot ID is based on the TSM SHA-256, so duplicates are detected.
-	intermediateID, err := createSnapshotWithFidx(snapshotSource, baseStampID, nil, false)
+	intermediateID, err := createSnapshotWithTaints(snapshotSource, baseStampID, nil, nil, false)
 	if err != nil {
 		return fmt.Errorf("create intermediate snapshot from %s: %w", snapshotSource, err)
 	}
@@ -3466,7 +3466,9 @@ func makeSnapHandler(rootFS string) http.HandlerFunc {
 			return
 		}
 
-		// Non-streaming: original behavior
+		// Non-streaming fallback: a single JSON response with no progress
+		// events. The in-tree `ts` client always requests stream=1, so this
+		// branch only serves plain HTTP clients that omit it.
 		snapshotID, err := createSnapshotSubdir(rootFS, subdir, nil, false)
 		if err != nil {
 			log.Printf("snap failed for %s: %v", rootFS, err)
@@ -4923,8 +4925,10 @@ func prepareDownloadDir(targetDir string, fileList []string, progress io.Writer)
 }
 
 // createSnapshot creates a read-only snapshot of the given rootFS in snaps-dir.
-// Returns the snapshot ID (based on the fidx checksum).
-// If progressWriter is non-nil, progress updates are written to it.
+// Returns the snapshot ID (based on the fidx checksum). If progressWriter is
+// non-nil, progress updates are written to it. This is the whole-frame
+// convenience form (no subdir); production handlers call createSnapshotSubdir
+// directly, but it remains the entry point used by the e2e tests.
 func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string, error) {
 	return createSnapshotSubdir(rootFS, "", progressWriter, isTTY)
 }
@@ -5035,23 +5039,6 @@ func createSnapshotSubdir(rootFS, subdir string, progressWriter io.Writer, isTTY
 	return fmt.Sprintf("%s:%s:%s", rootfsID, homeStr, workStr), nil
 }
 
-// createSnapshotWithFidx creates a read-only snapshot in snaps-dir and generates
-// fidx and tsm files for it. The snapshot is named after the SHA-256 of its TSM manifest.
-// If a snapshot with the same SHA-256 already exists, it returns the existing ID
-// and discards the new snapshot, performing taint intersection on the metadata.
-//
-// The process is:
-// 1. Create btrfs snapshot to a random tmp name
-// 2. Create mfidx (with --ref to parent if exists)
-// 3. Create TSM/TSC manifests
-// 4. Load TSM to get its SHA-256, use that as the final snapshot ID
-// 5. If snapshot already exists with that ID, perform taint intersection and discard new one
-// 6. Otherwise rename all files to the SHA-256-based final names
-// 7. Create fidx of the fidx and write snap.jsonc metadata
-func createSnapshotWithFidx(source, parentStampID string, progressWriter io.Writer, isTTY bool) (string, error) {
-	return createSnapshotWithTaints(source, parentStampID, nil, progressWriter, isTTY)
-}
-
 // loadParentManifest loads the TSM and TSC manifests for the given parent
 // snapshot ID from the snaps directory, for use as the incremental-indexing
 // baseline. It returns (nil, nil) when the parent has no usable manifest
@@ -5073,20 +5060,32 @@ func loadParentManifest(parentStampID string) (*tsm.TSMReader, *tsm.TSCReader) {
 	return parentTSM, parentTSC
 }
 
-// createSnapshotWithTaints is like createSnapshotWithFidx but accepts explicit taints.
-// If taints is nil, taints are inherited from the parent snap.
+// createSnapshotWithTaints creates a read-only snapshot of source with the
+// given explicit taints. If taints is nil, taints are inherited from the parent
+// snap.
 func createSnapshotWithTaints(source, parentStampID string, taints []string, progressWriter io.Writer, isTTY bool) (string, error) {
 	return createSnapshotWithTaintsSubdir(source, "", parentStampID, taints, progressWriter, isTTY)
 }
 
-// createSnapshotWithTaintsSubdir is createSnapshotWithTaints with optional
-// subdir support. When subdir is non-empty (a slash-relative path within the
-// source subvolume), only that subtree is snapshotted: for atomicity the whole
-// subvolume is still snapshotted first, then everything outside subdir is
-// deleted and subdir's contents are promoted to the snapshot root before the
-// subvolume is made read-only and indexed. The resulting snapshot ID is the
-// content hash of just that subtree, so it can be dropped into a frame on its
-// own.
+// createSnapshotWithTaintsSubdir creates a read-only snapshot in snaps-dir and
+// generates fidx and tsm files for it. The snapshot is named after the SHA-256
+// of its TSM manifest, so if a snapshot with the same SHA-256 already exists it
+// returns the existing ID and discards the new snapshot, performing taint
+// intersection on the metadata. The process is:
+//  1. Create btrfs snapshot to a random tmp name
+//  2. Create mfidx (with --ref to parent if exists)
+//  3. Create TSM/TSC manifests
+//  4. Load TSM to get its SHA-256, use that as the final snapshot ID
+//  5. If snapshot already exists with that ID, perform taint intersection and discard new one
+//  6. Otherwise rename all files to the SHA-256-based final names
+//  7. Create fidx of the fidx and write snap.jsonc metadata
+//
+// When subdir is non-empty (a slash-relative path within the source subvolume),
+// only that subtree is snapshotted: for atomicity the whole subvolume is still
+// snapshotted first, then everything outside subdir is deleted and subdir's
+// contents are promoted to the snapshot root before the subvolume is made
+// read-only and indexed. The resulting snapshot ID is then the content hash of
+// just that subtree, so it can be dropped into a frame on its own.
 func createSnapshotWithTaintsSubdir(source, subdir, parentStampID string, taints []string, progressWriter io.Writer, isTTY bool) (string, error) {
 	// Generate a random temporary ID for the work-in-progress snapshot
 	tmpID, err := generateRandomID()
