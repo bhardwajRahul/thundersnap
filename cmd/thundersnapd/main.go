@@ -1608,6 +1608,10 @@ func buildSessionCommand(initPid int, tsBinary, absRootFS, runAsUser, rawCmd str
 	tsArgs := []string{
 		tsBinary, "drop-caps-and-run",
 		"--chroot=" + absRootFS,
+		// --skip-mount-setup: container-init already mounted proc/sys and a
+		// devpts "newinstance" once for this namespace. Per-session setup would
+		// stack a fresh devpts per session, restarting pts numbering at 0 so
+		// every session sees /dev/pts/0 (bug #11); skip it for joining sessions.
 		"--skip-mount-setup",
 	}
 	if ptyHandshake {
@@ -1725,15 +1729,12 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	// - Exec the final command
 	tsBinary := filepath.Join(absRootFS, "bin", "ts")
 
-	// Build the nsenter command that joins the container namespaces and execs
-	// the login shell. For non-PTY sessions there is no handshake fd.
-	cmd := buildSessionCommand(initPid, tsBinary, absRootFS, runAsUser, rawCmd, false)
-	cmd.Env = sessionEnv(sshUser, tailscaleUser, "")
-
 	// Build cgroup name for this container (used for OOM group killing)
 	// Uses parentCgroupName which includes daemon PID to avoid conflicts with other instances
 	cgroupName := fmt.Sprintf("%s/%s/%s", parentCgroupName, sanitizeForPath(tailscaleUser), sanitizeForPath(sshUser))
 
+	// The nsenter command is built per-branch: the PTY branch needs the handshake
+	// fd and TERM, the non-PTY branch does not.
 	if isPty {
 		// For PTY sessions, we allocate the PTY from outside the namespace by
 		// opening the container's devpts ptmx directly. This gives us the master
@@ -1759,7 +1760,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 
 		// Same command as the non-PTY branch but with the PTY handshake fd so ts
 		// waits for the slave path; TERM is added to the environment.
-		cmd = buildSessionCommand(initPid, tsBinary, absRootFS, runAsUser, rawCmd, true)
+		cmd := buildSessionCommand(initPid, tsBinary, absRootFS, runAsUser, rawCmd, true)
 		cmd.Env = sessionEnv(sshUser, tailscaleUser, ptyReq.Term)
 
 		// Pass their end of the socket as extra fd (fd 3)
@@ -1833,7 +1834,9 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		cmd.Wait()
 		s.Exit(cmd.ProcessState.ExitCode())
 	} else {
-		// No PTY requested, run without one
+		// No PTY requested, run without one (no handshake fd, no TERM).
+		cmd := buildSessionCommand(initPid, tsBinary, absRootFS, runAsUser, rawCmd, false)
+		cmd.Env = sessionEnv(sshUser, tailscaleUser, "")
 
 		// Set up pipes for stdin/stdout/stderr
 		stdin, err := cmd.StdinPipe()
@@ -2272,7 +2275,10 @@ func prepareVMXRootFS(vmxRootFS string) error {
 		return fmt.Errorf("copy vshd binary: %w", err)
 	}
 
-	// Symlink /bin/sh -> ts (relative symlink to ts in same directory)
+	// Symlink /bin/sh -> ts (relative symlink to ts in same directory). The ts
+	// binary *is* the shell: when invoked with argv0 "sh" it enters shell mode,
+	// so the VM's init/shell and any "/bin/sh -c ..." spawned in the VMX rootfs
+	// run ts itself rather than needing a separate shell binary.
 	shPath := filepath.Join(vmxRootFS, "bin/sh")
 	if err := os.Symlink("ts", shPath); err != nil && !os.IsExist(err) {
 		return fmt.Errorf("symlink sh: %w", err)
@@ -2431,16 +2437,19 @@ func proxyVMSession(s ssh.Session, conn net.Conn, done <-chan struct{}, panicked
 
 	conn.Close()
 
-	// Wait briefly for goroutines to finish
-	timeout := time.After(100 * time.Millisecond)
+	// Closing conn unblocks the io.Copy goroutines; wait briefly for both to
+	// finish, but don't block the session teardown if one is wedged (e.g. the
+	// SSH side of the copy not unblocking). The shared deadline bounds the total
+	// wait at ~100ms regardless of how many goroutines have already returned.
+	deadline := time.After(100 * time.Millisecond)
+drain:
 	for i := 0; i < 2; i++ {
 		select {
 		case <-copyDone:
-		case <-timeout:
-			goto done
+		case <-deadline:
+			break drain
 		}
 	}
-done:
 
 	s.Exit(0)
 	return nil
@@ -3040,7 +3049,10 @@ func copyBinaryToRootFS(rootFS, binaryName, destPath string) error {
 	return nil
 }
 
-// thunderPort is the vsock port used for the thunder control protocol.
+// thunderPort is the vsock port used for the thunder control protocol (snap,
+// ping, etc.). It is one past VshPort (5222) so the two protocols don't collide
+// on the same vsock CID. This value MUST match the CONNECT port hardcoded in the
+// in-container `ts` client, which dials it to reach the control socket.
 const thunderPort = 5223
 
 // controlServer wraps the HTTP server and listener for cleanup.
@@ -3131,6 +3143,12 @@ func (c *controlServer) serve() {
 func (c *controlServer) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	// The in-container `ts` client uses the same code path to reach two kinds of
+	// control sockets: a real cloud-hypervisor vsock (for VM/VMX frames) and this
+	// Unix socket (for plain container frames). Cloud-hypervisor's vsock requires
+	// a "CONNECT <port>\n" / "OK <port>\n" text handshake before the real stream,
+	// so we emulate that handshake here over the Unix socket and only then speak
+	// HTTP, letting the client be oblivious to which transport it actually got.
 	// Read vsock-style CONNECT handshake
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadString('\n')
@@ -5642,7 +5660,8 @@ func (fs *bupdateFileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	io.CopyN(w, f, contentLength)
 }
 
-// btrfsMagic is the magic number for btrfs filesystems (from statfs).
+// btrfsMagic is the btrfs superblock magic returned by statfs(2). It is
+// BTRFS_SUPER_MAGIC from <linux/magic.h>.
 const btrfsMagic = 0x9123683E
 
 // checkBtrfsFilesystems verifies that both directories exist, are on btrfs,
@@ -5797,6 +5816,10 @@ func openContainerPTY(pid int) (*os.File, string, error) {
 }
 
 // ptsnameFromMaster returns the slave device path for the given PTY master.
+// This is the Go equivalent of glibc's ptsname(3): TIOCGPTN reads the pty
+// number directly off the master fd. We reimplement it (rather than call
+// ptsname) because the master was opened from the *container's* ptmx via
+// /proc/<pid>/root, so the slave lives under the container's /dev/pts.
 func ptsnameFromMaster(ptmx *os.File) (string, error) {
 	var ptyno uint32
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&ptyno)))
@@ -5806,7 +5829,8 @@ func ptsnameFromMaster(ptmx *os.File) (string, error) {
 	return fmt.Sprintf("/dev/pts/%d", ptyno), nil
 }
 
-// unlockPTY unlocks the PTY slave device.
+// unlockPTY unlocks the PTY slave device. This is the Go equivalent of glibc's
+// unlockpt(3): TIOCSPTLCK with 0 clears the slave's lock so it can be opened.
 func unlockPTY(ptmx *os.File) error {
 	var unlock int32 = 0
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&unlock)))
