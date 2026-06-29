@@ -99,6 +99,10 @@ var (
 	// as frames, allowing reflinks to work even when the original libexec-dir
 	// is on a different filesystem.
 	fsDirLibexec string
+
+	// testModeUser is set via --test-user and overrides the identity lookup
+	// for all SSH connections. When non-empty, the daemon is in test mode.
+	testModeUser string
 )
 
 // controlServerManager manages shared control servers for container sessions.
@@ -129,7 +133,8 @@ func (m *controlServerManager) getOrCreateControlServer(rootFS string) (*control
 		return ms.server, nil
 	}
 
-	// Create new control server
+	// Create new control server with socket inside the rootFS.
+	// Use short relative name "thunder.sock" to avoid Unix socket path length limits.
 	sockPath := filepath.Join(rootFS, "thunder.sock")
 	cs, err := startControlServer(sockPath, rootFS)
 	if err != nil {
@@ -400,6 +405,8 @@ func main() {
 	flagMesh = getopt.BoolLong("mesh", 0, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
 	flagNfsd = getopt.BoolLong("nfsd", 0, "Enable NFSv4 server to export the snaps directory")
 	flagNfsPort = getopt.IntLong("nfs-port", 0, 2049, "Port for NFSv4 server")
+	testListen := getopt.StringLong("test-listen", 0, "", "Test mode: listen on this local TCP address (e.g. 127.0.0.1:2222) instead of tsnet")
+	testUser := getopt.StringLong("test-user", 0, "", "Test mode: use this identity for all SSH connections (e.g. test@example.com)")
 	getopt.Parse()
 
 	if *activate {
@@ -485,6 +492,18 @@ func main() {
 	initRefStore(*flagDataDir)
 	initFrameStore(*flagDataDir)
 
+	// In test mode (--test-listen), skip tsnet and listen on local TCP.
+	// testModeUser will be used for identity instead of WhoIs.
+	if *testListen != "" {
+		if *testUser == "" {
+			log.Fatalf("--test-listen requires --test-user")
+		}
+		testModeUser = *testUser
+		log.Printf("TEST MODE: listening on %s as user %q", *testListen, testModeUser)
+		runTestMode(*testListen, *stateDir)
+		return
+	}
+
 	// Create tsnet server
 	srv := &tsnet.Server{
 		Hostname: *hostname,
@@ -565,145 +584,7 @@ func main() {
 	go startAdminControlSocket(lc)
 
 	// Create SSH server with gliderlabs/ssh and persistent host key
-	forwardHandler := &ssh.ForwardedTCPHandler{}
-	sshServer := &ssh.Server{
-		Handler: func(s ssh.Session) {
-			log.Printf("New SSH session from %s (user: %s)", s.RemoteAddr(), s.User())
-
-			// Look up the Tailscale identity of the connecting peer
-			who := getWhoIs(s.Context(), lc, s.RemoteAddr().String())
-			tailscaleUser := "unknown"
-			if who != nil {
-				if who.Node != nil && len(who.Node.Tags) > 0 {
-					tailscaleUser = fmt.Sprintf("tags: %s", strings.Join(who.Node.Tags, ", "))
-				} else if who.UserProfile != nil && who.UserProfile.LoginName != "" {
-					tailscaleUser = who.UserProfile.LoginName
-				}
-			}
-
-			// Resolve capability from policy
-			cap := ResolveCap(who, globalPolicy)
-			log.Printf("Resolved cap for %s: role=%s isolation=%s", tailscaleUser, cap.Role, cap.Isolation)
-
-			// Helper to log error to both server log and client
-			logErr := func(format string, args ...any) {
-				msg := fmt.Sprintf(format, args...)
-				log.Print(msg)
-				fmt.Fprintf(s, "* Error: %s\r\n", msg)
-			}
-
-			// Parse SSH username to extract target user and frame name.
-			// See parseSSHUser for format documentation.
-			parsedIsolation, vmxIsolation, targetUser, frameName := parseSSHUser(s.User())
-			if parsedIsolation != "container" {
-				cap.Isolation = parsedIsolation
-			}
-
-			// Resolve the frame name to its canonical fs/<user>/<uuid> path via
-			// the user's ref store solely to choose the Unix user shown in the
-			// greeting. Resolution errors (e.g. an unknown frame name) are
-			// ignored here and surfaced authoritatively by the session function
-			// below; the greeting just falls back to the requested target user.
-			runAsUser := targetUser
-			if rootFS, _, rerr := resolveFrameRootFS(tailscaleUser, frameName); rerr == nil {
-				runAsUser = selectTargetUser(rootFS, targetUser)
-			}
-
-			// Only greet the user in interactive mode. When a subcommand is
-			// supplied (e.g. `ssh host -- some-cmd`, scp, rsync) the greeting
-			// would corrupt the program's output, so suppress it.
-			interactive := isInteractiveSession(s.RawCommand())
-			greet := func(format string, args ...any) {
-				if interactive {
-					fmt.Fprintf(s.Stderr(), format, args...)
-				}
-			}
-
-			// Route based on isolation level
-			switch cap.Isolation {
-			case "vmx":
-				if frameName == "" {
-					// Direct shell into outer VM
-					greet("* Hello <%s>, connecting you to outer VM <%s>\r\n", tailscaleUser, vmxIsolation)
-					if err := runVMXOuterShell(s, tailscaleUser, vmxIsolation, targetUser, logErr); err != nil {
-						logErr("VMX outer shell failed: %v", err)
-						s.Exit(1)
-					}
-				} else {
-					// Container inside VM
-					greet("* Hello <%s>, connecting you to <%s> in <%s> (VMX/%s)\r\n", tailscaleUser, runAsUser, frameName, vmxIsolation)
-					if err := runVMXSession(s, tailscaleUser, vmxIsolation, frameName, targetUser, logErr); err != nil {
-						logErr("VMX session failed: %v", err)
-						s.Exit(1)
-					}
-				}
-			default:
-				// "container" is the default; "none" (no host isolation) takes
-				// the same code path and differs only in the greeting suffix.
-				suffix := ""
-				if cap.Isolation == "none" {
-					suffix = " (no isolation)"
-				}
-				greet("* Hello <%s>, connecting you to <%s> in <%s>%s\r\n", tailscaleUser, runAsUser, frameName, suffix)
-				if err := runContainerSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
-					logErr("Container session failed: %v", err)
-					s.Exit(1)
-				}
-			}
-
-			// TODO: Handle ephemeral cleanup if cap.Ephemeral is true
-		},
-		// No authentication required - Tailscale already authenticated the connection.
-		// When both PasswordHandler and PublicKeyHandler are nil, gliderlabs/ssh
-		// performs no client authentication.
-
-		// Enable port forwarding
-		LocalPortForwardingCallback: ssh.LocalPortForwardingCallback(func(ctx ssh.Context, dhost string, dport uint32) bool {
-			log.Printf("Accepted local forward to %s:%d", dhost, dport)
-			return true
-		}),
-		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
-			log.Printf("Accepted reverse forward on %s:%d", host, port)
-			return true
-		}),
-		RequestHandlers: map[string]ssh.RequestHandler{
-			"tcpip-forward":        forwardHandler.HandleSSHRequest,
-			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
-		},
-		SubsystemHandlers: map[string]ssh.SubsystemHandler{
-			"sftp": func(s ssh.Session) {
-				// Handle SFTP subsystem by running sftp-server in the container.
-				// This is invoked by modern scp (which uses SFTP by default).
-				tailscaleUser := getTailscaleUser(s.Context(), lc, s.RemoteAddr().String())
-				sshUser := s.User()
-
-				// Parse user@container format
-				targetUser := ""
-				containerName := sshUser
-				if idx := strings.Index(sshUser, "@"); idx != -1 {
-					targetUser = sshUser[:idx]
-					containerName = sshUser[idx+1:]
-				}
-
-				// Resolve the frame name to its canonical fs/<user>/<uuid> path
-				// via the user's ref store, then set up the root filesystem
-				// (same setup as container sessions).
-				rootFS, _, err := resolveFrameRootFS(tailscaleUser, containerName)
-				if err != nil {
-					log.Printf("SFTP session failed: %v", err)
-					return
-				}
-				if err := prepareContainerRootFS(rootFS, ""); err != nil {
-					log.Printf("SFTP session failed: %v", err)
-					return
-				}
-
-				if err := runSFTPSession(s, rootFS, targetUser); err != nil {
-					log.Printf("SFTP session failed: %v", err)
-				}
-			},
-		},
-	}
+	sshServer := newSSHServer(lc)
 
 	// Load the persistent host key
 	if err := ssh.HostKeyFile(hostKeyPath)(sshServer); err != nil {
@@ -803,6 +684,198 @@ func main() {
 	// Serve SSH connections
 	if err := sshServer.Serve(ln); err != nil {
 		log.Fatalf("SSH server error: %v", err)
+	}
+}
+
+// runTestMode runs the daemon in test mode: listening on a local TCP port
+// instead of tsnet, using testModeUser for identity. This enables e2e tests
+// to connect via SSH without a real Tailscale network.
+func runTestMode(listenAddr, stateDir string) {
+	// In test mode, use stateDir for the control socket instead of /run/thundersnap
+	// so each test daemon instance has its own socket path.
+	controlSocket = filepath.Join(stateDir, "control.sock")
+
+	// Ensure SSH host key exists
+	hostKeyPath := filepath.Join(stateDir, "ssh_host_ed25519_key")
+	if err := ensureHostKey(hostKeyPath); err != nil {
+		log.Fatalf("Failed to ensure host key: %v", err)
+	}
+
+	// Listen on local TCP
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatalf("Failed to listen on %s: %v", listenAddr, err)
+	}
+	defer ln.Close()
+
+	log.Printf("SSH server listening on %s (test mode)", listenAddr)
+
+	// Create SSH server (no LocalClient needed - testModeUser is set)
+	sshServer := newSSHServer(nil)
+
+	// Load the persistent host key
+	if err := ssh.HostKeyFile(hostKeyPath)(sshServer); err != nil {
+		log.Fatalf("Failed to load host key: %v", err)
+	}
+
+	// Serve SSH connections
+	log.Printf("Waiting for SSH connections...")
+	if err := sshServer.Serve(ln); err != nil {
+		log.Fatalf("SSH server error: %v", err)
+	}
+}
+
+// newSSHServer creates an SSH server with the standard handler configuration.
+// The LocalClient lc may be nil in test mode (when testModeUser is set).
+func newSSHServer(lc *tailscale.LocalClient) *ssh.Server {
+	forwardHandler := &ssh.ForwardedTCPHandler{}
+	return &ssh.Server{
+		Handler: func(s ssh.Session) {
+			log.Printf("New SSH session from %s (user: %s)", s.RemoteAddr(), s.User())
+
+			// Look up the Tailscale identity of the connecting peer.
+			// In test mode (--test-user), use the configured test user.
+			var who *apitype.WhoIsResponse
+			tailscaleUser := "unknown"
+			if testModeUser != "" {
+				tailscaleUser = testModeUser
+				// In test mode, who stays nil and we use DefaultCap
+			} else {
+				who = getWhoIs(s.Context(), lc, s.RemoteAddr().String())
+				if who != nil {
+					if who.Node != nil && len(who.Node.Tags) > 0 {
+						tailscaleUser = fmt.Sprintf("tags: %s", strings.Join(who.Node.Tags, ", "))
+					} else if who.UserProfile != nil && who.UserProfile.LoginName != "" {
+						tailscaleUser = who.UserProfile.LoginName
+					}
+				}
+			}
+
+			// Resolve capability from policy (in test mode uses DefaultCap)
+			cap := ResolveCap(who, globalPolicy)
+			log.Printf("Resolved cap for %s: role=%s isolation=%s", tailscaleUser, cap.Role, cap.Isolation)
+
+			// Helper to log error to both server log and client
+			logErr := func(format string, args ...any) {
+				msg := fmt.Sprintf(format, args...)
+				log.Print(msg)
+				fmt.Fprintf(s, "* Error: %s\r\n", msg)
+			}
+
+			// Parse SSH username to extract target user and frame name.
+			// See parseSSHUser for format documentation.
+			parsedIsolation, vmxIsolation, targetUser, frameName := parseSSHUser(s.User())
+			if parsedIsolation != "container" {
+				cap.Isolation = parsedIsolation
+			}
+
+			// Resolve the frame name to its canonical fs/<user>/<uuid> path via
+			// the user's ref store solely to choose the Unix user shown in the
+			// greeting. Resolution errors (e.g. an unknown frame name) are
+			// ignored here and surfaced authoritatively by the session function
+			// below; the greeting just falls back to the requested target user.
+			runAsUser := targetUser
+			if rootFS, _, rerr := resolveFrameRootFS(tailscaleUser, frameName); rerr == nil {
+				runAsUser = selectTargetUser(rootFS, targetUser)
+			}
+
+			// Only greet the user in interactive mode. When a subcommand is
+			// supplied (e.g. `ssh host -- some-cmd`, scp, rsync) the greeting
+			// would corrupt the program's output, so suppress it.
+			interactive := isInteractiveSession(s.RawCommand())
+			greet := func(format string, args ...any) {
+				if interactive {
+					fmt.Fprintf(s.Stderr(), format, args...)
+				}
+			}
+
+			// Route based on isolation level
+			switch cap.Isolation {
+			case "vmx":
+				if frameName == "" {
+					// Direct shell into outer VM
+					greet("* Hello <%s>, connecting you to outer VM <%s>\r\n", tailscaleUser, vmxIsolation)
+					if err := runVMXOuterShell(s, tailscaleUser, vmxIsolation, targetUser, logErr); err != nil {
+						logErr("VMX outer shell failed: %v", err)
+						s.Exit(1)
+					}
+				} else {
+					// Container inside VM
+					greet("* Hello <%s>, connecting you to <%s> in <%s> (VMX/%s)\r\n", tailscaleUser, runAsUser, frameName, vmxIsolation)
+					if err := runVMXSession(s, tailscaleUser, vmxIsolation, frameName, targetUser, logErr); err != nil {
+						logErr("VMX session failed: %v", err)
+						s.Exit(1)
+					}
+				}
+			default:
+				// "container" is the default; "none" (no host isolation) takes
+				// the same code path and differs only in the greeting suffix.
+				suffix := ""
+				if cap.Isolation == "none" {
+					suffix = " (no isolation)"
+				}
+				greet("* Hello <%s>, connecting you to <%s> in <%s>%s\r\n", tailscaleUser, runAsUser, frameName, suffix)
+				if err := runContainerSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
+					logErr("Container session failed: %v", err)
+					s.Exit(1)
+				}
+			}
+
+			// TODO: Handle ephemeral cleanup if cap.Ephemeral is true
+		},
+		// No authentication required - Tailscale already authenticated the connection.
+		// When both PasswordHandler and PublicKeyHandler are nil, gliderlabs/ssh
+		// performs no client authentication.
+
+		// Enable port forwarding
+		LocalPortForwardingCallback: ssh.LocalPortForwardingCallback(func(ctx ssh.Context, dhost string, dport uint32) bool {
+			log.Printf("Accepted local forward to %s:%d", dhost, dport)
+			return true
+		}),
+		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
+			log.Printf("Accepted reverse forward on %s:%d", host, port)
+			return true
+		}),
+		RequestHandlers: map[string]ssh.RequestHandler{
+			"tcpip-forward":        forwardHandler.HandleSSHRequest,
+			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
+		},
+		SubsystemHandlers: map[string]ssh.SubsystemHandler{
+			"sftp": func(s ssh.Session) {
+				// Handle SFTP subsystem by running sftp-server in the container.
+				// This is invoked by modern scp (which uses SFTP by default).
+				tailscaleUser := testModeUser
+				if tailscaleUser == "" {
+					tailscaleUser = getTailscaleUser(s.Context(), lc, s.RemoteAddr().String())
+				}
+				sshUser := s.User()
+
+				// Parse user@container format
+				targetUser := ""
+				containerName := sshUser
+				if idx := strings.Index(sshUser, "@"); idx != -1 {
+					targetUser = sshUser[:idx]
+					containerName = sshUser[idx+1:]
+				}
+
+				// Resolve the frame name to its canonical fs/<user>/<uuid> path
+				// via the user's ref store, then set up the root filesystem
+				// (same setup as container sessions).
+				rootFS, _, err := resolveFrameRootFS(tailscaleUser, containerName)
+				if err != nil {
+					log.Printf("SFTP session failed: %v", err)
+					return
+				}
+				if err := prepareContainerRootFS(rootFS, ""); err != nil {
+					log.Printf("SFTP session failed: %v", err)
+					return
+				}
+
+				if err := runSFTPSession(s, rootFS, targetUser); err != nil {
+					log.Printf("SFTP session failed: %v", err)
+				}
+			},
+		},
 	}
 }
 
@@ -1120,7 +1193,13 @@ func getWhoIs(ctx context.Context, lc *tailscale.LocalClient, remoteAddr string)
 
 // getTailscaleUser looks up the Tailscale identity for the given remote address.
 // Returns the user's login name, or tags if it's a tagged node, or the IP if lookup fails.
+// In test mode (--test-user set), returns the configured test user instead.
 func getTailscaleUser(ctx context.Context, lc *tailscale.LocalClient, remoteAddr string) string {
+	// In test mode, return the configured test user for all connections.
+	if testModeUser != "" {
+		return testModeUser
+	}
+
 	whois := getWhoIs(ctx, lc, remoteAddr)
 	if whois == nil {
 		return "unknown"
@@ -1370,13 +1449,29 @@ func (c *controlServer) Close() error {
 
 // startControlServer starts the HTTP control server on a Unix socket.
 // The server expects a vsock-style handshake (CONNECT/OK) before HTTP.
+//
+// To avoid Unix socket path length limits (~108 chars), the socket is bound
+// using a relative path from within rootFS. The full sockPath is still stored
+// for cleanup.
 func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	// Remove existing socket file if it exists
 	os.Remove(sockPath)
 
-	ln, err := net.Listen("unix", sockPath)
+	// Bind using a relative path to avoid socket path length limits.
+	// Unix socket paths are limited to ~108 characters; deep test paths can exceed this.
+	// By chdir'ing to rootFS first, we use a short relative name for the bind.
+	sockName := filepath.Base(sockPath) // e.g., "ctrl.sock"
+	cwd, err := os.Getwd()
 	if err != nil {
-		return nil, fmt.Errorf("listen on control socket %s: %w", sockPath, err)
+		return nil, fmt.Errorf("get cwd: %w", err)
+	}
+	if err := os.Chdir(rootFS); err != nil {
+		return nil, fmt.Errorf("chdir to rootFS %s: %w", rootFS, err)
+	}
+	ln, listenErr := net.Listen("unix", sockName)
+	os.Chdir(cwd) // restore cwd regardless of error
+	if listenErr != nil {
+		return nil, fmt.Errorf("listen on control socket %s: %w", sockPath, listenErr)
 	}
 
 	// Make socket accessible
