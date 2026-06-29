@@ -1,4 +1,4 @@
-package main
+package sftpfs
 
 import (
 	"io"
@@ -12,20 +12,16 @@ import (
 )
 
 // startTestSFTP wires a real sftp.Client to a real sftp.RequestServer backed by
-// the production sftpHandler, over an in-memory pipe. This exercises the exact
-// code path used for scp/sftp uploads (Filewrite/Filecmd), including the chown
-// of newly-created files to the target user.
-func startTestSFTP(t *testing.T, h *sftpHandler) *sftp.Client {
+// the production Handler, over an in-memory pipe. This exercises the exact code
+// path used for scp/sftp uploads (Filewrite/Filecmd), including the chown of
+// newly-created files to the target user.
+func startTestSFTP(t *testing.T, h *Handler) *sftp.Client {
 	t.Helper()
 
 	clientConn, serverConn := net.Pipe()
 
-	server := sftp.NewRequestServer(serverConn, sftp.Handlers{
-		FileGet:  h,
-		FilePut:  h,
-		FileCmd:  h,
-		FileList: h,
-	}, sftp.WithStartDirectory(h.homeDir))
+	server := sftp.NewRequestServer(serverConn, h.Handlers(),
+		sftp.WithStartDirectory(h.HomeDir()))
 	go func() {
 		if err := server.Serve(); err != nil && err != io.EOF {
 			t.Logf("sftp server: %v", err)
@@ -46,7 +42,7 @@ func startTestSFTP(t *testing.T, h *sftpHandler) *sftp.Client {
 
 // TestSFTPUploadOwnership verifies that files and directories created over SFTP
 // (as scp does) are chowned to the target user, not left owned by root (the
-// thundersnapd process). This guards the "scp runs as root" security hole.
+// daemon process). This guards the "scp runs as root" security hole.
 //
 // Requires root because it asserts on file ownership after chown.
 func TestSFTPUploadOwnership(t *testing.T) {
@@ -61,12 +57,7 @@ func TestSFTPUploadOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h := &sftpHandler{
-		rootFS:  rootFS,
-		homeDir: "/home/user",
-		uid:     wantUID,
-		gid:     wantGID,
-	}
+	h := NewHandler(rootFS, "/home/user", wantUID, wantGID)
 	client := startTestSFTP(t, h)
 
 	// Upload a file (the scp case).
