@@ -92,44 +92,36 @@ func TestStatusFileDirectoryCreation(t *testing.T) {
 	}
 }
 
-// TestParentCgroupNameUsesPID tests that parentCgroupName includes the daemon PID
-// to allow multiple thundersnapd instances to run without cgroup conflicts.
+// TestParentCgroupNameUsesPID tests that the daemon's cgroup manager parent name
+// includes the daemon PID to allow multiple thundersnapd instances to run without
+// cgroup conflicts.
 func TestParentCgroupNameUsesPID(t *testing.T) {
 	pid := os.Getpid()
-
-	// Check that parentCgroupName contains the PID
-	if !strings.Contains(parentCgroupName, "thundersnap-") {
-		t.Errorf("parentCgroupName should start with 'thundersnap-', got: %s", parentCgroupName)
-	}
-
-	// Check that it contains a PID-like number (our test process PID)
-	// The actual daemon would use its own PID
-	expectedPrefix := "thundersnap-"
-	if !strings.HasPrefix(parentCgroupName, expectedPrefix) {
-		t.Errorf("parentCgroupName should have prefix %q, got: %s", expectedPrefix, parentCgroupName)
-	}
+	parentName := cgroupManager.ParentName()
 
 	// Verify format is thundersnap-<pid>
-	parts := strings.SplitN(parentCgroupName, "-", 2)
-	if len(parts) != 2 {
-		t.Errorf("parentCgroupName should be thundersnap-<pid>, got: %s", parentCgroupName)
+	expectedPrefix := "thundersnap-"
+	if !strings.HasPrefix(parentName, expectedPrefix) {
+		t.Errorf("parent cgroup name should have prefix %q, got: %s", expectedPrefix, parentName)
 	}
 
-	// The PID part should be a valid number (might not match test process PID
-	// since parentCgroupName is initialized at package load time, but it should
-	// be a number)
+	parts := strings.SplitN(parentName, "-", 2)
+	if len(parts) != 2 {
+		t.Fatalf("parent cgroup name should be thundersnap-<pid>, got: %s", parentName)
+	}
+
+	// The PID part should be a non-empty numeric string. It matches the test
+	// process PID because cgroupManager is initialized at package load time.
 	pidStr := parts[1]
 	if len(pidStr) == 0 {
-		t.Error("parentCgroupName PID part is empty")
+		t.Error("parent cgroup name PID part is empty")
 	}
-
-	// Check that it's numeric
 	for _, c := range pidStr {
 		if c < '0' || c > '9' {
-			t.Errorf("parentCgroupName PID part should be numeric, got: %s", pidStr)
+			t.Errorf("parent cgroup name PID part should be numeric, got: %s", pidStr)
 			break
 		}
 	}
 
-	t.Logf("parentCgroupName=%s (test process pid=%d)", parentCgroupName, pid)
+	t.Logf("parent cgroup name=%s (test process pid=%d)", parentName, pid)
 }

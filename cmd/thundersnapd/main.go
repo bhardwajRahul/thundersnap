@@ -33,6 +33,7 @@ import (
 	"github.com/pborman/getopt/v2"
 	"github.com/pkg/sftp"
 	"github.com/tailscale/thundersnap/btrfsutil"
+	"github.com/tailscale/thundersnap/cgroup"
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/frames"
 	"github.com/tailscale/thundersnap/snaphash"
@@ -1203,204 +1204,10 @@ func getTailscaleUser(ctx context.Context, lc *tailscale.LocalClient, remoteAddr
 	return "unknown"
 }
 
-// Resource limit constants for container isolation.
-// These provide defense against runaway processes while allowing efficient memory sharing.
-const (
-	// containerOOMScore is the OOM score adjustment applied to container processes.
-	// Higher values make processes more likely to be killed by the OOM killer.
-	// Range is -1000 to +1000; default is 0. We use +500 to make containers much more
-	// likely to be killed than the host OS or thundersnapd itself during memory pressure.
-	containerOOMScore = 500
-
-	// parentMemoryMaxPercent is the percentage of system RAM that all thundersnap
-	// containers combined can use. This is a hard limit to protect the host OS.
-	parentMemoryMaxPercent = 80
-
-	// parentCPUWeight is the CPU weight for all thundersnap containers relative to
-	// other work on the system. Default is 100; we use 50 so non-thundersnap work
-	// gets priority when CPU is contested. When CPU is idle, containers can still
-	// use all available CPU.
-	parentCPUWeight = 50
-
-	// containerMemoryHighPercent is the percentage of system RAM for the soft limit
-	// per container. When exceeded, the kernel aggressively reclaims memory from
-	// the container (swapping, dropping caches) but doesn't OOM kill. This allows
-	// containers to burst above their "fair share" when memory is available.
-	// With 8 containers, each gets ~10% as a soft limit but can burst higher.
-	containerMemoryHighPercent = 10
-
-	// containerPidsMax limits the number of processes per container.
-	// This is the primary defense against fork bombs.
-	containerPidsMax = 2000
-
-	// containerCPUWeight is the CPU weight for each container relative to other
-	// containers. All containers get equal weight (100 = default).
-	containerCPUWeight = 100
-)
-
-// cgroupInitialized tracks whether the parent cgroup has been set up.
-var cgroupInitialized bool
-
-// parentCgroupName is the cgroup that contains all thundersnap containers for this instance.
-// Uses the daemon's PID to allow multiple instances on the same machine and nested instances.
-// Format: "thundersnap-{pid}" (e.g., "thundersnap-1234").
-var parentCgroupName = fmt.Sprintf("thundersnap-%d", os.Getpid())
-
-// getSystemMemoryBytes returns the total system memory in bytes.
-func getSystemMemoryBytes() (uint64, error) {
-	data, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return 0, err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "MemTotal:") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				kb, err := strconv.ParseUint(fields[1], 10, 64)
-				if err != nil {
-					return 0, err
-				}
-				return kb * 1024, nil // Convert KB to bytes
-			}
-		}
-	}
-	return 0, fmt.Errorf("MemTotal not found in /proc/meminfo")
-}
-
-// initParentCgroup creates the parent thundersnap cgroup with system-wide limits.
-// This should be called once at startup. Errors are logged but not fatal.
-func initParentCgroup() {
-	if cgroupInitialized {
-		return
-	}
-
-	cgroupPath := filepath.Join("/sys/fs/cgroup", parentCgroupName)
-
-	// Create parent cgroup directory
-	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
-		log.Printf("warning: failed to create parent cgroup %s: %v", cgroupPath, err)
-		return
-	}
-
-	// Enable controllers for child cgroups
-	// We need to enable controllers in the parent so children can use them
-	subtreeControl := filepath.Join(cgroupPath, "cgroup.subtree_control")
-	if err := os.WriteFile(subtreeControl, []byte("+memory +pids +cpu"), 0644); err != nil {
-		log.Printf("warning: failed to enable cgroup controllers: %v", err)
-		// Continue anyway - some controllers might already be enabled
-	}
-
-	// Set CPU weight (lower priority than default)
-	cpuWeight := filepath.Join(cgroupPath, "cpu.weight")
-	if err := os.WriteFile(cpuWeight, []byte(strconv.Itoa(parentCPUWeight)), 0644); err != nil {
-		log.Printf("warning: failed to set parent cpu.weight: %v", err)
-	}
-
-	// Set memory.max as hard backstop (percentage of system RAM)
-	totalMem, err := getSystemMemoryBytes()
-	if err != nil {
-		log.Printf("warning: failed to get system memory: %v", err)
-	} else {
-		memMax := totalMem * parentMemoryMaxPercent / 100
-		memMaxPath := filepath.Join(cgroupPath, "memory.max")
-		if err := os.WriteFile(memMaxPath, []byte(strconv.FormatUint(memMax, 10)), 0644); err != nil {
-			log.Printf("warning: failed to set parent memory.max: %v", err)
-		} else {
-			log.Printf("Configured parent cgroup %s: memory.max=%dMB, cpu.weight=%d",
-				parentCgroupName, memMax/(1024*1024), parentCPUWeight)
-		}
-	}
-
-	cgroupInitialized = true
-}
-
-// setProcessOOMScore sets the OOM score adjustment for a process.
-// Higher scores make the process more likely to be killed during memory pressure.
-// Errors are logged but not fatal since OOM adjustment is best-effort.
-func setProcessOOMScore(pid int, score int) {
-	path := fmt.Sprintf("/proc/%d/oom_score_adj", pid)
-	if err := os.WriteFile(path, []byte(strconv.Itoa(score)), 0644); err != nil {
-		log.Printf("warning: failed to set OOM score for pid %d: %v", pid, err)
-	}
-}
-
-// setupContainerCgroup creates a cgroup for the container process with resource limits.
-// Limits applied:
-//   - memory.high: soft memory limit (kernel reclaims aggressively above this)
-//   - memory.oom.group: kill entire container on OOM, not just one process
-//   - pids.max: limit process count (fork bomb protection)
-//   - cpu.weight: fair sharing among containers
-//
-// Errors are logged but not fatal since cgroup setup is best-effort.
-func setupContainerCgroup(pid int, cgroupName string) {
-	// Ensure parent cgroup exists with system-wide limits
-	initParentCgroup()
-
-	// Use cgroup v2 unified hierarchy
-	cgroupPath := filepath.Join("/sys/fs/cgroup", cgroupName)
-
-	// Create cgroup directory
-	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
-		log.Printf("warning: failed to create cgroup %s: %v", cgroupPath, err)
-		return
-	}
-
-	// Enable subtree_control on all intermediate directories between parent and leaf.
-	// In cgroup v2, each intermediate directory must have controllers enabled for
-	// children to use them. The cgroupName is like "thundersnap-123/user/container",
-	// so we need to enable controllers on "thundersnap-123/user" as well.
-	parts := strings.Split(cgroupName, "/")
-	for i := 1; i < len(parts); i++ {
-		intermediateDir := filepath.Join("/sys/fs/cgroup", filepath.Join(parts[:i]...))
-		subtreeControl := filepath.Join(intermediateDir, "cgroup.subtree_control")
-		// Ignore errors - the parent's initParentCgroup already set the top level,
-		// and some systems may not support all controllers
-		os.WriteFile(subtreeControl, []byte("+memory +pids +cpu"), 0644)
-	}
-
-	// Set memory.high (soft limit) - kernel reclaims aggressively above this
-	totalMem, err := getSystemMemoryBytes()
-	if err == nil {
-		memHigh := totalMem * containerMemoryHighPercent / 100
-		memHighPath := filepath.Join(cgroupPath, "memory.high")
-		if err := os.WriteFile(memHighPath, []byte(strconv.FormatUint(memHigh, 10)), 0644); err != nil {
-			log.Printf("warning: failed to set memory.high for %s: %v", cgroupName, err)
-		}
-	}
-
-	// Enable memory.oom.group=1 so OOM kills the entire cgroup
-	oomGroupPath := filepath.Join(cgroupPath, "memory.oom.group")
-	if err := os.WriteFile(oomGroupPath, []byte("1"), 0644); err != nil {
-		log.Printf("warning: failed to set memory.oom.group for %s: %v", cgroupName, err)
-	}
-
-	// Set pids.max (fork bomb protection)
-	pidsMaxPath := filepath.Join(cgroupPath, "pids.max")
-	if err := os.WriteFile(pidsMaxPath, []byte(strconv.Itoa(containerPidsMax)), 0644); err != nil {
-		log.Printf("warning: failed to set pids.max for %s: %v", cgroupName, err)
-	}
-
-	// Set cpu.weight for fair sharing among containers
-	cpuWeightPath := filepath.Join(cgroupPath, "cpu.weight")
-	if err := os.WriteFile(cpuWeightPath, []byte(strconv.Itoa(containerCPUWeight)), 0644); err != nil {
-		log.Printf("warning: failed to set cpu.weight for %s: %v", cgroupName, err)
-	}
-
-	// Move the process into the cgroup
-	procsPath := filepath.Join(cgroupPath, "cgroup.procs")
-	if err := os.WriteFile(procsPath, []byte(strconv.Itoa(pid)), 0644); err != nil {
-		log.Printf("warning: failed to add pid %d to cgroup %s: %v", pid, cgroupName, err)
-		return
-	}
-}
-
-// configureContainerResources sets up resource limits for a container process.
-// It adjusts OOM score to prioritize killing containers over host services,
-// and sets up a cgroup with memory limits, fork bomb protection, and CPU fairness.
-func configureContainerResources(pid int, cgroupName string) {
-	setProcessOOMScore(pid, containerOOMScore)
-	setupContainerCgroup(pid, cgroupName)
-}
+// cgroupManager owns the per-instance parent cgroup and applies resource limits
+// to container processes. The parent name embeds the daemon PID so multiple or
+// nested instances on the same machine do not collide.
+var cgroupManager = cgroup.New(fmt.Sprintf("thundersnap-%d", os.Getpid()))
 
 // btrfsCreateSubvol creates a new empty btrfs subvolume at path.
 func btrfsCreateSubvol(path string) error {
@@ -1715,8 +1522,9 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	tsBinary := filepath.Join(absRootFS, "bin", "ts")
 
 	// Build cgroup name for this container (used for OOM group killing)
-	// Uses parentCgroupName which includes daemon PID to avoid conflicts with other instances
-	cgroupName := fmt.Sprintf("%s/%s/%s", parentCgroupName, sanitizeForPath(tailscaleUser), sanitizeForPath(sshUser))
+	// Uses the cgroup manager's parent name, which includes the daemon PID to
+	// avoid conflicts with other instances.
+	cgroupName := fmt.Sprintf("%s/%s/%s", cgroupManager.ParentName(), sanitizeForPath(tailscaleUser), sanitizeForPath(sshUser))
 
 	// The nsenter command is built per-branch: the PTY branch needs the handshake
 	// fd and TERM, the non-PTY branch does not.
@@ -1760,7 +1568,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 
 		// Configure resource limits: OOM priority, memory soft limit, fork bomb
 		// protection (pids.max), and CPU fairness
-		configureContainerResources(cmd.Process.Pid, cgroupName)
+		cgroupManager.ConfigureContainer(cmd.Process.Pid, cgroupName)
 
 		// Wait for "READY\n" from ts indicating devpts is mounted
 		readyBuf := make([]byte, 64)
@@ -1837,7 +1645,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 
 		// Configure resource limits: OOM priority, memory soft limit, fork bomb
 		// protection (pids.max), and CPU fairness
-		configureContainerResources(cmd.Process.Pid, cgroupName)
+		cgroupManager.ConfigureContainer(cmd.Process.Pid, cgroupName)
 
 		// Copy stdin from SSH session to command in background
 		go func() {
