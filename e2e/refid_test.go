@@ -117,3 +117,74 @@ func TestIdRefSubvolumeMoveSequence(t *testing.T) {
 	}
 	t.Logf("frameA /id/%s removed after move (correct)", refName)
 }
+
+// TestIdRefMoveNoPriorSubvolume guards the Move fast-path: when the source ref
+// has no identity subvolume yet, Move must NOT attempt an os.Rename (which only
+// works when the source is precisely a subvolume root). Instead it ensures a
+// fresh empty subvolume at the destination. This pins the invariant documented
+// in refid.Move so nobody "simplifies" it into an unconditional rename and
+// reintroduces the EXDEV trap for plain directories.
+func TestIdRefMoveNoPriorSubvolume(t *testing.T) {
+	env := newTestEnv(t)
+
+	frameA := filepath.Join(env.fsDir, "frameA")
+	frameB := filepath.Join(env.fsDir, "frameB")
+	for _, f := range []string{frameA, frameB} {
+		if out, err := exec.Command("btrfs", "subvolume", "create", f).CombinedOutput(); err != nil {
+			t.Fatalf("btrfs subvolume create %s: %v\n%s", f, err, out)
+		}
+		defer exec.Command("btrfs", "subvolume", "delete", f).Run()
+	}
+
+	const refName = "newref"
+
+	// No refid.Ensure on frameA: the source /id/<ref> subvolume never exists.
+	if err := refid.Move(frameA, frameB, refName); err != nil {
+		t.Fatalf("refid.Move with no prior source subvolume: %v", err)
+	}
+
+	// The destination gets a fresh, empty identity subvolume.
+	refPathB := refid.Path(frameB, refName)
+	if err := exec.Command("btrfs", "subvolume", "show", refPathB).Run(); err != nil {
+		t.Fatalf("frameB /id/%s should be a fresh subvolume after move: %v", refName, err)
+	}
+	entries, err := os.ReadDir(refPathB)
+	if err != nil {
+		t.Fatalf("read frameB /id/%s: %v", refName, err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("frameB /id/%s should be empty, has %d entries", refName, len(entries))
+	}
+	t.Logf("Move with no prior source subvolume produced a fresh empty dst subvolume (correct)")
+}
+
+// TestIdRefForceDeleteScrubsSubvolume verifies the production refid.Remove call
+// the daemon's force ref delete makes: it deletes the per-frame identity
+// subvolume (and its private contents) so a force delete never leaves key
+// material orphaned on the frame.
+func TestIdRefForceDeleteScrubsSubvolume(t *testing.T) {
+	env := newTestEnv(t)
+
+	frame := filepath.Join(env.fsDir, "frame")
+	if out, err := exec.Command("btrfs", "subvolume", "create", frame).CombinedOutput(); err != nil {
+		t.Fatalf("btrfs subvolume create %s: %v\n%s", frame, err, out)
+	}
+	defer exec.Command("btrfs", "subvolume", "delete", frame).Run()
+
+	const refName = "secretref"
+	if err := refid.Ensure(frame, refName); err != nil {
+		t.Fatalf("refid.Ensure: %v", err)
+	}
+	refPath := refid.Path(frame, refName)
+	if err := os.WriteFile(filepath.Join(refPath, "identity.key"), []byte("k"), 0600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+
+	if err := refid.Remove(frame, refName); err != nil {
+		t.Fatalf("refid.Remove: %v", err)
+	}
+	if _, err := os.Stat(refPath); !os.IsNotExist(err) {
+		t.Fatalf("identity subvolume should be gone after Remove, stat err = %v", err)
+	}
+	t.Logf("identity subvolume scrubbed (correct)")
+}

@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/tailscale/thundersnap/frameid"
+	"github.com/tailscale/thundersnap/refid"
 	"github.com/tailscale/thundersnap/refs"
 )
 
@@ -188,6 +191,75 @@ func TestRefHandlers(t *testing.T) {
 			t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
 		}
 	})
+}
+
+// TestRefDeleteForceScrubsFrameIdentity verifies that a force delete removes
+// the ref's per-frame identity directory, not just the ref config. The frame's
+// /id/<ref> here is a plain directory (a unit test cannot create btrfs
+// subvolumes); refid.Remove falls back to os.RemoveAll for plain dirs, which is
+// enough to prove the handler now resolves the frame UUID and wires the frame
+// path through to refid.Remove on force.
+func TestRefDeleteForceScrubsFrameIdentity(t *testing.T) {
+	stateDir := t.TempDir()
+	initRefStore(stateDir)
+
+	fsDir := t.TempDir()
+	old := flagFsDir
+	flagFsDir = &fsDir
+	defer func() { flagFsDir = old }()
+
+	uuid := frameid.MustNew()
+	if err := refStore.Create("secret-ref", uuid); err != nil {
+		t.Fatalf("create ref: %v", err)
+	}
+
+	// The conflict guard checks the state-dir id dir; populate it so a
+	// non-force delete is refused.
+	if err := refStore.EnsureIDDir("secret-ref"); err != nil {
+		t.Fatalf("ensure state-dir id dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "id", "secret-ref", "state"), []byte("x"), 0600); err != nil {
+		t.Fatalf("write state-dir id state: %v", err)
+	}
+
+	// Populate the per-frame identity dir with key material; this is what a
+	// force delete must scrub via refid.Remove.
+	framePath := filepath.Join(fsDir, uuid.String())
+	idPath := refid.Path(framePath, "secret-ref")
+	if err := os.MkdirAll(idPath, 0700); err != nil {
+		t.Fatalf("mkdir id path: %v", err)
+	}
+	keyPath := filepath.Join(idPath, "identity.key")
+	if err := os.WriteFile(keyPath, []byte("private"), 0600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+
+	// Without force, a non-empty identity dir blocks deletion.
+	body, _ := json.Marshal(RefRequest{Name: "secret-ref"})
+	r := httptest.NewRequest(http.MethodPost, "/ref/delete", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handleRefDelete(w, r)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("non-force delete status = %d, want %d; body=%s", w.Code, http.StatusConflict, w.Body.String())
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Fatalf("identity key should survive a refused delete: %v", err)
+	}
+
+	// With force, the ref and its per-frame identity dir are both gone.
+	body, _ = json.Marshal(RefRequest{Name: "secret-ref", Force: true})
+	r = httptest.NewRequest(http.MethodPost, "/ref/delete", bytes.NewReader(body))
+	w = httptest.NewRecorder()
+	handleRefDelete(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("force delete status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if refStore.Exists("secret-ref") {
+		t.Error("ref still exists after force delete")
+	}
+	if _, err := os.Stat(idPath); !os.IsNotExist(err) {
+		t.Errorf("per-frame identity dir should be scrubbed after force delete, stat err = %v", err)
+	}
 }
 
 func TestRefHandlersValidation(t *testing.T) {

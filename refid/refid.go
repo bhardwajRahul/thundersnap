@@ -156,8 +156,16 @@ func Move(srcFramePath, dstFramePath, refName string) error {
 		return err
 	}
 
-	// A rename across two parent subvolumes on the same btrfs filesystem keeps
-	// the nested subvolume (and its contents) intact.
+	// This os.Rename works because of a precise btrfs invariant: src is itself
+	// a subvolume root (created by Ensure/createSubvol). rename(2) can relink a
+	// subvolume root from one subvolume's directory into another's as a pure
+	// metadata move of that one object, even though the two parents (the frames'
+	// /id subvolumes) have distinct inode namespaces. The same rename of a
+	// *plain* directory across that boundary, or across a separately mounted
+	// filesystem, returns EXDEV. So this holds only while (1) both frames live
+	// under the same btrfs mount (true today: <data-dir>/fs/<uuid>) and (2) src
+	// is exactly a subvolume root. If frames were ever mounted individually, or
+	// src were a plain dir, this would need a btrfs snapshot+delete fallback.
 	if err := os.Rename(src, dst); err != nil {
 		return fmt.Errorf("move ref id subvolume %s -> %s: %w", src, dst, err)
 	}

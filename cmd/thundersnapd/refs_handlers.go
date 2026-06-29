@@ -188,6 +188,12 @@ func handleRefDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Resolve the ref's current frame UUID before deleting the ref config: on
+	// a force delete we must scrub the ref's per-frame identity subvolume
+	// (<fs-dir>/<uuid>/id/<ref>) too, and once the config is gone we can no
+	// longer find which frame held it. A missing ref here is reported below.
+	ref, getErr := refStore.Get(req.Name)
+
 	// Delete the ref
 	if err := refStore.Delete(req.Name); err != nil {
 		if err == refs.ErrRefNotFound {
@@ -199,9 +205,19 @@ func handleRefDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Also remove id dir if force
+	// Also remove identity state if force. RemoveIDDir clears the state-dir id
+	// dir; refid.Remove scrubs the per-frame identity subvolume that actually
+	// holds the ref's private key material, so a force delete does not leave it
+	// orphaned on the frame for a later snapshot or frame reuse to expose.
 	if req.Force {
 		refStore.RemoveIDDir(req.Name)
+		if getErr == nil {
+			if framePath := framePathForUUID(ref.UUID); framePath != "" {
+				if err := refid.Remove(framePath, req.Name); err != nil {
+					log.Printf("Warning: remove id subvolume for ref %s in frame %s: %v", req.Name, ref.UUID, err)
+				}
+			}
+		}
 	}
 
 	log.Printf("Deleted ref %s", req.Name)
