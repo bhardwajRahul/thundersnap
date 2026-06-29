@@ -706,15 +706,14 @@ func main() {
 						s.Exit(1)
 					}
 				}
-			case "none":
-				// Direct session on host (no isolation)
-				greet("* Hello <%s>, connecting you to <%s> in <%s> (no isolation)\r\n", tailscaleUser, runAsUser, frameName)
-				if err := runContainerSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
-					logErr("Session failed: %v", err)
-					s.Exit(1)
+			default:
+				// "container" is the default; "none" (no host isolation) takes
+				// the same code path and differs only in the greeting suffix.
+				suffix := ""
+				if cap.Isolation == "none" {
+					suffix = " (no isolation)"
 				}
-			default: // "container" is the default
-				greet("* Hello <%s>, connecting you to <%s> in <%s>\r\n", tailscaleUser, runAsUser, frameName)
+				greet("* Hello <%s>, connecting you to <%s> in <%s>%s\r\n", tailscaleUser, runAsUser, frameName, suffix)
 				if err := runContainerSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
 					logErr("Container session failed: %v", err)
 					s.Exit(1)
@@ -755,14 +754,8 @@ func main() {
 					containerName = sshUser[idx+1:]
 				}
 
-				// Sanitize usernames for filesystem paths
-				safeTailscaleUser := sanitizeForPath(tailscaleUser)
-				safeContainerName := sanitizeForPath(containerName)
-				homeUser := stripDomain(safeTailscaleUser)
-
 				// Set up the root filesystem (same setup as container sessions)
-				rootFS := filepath.Join(*flagFsDir, safeTailscaleUser, safeContainerName)
-				baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
+				rootFS, baseUserFS := frameRootFSPaths(tailscaleUser, containerName)
 				if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
 					log.Printf("SFTP session failed: %v", err)
 					return
@@ -1655,19 +1648,24 @@ func sessionEnv(sshUser, tailscaleUser, term string) []string {
 	return env
 }
 
-func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser string, logErr func(string, ...any)) error {
-	// Sanitize usernames for filesystem paths (replace unsafe chars)
+// frameRootFSPaths returns the on-disk paths for a user's frame: rootFS is the
+// frame itself (<fs-dir>/<user>/<frame>) and baseUserFS is the user's base
+// filesystem (<fs-dir>/<user>/<stripped-user>) used as the clone source when the
+// frame does not yet exist. Both username components are sanitized for path use.
+func frameRootFSPaths(tailscaleUser, frameName string) (rootFS, baseUserFS string) {
 	safeTailscaleUser := sanitizeForPath(tailscaleUser)
-	safeSSHUser := sanitizeForPath(sshUser)
-
-	// For home directory, strip @host from username for a cleaner look
+	safeFrameName := sanitizeForPath(frameName)
 	homeUser := stripDomain(safeTailscaleUser)
+	rootFS = filepath.Join(*flagFsDir, safeTailscaleUser, safeFrameName)
+	baseUserFS = filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
+	return rootFS, baseUserFS
+}
 
-	// Set up the root filesystem for this user
+func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser string, logErr func(string, ...any)) error {
+	// Set up the root filesystem for this user.
 	// If this is not the "base" user (stripped username), try to clone from
-	// the base user's filesystem first, falling back to the clean snapshot
-	rootFS := filepath.Join(*flagFsDir, safeTailscaleUser, safeSSHUser)
-	baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
+	// the base user's filesystem first, falling back to the clean snapshot.
+	rootFS, baseUserFS := frameRootFSPaths(tailscaleUser, sshUser)
 	if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
 		return err
 	}
@@ -1734,7 +1732,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 
 	// Build cgroup name for this container (used for OOM group killing)
 	// Uses parentCgroupName which includes daemon PID to avoid conflicts with other instances
-	cgroupName := fmt.Sprintf("%s/%s/%s", parentCgroupName, safeTailscaleUser, safeSSHUser)
+	cgroupName := fmt.Sprintf("%s/%s/%s", parentCgroupName, sanitizeForPath(tailscaleUser), sanitizeForPath(sshUser))
 
 	if isPty {
 		// For PTY sessions, we allocate the PTY from outside the namespace by
@@ -2579,24 +2577,8 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		log.Printf("Warning: failed to write stamp file for %s: %v", rootFS, err)
 	}
 
-	// Ensure a "user" account exists in /etc/passwd for the container.
-	// This creates UID/GID 7575 if "user" doesn't already exist.
-	if _, err := tsm.EnsureUserInPasswd(rootFS); err != nil {
-		log.Printf("Warning: EnsureUserInPasswd on %s: %v", rootFS, err)
-	}
-	if err := tsm.EnsureSudoers(rootFS); err != nil {
-		log.Printf("Warning: EnsureSudoers on %s: %v", rootFS, err)
-	}
-
-	// Ensure resolv.conf exists for DNS resolution inside the frame
-	if err := ensureResolvConf(rootFS); err != nil {
-		log.Printf("Warning: ensure resolv.conf on %s: %v", rootFS, err)
-	}
-
-	// Ensure /tmp has correct permissions (1777 with sticky bit)
-	if err := ensureTmpDir(rootFS); err != nil {
-		log.Printf("Warning: ensure /tmp on %s: %v", rootFS, err)
-	}
+	// Ensure the "user" account, sudoers, resolv.conf, and /tmp are set up.
+	finalizeFrameRootfs(rootFS)
 
 	return nil
 }
@@ -2723,23 +2705,8 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 		log.Printf("Warning: failed to write stamp file for %s: %v", rootFS, err)
 	}
 
-	// Step 7: Ensure a "user" account exists in /etc/passwd
-	if _, err := tsm.EnsureUserInPasswd(rootFS); err != nil {
-		log.Printf("Warning: EnsureUserInPasswd on %s: %v", rootFS, err)
-	}
-	if err := tsm.EnsureSudoers(rootFS); err != nil {
-		log.Printf("Warning: EnsureSudoers on %s: %v", rootFS, err)
-	}
-
-	// Step 8: Ensure resolv.conf exists for DNS resolution inside the frame
-	if err := ensureResolvConf(rootFS); err != nil {
-		log.Printf("Warning: ensure resolv.conf on %s: %v", rootFS, err)
-	}
-
-	// Step 9: Ensure /tmp has correct permissions (1777 with sticky bit)
-	if err := ensureTmpDir(rootFS); err != nil {
-		log.Printf("Warning: ensure /tmp on %s: %v", rootFS, err)
-	}
+	// Step 7-9: Ensure the "user" account, sudoers, resolv.conf, and /tmp.
+	finalizeFrameRootfs(rootFS)
 
 	// Step 10: Create /id subvolume for frame-local secrets (never persisted in snapshots)
 	// This is always created fresh and empty, never cloned from a snapshot.
@@ -2780,6 +2747,26 @@ func isDirEmpty(path string) bool {
 		return true // treat errors as empty
 	}
 	return len(entries) == 0
+}
+
+// finalizeFrameRootfs performs the common post-clone setup for a frame's root
+// filesystem: ensure the "user" account (UID/GID 7575) exists in /etc/passwd,
+// ensure sudoers, copy in the host's resolv.conf for DNS, and fix /tmp
+// permissions. Each step is best-effort and logs a warning on failure rather
+// than aborting frame setup.
+func finalizeFrameRootfs(rootFS string) {
+	if _, err := tsm.EnsureUserInPasswd(rootFS); err != nil {
+		log.Printf("Warning: EnsureUserInPasswd on %s: %v", rootFS, err)
+	}
+	if err := tsm.EnsureSudoers(rootFS); err != nil {
+		log.Printf("Warning: EnsureSudoers on %s: %v", rootFS, err)
+	}
+	if err := ensureResolvConf(rootFS); err != nil {
+		log.Printf("Warning: ensure resolv.conf on %s: %v", rootFS, err)
+	}
+	if err := ensureTmpDir(rootFS); err != nil {
+		log.Printf("Warning: ensure /tmp on %s: %v", rootFS, err)
+	}
 }
 
 // ensureResolvConf copies the host's /etc/resolv.conf into the frame if
@@ -4505,23 +4492,8 @@ func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) er
 		log.Printf("Warning: failed to copy ts binary to %s: %v", framePath, err)
 	}
 
-	// Ensure a "user" account exists in /etc/passwd for the container.
-	if _, err := tsm.EnsureUserInPasswd(framePath); err != nil {
-		log.Printf("Warning: EnsureUserInPasswd on %s: %v", framePath, err)
-	}
-	if err := tsm.EnsureSudoers(framePath); err != nil {
-		log.Printf("Warning: EnsureSudoers on %s: %v", framePath, err)
-	}
-
-	// Ensure resolv.conf exists for DNS resolution inside the frame
-	if err := ensureResolvConf(framePath); err != nil {
-		log.Printf("Warning: ensure resolv.conf on %s: %v", framePath, err)
-	}
-
-	// Ensure /tmp has correct permissions (1777 with sticky bit)
-	if err := ensureTmpDir(framePath); err != nil {
-		log.Printf("Warning: ensure /tmp on %s: %v", framePath, err)
-	}
+	// Ensure the "user" account, sudoers, resolv.conf, and /tmp are set up.
+	finalizeFrameRootfs(framePath)
 
 	return nil
 }
