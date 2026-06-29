@@ -23,7 +23,6 @@ import (
 
 	"github.com/tailscale/hujson"
 	"github.com/tailscale/thundersnap/frameid"
-	"github.com/tailscale/thundersnap/snaphash"
 )
 
 var (
@@ -35,35 +34,33 @@ var (
 
 // HistoryEntry records when a snapshot was taken.
 type HistoryEntry struct {
-	// Snap is the content hash of this snapshot.
-	Snap snaphash.Hash `json:"snap"`
+	// Snap is the snap ID of this snapshot.
+	Snap string `json:"snap"`
 	// Time is when this snapshot was created.
 	Time time.Time `json:"time"`
 	// Message is an optional description of this snapshot.
 	Message string `json:"message,omitempty"`
 }
 
-// Frame represents the metadata for a frame (fs/<uuid>.jsonc).
+// Frame represents the metadata for a frame (fs/<user>/<uuid>.jsonc).
+//
+// Rootfs/Home/Work are snap IDs (the on-disk snap directory names under
+// snaps/), so the daemon can rebuild each component subvolume from the snap
+// store. An empty Home/Work means an empty subvolume was created.
 type Frame struct {
-	// Rootfs is the snap hash for the rootfs component.
+	// Rootfs is the snap ID for the rootfs component.
 	// This is the base OS, packages, /var, /usr, /etc, system state.
-	Rootfs snaphash.Hash `json:"rootfs"`
+	Rootfs string `json:"rootfs"`
 
-	// Home is the snap hash for the home component.
+	// Home is the snap ID for the home component.
 	// Contains user dotfiles, shell config, editor settings.
-	// Zero hash means an empty subvolume was created.
-	//
-	// Note: `omitempty` has no effect here because snaphash.Hash is an array
-	// type, which encoding/json never treats as empty. A zero Home is always
-	// serialized, so the zero hash (not the field's absence) is what signals
-	// "empty subvolume".
-	Home snaphash.Hash `json:"home,omitempty"`
+	// Empty string means an empty subvolume was created.
+	Home string `json:"home,omitempty"`
 
-	// Work is the snap hash for the work component.
+	// Work is the snap ID for the work component.
 	// Contains source code, project files, application state.
-	// Zero hash means an empty subvolume was created. As with Home, `omitempty`
-	// is inert on this array-typed field.
-	Work snaphash.Hash `json:"work,omitempty"`
+	// Empty string means an empty subvolume was created.
+	Work string `json:"work,omitempty"`
 
 	// Taints on this frame (union of component taints, plus any acquired at runtime).
 	Taints []string `json:"taints,omitempty"`
@@ -205,7 +202,7 @@ func (s *Store) Delete(uuid frameid.ID) error {
 }
 
 // AddHistoryEntry adds a snapshot to a frame's history.
-func (s *Store) AddHistoryEntry(uuid frameid.ID, snap snaphash.Hash, message string) error {
+func (s *Store) AddHistoryEntry(uuid frameid.ID, snap string, message string) error {
 	frame, err := s.Get(uuid)
 	if err != nil {
 		return err

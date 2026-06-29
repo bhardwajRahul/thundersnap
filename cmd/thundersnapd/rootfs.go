@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/tailscale/thundersnap/frames"
 	"github.com/tailscale/thundersnap/tsm"
 )
 
@@ -57,8 +58,8 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		return fmt.Errorf("checking rootfs: %w", err)
 	}
 
-	// Check if a frame.jsonc exists specifying the frame composition
-	frameMeta, err := readFrameMeta(rootFS)
+	// Check if a frame sidecar exists specifying the frame composition
+	frameMeta, err := readFrameSidecar(rootFS)
 	if err != nil {
 		return fmt.Errorf("reading frame meta: %w", err)
 	}
@@ -128,7 +129,7 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 	return nil
 }
 
-// ensureFrameFS creates a three-component frame from the given FrameMeta.
+// ensureFrameFS creates a three-component frame from the given frame metadata.
 // It creates:
 // - rootFS: the rootfs subvolume (the frame directory itself)
 // - rootFS/home: nested home subvolume
@@ -136,7 +137,7 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 //
 // If meta.Rootfs is empty (nil:nil:nil frame spec), creates an empty rootfs
 // with minimal directory structure needed for the container to function.
-func ensureFrameFS(rootFS string, meta *FrameMeta) error {
+func ensureFrameFS(rootFS string, meta *frames.Frame) error {
 	// Ensure the parent directory exists
 	parentDir := filepath.Dir(rootFS)
 	if err := os.MkdirAll(parentDir, 0755); err != nil {
@@ -241,7 +242,7 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 	meta.Taints = UnionTaints(rootfsTaints, homeTaints, workTaints)
 
 	// Step 5: Write frame.jsonc with updated taints
-	if err := writeFrameMeta(rootFS, meta); err != nil {
+	if err := writeFrameSidecar(rootFS, meta); err != nil {
 		log.Printf("Warning: failed to write frame.jsonc for %s: %v", rootFS, err)
 	}
 

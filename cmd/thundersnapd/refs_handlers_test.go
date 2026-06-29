@@ -14,10 +14,25 @@ import (
 	"github.com/tailscale/thundersnap/refs"
 )
 
+// newTestControlServer wires up a controlServer whose rootFS encodes the given
+// tailscale user under flagFsDir, so the per-user store handlers (which derive
+// the user via tailscaleUserFromRootFS) resolve to <dataDir>/refs/<user>. It
+// returns the server plus a ref store scoped to that user for verification.
+func newTestControlServer(t *testing.T, user string) (*controlServer, *refs.Store) {
+	t.Helper()
+	dataDir := t.TempDir()
+	fsDir := filepath.Join(dataDir, "fs")
+	initRefStore(dataDir)
+	initFrameStore(dataDir)
+	old := flagFsDir
+	flagFsDir = &fsDir
+	t.Cleanup(func() { flagFsDir = old })
+	cs := &controlServer{rootFS: filepath.Join(fsDir, user, frameid.MustNew().String())}
+	return cs, userRefStore(user)
+}
+
 func TestRefHandlers(t *testing.T) {
-	// Create temp directory for ref store
-	dir := t.TempDir()
-	initRefStore(dir)
+	cs, refStore := newTestControlServer(t, "testuser")
 
 	// Create a UUID for testing
 	uuid := frameid.MustNew()
@@ -29,7 +44,7 @@ func TestRefHandlers(t *testing.T) {
 
 		r := httptest.NewRequest(http.MethodPost, "/ref/create", bytes.NewReader(body))
 		w := httptest.NewRecorder()
-		handleRefCreate(w, r)
+		cs.handleRefCreate(w, r)
 
 		if w.Code != http.StatusOK {
 			t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusOK, w.Body.String())
@@ -49,7 +64,7 @@ func TestRefHandlers(t *testing.T) {
 
 		r := httptest.NewRequest(http.MethodPost, "/ref/create", bytes.NewReader(body))
 		w := httptest.NewRecorder()
-		handleRefCreate(w, r)
+		cs.handleRefCreate(w, r)
 
 		if w.Code != http.StatusConflict {
 			t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
@@ -60,7 +75,7 @@ func TestRefHandlers(t *testing.T) {
 	t.Run("list", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/refs", nil)
 		w := httptest.NewRecorder()
-		handleListRefs(w, r)
+		cs.handleListRefs(w, r)
 
 		if w.Code != http.StatusOK {
 			t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
@@ -80,7 +95,7 @@ func TestRefHandlers(t *testing.T) {
 	t.Run("reflog", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/reflog?name=test-ref", nil)
 		w := httptest.NewRecorder()
-		handleReflog(w, r)
+		cs.handleReflog(w, r)
 
 		if w.Code != http.StatusOK {
 			t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
@@ -101,7 +116,7 @@ func TestRefHandlers(t *testing.T) {
 
 		r := httptest.NewRequest(http.MethodPost, "/ref/move", bytes.NewReader(body))
 		w := httptest.NewRecorder()
-		handleRefMove(w, r)
+		cs.handleRefMove(w, r)
 
 		if w.Code != http.StatusOK {
 			t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusOK, w.Body.String())
@@ -110,7 +125,7 @@ func TestRefHandlers(t *testing.T) {
 		// Verify reflog has 2 entries now
 		r = httptest.NewRequest(http.MethodGet, "/reflog?name=test-ref", nil)
 		w = httptest.NewRecorder()
-		handleReflog(w, r)
+		cs.handleReflog(w, r)
 
 		var resp ReflogResponse
 		json.Unmarshal(w.Body.Bytes(), &resp)
@@ -126,7 +141,7 @@ func TestRefHandlers(t *testing.T) {
 
 		r := httptest.NewRequest(http.MethodPost, "/autorun", bytes.NewReader(body))
 		w := httptest.NewRecorder()
-		handleAutorun(w, r)
+		cs.handleAutorun(w, r)
 
 		if w.Code != http.StatusOK {
 			t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
@@ -146,7 +161,7 @@ func TestRefHandlers(t *testing.T) {
 
 		r := httptest.NewRequest(http.MethodPost, "/autorun", bytes.NewReader(body))
 		w := httptest.NewRecorder()
-		handleAutorun(w, r)
+		cs.handleAutorun(w, r)
 
 		if w.Code != http.StatusOK {
 			t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
@@ -166,7 +181,7 @@ func TestRefHandlers(t *testing.T) {
 
 		r := httptest.NewRequest(http.MethodPost, "/ref/delete", bytes.NewReader(body))
 		w := httptest.NewRecorder()
-		handleRefDelete(w, r)
+		cs.handleRefDelete(w, r)
 
 		if w.Code != http.StatusOK {
 			t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusOK, w.Body.String())
@@ -185,7 +200,7 @@ func TestRefHandlers(t *testing.T) {
 
 		r := httptest.NewRequest(http.MethodPost, "/ref/move", bytes.NewReader(body))
 		w := httptest.NewRecorder()
-		handleRefMove(w, r)
+		cs.handleRefMove(w, r)
 
 		if w.Code != http.StatusNotFound {
 			t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
@@ -200,15 +215,17 @@ func TestRefHandlers(t *testing.T) {
 // enough to prove the handler now resolves the frame UUID and wires the frame
 // path through to refid.Remove on force.
 func TestRefDeleteForceScrubsFrameIdentity(t *testing.T) {
-	stateDir := t.TempDir()
-	initRefStore(stateDir)
-
-	fsDir := t.TempDir()
+	const user = "testuser"
+	dataDir := t.TempDir()
+	fsDir := filepath.Join(dataDir, "fs")
+	initRefStore(dataDir)
 	old := flagFsDir
 	flagFsDir = &fsDir
 	defer func() { flagFsDir = old }()
 
 	uuid := frameid.MustNew()
+	cs := &controlServer{rootFS: filepath.Join(fsDir, user, uuid.String())}
+	refStore := userRefStore(user)
 	if err := refStore.Create("secret-ref", uuid); err != nil {
 		t.Fatalf("create ref: %v", err)
 	}
@@ -218,13 +235,13 @@ func TestRefDeleteForceScrubsFrameIdentity(t *testing.T) {
 	if err := refStore.EnsureIDDir("secret-ref"); err != nil {
 		t.Fatalf("ensure state-dir id dir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(stateDir, "id", "secret-ref", "state"), []byte("x"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dataDir, "id", user, "secret-ref", "state"), []byte("x"), 0600); err != nil {
 		t.Fatalf("write state-dir id state: %v", err)
 	}
 
 	// Populate the per-frame identity dir with key material; this is what a
 	// force delete must scrub via refid.Remove.
-	framePath := filepath.Join(fsDir, uuid.String())
+	framePath := filepath.Join(fsDir, user, uuid.String())
 	idPath := refid.Path(framePath, "secret-ref")
 	if err := os.MkdirAll(idPath, 0700); err != nil {
 		t.Fatalf("mkdir id path: %v", err)
@@ -238,7 +255,7 @@ func TestRefDeleteForceScrubsFrameIdentity(t *testing.T) {
 	body, _ := json.Marshal(RefRequest{Name: "secret-ref"})
 	r := httptest.NewRequest(http.MethodPost, "/ref/delete", bytes.NewReader(body))
 	w := httptest.NewRecorder()
-	handleRefDelete(w, r)
+	cs.handleRefDelete(w, r)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("non-force delete status = %d, want %d; body=%s", w.Code, http.StatusConflict, w.Body.String())
 	}
@@ -250,7 +267,7 @@ func TestRefDeleteForceScrubsFrameIdentity(t *testing.T) {
 	body, _ = json.Marshal(RefRequest{Name: "secret-ref", Force: true})
 	r = httptest.NewRequest(http.MethodPost, "/ref/delete", bytes.NewReader(body))
 	w = httptest.NewRecorder()
-	handleRefDelete(w, r)
+	cs.handleRefDelete(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("force delete status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
 	}
@@ -263,8 +280,7 @@ func TestRefDeleteForceScrubsFrameIdentity(t *testing.T) {
 }
 
 func TestRefHandlersValidation(t *testing.T) {
-	dir := t.TempDir()
-	initRefStore(dir)
+	cs, _ := newTestControlServer(t, "testuser")
 
 	// Test invalid ref name
 	t.Run("invalid_name", func(t *testing.T) {
@@ -273,7 +289,7 @@ func TestRefHandlersValidation(t *testing.T) {
 
 		r := httptest.NewRequest(http.MethodPost, "/ref/create", bytes.NewReader(body))
 		w := httptest.NewRecorder()
-		handleRefCreate(w, r)
+		cs.handleRefCreate(w, r)
 
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
@@ -287,7 +303,7 @@ func TestRefHandlersValidation(t *testing.T) {
 
 		r := httptest.NewRequest(http.MethodPost, "/ref/create", bytes.NewReader(body))
 		w := httptest.NewRecorder()
-		handleRefCreate(w, r)
+		cs.handleRefCreate(w, r)
 
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
@@ -301,7 +317,7 @@ func TestRefHandlersValidation(t *testing.T) {
 
 		r := httptest.NewRequest(http.MethodPost, "/ref/create", bytes.NewReader(body))
 		w := httptest.NewRecorder()
-		handleRefCreate(w, r)
+		cs.handleRefCreate(w, r)
 
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
@@ -312,10 +328,103 @@ func TestRefHandlersValidation(t *testing.T) {
 	t.Run("wrong_method", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/ref/create", nil)
 		w := httptest.NewRecorder()
-		handleRefCreate(w, r)
+		cs.handleRefCreate(w, r)
 
 		if w.Code != http.StatusMethodNotAllowed {
 			t.Errorf("status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
+		}
+	})
+}
+
+// TestResolveFrameForUser drives the real production resolver
+// (resolveFrameForUser) against a real per-user ref store. It pins the four
+// resolution branches the canonical fs/<user>/<uuid> layout depends on:
+//   - a named ref resolves to its bound UUID and the fs/<user>/<uuid> path,
+//   - an empty name (or the bare-login username) resolves the reserved
+//     "default" ref when bound,
+//   - the default with no ref bound returns a fresh, UNATTACHED frame,
+//   - any other unknown name is an error (no implicit create),
+//   - and refs are isolated per user.
+func TestResolveFrameForUser(t *testing.T) {
+	const user = "alice"
+	dataDir := t.TempDir()
+	fsDir := filepath.Join(dataDir, "fs")
+	initRefStore(dataDir)
+	old := flagFsDir
+	flagFsDir = &fsDir
+	t.Cleanup(func() { flagFsDir = old })
+
+	store := userRefStore(user)
+	debUUID := frameid.MustNew()
+	if err := store.Create("deb", debUUID); err != nil {
+		t.Fatalf("create deb ref: %v", err)
+	}
+	defUUID := frameid.MustNew()
+	if err := store.Create(defaultRefName, defUUID); err != nil {
+		t.Fatalf("create default ref: %v", err)
+	}
+
+	// A named ref resolves to its UUID and the fs/<user>/<uuid> path.
+	t.Run("named", func(t *testing.T) {
+		uuid, path, attached, err := resolveFrameForUser(user, "deb")
+		if err != nil {
+			t.Fatalf("resolve deb: %v", err)
+		}
+		if uuid != debUUID {
+			t.Errorf("uuid = %s, want %s", uuid, debUUID)
+		}
+		if want := filepath.Join(fsDir, user, debUUID.String()); path != want {
+			t.Errorf("path = %q, want %q", path, want)
+		}
+		if !attached {
+			t.Error("attached = false, want true for a bound ref")
+		}
+	})
+
+	// Empty name and the bare-login username both resolve the default ref.
+	for _, name := range []string{"", user} {
+		t.Run("default_"+name, func(t *testing.T) {
+			uuid, path, attached, err := resolveFrameForUser(user, name)
+			if err != nil {
+				t.Fatalf("resolve %q: %v", name, err)
+			}
+			if uuid != defUUID {
+				t.Errorf("uuid = %s, want default %s", uuid, defUUID)
+			}
+			if want := filepath.Join(fsDir, user, defUUID.String()); path != want {
+				t.Errorf("path = %q, want %q", path, want)
+			}
+			if !attached {
+				t.Error("attached = false, want true for a bound default ref")
+			}
+		})
+	}
+
+	// An unknown name is a hard error: no implicit frame creation.
+	t.Run("unknown", func(t *testing.T) {
+		if _, _, _, err := resolveFrameForUser(user, "nope"); err == nil {
+			t.Error("resolve unknown name should error")
+		}
+	})
+
+	// Refs are per-user: bob has no "deb", so it must error, and bob's
+	// unbound default yields a fresh, unattached frame.
+	t.Run("per_user_isolation", func(t *testing.T) {
+		if _, _, _, err := resolveFrameForUser("bob", "deb"); err == nil {
+			t.Error("bob resolving alice's ref should error")
+		}
+		uuid, path, attached, err := resolveFrameForUser("bob", "")
+		if err != nil {
+			t.Fatalf("resolve bob default: %v", err)
+		}
+		if attached {
+			t.Error("bob's unbound default should be unattached")
+		}
+		if uuid == frameid.Nil {
+			t.Error("unattached default should still mint a fresh uuid")
+		}
+		if want := filepath.Join(fsDir, "bob", uuid.String()); path != want {
+			t.Errorf("path = %q, want %q", path, want)
 		}
 	})
 }

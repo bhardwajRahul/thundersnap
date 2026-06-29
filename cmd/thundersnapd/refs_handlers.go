@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"path/filepath"
@@ -12,22 +13,90 @@ import (
 	"github.com/tailscale/thundersnap/refs"
 )
 
-// framePathForUUID returns the on-disk frame path for a frame UUID. Frames live
-// at <fs-dir>/<uuid>/. It returns "" when the fs dir is not configured (e.g. in
-// unit tests that exercise the ref store without a running daemon).
-func framePathForUUID(uuid frameid.ID) string {
+// framePathForUserUUID returns the on-disk frame path for a user's frame UUID.
+// Frames live at <fs-dir>/<user>/<uuid>/. It returns "" when the fs dir is not
+// configured (e.g. in unit tests that exercise the ref store without a running
+// daemon).
+func framePathForUserUUID(user string, uuid frameid.ID) string {
 	if flagFsDir == nil || *flagFsDir == "" {
 		return ""
 	}
-	return filepath.Join(*flagFsDir, uuid.String())
+	return filepath.Join(*flagFsDir, user, uuid.String())
 }
 
-// refStore is the global ref store, initialized in main().
-var refStore *refs.Store
+// refsStateDir is the data directory used to construct per-user ref stores.
+// It is set in initRefStore from --data-dir, NOT the fs dir: a per-user
+// refs.Store appends "refs/<user>", so its root must be the data dir.
+var refsStateDir string
 
-// initRefStore initializes the ref store with the state directory.
-func initRefStore(stateDir string) {
-	refStore = refs.NewStore(stateDir)
+// initRefStore records the data directory used for per-user ref stores.
+func initRefStore(dataDir string) {
+	refsStateDir = dataDir
+}
+
+// userRefStore returns a ref store scoped to the given tailscale user.
+func userRefStore(user string) *refs.Store {
+	return refs.NewUserStore(refsStateDir, user)
+}
+
+// userRefStore returns a ref store scoped to the tailscale user that owns this
+// control server's frame. The user is derived from the frame's rootFS path
+// (<fs-dir>/<user>/<uuid>).
+func (c *controlServer) userRefStore() (*refs.Store, string, error) {
+	user, err := tailscaleUserFromRootFS(c.rootFS)
+	if err != nil {
+		return nil, "", err
+	}
+	return userRefStore(user), user, nil
+}
+
+// defaultRefName is the reserved ref name used for a user's "default" frame:
+// the one reached by a bare login (`ssh host`, which tsnet turns into
+// `<tailscale-user>@host`) or an explicitly empty frame name (`root@@host`).
+const defaultRefName = "default"
+
+// resolveFrameForUser maps an SSH frame name to a concrete frame for the given
+// tailscale user, using that user's ref store. The returned uuid identifies the
+// frame; framePath is its on-disk location (<fs-dir>/<user>/<uuid>).
+//
+// Resolution rules:
+//   - An empty name, or a name equal to the tailscale username (a bare login,
+//     where tsnet inserts the username as the SSH user), resolves the reserved
+//     "default" ref.
+//   - Any other name is looked up verbatim as a ref.
+//   - If the "default" ref does not exist, the caller is told to use a fresh
+//     unattached frame (attached==false, a freshly minted uuid, no ref bound).
+//   - Any OTHER unknown name is an error ("no such frame ...") — no implicit
+//     create.
+//
+// attached reports whether the returned uuid is bound to an existing ref. When
+// false (only possible for the default case), the caller should create/connect
+// to an empty frame without binding a ref.
+func resolveFrameForUser(tailscaleUser, name string) (uuid frameid.ID, framePath string, attached bool, err error) {
+	store := userRefStore(tailscaleUser)
+
+	isDefault := name == "" || name == tailscaleUser
+	lookup := name
+	if isDefault {
+		lookup = defaultRefName
+	}
+
+	ref, gerr := store.Get(lookup)
+	if gerr == nil {
+		return ref.UUID, framePathForUserUUID(tailscaleUser, ref.UUID), true, nil
+	}
+	if gerr != refs.ErrRefNotFound {
+		return frameid.Nil, "", false, gerr
+	}
+
+	if isDefault {
+		// No bound default yet: hand back a fresh, unattached frame. The user
+		// can later run `ts frame --ref=default ...` to bind it.
+		fresh := frameid.MustNew()
+		return fresh, framePathForUserUUID(tailscaleUser, fresh), false, nil
+	}
+
+	return frameid.Nil, "", false, fmt.Errorf("no such frame %q", name)
 }
 
 // RefRequest is the request body for ref operations.
@@ -44,8 +113,14 @@ type RefResponse struct {
 }
 
 // handleRefCreate handles POST /ref/create
-func handleRefCreate(w http.ResponseWriter, r *http.Request) {
+func (c *controlServer) handleRefCreate(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+
+	refStore, user, err := c.userRefStore()
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -85,19 +160,25 @@ func handleRefCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Initialize the ref's identity subvolume inside the target frame's /id.
-	if framePath := framePathForUUID(uuid); framePath != "" {
+	if framePath := framePathForUserUUID(user, uuid); framePath != "" {
 		if err := refid.Ensure(framePath, req.Name); err != nil {
 			log.Printf("Warning: ensure id subvolume for ref %s in frame %s: %v", req.Name, uuid, err)
 		}
 	}
 
-	log.Printf("Created ref %s -> %s", req.Name, req.UUID)
+	log.Printf("Created ref %s -> %s for user %s", req.Name, req.UUID, user)
 	jsonResponse(w, RefResponse{Status: "ok"})
 }
 
 // handleRefMove handles POST /ref/move
-func handleRefMove(w http.ResponseWriter, r *http.Request) {
+func (c *controlServer) handleRefMove(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+
+	refStore, user, err := c.userRefStore()
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -147,7 +228,7 @@ func handleRefMove(w http.ResponseWriter, r *http.Request) {
 
 	// Move the ref's identity subvolume from the old frame's /id to the new
 	// frame's /id so its private state follows the ref.
-	srcFrame, dstFrame := framePathForUUID(oldUUID), framePathForUUID(uuid)
+	srcFrame, dstFrame := framePathForUserUUID(user, oldUUID), framePathForUserUUID(user, uuid)
 	if oldUUID != uuid && srcFrame != "" && dstFrame != "" {
 		if err := refid.Move(srcFrame, dstFrame, req.Name); err != nil {
 			log.Printf("Warning: move id subvolume for ref %s (%s -> %s): %v", req.Name, oldUUID, uuid, err)
@@ -159,8 +240,14 @@ func handleRefMove(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRefDelete handles POST /ref/delete
-func handleRefDelete(w http.ResponseWriter, r *http.Request) {
+func (c *controlServer) handleRefDelete(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+
+	refStore, user, err := c.userRefStore()
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -212,7 +299,7 @@ func handleRefDelete(w http.ResponseWriter, r *http.Request) {
 	if req.Force {
 		refStore.RemoveIDDir(req.Name)
 		if getErr == nil {
-			if framePath := framePathForUUID(ref.UUID); framePath != "" {
+			if framePath := framePathForUserUUID(user, ref.UUID); framePath != "" {
 				if err := refid.Remove(framePath, req.Name); err != nil {
 					log.Printf("Warning: remove id subvolume for ref %s in frame %s: %v", req.Name, ref.UUID, err)
 				}
@@ -238,8 +325,14 @@ type RefListResponse struct {
 }
 
 // handleListRefs handles GET /refs
-func handleListRefs(w http.ResponseWriter, r *http.Request) {
+func (c *controlServer) handleListRefs(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+
+	refStore, _, err := c.userRefStore()
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -281,8 +374,14 @@ type ReflogResponse struct {
 }
 
 // handleReflog handles GET /reflog?name=<name>
-func handleReflog(w http.ResponseWriter, r *http.Request) {
+func (c *controlServer) handleReflog(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+
+	refStore, _, err := c.userRefStore()
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -330,8 +429,14 @@ type AutorunResponse struct {
 }
 
 // handleAutorun handles POST /autorun
-func handleAutorun(w http.ResponseWriter, r *http.Request) {
+func (c *controlServer) handleAutorun(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+
+	refStore, _, err := c.userRefStore()
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 

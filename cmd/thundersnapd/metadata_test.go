@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/tailscale/thundersnap/frames"
 )
 
 func TestUnionTaints(t *testing.T) {
@@ -237,7 +239,7 @@ func TestFrameMetaReadWrite(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	meta := &FrameMeta{
+	meta := &frames.Frame{
 		Rootfs:    "abc123",
 		Home:      "def456",
 		Work:      "789xyz",
@@ -246,8 +248,8 @@ func TestFrameMetaReadWrite(t *testing.T) {
 	}
 
 	// Write
-	if err := writeFrameMeta(framePath, meta); err != nil {
-		t.Fatalf("writeFrameMeta: %v", err)
+	if err := writeFrameSidecar(framePath, meta); err != nil {
+		t.Fatalf("writeFrameSidecar: %v", err)
 	}
 
 	// Verify file exists
@@ -257,9 +259,9 @@ func TestFrameMetaReadWrite(t *testing.T) {
 	}
 
 	// Read back
-	got, err := readFrameMeta(framePath)
+	got, err := readFrameSidecar(framePath)
 	if err != nil {
-		t.Fatalf("readFrameMeta: %v", err)
+		t.Fatalf("readFrameSidecar: %v", err)
 	}
 
 	if got.Rootfs != meta.Rootfs {
@@ -283,9 +285,9 @@ func TestFrameMetaReadNonExistent(t *testing.T) {
 	tmpDir := t.TempDir()
 	framePath := filepath.Join(tmpDir, "nonexistent")
 
-	got, err := readFrameMeta(framePath)
+	got, err := readFrameSidecar(framePath)
 	if err != nil {
-		t.Fatalf("readFrameMeta: %v", err)
+		t.Fatalf("readFrameSidecar: %v", err)
 	}
 	if got != nil {
 		t.Errorf("expected nil for nonexistent file, got %+v", got)

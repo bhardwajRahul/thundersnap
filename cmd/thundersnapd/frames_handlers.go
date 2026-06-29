@@ -9,12 +9,19 @@ import (
 	"github.com/tailscale/thundersnap/frames"
 )
 
-// frameStore is the global frame store, initialized in main().
-var frameStore *frames.Store
+// framesStateDir is the data directory used to construct per-user frame stores.
+// It is set in initFrameStore from --data-dir, NOT the fs dir: a per-user
+// frames.Store appends "fs/<user>", so its root must be the data dir.
+var framesStateDir string
 
-// initFrameStore initializes the frame store with the state directory.
-func initFrameStore(stateDir string) {
-	frameStore = frames.NewStore(stateDir)
+// initFrameStore records the data directory used for per-user frame stores.
+func initFrameStore(dataDir string) {
+	framesStateDir = dataDir
+}
+
+// userFrameStore returns a frame store scoped to the given tailscale user.
+func userFrameStore(user string) *frames.Store {
+	return frames.NewUserStore(framesStateDir, user)
 }
 
 // LogEntry is a single entry in the frame history response.
@@ -34,10 +41,17 @@ type LogResponse struct {
 
 // handleLog handles GET /log?uuid=<uuid>
 // If uuid is not provided, it returns the log for the current frame.
-func handleLog(w http.ResponseWriter, r *http.Request) {
+func (c *controlServer) handleLog(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
+
+	user, err := tailscaleUserFromRootFS(c.rootFS)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	frameStore := userFrameStore(user)
 
 	uuidStr := r.URL.Query().Get("uuid")
 	if uuidStr == "" {
@@ -67,7 +81,7 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 	var entries []LogEntry
 	for _, entry := range frame.History {
 		entries = append(entries, LogEntry{
-			Snap:    entry.Snap.String(),
+			Snap:    entry.Snap,
 			Time:    entry.Time.Format("2006-01-02T15:04:05Z07:00"),
 			Message: entry.Message,
 		})

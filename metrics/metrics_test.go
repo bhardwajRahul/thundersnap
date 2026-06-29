@@ -8,7 +8,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/tailscale/thundersnap/frameid"
-	"github.com/tailscale/thundersnap/refs"
 )
 
 func TestCountSnaps(t *testing.T) {
@@ -66,11 +65,16 @@ func TestCountFrames(t *testing.T) {
 		t.Errorf("CountFrames(empty) = %d, want 0", n)
 	}
 
-	// user/frame1/ with frame1.jsonc -> counts.
+	// fs/<user>/<uuid>.jsonc -> counts (the sidecar's stem must be a UUID).
+	uuid := frameid.MustNew().String()
 	user := filepath.Join(fsDir, "user")
-	if err := os.MkdirAll(filepath.Join(user, "frame1"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(user, uuid), 0755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(user, uuid+".jsonc"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// A legacy-layout sidecar whose stem is NOT a UUID -> ignored.
 	if err := os.WriteFile(filepath.Join(user, "frame1.jsonc"), []byte("{}"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -78,46 +82,29 @@ func TestCountFrames(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(user, "bare"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	// A .jsonc whose <name>/ is a file, not a dir -> not counted (the entry
-	// must be a directory).
-	if err := os.WriteFile(filepath.Join(user, "asfile"), []byte("x"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(user, "asfile.jsonc"), []byte("{}"), 0644); err != nil {
-		t.Fatal(err)
-	}
 	if n := CountFrames(fsDir); n != 1 {
 		t.Errorf("CountFrames = %d, want 1", n)
+	}
+
+	// A second user with its own UUID sidecar -> counted across users.
+	user2 := filepath.Join(fsDir, "user2")
+	uuid2 := frameid.MustNew().String()
+	if err := os.MkdirAll(user2, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(user2, uuid2+".jsonc"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if n := CountFrames(fsDir); n != 2 {
+		t.Errorf("CountFrames across users = %d, want 2", n)
 	}
 
 	// A non-directory at the user level is skipped.
 	if err := os.WriteFile(filepath.Join(fsDir, "loose.txt"), []byte("x"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if n := CountFrames(fsDir); n != 1 {
-		t.Errorf("CountFrames after loose file = %d, want 1", n)
-	}
-}
-
-func TestCountRefs(t *testing.T) {
-	// Nil store counts as zero.
-	if n := CountRefs(nil); n != 0 {
-		t.Errorf("CountRefs(nil) = %d, want 0", n)
-	}
-
-	store := refs.NewStore(t.TempDir())
-	// Empty store counts as zero.
-	if n := CountRefs(store); n != 0 {
-		t.Errorf("CountRefs(empty) = %d, want 0", n)
-	}
-
-	for _, name := range []string{"alpha", "beta", "gamma"} {
-		if err := store.Create(name, frameid.MustNew()); err != nil {
-			t.Fatalf("Create %s: %v", name, err)
-		}
-	}
-	if n := CountRefs(store); n != 3 {
-		t.Errorf("CountRefs = %d, want 3", n)
+	if n := CountFrames(fsDir); n != 2 {
+		t.Errorf("CountFrames after loose file = %d, want 2", n)
 	}
 }
 
@@ -128,25 +115,21 @@ func TestCollectNilClosures(t *testing.T) {
 	fsDir := t.TempDir()
 	snapsDir := t.TempDir()
 	user := filepath.Join(fsDir, "user")
-	if err := os.MkdirAll(filepath.Join(user, "f1"), 0755); err != nil {
+	uuid := frameid.MustNew().String()
+	if err := os.MkdirAll(filepath.Join(user, uuid), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(user, "f1.jsonc"), []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(user, uuid+".jsonc"), []byte("{}"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(snapsDir, "a.tsm"), []byte("x"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	store := refs.NewStore(t.TempDir())
-	if err := store.Create("r1", frameid.MustNew()); err != nil {
-		t.Fatal(err)
-	}
-
 	c := newCollector(Sources{
 		FsDir:    fsDir,
 		SnapsDir: snapsDir,
-		Refs:     store,
+		Refs:     func() int { return 1 },
 		// RunningSessions and RunningVMs deliberately nil.
 	})
 

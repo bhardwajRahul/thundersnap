@@ -4,6 +4,8 @@
 package e2e
 
 import (
+	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -140,8 +142,8 @@ func TestFramesPackage(t *testing.T) {
 	store := frames.NewStore(dir)
 
 	uuid := frameid.MustNew()
-	rootfs := snaphash.Sum([]byte("test-rootfs"))
-	home := snaphash.Sum([]byte("test-home"))
+	rootfs := snaphash.Encode(snaphash.Sum([]byte("test-rootfs")))
+	home := snaphash.Encode(snaphash.Sum([]byte("test-home")))
 
 	// Test create
 	t.Run("create", func(t *testing.T) {
@@ -180,8 +182,8 @@ func TestFramesPackage(t *testing.T) {
 
 	// Test history
 	t.Run("history", func(t *testing.T) {
-		snap1 := snaphash.Sum([]byte("snap1"))
-		snap2 := snaphash.Sum([]byte("snap2"))
+		snap1 := snaphash.Encode(snaphash.Sum([]byte("snap1")))
+		snap2 := snaphash.Encode(snaphash.Sum([]byte("snap2")))
 
 		if err := store.AddHistoryEntry(uuid, snap1, "first snapshot"); err != nil {
 			t.Fatalf("AddHistoryEntry 1: %v", err)
@@ -239,6 +241,100 @@ func TestFramesPackage(t *testing.T) {
 			t.Error("frame still exists after delete")
 		}
 	})
+}
+
+// TestFrameRefResolution pins the canonical fs/<user>/<uuid> layout end-to-end
+// on real btrfs, using the SAME per-user frames.Store and refs.Store the daemon
+// uses. It mirrors what handleCreateWithUUID + resolveFrameForUser do: a UUID
+// frame is created at fs/<user>/<uuid>, a ref "deb" is bound to it, resolving
+// "deb" through the user's ref store reaches that exact path, an unknown name
+// resolves to nothing, and a second user's identically-named ref is isolated.
+func TestFrameRefResolution(t *testing.T) {
+	env := newTestEnv(t)
+	// The per-user stores derive fs/<user> and refs/<user> from their root, so
+	// root them at env.root: frames land at env.root/fs/<user>/<uuid>, matching
+	// where the daemon and env.fsDir put them.
+	dataDir := env.root
+
+	const user = "alice"
+	frameStore := frames.NewUserStore(dataDir, user)
+	refStore := refs.NewUserStore(dataDir, user)
+
+	// Create a UUID frame as the daemon does: btrfs subvolume at
+	// fs/<user>/<uuid> first, then the per-user .jsonc sidecar.
+	uuid := frameid.MustNew()
+	framePath := filepath.Join(env.root, "fs", user, uuid.String())
+	if err := os.MkdirAll(filepath.Dir(framePath), 0755); err != nil {
+		t.Fatalf("mkdir user fs dir: %v", err)
+	}
+	if out, err := exec.Command("btrfs", "subvolume", "create", framePath).CombinedOutput(); err != nil {
+		t.Fatalf("btrfs subvolume create %s: %v\n%s", framePath, err, out)
+	}
+	defer exec.Command("btrfs", "subvolume", "delete", framePath).Run()
+	if err := frameStore.Create(uuid, &frames.Frame{Isolation: "container"}); err != nil {
+		t.Fatalf("frameStore.Create: %v", err)
+	}
+
+	// Sidecar lands at fs/<user>/<uuid>.jsonc.
+	sidecar := framePath + ".jsonc"
+	if _, err := os.Stat(sidecar); err != nil {
+		t.Fatalf("frame sidecar not at %s: %v", sidecar, err)
+	}
+
+	// Bind ref "deb" -> uuid, then resolve "deb" back to the same frame path.
+	if err := refStore.Create("deb", uuid); err != nil {
+		t.Fatalf("create ref deb: %v", err)
+	}
+	ref, err := refStore.Get("deb")
+	if err != nil {
+		t.Fatalf("get ref deb: %v", err)
+	}
+	if ref.UUID != uuid {
+		t.Errorf("ref deb uuid = %s, want %s", ref.UUID, uuid)
+	}
+	resolved := filepath.Join(env.root, "fs", user, ref.UUID.String())
+	if resolved != framePath {
+		t.Errorf("resolved path = %q, want %q", resolved, framePath)
+	}
+
+	// An unknown name is not a ref.
+	if _, err := refStore.Get("nope"); err != refs.ErrRefNotFound {
+		t.Errorf("get unknown ref = %v, want ErrRefNotFound", err)
+	}
+
+	// Per-user isolation: bob's "deb" is independent and lands under fs/bob.
+	bobRefs := refs.NewUserStore(dataDir, "bob")
+	if _, err := bobRefs.Get("deb"); err != refs.ErrRefNotFound {
+		t.Errorf("bob get deb = %v, want ErrRefNotFound", err)
+	}
+	bobUUID := frameid.MustNew()
+	bobFrame := filepath.Join(env.root, "fs", "bob", bobUUID.String())
+	if err := os.MkdirAll(filepath.Dir(bobFrame), 0755); err != nil {
+		t.Fatalf("mkdir bob fs dir: %v", err)
+	}
+	if out, err := exec.Command("btrfs", "subvolume", "create", bobFrame).CombinedOutput(); err != nil {
+		t.Fatalf("btrfs subvolume create %s: %v\n%s", bobFrame, err, out)
+	}
+	defer exec.Command("btrfs", "subvolume", "delete", bobFrame).Run()
+	if err := bobRefs.Create("deb", bobUUID); err != nil {
+		t.Fatalf("bob create ref deb: %v", err)
+	}
+	bobRef, err := bobRefs.Get("deb")
+	if err != nil {
+		t.Fatalf("bob get deb: %v", err)
+	}
+	if bobRef.UUID == uuid {
+		t.Error("bob's deb resolves to alice's frame; users not isolated")
+	}
+
+	// alice still lists exactly one frame (bob's is invisible to her store).
+	uuids, err := frameStore.List()
+	if err != nil {
+		t.Fatalf("frameStore.List: %v", err)
+	}
+	if len(uuids) != 1 || uuids[0] != uuid {
+		t.Errorf("alice frames = %v, want [%s]", uuids, uuid)
+	}
 }
 
 // TestSnaphashEncoding tests the snap hash encoding.

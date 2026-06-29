@@ -17,6 +17,7 @@ import (
 
 	"github.com/gliderlabs/ssh"
 	"github.com/pkg/sftp"
+	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/sftpfs"
 	"github.com/tailscale/thundersnap/thundersnap"
 	"github.com/tailscale/thundersnap/tsm"
@@ -82,33 +83,37 @@ func sessionEnv(sshUser, tailscaleUser, term string) []string {
 	return env
 }
 
-// frameRootFSPaths returns the on-disk paths for a user's frame: rootFS is the
-// frame itself (<fs-dir>/<user>/<frame>) and baseUserFS is the user's base
-// filesystem (<fs-dir>/<user>/<stripped-user>) used as the clone source when the
-// frame does not yet exist. Both username components are sanitized for path use.
-func frameRootFSPaths(tailscaleUser, frameName string) (rootFS, baseUserFS string) {
-	safeTailscaleUser := sanitizeForPath(tailscaleUser)
-	safeFrameName := sanitizeForPath(frameName)
-	homeUser := stripDomain(safeTailscaleUser)
-	rootFS = filepath.Join(*flagFsDir, safeTailscaleUser, safeFrameName)
-	baseUserFS = filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
-	return rootFS, baseUserFS
+// resolveFrameRootFS maps an SSH frame name to a concrete frame for the given
+// tailscale user via that user's ref store, returning the frame's on-disk root
+// (<fs-dir>/<user>/<uuid>) and its UUID. The frame name is resolved as a ref:
+// the reserved "default" for a bare/empty login, a named ref otherwise, or a
+// fresh unattached frame for an unbound default. An unknown name is an error.
+// See resolveFrameForUser for the full resolution rules.
+func resolveFrameRootFS(tailscaleUser, frameName string) (rootFS string, uuid frameid.ID, err error) {
+	uuid, framePath, _, err := resolveFrameForUser(tailscaleUser, frameName)
+	if err != nil {
+		return "", frameid.Nil, err
+	}
+	return framePath, uuid, nil
 }
 
 // runContainerSession handles a container-based SSH session.
 // targetUser specifies the Unix user to run as. If empty, auto-detect from
 // [ubuntu, user] based on which /home/<user> exists, or fall back to root.
-func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser string, logErr func(string, ...any)) error {
-	// Set up the root filesystem for this user.
-	// If this is not the "base" user (stripped username), try to clone from
-	// the base user's filesystem first, falling back to the clean snapshot.
-	rootFS, baseUserFS := frameRootFSPaths(tailscaleUser, sshUser)
-	if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
+func runContainerSession(s ssh.Session, tailscaleUser, frameName, targetUser string, logErr func(string, ...any)) error {
+	// Resolve the frame name to its canonical fs/<user>/<uuid> path via the
+	// user's ref store. A fresh unattached default frame is created on demand
+	// below by ensureRootFS (falling back to the base snapshot).
+	rootFS, uuid, err := resolveFrameRootFS(tailscaleUser, frameName)
+	if err != nil {
+		return err
+	}
+	if err := prepareContainerRootFS(rootFS, ""); err != nil {
 		return err
 	}
 
 	// Get or create shared control socket server for this container
-	_, err := controlServers.getOrCreateControlServer(rootFS)
+	_, err = controlServers.getOrCreateControlServer(rootFS)
 	if err != nil {
 		return fmt.Errorf("start control socket: %w", err)
 	}
@@ -165,7 +170,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	// Build cgroup name for this container (used for OOM group killing)
 	// Uses the cgroup manager's parent name, which includes the daemon PID to
 	// avoid conflicts with other instances.
-	cgroupName := fmt.Sprintf("%s/%s/%s", cgroupManager.ParentName(), sanitizeForPath(tailscaleUser), sanitizeForPath(sshUser))
+	cgroupName := fmt.Sprintf("%s/%s/%s", cgroupManager.ParentName(), sanitizeForPath(tailscaleUser), uuid.String())
 
 	// The nsenter command is built per-branch: the PTY branch needs the handshake
 	// fd and TERM, the non-PTY branch does not.
@@ -195,7 +200,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		// Same command as the non-PTY branch but with the PTY handshake fd so ts
 		// waits for the slave path; TERM is added to the environment.
 		cmd := buildSessionCommand(initPid, tsBinary, absRootFS, runAsUser, rawCmd, true)
-		cmd.Env = sessionEnv(sshUser, tailscaleUser, ptyReq.Term)
+		cmd.Env = sessionEnv(frameName, tailscaleUser, ptyReq.Term)
 
 		// Pass their end of the socket as extra fd (fd 3)
 		cmd.ExtraFiles = []*os.File{handshakeTheirs}
@@ -270,7 +275,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	} else {
 		// No PTY requested, run without one (no handshake fd, no TERM).
 		cmd := buildSessionCommand(initPid, tsBinary, absRootFS, runAsUser, rawCmd, false)
-		cmd.Env = sessionEnv(sshUser, tailscaleUser, "")
+		cmd.Env = sessionEnv(frameName, tailscaleUser, "")
 
 		// Set up pipes for stdin/stdout/stderr
 		stdin, err := cmd.StdinPipe()
@@ -499,16 +504,17 @@ func prepareVMXRootFS(vmxRootFS string) error {
 func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targetUser string, logErr func(string, ...any)) error {
 	safeTailscaleUser := sanitizeForPath(tailscaleUser)
 	safeIsolationName := sanitizeForPath(isolationName)
-	safeFrameName := sanitizeForPath(frameName)
 
 	// The user's fs directory (becomes virtiofs root)
 	userFsDir := filepath.Join(*flagFsDir, safeTailscaleUser)
 
-	// Prepare the frame's rootfs (same as container mode)
-	homeUser := stripDomain(safeTailscaleUser)
-	frameRootFS := filepath.Join(userFsDir, safeFrameName)
-	baseUserFS := filepath.Join(userFsDir, homeUser)
-	if err := prepareContainerRootFS(frameRootFS, baseUserFS); err != nil {
+	// Resolve the frame name to its canonical fs/<user>/<uuid> path via the
+	// user's ref store, then prepare the frame's rootfs (same as container mode).
+	frameRootFS, uuid, err := resolveFrameRootFS(tailscaleUser, frameName)
+	if err != nil {
+		return err
+	}
+	if err := prepareContainerRootFS(frameRootFS, ""); err != nil {
 		return fmt.Errorf("prepare frame rootfs: %w", err)
 	}
 
@@ -537,8 +543,9 @@ func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targe
 	defer conn.Close()
 
 	// Send VMX protocol: VMX\0framePath\0targetUser\0argCount\0args...
-	// framePath is relative to the virtiofs root (which is userFsDir)
-	writeVshdRequest(conn, safeFrameName, targetUser, s.Command())
+	// framePath is the frame's UUID, relative to the virtiofs root (userFsDir,
+	// i.e. fs/<user>): the frame lives at fs/<user>/<uuid> on the host.
+	writeVshdRequest(conn, uuid.String(), targetUser, s.Command())
 
 	// Proxy SSH I/O (same as runVMSession)
 	return proxyVMSession(s, conn, ms.done, ms.panicked)

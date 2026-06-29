@@ -15,7 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/tailscale/thundersnap/refs"
+	"github.com/tailscale/thundersnap/frameid"
 )
 
 // CountSnaps returns the number of snapshots in snapsDir, identified by their
@@ -36,8 +36,9 @@ func CountSnaps(snapsDir string) int {
 }
 
 // CountFrames returns the number of frames stored under fsDir. Frames live at
-// fsDir/<user>/<name>/ alongside a <name>.jsonc metadata file; the metadata
-// file is what distinguishes a frame directory from an ordinary subdirectory.
+// fsDir/<user>/<uuid>/ alongside a <uuid>.jsonc metadata sidecar; that sidecar,
+// whose stem is a valid frame UUID, is what identifies a frame. Non-UUID stems
+// (legacy-layout leftovers, the "id"/"refs" dirs, ".vmx-*" files) are ignored.
 // A missing or unreadable directory is reported as zero so a scrape never fails.
 func CountFrames(fsDir string) int {
 	userEntries, err := os.ReadDir(fsDir)
@@ -54,37 +55,31 @@ func CountFrames(fsDir string) int {
 			continue
 		}
 		for _, fe := range frameEntries {
-			if !fe.IsDir() {
+			if fe.IsDir() {
 				continue
 			}
-			if _, err := os.Stat(filepath.Join(fsDir, ue.Name(), fe.Name()) + ".jsonc"); err == nil {
-				n++
+			name := fe.Name()
+			stem, ok := strings.CutSuffix(name, ".jsonc")
+			if !ok {
+				continue
 			}
+			if _, err := frameid.Parse(stem); err != nil {
+				continue // skip non-UUID stems (legacy layout)
+			}
+			n++
 		}
 	}
 	return n
 }
 
-// CountRefs returns the number of refs in store. A nil store, or a List error
-// (e.g. an unreadable refs dir), counts as zero so a scrape never fails.
-func CountRefs(store *refs.Store) int {
-	if store == nil {
-		return 0
-	}
-	names, err := store.List()
-	if err != nil {
-		return 0
-	}
-	return len(names)
-}
-
 // Sources supplies the live data the collector reads on each scrape. FsDir and
-// SnapsDir are scanned on disk; RunningSessions and RunningVMs are closures
-// over the daemon's in-memory session/VM state (nil closures report zero).
+// SnapsDir are scanned on disk; Refs, RunningSessions and RunningVMs are
+// closures over the daemon's per-user ref stores and in-memory session/VM
+// state (nil closures report zero).
 type Sources struct {
 	FsDir           string
 	SnapsDir        string
-	Refs            *refs.Store
+	Refs            func() int
 	RunningSessions func() int
 	RunningVMs      func() int
 }
@@ -149,9 +144,13 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	if c.src.RunningVMs != nil {
 		vms = c.src.RunningVMs()
 	}
+	refs := 0
+	if c.src.Refs != nil {
+		refs = c.src.Refs()
+	}
 	ch <- prometheus.MustNewConstMetric(c.framesDesc, prometheus.GaugeValue, float64(CountFrames(c.src.FsDir)))
 	ch <- prometheus.MustNewConstMetric(c.snapsDesc, prometheus.GaugeValue, float64(CountSnaps(c.src.SnapsDir)))
-	ch <- prometheus.MustNewConstMetric(c.refsDesc, prometheus.GaugeValue, float64(CountRefs(c.src.Refs)))
+	ch <- prometheus.MustNewConstMetric(c.refsDesc, prometheus.GaugeValue, float64(refs))
 	ch <- prometheus.MustNewConstMetric(c.sessionsDesc, prometheus.GaugeValue, float64(sessions))
 	ch <- prometheus.MustNewConstMetric(c.vmsDesc, prometheus.GaugeValue, float64(vms))
 }

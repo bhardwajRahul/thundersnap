@@ -10,6 +10,7 @@ import (
 	"sort"
 
 	"github.com/tailscale/hujson"
+	"github.com/tailscale/thundersnap/frames"
 )
 
 // SnapMeta represents the metadata for a snap (snaps/$snapid.jsonc).
@@ -32,33 +33,6 @@ type SnapMeta struct {
 type SnapSource struct {
 	Type string `json:"type"` // "docker"
 	Ref  string `json:"ref"`  // full image ref with digest, e.g., "docker.io/library/ubuntu:24.04@sha256:abcd..."
-}
-
-// FrameMeta represents the metadata for a frame (fs/$user/$frame.jsonc).
-// A frame is a named instance that combines rootfs, home, and work components.
-type FrameMeta struct {
-	// Rootfs is the snap ID for the rootfs component.
-	// This is the base OS, packages, /var, /usr, /etc, system state.
-	Rootfs string `json:"rootfs"`
-
-	// Home is the snap ID for the home component.
-	// Contains user dotfiles, shell config, editor settings.
-	// Empty string means an empty subvolume was created.
-	Home string `json:"home,omitempty"`
-
-	// Work is the snap ID for the work component.
-	// Contains source code, project files, application state.
-	// Empty string means an empty subvolume was created.
-	Work string `json:"work,omitempty"`
-
-	// Taints on this frame (union of component taints, plus any acquired at runtime).
-	Taints []string `json:"taints,omitempty"`
-
-	// Isolation determines the execution environment.
-	// "vm" (default): user gets a dedicated VM, containers inside it
-	// "container": direct chroot container on the host (no VM)
-	// "none": no sub-isolation (single-user thundersnap instance)
-	Isolation string `json:"isolation,omitempty"`
 }
 
 // readSnapMeta reads and parses a snap's metadata file.
@@ -101,10 +75,12 @@ func writeSnapMeta(snapshotsDir, snapID string, meta *SnapMeta) error {
 	return nil
 }
 
-// readFrameMeta reads and parses a frame's metadata file.
-// framePath is the path to the frame directory (e.g., fs/user/dev).
+// readFrameSidecar reads and parses a frame's metadata sidecar.
+// framePath is the path to the frame directory (e.g., fs/user/<uuid>); the
+// sidecar lives alongside it at <framePath>.jsonc. The sidecar holds the
+// build spec (rootfs/home/work snap IDs), taints, isolation, and history.
 // Returns nil, nil if the file doesn't exist.
-func readFrameMeta(framePath string) (*FrameMeta, error) {
+func readFrameSidecar(framePath string) (*frames.Frame, error) {
 	path := framePath + ".jsonc"
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -120,19 +96,18 @@ func readFrameMeta(framePath string) (*FrameMeta, error) {
 		return nil, fmt.Errorf("parse frame meta %s: %w", framePath, err)
 	}
 
-	var meta FrameMeta
-	if err := json.Unmarshal(standardized, &meta); err != nil {
+	var f frames.Frame
+	if err := json.Unmarshal(standardized, &f); err != nil {
 		return nil, fmt.Errorf("unmarshal frame meta %s: %w", framePath, err)
 	}
-	return &meta, nil
+	return &f, nil
 }
 
-// writeFrameMeta writes a frame's metadata file.
-// framePath is the path to the frame directory (e.g., fs/user/dev).
-func writeFrameMeta(framePath string, meta *FrameMeta) error {
+// writeFrameSidecar writes a frame's metadata sidecar at <framePath>.jsonc.
+func writeFrameSidecar(framePath string, f *frames.Frame) error {
 	path := framePath + ".jsonc"
 
-	data, err := json.MarshalIndent(meta, "", "  ")
+	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal frame meta %s: %w", framePath, err)
 	}

@@ -51,26 +51,33 @@ func TestMetricsExport(t *testing.T) {
 	}
 	wantSnaps := 2
 
-	// Three frames under fs/<user>/<name>/ each marked by a <name>.jsonc file,
-	// the layout the daemon's frame listing (and the metrics collector) counts.
+	// Three frames under fs/<user>/<uuid>/ each marked by a <uuid>.jsonc file,
+	// the canonical layout the daemon's frame listing (and the metrics
+	// collector) counts. The sidecar stem must be a valid frame UUID.
 	wantFrames := 3
 	for i := 0; i < wantFrames; i++ {
 		user := "testuser"
-		name := fmt.Sprintf("frame%d", i)
+		name := frameid.MustNew().String()
 		framePath := filepath.Join(env.fsDir, user, name)
 		if err := os.MkdirAll(framePath, 0755); err != nil {
 			t.Fatalf("mkdir frame: %v", err)
 		}
 		mustWriteFile(t, framePath+".jsonc", "{}\n")
 	}
+	// A legacy-layout sidecar whose stem is NOT a UUID must NOT be counted.
+	if err := os.MkdirAll(filepath.Join(env.fsDir, "testuser", "legacy"), 0755); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	mustWriteFile(t, filepath.Join(env.fsDir, "testuser", "legacy.jsonc"), "{}\n")
 	// A bare directory with no .jsonc must NOT be counted as a frame.
 	if err := os.MkdirAll(filepath.Join(env.fsDir, "testuser", "notaframe"), 0755); err != nil {
 		t.Fatalf("mkdir notaframe: %v", err)
 	}
 
-	// Two refs in a real ref store.
-	stateDir := filepath.Join(env.root, "state")
-	store := refs.NewStore(stateDir)
+	// Two refs in a real per-user ref store, counted via the Refs closure the
+	// daemon supplies (summing each user's List()).
+	dataDir := filepath.Join(env.root, "state")
+	store := refs.NewUserStore(dataDir, "testuser")
 	wantRefs := 2
 	for i := 0; i < wantRefs; i++ {
 		if err := store.Create(fmt.Sprintf("ref%d", i), frameid.MustNew()); err != nil {
@@ -86,7 +93,7 @@ func TestMetricsExport(t *testing.T) {
 	handler, err := metrics.NewHandler(metrics.Sources{
 		FsDir:           env.fsDir,
 		SnapsDir:        env.snapshotsDir,
-		Refs:            store,
+		Refs:            func() int { names, _ := store.List(); return len(names) },
 		RunningSessions: func() int { return wantSessions },
 		RunningVMs:      func() int { return wantVMs },
 	})

@@ -35,7 +35,7 @@ import (
 	"github.com/tailscale/thundersnap/cgroup"
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/frames"
-	"github.com/tailscale/thundersnap/snaphash"
+	"github.com/tailscale/thundersnap/refs"
 	"github.com/tailscale/thundersnap/snapsubdir"
 	"github.com/tailscale/thundersnap/thunderproto"
 	"github.com/tailscale/thundersnap/thundersnap"
@@ -557,11 +557,12 @@ func main() {
 		log.Fatalf("Failed to create state directory: %v", err)
 	}
 
-	// Initialize ref and frame stores for the new UUID-based API.
-	// These use the fs-dir as the state directory since that's where
-	// frames and refs are stored.
-	initRefStore(*flagFsDir)
-	initFrameStore(*flagFsDir)
+	// Initialize ref and frame stores for the new UUID-based API. These are
+	// per-user: a per-user refs.Store appends "refs/<user>" and a per-user
+	// frames.Store appends "fs/<user>", so both are rooted at the data dir
+	// (NOT the fs dir, which would double the "fs" component).
+	initRefStore(*flagDataDir)
+	initFrameStore(*flagDataDir)
 
 	// Create tsnet server
 	srv := &tsnet.Server{
@@ -677,8 +678,15 @@ func main() {
 				cap.Isolation = parsedIsolation
 			}
 
-			rootFS := filepath.Join(*flagFsDir, sanitizeForPath(tailscaleUser), sanitizeForPath(frameName))
-			runAsUser := selectTargetUser(rootFS, targetUser)
+			// Resolve the frame name to its canonical fs/<user>/<uuid> path via
+			// the user's ref store solely to choose the Unix user shown in the
+			// greeting. Resolution errors (e.g. an unknown frame name) are
+			// ignored here and surfaced authoritatively by the session function
+			// below; the greeting just falls back to the requested target user.
+			runAsUser := targetUser
+			if rootFS, _, rerr := resolveFrameRootFS(tailscaleUser, frameName); rerr == nil {
+				runAsUser = selectTargetUser(rootFS, targetUser)
+			}
 
 			// Only greet the user in interactive mode. When a subcommand is
 			// supplied (e.g. `ssh host -- some-cmd`, scp, rsync) the greeting
@@ -756,9 +764,15 @@ func main() {
 					containerName = sshUser[idx+1:]
 				}
 
-				// Set up the root filesystem (same setup as container sessions)
-				rootFS, baseUserFS := frameRootFSPaths(tailscaleUser, containerName)
-				if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
+				// Resolve the frame name to its canonical fs/<user>/<uuid> path
+				// via the user's ref store, then set up the root filesystem
+				// (same setup as container sessions).
+				rootFS, _, err := resolveFrameRootFS(tailscaleUser, containerName)
+				if err != nil {
+					log.Printf("SFTP session failed: %v", err)
+					return
+				}
+				if err := prepareContainerRootFS(rootFS, ""); err != nil {
 					log.Printf("SFTP session failed: %v", err)
 					return
 				}
@@ -1466,19 +1480,20 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux.HandleFunc("/delete-snap", handleDeleteSnap)
 	mux.HandleFunc("/delete-frame", cs.handleDeleteFrame)
 	mux.HandleFunc("/list-snaps", handleListSnaps)
-	mux.HandleFunc("/list-frames", handleListFrames)
+	mux.HandleFunc("/list-frames", cs.handleListFrames)
 	mux.HandleFunc("/download-docker", handleDownloadDocker)
 	mux.HandleFunc("/download-snap", handleDownloadSnap)
 	mux.HandleFunc("/who-has", handleWhoHas)
 	mux.HandleFunc("/ts/servers.json", handleServersJSONControl)
-	// Ref and frame UUID-based API handlers
-	mux.HandleFunc("/ref/create", handleRefCreate)
-	mux.HandleFunc("/ref/move", handleRefMove)
-	mux.HandleFunc("/ref/delete", handleRefDelete)
-	mux.HandleFunc("/refs", handleListRefs)
-	mux.HandleFunc("/reflog", handleReflog)
-	mux.HandleFunc("/log", handleLog)
-	mux.HandleFunc("/autorun", handleAutorun)
+	// Ref and frame UUID-based API handlers (per-user, keyed off the frame's
+	// rootFS path).
+	mux.HandleFunc("/ref/create", cs.handleRefCreate)
+	mux.HandleFunc("/ref/move", cs.handleRefMove)
+	mux.HandleFunc("/ref/delete", cs.handleRefDelete)
+	mux.HandleFunc("/refs", cs.handleListRefs)
+	mux.HandleFunc("/reflog", cs.handleReflog)
+	mux.HandleFunc("/log", cs.handleLog)
+	mux.HandleFunc("/autorun", cs.handleAutorun)
 	cs.handler = mux
 
 	go cs.serve()
@@ -1897,7 +1912,7 @@ func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Read existing frame metadata
-	frameMeta, err := readFrameMeta(c.rootFS)
+	frameMeta, err := readFrameSidecar(c.rootFS)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, TaintResponse{
 			Status:  "error",
@@ -1908,7 +1923,7 @@ func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
 
 	// Create default frame metadata if none exists
 	if frameMeta == nil {
-		frameMeta = &FrameMeta{
+		frameMeta = &frames.Frame{
 			Rootfs: readStampFile(c.rootFS), // Use stamp file as rootfs ID
 		}
 	}
@@ -1928,7 +1943,7 @@ func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Write updated frame metadata
-	if err := writeFrameMeta(c.rootFS, frameMeta); err != nil {
+	if err := writeFrameSidecar(c.rootFS, frameMeta); err != nil {
 		writeJSON(w, http.StatusInternalServerError, TaintResponse{
 			Status:  "error",
 			Message: fmt.Sprintf("write frame meta: %v", err),
@@ -2088,8 +2103,8 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Extract tailscale user from rootFS path: /fs-dir/<tailscale-user>/<frame>
-	safeTailscaleUser, err := tailscaleUserFromRootFS(c.rootFS)
+	// Extract tailscale user from rootFS path: fs/<tailscale-user>/<uuid>
+	user, err := tailscaleUserFromRootFS(c.rootFS)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, DeleteFrameResponse{
 			Status:  "error",
@@ -2098,20 +2113,28 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Sanitize frame name for filesystem path
-	safeFrameName := sanitizeForPath(req.FrameName)
+	refStore := userRefStore(user)
+	frameStore := userFrameStore(user)
 
-	// Build the target path
-	framePath := filepath.Join(*flagFsDir, safeTailscaleUser, safeFrameName)
-
-	// Check if frame exists
-	if _, err := os.Stat(framePath); os.IsNotExist(err) {
-		writeJSON(w, http.StatusNotFound, DeleteFrameResponse{
+	// Resolve the frame name (a ref) to its UUID. Frames are addressed by ref
+	// in this API; there is no name-based fallback path on disk.
+	ref, err := refStore.Get(req.FrameName)
+	if err != nil {
+		if err == refs.ErrRefNotFound {
+			writeJSON(w, http.StatusNotFound, DeleteFrameResponse{
+				Status:  "error",
+				Message: fmt.Sprintf("no such frame %q", req.FrameName),
+			})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, DeleteFrameResponse{
 			Status:  "error",
-			Message: fmt.Sprintf("frame %q not found", req.FrameName),
+			Message: err.Error(),
 		})
 		return
 	}
+	uuid := ref.UUID
+	framePath := framePathForUserUUID(user, uuid)
 
 	// Prevent deleting the current frame
 	if framePath == c.rootFS {
@@ -2154,10 +2177,15 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Delete the frame metadata file
-	os.Remove(framePath + ".jsonc")
+	// Delete the frame metadata sidecar via the store, then drop the ref.
+	if err := frameStore.Delete(uuid); err != nil && err != frames.ErrFrameNotFound {
+		log.Printf("Warning: delete frame metadata for %s: %v", uuid, err)
+	}
+	if err := refStore.Delete(req.FrameName); err != nil && err != refs.ErrRefNotFound {
+		log.Printf("Warning: delete ref %s: %v", req.FrameName, err)
+	}
 
-	log.Printf("Deleted frame %s", framePath)
+	log.Printf("Deleted frame %s (ref %q, user %s)", framePath, req.FrameName, user)
 
 	writeJSON(w, http.StatusOK, DeleteFrameResponse{
 		Status: "ok",
@@ -2234,66 +2262,70 @@ type FrameInfo struct {
 	Status string `json:"status"` // "stopped" or number of processes
 }
 
-// handleListFrames handles GET /list-frames - list all frames with status
-func handleListFrames(w http.ResponseWriter, r *http.Request) {
+// handleListFrames handles GET /list-frames - list the requesting user's
+// frames with status. Frames are stored at fs/<user>/<uuid> with a
+// fs/<user>/<uuid>.jsonc sidecar; each is reported by its bound ref name when
+// one exists, otherwise by its UUID. Legacy non-UUID dirs are ignored by the
+// per-user frames.Store.List().
+func (c *controlServer) handleListFrames(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 
-	// Walk the fs-dir to find all frames
-	// Structure: fs-dir/<user>/<frame-name>/ with <frame-name>.jsonc metadata
-	var frames []FrameInfo
-
-	userEntries, err := os.ReadDir(*flagFsDir)
+	user, err := tailscaleUserFromRootFS(c.rootFS)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, ListFramesResponse{
 			Status: "error",
-			Error:  fmt.Sprintf("read fs dir: %v", err),
+			Error:  err.Error(),
 		})
 		return
 	}
 
-	for _, userEntry := range userEntries {
-		if !userEntry.IsDir() {
-			continue
-		}
-		userName := userEntry.Name()
-		userDir := filepath.Join(*flagFsDir, userName)
+	frameStore := userFrameStore(user)
+	refStore := userRefStore(user)
 
-		frameEntries, err := os.ReadDir(userDir)
-		if err != nil {
-			continue
-		}
+	uuids, err := frameStore.List()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, ListFramesResponse{
+			Status: "error",
+			Error:  fmt.Sprintf("list frames: %v", err),
+		})
+		return
+	}
 
-		for _, frameEntry := range frameEntries {
-			if !frameEntry.IsDir() {
-				continue
+	// Build a UUID -> ref-name map so frames are reported by their ref.
+	refByUUID := map[frameid.ID]string{}
+	if names, err := refStore.List(); err == nil {
+		for _, name := range names {
+			if ref, err := refStore.Get(name); err == nil {
+				refByUUID[ref.UUID] = name
 			}
-			frameName := frameEntry.Name()
-			framePath := filepath.Join(userDir, frameName)
-
-			// Check if metadata file exists to confirm it's a frame
-			if _, err := os.Stat(framePath + ".jsonc"); os.IsNotExist(err) {
-				continue
-			}
-
-			// Determine status based on active control servers
-			sessionCount := getActiveFrameCount(framePath)
-			status := "stopped"
-			if sessionCount > 0 {
-				status = fmt.Sprintf("%d", sessionCount)
-			}
-
-			frames = append(frames, FrameInfo{
-				Name:   frameName,
-				Status: status,
-			})
 		}
+	}
+
+	var frameInfos []FrameInfo
+	for _, uuid := range uuids {
+		name := uuid.String()
+		if refName, ok := refByUUID[uuid]; ok {
+			name = refName
+		}
+
+		// Determine status based on active control servers.
+		sessionCount := getActiveFrameCount(framePathForUserUUID(user, uuid))
+		status := "stopped"
+		if sessionCount > 0 {
+			status = fmt.Sprintf("%d", sessionCount)
+		}
+
+		frameInfos = append(frameInfos, FrameInfo{
+			Name:   name,
+			Status: status,
+		})
 	}
 
 	writeJSON(w, http.StatusOK, ListFramesResponse{
 		Status: "ok",
-		Frames: frames,
+		Frames: frameInfos,
 	})
 }
 
@@ -2390,31 +2422,30 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	stream := r.URL.Query().Get("stream") == "1"
 	isTTY := r.URL.Query().Get("tty") == "1"
 
-	// Detect new UUID-based API vs legacy API
-	useNewAPI := req.SnapshotSpec != ""
-
-	if useNewAPI {
-		// New UUID-based API: snapshot_spec is provided, frame gets a UUID
-		handleCreateWithUUID(w, r, req, stream, isTTY)
-		return
+	// Allow either snapshot_spec or the legacy rootfs/snapshot_id fields to
+	// specify the rootfs; everything funnels through the UUID-based create.
+	if req.SnapshotSpec == "" {
+		if req.RootfsSnap != "" && req.SnapshotID == "" {
+			req.SnapshotID = req.RootfsSnap
+		}
+		req.SnapshotSpec = req.SnapshotID
 	}
 
-	// Legacy API: frame_name and snapshot_id are required
-	// Allow either snapshot_id or rootfs field for specifying the rootfs
-	if req.RootfsSnap != "" && req.SnapshotID == "" {
-		req.SnapshotID = req.RootfsSnap
-	}
-
-	if req.FrameName == "" || req.SnapshotID == "" {
+	if req.SnapshotSpec == "" {
 		writeJSON(w, http.StatusBadRequest, CreateResponse{
 			Status:  "error",
-			Message: "frame_name and snapshot_id (or rootfs) are required",
+			Message: "snapshot_spec (or rootfs) is required",
 		})
 		return
 	}
 
-	// Extract tailscale user from rootFS path: /fs-dir/<tailscale-user>/<frame>
-	safeTailscaleUser, err := tailscaleUserFromRootFS(c.rootFS)
+	c.handleCreateWithUUID(w, req, stream, isTTY)
+}
+
+// handleCreateWithUUID handles frame creation using the UUID-based API.
+// Frames are created at fs/<user>/<uuid>/ and optionally a ref is bound.
+func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, req CreateRequest, stream, isTTY bool) {
+	user, err := tailscaleUserFromRootFS(c.rootFS)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, CreateResponse{
 			Status:  "error",
@@ -2423,76 +2454,6 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sanitize frame name for filesystem path
-	safeFrameName := sanitizeForPath(req.FrameName)
-
-	// Build the target path
-	framePath := filepath.Join(*flagFsDir, safeTailscaleUser, safeFrameName)
-
-	// Check if frame already exists
-	if _, err := os.Stat(framePath); err == nil {
-		writeJSON(w, http.StatusConflict, CreateResponse{
-			Status:  "error",
-			Message: fmt.Sprintf("frame %q already exists", req.FrameName),
-		})
-		return
-	}
-
-	if stream {
-		handleCreateStreaming(w, req, framePath, isTTY)
-		return
-	}
-
-	// Non-streaming mode - no auto-download, just check existence of rootfs snap
-	rootfsSnap := req.SnapshotID
-	if isFrameSpec(req.SnapshotID) {
-		rootfsSnap, _, _ = parseFrameSpec(req.SnapshotID)
-	}
-
-	// Check if this is a blank container request
-	isBlank, isExplicitNil := hasBlankRootfs(req.SnapshotID)
-	if isBlank && !isExplicitNil {
-		// Empty rootfs component (e.g., from "::") without explicit "nil" is an error
-		writeJSON(w, http.StatusBadRequest, CreateResponse{
-			Status:  "error",
-			Message: "rootfs component is required (use 'nil' for blank container)",
-		})
-		return
-	}
-
-	// For blank containers (nil:...), skip snapshot existence check
-	if !isBlank {
-		snapshotPath := filepath.Join(*flagSnapsDir, rootfsSnap)
-		if _, err := os.Stat(snapshotPath); err != nil {
-			writeJSON(w, http.StatusNotFound, CreateResponse{
-				Status:  "error",
-				Message: fmt.Sprintf("snapshot %q not found", rootfsSnap),
-			})
-			return
-		}
-	}
-
-	// Create frame from the snapshot/frame spec
-	if err := createFrame(framePath, req.SnapshotID, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
-		log.Printf("create frame failed: %v", err)
-		writeJSON(w, http.StatusInternalServerError, CreateResponse{
-			Status:  "error",
-			Message: err.Error(),
-		})
-		return
-	}
-
-	log.Printf("Created frame %s from snapshot %s", framePath, req.SnapshotID)
-
-	writeJSON(w, http.StatusOK, CreateResponse{
-		Status: "ok",
-		Path:   framePath,
-	})
-}
-
-// handleCreateWithUUID handles frame creation using the new UUID-based API.
-// Frames are created at fs/<uuid>/ and optionally a ref is created.
-func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequest, stream, isTTY bool) {
 	// Parse the snapshot spec
 	rootfsSpec, homeSpec, workSpec := parseFrameSpec(req.SnapshotSpec)
 
@@ -2518,6 +2479,9 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 		}
 	}
 
+	frameStore := userFrameStore(user)
+	refStore := userRefStore(user)
+
 	// If a ref name is provided, validate it and check it doesn't already exist
 	if req.RefName != "" {
 		if refStore.Exists(req.RefName) {
@@ -2540,17 +2504,37 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 		return
 	}
 
-	// Build the frame path using UUID
-	framePath := filepath.Join(*flagFsDir, uuid.String())
+	// Build the per-user frame path using UUID.
+	framePath := framePathForUserUUID(user, uuid)
 
-	// For streaming mode, delegate to the streaming handler
-	if stream {
-		handleCreateStreamingWithUUID(w, req, framePath, uuid, isTTY)
+	frameMeta := &frames.Frame{
+		Rootfs:    rootfsSpec,
+		Home:      homeSpec,
+		Work:      workSpec,
+		Isolation: req.Isolation,
+	}
+
+	// Persist the metadata sidecar through the per-user store FIRST: it writes
+	// fs/<user>/<uuid>.jsonc (stamping CreatedAt), which buildFrameFS then reads
+	// to assemble the rootfs/home/work subvolumes. (Doing the FS build first
+	// would write the sidecar twice and collide with store.Create.)
+	if err := frameStore.Create(uuid, frameMeta); err != nil {
+		log.Printf("failed to store frame metadata: %v", err)
+		writeJSON(w, http.StatusInternalServerError, CreateResponse{
+			Status:  "error",
+			Message: err.Error(),
+		})
 		return
 	}
 
-	// Create the frame
-	if err := createFrame(framePath, req.SnapshotSpec, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
+	// For streaming mode, delegate to the streaming handler.
+	if stream {
+		handleCreateStreamingWithUUID(w, req, framePath, frameMeta, uuid, refStore, isTTY)
+		return
+	}
+
+	// Assemble the frame's filesystem from the (already-written) sidecar.
+	if err := buildFrameFS(framePath, frameMeta); err != nil {
 		log.Printf("create frame failed: %v", err)
 		writeJSON(w, http.StatusInternalServerError, CreateResponse{
 			Status:  "error",
@@ -2559,39 +2543,13 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 		return
 	}
 
-	// Parse snap hashes for frame metadata
-	var rootfsHash, homeHash, workHash snaphash.Hash
-	if rootfsSpec != "" {
-		// For now, use the spec string as-is; in a full implementation,
-		// we'd look up the actual content hash from the snap metadata
-		rootfsHash = snaphash.Sum([]byte(rootfsSpec))
-	}
-	if homeSpec != "" {
-		homeHash = snaphash.Sum([]byte(homeSpec))
-	}
-	if workSpec != "" {
-		workHash = snaphash.Sum([]byte(workSpec))
-	}
-
-	// Store frame metadata
-	frameMeta := &frames.Frame{
-		Rootfs:    rootfsHash,
-		Home:      homeHash,
-		Work:      workHash,
-		Isolation: req.Isolation,
-	}
-	if err := frameStore.Create(uuid, frameMeta); err != nil {
-		log.Printf("failed to store frame metadata: %v", err)
-		// Frame was created on disk but metadata failed - log warning but don't fail
-	}
-
 	// Create the ref if requested
 	if req.RefName != "" {
 		if err := refStore.Create(req.RefName, uuid); err != nil {
 			log.Printf("failed to create ref %s: %v", req.RefName, err)
 			// Frame was created but ref failed - log warning
 		} else {
-			log.Printf("Created ref %s -> %s", req.RefName, uuid)
+			log.Printf("Created ref %s -> %s for user %s", req.RefName, uuid, user)
 		}
 	}
 
@@ -2605,7 +2563,9 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 }
 
 // handleCreateStreamingWithUUID handles streaming create for UUID-based frames.
-func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, framePath string, uuid frameid.ID, isTTY bool) {
+// The metadata sidecar has already been written by the caller via the per-user
+// frames.Store; this only assembles the filesystem and binds the optional ref.
+func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, framePath string, frameMeta *frames.Frame, uuid frameid.ID, refStore *refs.Store, isTTY bool) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 
 	if f, ok := w.(http.Flusher); ok {
@@ -2614,21 +2574,18 @@ func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, fra
 
 	pw := &createProgressWriter{newProgressEmitter(w)}
 
-	// Parse frame spec
-	rootfsSpec, homeSpec, workSpec := parseFrameSpec(req.SnapshotSpec)
-
 	// Check if this is a blank container
 	isBlank, _ := hasBlankRootfs(req.SnapshotSpec)
 
 	// For non-blank containers, check/download the rootfs snap
 	if !isBlank {
-		snapshotPath := filepath.Join(*flagSnapsDir, rootfsSpec)
+		snapshotPath := filepath.Join(*flagSnapsDir, frameMeta.Rootfs)
 		if _, err := os.Stat(snapshotPath); err != nil {
 			// Try to download from mesh
-			pw.writeProgress(fmt.Sprintf("Snapshot %s not found locally, downloading from mesh peers...", rootfsSpec))
-			result, err := doDownloadSnap(rootfsSpec, pw, isTTY)
+			pw.writeProgress(fmt.Sprintf("Snapshot %s not found locally, downloading from mesh peers...", frameMeta.Rootfs))
+			result, err := doDownloadSnap(frameMeta.Rootfs, pw, isTTY)
 			if err != nil {
-				log.Printf("create: auto-download of snapshot %s failed: %v", rootfsSpec, err)
+				log.Printf("create: auto-download of snapshot %s failed: %v", frameMeta.Rootfs, err)
 				pw.writeResultWithUUID("error", "", fmt.Sprintf("failed to download snapshot: %v", err), "")
 				return
 			}
@@ -2640,33 +2597,10 @@ func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, fra
 
 	pw.writeProgress("Creating frame...")
 
-	// Create the frame
-	if err := createFrame(framePath, req.SnapshotSpec, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
+	// Assemble the frame's filesystem from the (already-written) sidecar.
+	if err := buildFrameFS(framePath, frameMeta); err != nil {
 		pw.writeResultWithUUID("error", "", err.Error(), "")
 		return
-	}
-
-	// Parse snap hashes for frame metadata
-	var rootfsHash, homeHash, workHash snaphash.Hash
-	if rootfsSpec != "" {
-		rootfsHash = snaphash.Sum([]byte(rootfsSpec))
-	}
-	if homeSpec != "" {
-		homeHash = snaphash.Sum([]byte(homeSpec))
-	}
-	if workSpec != "" {
-		workHash = snaphash.Sum([]byte(workSpec))
-	}
-
-	// Store frame metadata
-	frameMeta := &frames.Frame{
-		Rootfs:    rootfsHash,
-		Home:      homeHash,
-		Work:      workHash,
-		Isolation: req.Isolation,
-	}
-	if err := frameStore.Create(uuid, frameMeta); err != nil {
-		log.Printf("failed to store frame metadata: %v", err)
 	}
 
 	// Create the ref if requested
@@ -2689,64 +2623,6 @@ type CreateStreamEvent struct {
 	Status  string `json:"status,omitempty"`  // "ok" or "error" (for result)
 	UUID    string `json:"uuid,omitempty"`    // frame UUID (for result)
 	Path    string `json:"path,omitempty"`    // frame path (for result)
-}
-
-// handleCreateStreaming handles streaming create with auto-download
-func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, framePath string, isTTY bool) {
-	w.Header().Set("Content-Type", "application/x-ndjson")
-
-	// Enable streaming mode immediately
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
-	pw := &createProgressWriter{newProgressEmitter(w)}
-
-	// Check if rootfs snapshot exists locally (parse frame spec if needed)
-	rootfsSnap := req.SnapshotID
-	if isFrameSpec(req.SnapshotID) {
-		rootfsSnap, _, _ = parseFrameSpec(req.SnapshotID)
-	}
-
-	// Check if this is a blank container request
-	isBlank, isExplicitNil := hasBlankRootfs(req.SnapshotID)
-	if isBlank && !isExplicitNil {
-		// Empty rootfs component (e.g., from "::") without explicit "nil" is an error
-		pw.writeResult("error", "", "rootfs component is required (use 'nil' for blank container)")
-		return
-	}
-
-	// For blank containers (nil:...), skip snapshot existence check
-	if isBlank {
-		// Skip to frame creation below
-	} else if _, err := os.Stat(filepath.Join(*flagSnapsDir, rootfsSnap)); err != nil {
-		// Snapshot doesn't exist - try to download it
-		pw.writeProgress(fmt.Sprintf("Snapshot %s not found locally, downloading from mesh peers...", rootfsSnap))
-
-		result, err := doDownloadSnap(rootfsSnap, pw, isTTY)
-		if err != nil {
-			log.Printf("create: auto-download of snapshot %s failed: %v", rootfsSnap, err)
-			pw.writeResult("error", "", fmt.Sprintf("failed to download snapshot: %v", err))
-			return
-		}
-
-		if result.AlreadyExists {
-			pw.writeProgress("Snapshot already present locally")
-		} else {
-			pw.writeProgress("Downloaded snapshot from mesh peer")
-		}
-	}
-
-	// Create frame from the snapshot/frame spec
-	pw.writeProgress("Creating frame...")
-	if err := createFrame(framePath, req.SnapshotID, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
-		log.Printf("create frame failed: %v", err)
-		pw.writeResult("error", "", err.Error())
-		return
-	}
-
-	log.Printf("Created frame %s from snapshot %s", framePath, req.SnapshotID)
-	pw.writeResult("ok", framePath, "")
 }
 
 // createProgressWriter wraps ResponseWriter to write progress events
@@ -2807,14 +2683,14 @@ func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) er
 
 	// If we have any frame components, use the frame model
 	if homeSnap != "" || workSnap != "" || strings.Contains(snapshotID, ":") {
-		meta := &FrameMeta{
+		meta := &frames.Frame{
 			Rootfs:    rootfsSnap,
 			Home:      homeSnap,
 			Work:      workSnap,
 			Isolation: isolation,
 		}
-		// Write the frame.jsonc first so ensureFrameFS can find it
-		if err := writeFrameMeta(framePath, meta); err != nil {
+		// Write the sidecar first so ensureFrameFS can find it
+		if err := writeFrameSidecar(framePath, meta); err != nil {
 			return fmt.Errorf("write frame meta: %w", err)
 		}
 		if err := ensureFrameFS(framePath, meta); err != nil {
@@ -2855,6 +2731,21 @@ func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) er
 	// Ensure the "user" account, sudoers, resolv.conf, and /tmp are set up.
 	finalizeFrameRootfs(framePath)
 
+	return nil
+}
+
+// buildFrameFS assembles a frame's on-disk filesystem (rootfs/home/work
+// subvolumes) from a metadata sidecar that the caller has ALREADY written
+// (e.g. via the per-user frames.Store). Unlike createFrame, it does not write
+// the sidecar itself, so it is safe to call after frames.Store.Create without
+// colliding on fs/<user>/<uuid>.jsonc.
+func buildFrameFS(framePath string, meta *frames.Frame) error {
+	if err := ensureFrameFS(framePath, meta); err != nil {
+		return err
+	}
+	if err := copyTsBinary(framePath); err != nil {
+		log.Printf("Warning: failed to copy ts binary to %s: %v", framePath, err)
+	}
 	return nil
 }
 
@@ -3286,7 +3177,7 @@ func createSnapshotSubdir(rootFS, subdir string, progressWriter io.Writer, isTTY
 		}
 		// Inherit the frame's taints, but index the subtree in full (no
 		// parent stamp, since the re-rooted paths don't match any parent).
-		frameMeta, _ := readFrameMeta(rootFS)
+		frameMeta, _ := readFrameSidecar(rootFS)
 		var frameTaints []string
 		if frameMeta != nil {
 			frameTaints = frameMeta.Taints
@@ -3301,7 +3192,7 @@ func createSnapshotSubdir(rootFS, subdir string, progressWriter io.Writer, isTTY
 	hasWorkSubvol := isSubvolume(workPath)
 
 	// Read the frame metadata for taints
-	frameMeta, _ := readFrameMeta(rootFS)
+	frameMeta, _ := readFrameSidecar(rootFS)
 	var frameTaints []string
 	if frameMeta != nil {
 		frameTaints = frameMeta.Taints
@@ -3357,13 +3248,13 @@ func createSnapshotSubdir(rootFS, subdir string, progressWriter io.Writer, isTTY
 
 	// Update frame metadata with new snap IDs
 	if frameMeta == nil {
-		frameMeta = &FrameMeta{}
+		frameMeta = &frames.Frame{}
 	}
 	frameMeta.Rootfs = rootfsID
 	frameMeta.Home = homeID
 	frameMeta.Work = workID
-	if err := writeFrameMeta(rootFS, frameMeta); err != nil {
-		log.Printf("Warning: failed to update frame.jsonc for %s: %v", rootFS, err)
+	if err := writeFrameSidecar(rootFS, frameMeta); err != nil {
+		log.Printf("Warning: failed to update frame sidecar for %s: %v", rootFS, err)
 	}
 
 	// Return frame spec format: rootfs:home:work

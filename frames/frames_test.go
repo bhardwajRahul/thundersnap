@@ -1,12 +1,12 @@
 package frames
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/tailscale/thundersnap/frameid"
-	"github.com/tailscale/thundersnap/snaphash"
 )
 
 func TestUserStoreIsolation(t *testing.T) {
@@ -51,9 +51,9 @@ func TestCreateAndGet(t *testing.T) {
 	store := NewStore(dir)
 
 	uuid := frameid.MustNew()
-	rootfs := snaphash.Sum([]byte("rootfs"))
-	home := snaphash.Sum([]byte("home"))
-	work := snaphash.Sum([]byte("work"))
+	rootfs := "rootfs-snap"
+	home := "home-snap"
+	work := "work-snap"
 
 	frame := &Frame{
 		Rootfs:    rootfs,
@@ -93,7 +93,7 @@ func TestCreateDuplicate(t *testing.T) {
 	store := NewStore(dir)
 
 	uuid := frameid.MustNew()
-	frame := &Frame{Rootfs: snaphash.Sum([]byte("rootfs"))}
+	frame := &Frame{Rootfs: "rootfs-snap"}
 
 	if err := store.Create(uuid, frame); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -120,7 +120,7 @@ func TestUpdate(t *testing.T) {
 	store := NewStore(dir)
 
 	uuid := frameid.MustNew()
-	frame := &Frame{Rootfs: snaphash.Sum([]byte("rootfs"))}
+	frame := &Frame{Rootfs: "rootfs-snap"}
 
 	if err := store.Create(uuid, frame); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -154,7 +154,7 @@ func TestDelete(t *testing.T) {
 	store := NewStore(dir)
 
 	uuid := frameid.MustNew()
-	frame := &Frame{Rootfs: snaphash.Sum([]byte("rootfs"))}
+	frame := &Frame{Rootfs: "rootfs-snap"}
 
 	if err := store.Create(uuid, frame); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -184,14 +184,14 @@ func TestAddHistoryEntry(t *testing.T) {
 	store := NewStore(dir)
 
 	uuid := frameid.MustNew()
-	frame := &Frame{Rootfs: snaphash.Sum([]byte("rootfs"))}
+	frame := &Frame{Rootfs: "rootfs-snap"}
 
 	if err := store.Create(uuid, frame); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
-	snap1 := snaphash.Sum([]byte("snap1"))
-	snap2 := snaphash.Sum([]byte("snap2"))
+	snap1 := "snap1"
+	snap2 := "snap2"
 
 	if err := store.AddHistoryEntry(uuid, snap1, "first snapshot"); err != nil {
 		t.Fatalf("AddHistoryEntry 1: %v", err)
@@ -223,7 +223,7 @@ func TestAddTaint(t *testing.T) {
 	store := NewStore(dir)
 
 	uuid := frameid.MustNew()
-	frame := &Frame{Rootfs: snaphash.Sum([]byte("rootfs"))}
+	frame := &Frame{Rootfs: "rootfs-snap"}
 
 	if err := store.Create(uuid, frame); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -276,7 +276,7 @@ func TestList(t *testing.T) {
 	// Create some frames.
 	for i := 0; i < 3; i++ {
 		uuid := frameid.MustNew()
-		frame := &Frame{Rootfs: snaphash.Sum([]byte{byte(i)})}
+		frame := &Frame{Rootfs: fmt.Sprintf("rootfs-%d", i)}
 		if err := store.Create(uuid, frame); err != nil {
 			t.Fatalf("Create %d: %v", i, err)
 		}
@@ -301,7 +301,7 @@ func TestExists(t *testing.T) {
 		t.Error("Exists before create = true")
 	}
 
-	frame := &Frame{Rootfs: snaphash.Sum([]byte("rootfs"))}
+	frame := &Frame{Rootfs: "rootfs-snap"}
 	store.Create(uuid, frame)
 
 	if !store.Exists(uuid) {
@@ -384,7 +384,7 @@ func TestListSkipsNonFrames(t *testing.T) {
 
 	// One real frame.
 	uuid := frameid.MustNew()
-	if err := store.Create(uuid, &Frame{Rootfs: snaphash.Sum([]byte("r"))}); err != nil {
+	if err := store.Create(uuid, &Frame{Rootfs: "r"}); err != nil {
 		t.Fatal(err)
 	}
 	// A directory that looks like a frame's subvolume (should be skipped).
@@ -418,7 +418,7 @@ func TestAddTaintNotFound(t *testing.T) {
 
 func TestAddHistoryEntryNotFound(t *testing.T) {
 	store := NewStore(t.TempDir())
-	if err := store.AddHistoryEntry(frameid.MustNew(), snaphash.Sum([]byte("s")), ""); err != ErrFrameNotFound {
+	if err := store.AddHistoryEntry(frameid.MustNew(), "s", ""); err != ErrFrameNotFound {
 		t.Errorf("AddHistoryEntry on missing frame = %v, want ErrFrameNotFound", err)
 	}
 }
@@ -450,7 +450,7 @@ func TestUpdateDoesNotPreserveCreatedAt(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)
 	uuid := frameid.MustNew()
-	if err := store.Create(uuid, &Frame{Rootfs: snaphash.Sum([]byte("r"))}); err != nil {
+	if err := store.Create(uuid, &Frame{Rootfs: "r"}); err != nil {
 		t.Fatal(err)
 	}
 	orig, _ := store.Get(uuid)
