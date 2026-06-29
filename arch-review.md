@@ -1337,7 +1337,7 @@ Highest-value extractions, roughly in priority order:
    `snapsubdir`/`refid` drop their private `isSubvolume` copies. `isSubvolume` literally exists
    3× (snapsubdir, refid, thundersnapd) today.
 
-2. **[DEFERRED→#13 session work] A `session` package for the container/VM entry layer.** This directly addresses the
+2. **[DONE as a file split — full package + sessionSpec deferred] A `session` package for the container/VM entry layer.** This directly addresses the
    user's session-redundancy question at the architectural level: pull `runContainerSession`,
    the 4 command-form builders, the nsenter/drop-caps arg construction, the PTY-vs-pipe I/O
    plumbing, and the VMX `connectToVshd`/`proxyVMSession`/`writeVshdRequest` logic out of
@@ -1346,6 +1346,18 @@ Highest-value extractions, roughly in priority order:
    third copy of the spawn logic) so there is exactly **one** implementation of "spawn into the
    container ns", shared by the daemon and any other caller. Most of the arg-building becomes
    pure and unit-testable once it's not entangled with `ssh.Session` I/O.
+   RESOLUTION: the entire container/VM session entry layer (14 funcs: `buildSessionCommand`,
+   `sessionEnv`, `frameRootFSPaths`, `runContainerSession`, `runSFTPSession`, `connectToVshd`,
+   `tryConnectToVshd`, `generateRandomID`, `prepareVMXRootFS`, `runVMXSession`,
+   `runVMXOuterShell`, `makeVMXControlHandler`, `writeVshdRequest`, `proxyVMSession`) is now in
+   `cmd/thundersnapd/session.go` (still `package main`), and a stranded `runContainerSession`
+   doc comment that had drifted onto `buildSessionCommand` was reattached. Pure code movement,
+   no API/behavior change. A *true* importable `session` package + the `sessionSpec`/`enterSession`
+   unification + folding in the dead `thundersnap.RunInContainerNs` copy remain DEFERRED: they
+   require redesigning the `ssh.Session` I/O coupling and the daemon globals these touch
+   (`*flagFsDir`, `*flagSnapsDir`, `*flagVMDir`, `activeFrames`, `vmxSessions`), which is a
+   behavior-bearing refactor, not a mechanical lift. The file split is the safe, high-value step
+   and isolates the surface for that later work.
 
 3. **[DONE — package named `sftpfs`] An `sftp` (or `sftpserver`) package.** The entire `sftpHandler` + `listerat` + `linkInfo`
    implementation (~270 lines in `main.go`) is a self-contained `sftp.Handlers` implementation
