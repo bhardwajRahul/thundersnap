@@ -501,8 +501,7 @@ func main() {
 	// --data-dir. Keeping them as separate internal variables avoids touching
 	// the many call sites that already use fs-dir/snaps-dir paths, and
 	// guarantees both live on the same btrfs filesystem.
-	fsDir := filepath.Join(*flagDataDir, "fs")
-	snapsDir := filepath.Join(*flagDataDir, "snaps")
+	fsDir, snapsDir := deriveDataDirs(*flagDataDir)
 	flagFsDir = &fsDir
 	flagSnapsDir = &snapsDir
 	if *flagPolicyPath == "" {
@@ -1409,6 +1408,46 @@ func configureContainerResources(pid int, cgroupName string) {
 	setupContainerCgroup(pid, cgroupName)
 }
 
+// btrfsCreateSubvol creates a new empty btrfs subvolume at path, wrapping the
+// command's combined output into the error on failure.
+func btrfsCreateSubvol(path string) error {
+	if output, err := exec.Command("btrfs", "subvolume", "create", path).CombinedOutput(); err != nil {
+		return fmt.Errorf("btrfs subvolume create %s: %w\noutput: %s", path, err, string(output))
+	}
+	return nil
+}
+
+// btrfsSnapshot creates a btrfs snapshot of src at dst. When readonly is true
+// the snapshot is created with -r (used for the immutable snaps-dir entries).
+func btrfsSnapshot(src, dst string, readonly bool) error {
+	args := []string{"subvolume", "snapshot"}
+	if readonly {
+		args = append(args, "-r")
+	}
+	args = append(args, src, dst)
+	if output, err := exec.Command("btrfs", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("btrfs subvolume snapshot %s -> %s: %w\noutput: %s", src, dst, err, string(output))
+	}
+	return nil
+}
+
+// btrfsDeleteSubvol deletes the btrfs subvolume at path, wrapping the command's
+// combined output into the error on failure.
+func btrfsDeleteSubvol(path string) error {
+	if output, err := exec.Command("btrfs", "subvolume", "delete", path).CombinedOutput(); err != nil {
+		return fmt.Errorf("btrfs subvolume delete %s: %w\noutput: %s", path, err, string(output))
+	}
+	return nil
+}
+
+// deriveDataDirs splits the single --data-dir into the live-filesystem
+// ("<dataDir>/fs") and snapshot ("<dataDir>/snaps") directories. Both are
+// children of the same data dir, which is what guarantees they land on the
+// same btrfs filesystem (load-bearing for the same-filesystem snapshot check).
+func deriveDataDirs(dataDir string) (fsDir, snapsDir string) {
+	return filepath.Join(dataDir, "fs"), filepath.Join(dataDir, "snaps")
+}
+
 // sanitizeForPath replaces characters that are unsafe for filesystem paths.
 func sanitizeForPath(s string) string {
 	// Replace / and null bytes, and collapse multiple replacements
@@ -1424,6 +1463,19 @@ func sanitizeForPath(s string) string {
 		result = "_"
 	}
 	return result
+}
+
+// tailscaleUserFromRootFS extracts the tailscale user from a frame's rootFS
+// path, which has the shape "<fsDir>/<tailscale-user>/<frame>". The user is the
+// first path component relative to flagFsDir; an error is returned when the
+// relative path has fewer than two components (so the user can't be determined).
+func tailscaleUserFromRootFS(rootFS string) (string, error) {
+	rootFSRel, _ := filepath.Rel(*flagFsDir, rootFS)
+	parts := strings.Split(rootFSRel, string(filepath.Separator))
+	if len(parts) < 2 {
+		return "", fmt.Errorf("cannot determine tailscale user from rootFS path")
+	}
+	return parts[0], nil
 }
 
 // stripDomain removes the @domain part from a username (e.g., "user@example.com" -> "user")
@@ -1928,7 +1980,7 @@ func (h *sftpHandler) toHostPath(p string) (string, error) {
 	// Join with rootFS
 	hostPath := filepath.Join(h.rootFS, cleaned)
 
-	// Verify the path is still within rootFS (防止目录遍历攻击)
+	// Verify the path is still within rootFS (prevent directory traversal attacks).
 	if !strings.HasPrefix(hostPath, h.rootFS+"/") && hostPath != h.rootFS {
 		return "", fmt.Errorf("path escapes container root: %s", p)
 	}
@@ -2532,11 +2584,8 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 	intermediatePath := filepath.Join(*flagSnapsDir, intermediateID)
 
 	// Step 2: Clone from intermediate snapshot to rootFS
-	cmd := exec.Command("btrfs", "subvolume", "snapshot", intermediatePath, rootFS)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("btrfs snapshot from %s to %s failed: %w\noutput: %s",
-			intermediatePath, rootFS, err, string(output))
+	if err := btrfsSnapshot(intermediatePath, rootFS, false); err != nil {
+		return err
 	}
 
 	// Write stamp file for the live filesystem
@@ -2591,19 +2640,13 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 			return fmt.Errorf("rootfs snap %s: %w", meta.Rootfs, err)
 		}
 
-		cmd := exec.Command("btrfs", "subvolume", "snapshot", rootfsSnapPath, rootFS)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("btrfs snapshot rootfs from %s to %s failed: %w\noutput: %s",
-				rootfsSnapPath, rootFS, err, string(output))
+		if err := btrfsSnapshot(rootfsSnapPath, rootFS, false); err != nil {
+			return err
 		}
 	} else {
 		// Create empty rootfs subvolume with minimal structure
-		cmd := exec.Command("btrfs", "subvolume", "create", rootFS)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("btrfs subvolume create rootfs at %s failed: %w\noutput: %s",
-				rootFS, err, string(output))
+		if err := btrfsCreateSubvol(rootFS); err != nil {
+			return err
 		}
 
 		// Set up minimal directory structure for a functional container
@@ -2627,19 +2670,13 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 		if _, err := os.Stat(homeSnapPath); err != nil {
 			return fmt.Errorf("home snap %s: %w", meta.Home, err)
 		}
-		cmd := exec.Command("btrfs", "subvolume", "snapshot", homeSnapPath, homePath)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("btrfs snapshot home from %s to %s failed: %w\noutput: %s",
-				homeSnapPath, homePath, err, string(output))
+		if err := btrfsSnapshot(homeSnapPath, homePath, false); err != nil {
+			return err
 		}
 	} else {
 		// Create empty home subvolume
-		cmd := exec.Command("btrfs", "subvolume", "create", homePath)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("btrfs subvolume create home at %s failed: %w\noutput: %s",
-				homePath, err, string(output))
+		if err := btrfsCreateSubvol(homePath); err != nil {
+			return err
 		}
 		// Chown to the thundersnap user (UID 7575)
 		if err := os.Chown(homePath, tsm.ThundersnapUID, tsm.ThundersnapGID); err != nil {
@@ -2662,19 +2699,13 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 		if _, err := os.Stat(workSnapPath); err != nil {
 			return fmt.Errorf("work snap %s: %w", meta.Work, err)
 		}
-		cmd := exec.Command("btrfs", "subvolume", "snapshot", workSnapPath, workPath)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("btrfs snapshot work from %s to %s failed: %w\noutput: %s",
-				workSnapPath, workPath, err, string(output))
+		if err := btrfsSnapshot(workSnapPath, workPath, false); err != nil {
+			return err
 		}
 	} else {
 		// Create empty work subvolume
-		cmd := exec.Command("btrfs", "subvolume", "create", workPath)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("btrfs subvolume create work at %s failed: %w\noutput: %s",
-				workPath, err, string(output))
+		if err := btrfsCreateSubvol(workPath); err != nil {
+			return err
 		}
 		// Chown to the thundersnap user (UID 7575)
 		if err := os.Chown(workPath, tsm.ThundersnapUID, tsm.ThundersnapGID); err != nil {
@@ -2737,11 +2768,8 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 		}
 	}
 	if !isSubvolume(idPath) {
-		cmd := exec.Command("btrfs", "subvolume", "create", idPath)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("btrfs subvolume create id at %s failed: %w\noutput: %s",
-				idPath, err, string(output))
+		if err := btrfsCreateSubvol(idPath); err != nil {
+			return err
 		}
 		// Set permissions: 0700 (only root can access)
 		if err := os.Chmod(idPath, 0700); err != nil {
@@ -3627,14 +3655,12 @@ func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Delete the snapshot directory (btrfs subvolume)
-	cmd := exec.Command("btrfs", "subvolume", "delete", snapPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+	if err := btrfsDeleteSubvol(snapPath); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(DeleteSnapResponse{
 			Status:  "error",
-			Message: fmt.Sprintf("btrfs subvolume delete failed: %v\noutput: %s", err, string(output)),
+			Message: err.Error(),
 		})
 		return
 	}
@@ -3724,18 +3750,16 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 	}
 
 	// Extract tailscale user from rootFS path: /fs-dir/<tailscale-user>/<frame>
-	rootFSRel, _ := filepath.Rel(*flagFsDir, c.rootFS)
-	parts := strings.Split(rootFSRel, string(filepath.Separator))
-	if len(parts) < 2 {
+	safeTailscaleUser, err := tailscaleUserFromRootFS(c.rootFS)
+	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(DeleteFrameResponse{
 			Status:  "error",
-			Message: "cannot determine tailscale user from rootFS path",
+			Message: err.Error(),
 		})
 		return
 	}
-	safeTailscaleUser := parts[0]
 
 	// Sanitize frame name for filesystem path
 	safeFrameName := sanitizeForPath(req.FrameName)
@@ -3771,35 +3795,30 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 	idPath := filepath.Join(framePath, "id")
 
 	if isSubvolume(homePath) {
-		cmd := exec.Command("btrfs", "subvolume", "delete", homePath)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to delete home subvolume: %v\noutput: %s", err, string(output))
+		if err := btrfsDeleteSubvol(homePath); err != nil {
+			log.Printf("Warning: failed to delete home subvolume: %v", err)
 		}
 	}
 
 	if isSubvolume(workPath) {
-		cmd := exec.Command("btrfs", "subvolume", "delete", workPath)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to delete work subvolume: %v\noutput: %s", err, string(output))
+		if err := btrfsDeleteSubvol(workPath); err != nil {
+			log.Printf("Warning: failed to delete work subvolume: %v", err)
 		}
 	}
 
 	if isSubvolume(idPath) {
-		cmd := exec.Command("btrfs", "subvolume", "delete", idPath)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to delete id subvolume: %v\noutput: %s", err, string(output))
+		if err := btrfsDeleteSubvol(idPath); err != nil {
+			log.Printf("Warning: failed to delete id subvolume: %v", err)
 		}
 	}
 
 	// Delete the frame directory (btrfs subvolume)
-	cmd := exec.Command("btrfs", "subvolume", "delete", framePath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+	if err := btrfsDeleteSubvol(framePath); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(DeleteFrameResponse{
 			Status:  "error",
-			Message: fmt.Sprintf("btrfs subvolume delete failed: %v\noutput: %s", err, string(output)),
+			Message: err.Error(),
 		})
 		return
 	}
@@ -4076,19 +4095,16 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract tailscale user from rootFS path: /fs-dir/<tailscale-user>/<frame>
-	// The tailscale user is the second-to-last path component
-	rootFSRel, _ := filepath.Rel(*flagFsDir, c.rootFS)
-	parts := strings.Split(rootFSRel, string(filepath.Separator))
-	if len(parts) < 2 {
+	safeTailscaleUser, err := tailscaleUserFromRootFS(c.rootFS)
+	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(CreateResponse{
 			Status:  "error",
-			Message: "cannot determine tailscale user from rootFS path",
+			Message: err.Error(),
 		})
 		return
 	}
-	safeTailscaleUser := parts[0]
 
 	// Sanitize frame name for filesystem path
 	safeFrameName := sanitizeForPath(req.FrameName)
@@ -4547,11 +4563,8 @@ func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) er
 	}
 
 	// Clone from the snapshot to the frame path
-	cmd := exec.Command("btrfs", "subvolume", "snapshot", snapshotPath, framePath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("btrfs snapshot from %s to %s failed: %w\noutput: %s",
-			snapshotPath, framePath, err, string(output))
+	if err := btrfsSnapshot(snapshotPath, framePath, false); err != nil {
+		return err
 	}
 
 	// Write stamp file for the live filesystem
@@ -4922,22 +4935,11 @@ func createDownloadTargetDir(path, parentStamp string, progress io.Writer) error
 		if progress != nil {
 			fmt.Fprintf(progress, "Cloning from local ancestor %s...\n", filepath.Base(localAncestor))
 		}
-		cmd := exec.Command("btrfs", "subvolume", "snapshot", localAncestor, path)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("btrfs subvolume snapshot from %s to %s: %w\noutput: %s",
-				localAncestor, path, err, output)
-		}
-		return nil
+		return btrfsSnapshot(localAncestor, path, false)
 	}
 
 	// No local ancestor found, create a fresh subvolume
-	cmd := exec.Command("btrfs", "subvolume", "create", path)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("btrfs subvolume create %s: %w\noutput: %s", path, err, output)
-	}
-	return nil
+	return btrfsCreateSubvol(path)
 }
 
 // findLocalAncestor walks the parent chain starting from stampID and returns
@@ -5216,10 +5218,8 @@ func createSnapshotWithTaintsSubdir(source, subdir, parentStampID string, taints
 
 	if subdir == "" {
 		// Step 1: Create read-only btrfs snapshot to tmp path
-		cmd := exec.Command("btrfs", "subvolume", "snapshot", "-r", source, tmpPath)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return "", fmt.Errorf("btrfs snapshot failed: %w\noutput: %s", err, string(output))
+		if err := btrfsSnapshot(source, tmpPath, true); err != nil {
+			return "", err
 		}
 	} else {
 		// Subdir snap: take a WRITABLE snapshot (so we can prune/promote),

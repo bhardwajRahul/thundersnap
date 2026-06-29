@@ -254,7 +254,7 @@ func handleListRefs(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, RefListResponse{Status: "ok", Refs: entries})
 }
 
-// ReflogEntry is a single entry in the reflog response.
+// ReflogEntryResponse is a single entry in the reflog response.
 type ReflogEntryResponse struct {
 	UUID string `json:"uuid"`
 	Time string `json:"time"`
