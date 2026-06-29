@@ -1113,54 +1113,10 @@ func openPty() (ptmx, tty *os.File, err error) {
 }
 
 // runVshCommand connects to vshd via vsock and runs a command.
+// runVshCommand runs a non-PTY command directly in the VM (no container),
+// returning combined stdout+stderr via the shared vshdproto TLV helper.
 func runVshCommand(vsockSock, user string, args ...string) (string, error) {
-	// Connect to cloud-hypervisor's vsock socket (the base socket, not port-specific)
-	conn, err := net.Dial("unix", vsockSock)
-	if err != nil {
-		return "", fmt.Errorf("dial vsock socket: %w", err)
-	}
-	defer conn.Close()
-
-	// Set deadline for the whole operation
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	// Cloud-hypervisor vsock protocol: send "CONNECT <port>\n"
-	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", 5222); err != nil {
-		return "", fmt.Errorf("send CONNECT: %w", err)
-	}
-
-	// Read response - should be "OK <port>\n"
-	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		return "", fmt.Errorf("read handshake response: %w", err)
-	}
-	response = strings.TrimSpace(response)
-	if !strings.HasPrefix(response, "OK") {
-		return "", fmt.Errorf("vsock handshake failed: %s", response)
-	}
-
-	// Now send vshd protocol:
-	// 1. target username (null-terminated)
-	// 2. arg count (null-terminated)
-	// 3. each arg (null-terminated)
-	if _, err := conn.Write([]byte(user + "\x00")); err != nil {
-		return "", fmt.Errorf("send user: %w", err)
-	}
-	if _, err := conn.Write([]byte(fmt.Sprintf("%d\x00", len(args)))); err != nil {
-		return "", fmt.Errorf("send arg count: %w", err)
-	}
-	for _, arg := range args {
-		if _, err := conn.Write([]byte(arg + "\x00")); err != nil {
-			return "", fmt.Errorf("send arg: %w", err)
-		}
-	}
-
-	// Read response
-	var buf bytes.Buffer
-	io.Copy(&buf, reader)
-
-	return buf.String(), nil
+	return runVshdCommand(vsockSock, "", user, "", args...)
 }
 
 // tryVsockConnect attempts to connect to the VM's vsock port and immediately closes.

@@ -16,11 +16,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 
 	"github.com/creack/pty"
 	"github.com/mdlayher/vsock"
+	"github.com/tailscale/thundersnap/vshdproto"
 )
 
 // selectUser determines which Unix user to run as, auto-detecting when the
@@ -135,19 +137,25 @@ func initTsBinaryPath() {
 	}
 }
 
-func handleConnection(conn *vsock.Conn) {
+// handleConnection serves one vshd session over conn. conn is an
+// io.ReadWriteCloser so the same handler serves both a VM vsock connection and
+// (in host mode) a Unix-socket connection.
+//
+// Request header (null-delimited), read before any TLV framing:
+//
+//	original: targetUser\0pty\0argCount\0arg1\0...argN\0
+//	VMX:      VMX\0framePath\0targetUser\0pty\0argCount\0arg1\0...argN\0
+//
+// where pty is "1" for a PTY session and "0" otherwise. After the header the
+// connection carries vshdproto TLV frames in both directions.
+func handleConnection(conn io.ReadWriteCloser) {
 	id := atomic.AddUint64(&connectionID, 1)
-	log.Printf("[conn %d] new connection from %v", id, conn.RemoteAddr())
+	log.Printf("[conn %d] new connection", id)
 	defer func() {
 		conn.Close()
 		log.Printf("[conn %d] connection closed", id)
 	}()
 
-	// Read the command protocol:
-	// Original protocol:
-	//   targetUser\0argCount\0arg1\0...argN\0
-	// Extended VMX protocol:
-	//   VMX\0framePath\0targetUser\0argCount\0arg1\0...argN\0
 	reader := bufio.NewReader(conn)
 
 	firstField, err := readField(reader)
@@ -156,32 +164,104 @@ func handleConnection(conn *vsock.Conn) {
 		return
 	}
 
-	// Check if this is the VMX protocol
+	// rootPrefix is "" for the host/VM filesystem, or the container rootfs for
+	// the VMX protocol.
+	rootPrefix := ""
 	if firstField == "VMX" {
-		handleVMXConnection(id, conn, reader)
-		return
+		framePath, err := readField(reader)
+		if err != nil {
+			log.Printf("[conn %d] VMX: failed to read frame path: %v", id, err)
+			return
+		}
+		// The frame rootfs is at /<framePath> from the virtiofs root
+		// (virtiofs is mounted as / in the VM).
+		rootPrefix = filepath.Clean("/" + framePath)
+		// The next field is the target user, read below.
+		firstField, err = readField(reader)
+		if err != nil {
+			log.Printf("[conn %d] VMX: failed to read target user: %v", id, err)
+			return
+		}
 	}
 
-	// Original protocol: firstField is targetUser
 	targetUser := firstField
-
+	wantPTY, err := readBool(reader)
+	if err != nil {
+		log.Printf("[conn %d] failed to read pty flag: %v", id, err)
+		return
+	}
 	cmdArgs, err := readArgs(reader)
 	if err != nil {
 		log.Printf("[conn %d] failed to read args: %v", id, err)
 		return
 	}
 
-	// Determine which user to run as
-	runAsUser := selectUser("", targetUser)
-	log.Printf("[conn %d] running as user %q (requested: %q)", id, runAsUser, targetUser)
+	runAsUser := selectUser(rootPrefix, targetUser)
+	log.Printf("[conn %d] running as user %q (requested: %q, rootPrefix: %q, pty: %v, args: %v)",
+		id, runAsUser, targetUser, rootPrefix, wantPTY, cmdArgs)
 
-	if len(cmdArgs) > 0 {
-		log.Printf("[conn %d] running command: %v", id, cmdArgs)
-		runCommand(id, conn, reader, runAsUser, cmdArgs)
-	} else {
-		log.Printf("[conn %d] starting interactive shell", id)
-		runInteractiveShell(id, conn, reader, runAsUser)
+	cmd := buildSessionCmd(rootPrefix, runAsUser, cmdArgs, wantPTY)
+	serveSession(id, conn, reader, cmd, wantPTY)
+}
+
+// buildSessionCmd constructs the *exec.Cmd for a session. rootPrefix is "" for a
+// direct VM/host shell or a container rootfs path for VMX mode (in which case
+// the command is wrapped in `ts drop-caps-and-run --chroot` and a fresh
+// PID/mount/UTS namespace). When cmdArgs is empty an interactive login shell is
+// started; otherwise the command is run (via `su - user -c` for non-root).
+func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY bool) *exec.Cmd {
+	// argv is what we ultimately exec (before any container wrapper).
+	var argv []string
+	switch {
+	case len(cmdArgs) == 0 && runAsUser == "root":
+		// Interactive root shell: run /bin/sh -l directly (avoids needing su).
+		argv = []string{"/bin/sh", "-l"}
+	case len(cmdArgs) == 0:
+		// Interactive login shell for a non-root user.
+		argv = []string{"su", "-", runAsUser}
+	case runAsUser == "root":
+		// Run the command directly as root.
+		argv = cmdArgs
+	default:
+		// Run the command via a login shell for the target user.
+		argv = []string{"su", "-", runAsUser, "-c", quoteArgsForSh(cmdArgs)}
 	}
+
+	if rootPrefix == "" {
+		// Direct shell/command in this filesystem (VM host or host mode).
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Env = sessionEnv(wantPTY)
+		return cmd
+	}
+
+	// VMX container mode: wrap in ts drop-caps-and-run to chroot + drop caps,
+	// in a fresh PID/mount/UTS namespace.
+	tsArgs := append([]string{"drop-caps-and-run", "--chroot=" + rootPrefix, "--"}, argv...)
+	cmd := exec.Command(tsBinaryPath, tsArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
+	}
+	cmd.Env = sessionEnv(wantPTY)
+	return cmd
+}
+
+// sessionEnv returns the environment for a session command, adding TERM for PTY
+// sessions.
+func sessionEnv(wantPTY bool) []string {
+	env := os.Environ()
+	if wantPTY {
+		env = append(env, "TERM=xterm-256color")
+	}
+	return env
+}
+
+// readBool reads a null-terminated field expected to be "1" or "0".
+func readBool(reader *bufio.Reader) (bool, error) {
+	s, err := readField(reader)
+	if err != nil {
+		return false, err
+	}
+	return s == "1", nil
 }
 
 // readArgs reads a null-delimited "argCount\0arg1\0...argN\0" sequence shared by
@@ -211,252 +291,169 @@ func readArgs(reader *bufio.Reader) ([]string, error) {
 	return cmdArgs, nil
 }
 
-// handleVMXConnection handles the VMX protocol for spawning containers inside the VM.
-// Protocol: VMX\0framePath\0targetUser\0argCount\0arg1\0...argN\0
-func handleVMXConnection(id uint64, conn *vsock.Conn, reader *bufio.Reader) {
-	// Read framePath (path to container rootfs relative to virtiofs root)
-	framePath, err := readField(reader)
-	if err != nil {
-		log.Printf("[conn %d] VMX: failed to read frame path: %v", id, err)
-		return
-	}
-
-	// Read target user
-	targetUser, err := readField(reader)
-	if err != nil {
-		log.Printf("[conn %d] VMX: failed to read target user: %v", id, err)
-		return
-	}
-
-	// Read arg count + arguments
-	cmdArgs, err := readArgs(reader)
-	if err != nil {
-		log.Printf("[conn %d] VMX: failed to read args: %v", id, err)
-		return
-	}
-
-	// The frame rootfs is at /<framePath> from the virtiofs root
-	// (virtiofs is mounted as / in the VM)
-	containerRootFS := filepath.Clean("/" + framePath)
-	log.Printf("[conn %d] VMX: spawning container at %s (user: %q, args: %v)", id, containerRootFS, targetUser, cmdArgs)
-
-	if len(cmdArgs) > 0 {
-		runContainerCommand(id, conn, reader, containerRootFS, targetUser, cmdArgs)
+// serveSession runs cmd, proxying it to the client over conn using vshdproto TLV
+// framing. For a PTY session (wantPTY) the command is started on a pty whose
+// size tracks FrameWinsize frames from the client; for a non-PTY session stdin
+// is fed from FrameStdin frames and stdout/stderr are framed separately. In both
+// cases the child's exit code is sent as a FrameExit frame before the connection
+// is closed.
+func serveSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, wantPTY bool) {
+	if wantPTY {
+		servePTYSession(id, conn, reader, cmd)
 	} else {
-		runContainerShell(id, conn, reader, containerRootFS, targetUser)
+		servePipeSession(id, conn, reader, cmd)
 	}
 }
 
-// runContainerShell spawns an interactive shell inside a container.
-// Uses ts drop-caps-and-run to set up namespaces and chroot.
-func runContainerShell(id uint64, conn *vsock.Conn, reader *bufio.Reader, containerRootFS, targetUser string) {
-	// Determine which user to run as (may auto-detect from container's /etc/passwd)
-	runAsUser := selectUser(containerRootFS, targetUser)
-
-	// Build ts command
-	// ts drop-caps-and-run --chroot=<path> -- su - <user>
-	var tsArgs []string
-	if runAsUser == "root" {
-		tsArgs = []string{"drop-caps-and-run", "--chroot=" + containerRootFS, "--", "/bin/sh", "-l"}
-	} else {
-		tsArgs = []string{"drop-caps-and-run", "--chroot=" + containerRootFS, "--", "su", "-", runAsUser}
-	}
-
-	cmd := exec.Command(tsBinaryPath, tsArgs...)
-	// New PID/mount/UTS namespaces give the container its own process tree,
-	// mount table, and hostname; `ts drop-caps-and-run` then performs the
-	// chroot and drops capabilities inside them.
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
-	}
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-
-	ptmx, err := pty.Start(cmd)
-	if err != nil {
-		log.Printf("[conn %d] VMX: failed to start container shell: %v", id, err)
-		fmt.Fprintf(conn, "vshd: failed to start container shell: %v\n", err)
-		return
-	}
-	defer ptmx.Close()
-	log.Printf("[conn %d] VMX: container shell started with PID %d (user: %s)", id, cmd.Process.Pid, runAsUser)
-
-	// Copy data between vsock and pty
-	done := make(chan struct{}, 2)
-
-	go func() {
-		n, err := io.Copy(ptmx, reader)
-		log.Printf("[conn %d] VMX: stdin copy ended: %d bytes, err=%v", id, n, err)
-		done <- struct{}{}
-	}()
-
-	go func() {
-		n, err := io.Copy(conn, ptmx)
-		log.Printf("[conn %d] VMX: stdout copy ended: %d bytes, err=%v", id, n, err)
-		done <- struct{}{}
-	}()
-
-	// One copy goroutine returning means the session is ending (the guest shell
-	// exited, closing the pty, or the vsock peer went away). SIGHUP tells the
-	// shell its controlling terminal hung up so it tears down its job-control
-	// children before we reap it with Wait.
-	<-done
-	log.Printf("[conn %d] VMX: signaling container to exit", id)
-	cmd.Process.Signal(syscall.SIGHUP)
-	cmd.Wait()
-	log.Printf("[conn %d] VMX: container exited", id)
-}
-
-// runContainerCommand runs a command inside a container.
-func runContainerCommand(id uint64, conn *vsock.Conn, reader *bufio.Reader, containerRootFS, targetUser string, cmdArgs []string) {
-	// Determine which user to run as
-	runAsUser := selectUser(containerRootFS, targetUser)
-
-	// Build ts command
-	// ts drop-caps-and-run --chroot=<path> -- su - <user> -c '<command>'
-	var tsArgs []string
-	if runAsUser == "root" {
-		// For root, run command directly
-		tsArgs = append([]string{"drop-caps-and-run", "--chroot=" + containerRootFS, "--"}, cmdArgs...)
-	} else {
-		// For non-root, use su -c
-		cmdStr := quoteArgsForSh(cmdArgs)
-		tsArgs = []string{"drop-caps-and-run", "--chroot=" + containerRootFS, "--", "su", "-", runAsUser, "-c", cmdStr}
-	}
-
-	cmd := exec.Command(tsBinaryPath, tsArgs...)
-	// See runContainerShell for why these three namespaces.
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
-	}
-	cmd.Env = os.Environ()
-
-	// Set up pipes
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		log.Printf("[conn %d] VMX: failed to create stdin pipe: %v", id, err)
-		fmt.Fprintf(conn, "vshd: failed to create stdin pipe: %v\n", err)
-		return
-	}
-	cmd.Stdout = conn
-	cmd.Stderr = conn
-
-	if err := cmd.Start(); err != nil {
-		log.Printf("[conn %d] VMX: failed to start container command: %v", id, err)
-		fmt.Fprintf(conn, "vshd: %v\n", err)
-		return
-	}
-	log.Printf("[conn %d] VMX: container command started with PID %d (user: %s)", id, cmd.Process.Pid, runAsUser)
-
-	// Copy stdin in background
-	go func() {
-		io.Copy(stdin, reader)
-		stdin.Close()
-	}()
-
-	// Wait for command to complete
-	err = cmd.Wait()
-	if err != nil {
-		log.Printf("[conn %d] VMX: container command exited with error: %v", id, err)
-	} else {
-		log.Printf("[conn %d] VMX: container command exited successfully", id)
-	}
-}
-
-// runInteractiveShell spawns an interactive login shell as the specified user with PTY.
-// For root, runs /bin/sh directly. For other users, uses "su - <user>".
-func runInteractiveShell(id uint64, conn *vsock.Conn, reader *bufio.Reader, runAsUser string) {
-	var cmd *exec.Cmd
-	if runAsUser == "root" {
-		// When running as root, start a shell directly without su.
-		// This avoids the need for a dynamically-linked su binary in minimal containers.
-		cmd = exec.Command("/bin/sh", "-l")
-	} else {
-		// Use su - <user> for a login shell (sets HOME, reads profile, etc.)
-		cmd = exec.Command("su", "-", runAsUser)
-	}
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-
+// servePTYSession starts cmd on a pty and bridges it to the TLV stream:
+// FrameStdin -> pty, FrameWinsize -> pty.Setsize, pty output -> FrameStdout.
+func servePTYSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd) {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		log.Printf("[conn %d] failed to start pty: %v", id, err)
-		fmt.Fprintf(conn, "vshd: failed to start shell as %s: %v\n", runAsUser, err)
+		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: failed to start shell: %v\n", err)))
+		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
 		return
 	}
 	defer ptmx.Close()
-	log.Printf("[conn %d] shell started with PID %d (user: %s)", id, cmd.Process.Pid, runAsUser)
+	log.Printf("[conn %d] pty session started with PID %d", id, cmd.Process.Pid)
 
-	// Copy data between vsock and pty
-	done := make(chan struct{}, 2)
-
+	// Client -> child: decode TLV frames, route stdin to the pty and winsize to
+	// the pty size. Runs until the client closes (EOF) or sends a malformed frame.
 	go func() {
-		n, err := io.Copy(ptmx, reader)
-		log.Printf("[conn %d] stdin copy ended: %d bytes, err=%v", id, n, err)
-		done <- struct{}{}
+		for {
+			typ, payload, err := vshdproto.ReadFrame(reader)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("[conn %d] read frame: %v", id, err)
+				}
+				return
+			}
+			switch typ {
+			case vshdproto.FrameStdin:
+				if _, werr := ptmx.Write(payload); werr != nil {
+					return
+				}
+			case vshdproto.FrameWinsize:
+				ws, derr := vshdproto.DecodeWinsize(payload)
+				if derr != nil {
+					log.Printf("[conn %d] bad winsize: %v", id, derr)
+					continue
+				}
+				pty.Setsize(ptmx, &pty.Winsize{Rows: ws.Rows, Cols: ws.Cols, X: ws.X, Y: ws.Y})
+			}
+		}
 	}()
 
+	// Child -> client: frame pty output as FrameStdout.
+	done := make(chan struct{})
 	go func() {
-		n, err := io.Copy(conn, ptmx)
-		log.Printf("[conn %d] stdout copy ended: %d bytes, err=%v", id, n, err)
-		done <- struct{}{}
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := ptmx.Read(buf)
+			if n > 0 {
+				if werr := vshdproto.WriteFrame(conn, vshdproto.FrameStdout, buf[:n]); werr != nil {
+					break
+				}
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		close(done)
 	}()
 
-	// See runContainerShell: one copy ending means the session is over; SIGHUP
-	// hangs up the shell's controlling terminal before we reap it.
 	<-done
-	log.Printf("[conn %d] signaling shell to exit", id)
+	log.Printf("[conn %d] signaling pty session to exit", id)
 	cmd.Process.Signal(syscall.SIGHUP)
-	cmd.Wait()
-	log.Printf("[conn %d] shell exited", id)
+	code := waitExitCode(cmd)
+	vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(code))
+	log.Printf("[conn %d] pty session exited (code %d)", id, code)
 }
 
-// runCommand executes a command as the specified user without PTY and exits when done.
-// For root, runs the command directly. For other users, uses "su - <user> -c" for a
-// login shell that sets HOME and changes to the user's home directory.
-func runCommand(id uint64, conn *vsock.Conn, reader *bufio.Reader, runAsUser string, cmdArgs []string) {
-	var cmd *exec.Cmd
-
-	if runAsUser == "root" {
-		// When running as root, execute the command directly without su.
-		// This avoids the need for a dynamically-linked su binary in minimal containers.
-		cmd = exec.Command(cmdArgs[0], cmdArgs[1:]...)
-	} else {
-		// For non-root users, use su - to switch users with a login shell.
-		// The login shell changes to the home directory, sets HOME, reads profile, etc.
-		cmdStr := quoteArgsForSh(cmdArgs)
-		cmd = exec.Command("su", "-", runAsUser, "-c", cmdStr)
-	}
-	cmd.Env = os.Environ()
-
-	// Set up pipes for stdin/stdout/stderr
+// servePipeSession runs cmd without a pty, feeding FrameStdin frames to the
+// child's stdin and framing its stdout/stderr separately (FrameStdout/
+// FrameStderr), then sending FrameExit.
+func servePipeSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd) {
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		log.Printf("[conn %d] failed to create stdin pipe: %v", id, err)
-		fmt.Fprintf(conn, "vshd: failed to create stdin pipe: %v\n", err)
+		log.Printf("[conn %d] stdin pipe: %v", id, err)
+		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: %v\n", err)))
+		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
 		return
 	}
-	cmd.Stdout = conn
-	cmd.Stderr = conn
+	// stdout and stderr are framed onto the same connection from independent
+	// goroutines; a shared mutex keeps each frame's header+payload contiguous.
+	var writeMu sync.Mutex
+	cmd.Stdout = &frameWriter{conn: conn, typ: vshdproto.FrameStdout, mu: &writeMu}
+	cmd.Stderr = &frameWriter{conn: conn, typ: vshdproto.FrameStderr, mu: &writeMu}
 
 	if err := cmd.Start(); err != nil {
-		log.Printf("[conn %d] failed to start command: %v", id, err)
-		fmt.Fprintf(conn, "vshd: %v\n", err)
+		log.Printf("[conn %d] start command: %v", id, err)
+		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: %v\n", err)))
+		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
 		return
 	}
-	log.Printf("[conn %d] command started with PID %d (user: %s)", id, cmd.Process.Pid, runAsUser)
+	log.Printf("[conn %d] command started with PID %d", id, cmd.Process.Pid)
 
-	// Copy stdin in background
+	// Client -> child stdin: decode FrameStdin frames. Other frame types (e.g.
+	// stray winsize) are ignored in pipe mode. Close stdin on EOF.
 	go func() {
-		io.Copy(stdin, reader)
-		stdin.Close()
+		defer stdin.Close()
+		for {
+			typ, payload, err := vshdproto.ReadFrame(reader)
+			if err != nil {
+				return
+			}
+			if typ == vshdproto.FrameStdin {
+				if _, werr := stdin.Write(payload); werr != nil {
+					return
+				}
+			}
+		}
 	}()
 
-	// Wait for command to complete
-	err = cmd.Wait()
-	if err != nil {
-		log.Printf("[conn %d] command exited with error: %v", id, err)
-	} else {
-		log.Printf("[conn %d] command exited successfully", id)
+	code := waitExitCode(cmd)
+	vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(code))
+	log.Printf("[conn %d] command exited (code %d)", id, code)
+}
+
+// waitExitCode waits for cmd and returns its exit code (0 on success, the
+// process exit status on a normal non-zero exit, or 1 for other failures).
+func waitExitCode(cmd *exec.Cmd) int32 {
+	err := cmd.Wait()
+	if err == nil {
+		return 0
 	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
+			if ws.Signaled() {
+				return int32(128 + int(ws.Signal()))
+			}
+			return int32(ws.ExitStatus())
+		}
+		return int32(ee.ExitCode())
+	}
+	return 1
+}
+
+// frameWriter wraps a connection so that each Write is emitted as one vshdproto
+// frame of a fixed type. Used to frame a child's stdout/stderr in pipe mode.
+type frameWriter struct {
+	conn io.Writer
+	typ  uint8
+	mu   *sync.Mutex // optional; serialises frames sharing one conn
+}
+
+func (fw *frameWriter) Write(p []byte) (int, error) {
+	if fw.mu != nil {
+		fw.mu.Lock()
+		defer fw.mu.Unlock()
+	}
+	if err := vshdproto.WriteFrame(fw.conn, fw.typ, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 func main() {

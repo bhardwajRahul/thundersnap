@@ -8,9 +8,7 @@ package e2e
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -19,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tailscale/thundersnap/vshdproto"
 )
 
 // prepareVMXFrame creates the VMX outer VM rootfs and a container frame.
@@ -174,44 +174,11 @@ func dialVsock(vsockSock string, port int) (net.Conn, error) {
 	return conn, nil
 }
 
-// readAll reads all data from a connection.
-func readAll(conn net.Conn) (string, error) {
-	var buf bytes.Buffer
-	io.Copy(&buf, conn)
-	return buf.String(), nil
-}
-
-// runVMXCommand connects to vshd via vsock and runs a command in a container inside the VM.
-// Protocol: VMX\0framePath\0targetUser\0argCount\0args...
+// runVMXCommand connects to vshd via vsock and runs a non-PTY command in a
+// container inside the VM, returning combined stdout+stderr. It speaks the
+// vshdproto TLV framing via the shared runVshdCommand helper.
 func runVMXCommand(vsockSock, framePath, user string, args ...string) (string, error) {
-	conn, err := dialVsock(vsockSock, 5222)
-	if err != nil {
-		return "", err
-	}
-	defer conn.Close()
-
-	// Send VMX protocol
-	if _, err := conn.Write([]byte("VMX\x00")); err != nil {
-		return "", fmt.Errorf("send VMX: %w", err)
-	}
-	if _, err := conn.Write([]byte(framePath + "\x00")); err != nil {
-		return "", fmt.Errorf("send frame path: %w", err)
-	}
-	if _, err := conn.Write([]byte(user + "\x00")); err != nil {
-		return "", fmt.Errorf("send user: %w", err)
-	}
-	if _, err := conn.Write([]byte(fmt.Sprintf("%d\x00", len(args)))); err != nil {
-		return "", fmt.Errorf("send arg count: %w", err)
-	}
-	for _, arg := range args {
-		if _, err := conn.Write([]byte(arg + "\x00")); err != nil {
-			return "", fmt.Errorf("send arg: %w", err)
-		}
-	}
-
-	// Read response
-	output, err := readAll(conn)
-	return output, err
+	return runVshdCommand(vsockSock, framePath, user, "", args...)
 }
 
 // TestVMXBasicSession tests that a VMX session starts a VM and runs a container inside.
@@ -493,4 +460,84 @@ func TestVMXConcurrentSessions(t *testing.T) {
 	}
 
 	t.Logf("Successfully ran %d concurrent commands in different VMX containers", count)
+}
+
+// TestVMXPtyWinsize verifies that a PTY session over vshd honours the initial
+// FrameWinsize and propagates mid-session FrameWinsize resizes to the pty. This
+// is the regression oracle for the previously-missing winsize support on the VM
+// path (sessions used to be stuck at 80x24 and ignored resizes).
+func TestVMXPtyWinsize(t *testing.T) {
+	env := newTestEnv(t)
+	vmDir := requireVMDeps(t)
+
+	userFsDir, framePath := prepareVMXFrame(t, env, "winsize", "frame1")
+
+	// busybox gives the frame a real /bin/sh plus a standalone `stty` so the
+	// shell can report its terminal size. The fixture /bin/sh is just the ts
+	// binary and cannot run `stty`.
+	installBusyboxShell(t, framePath)
+	busybox, err := exec.LookPath("busybox")
+	if err != nil {
+		t.Fatalf("busybox required: %v", err)
+	}
+	sttyDst := filepath.Join(framePath, "bin/stty")
+	if err := copyFile(busybox, sttyDst); err != nil {
+		t.Fatalf("copy busybox stty: %v", err)
+	}
+	if err := os.Chmod(sttyDst, 0755); err != nil {
+		t.Fatalf("chmod stty: %v", err)
+	}
+
+	initPrefix := ".vmx-winsize"
+	session, err := startVM(t, env, userFsDir, vmDir, 512, vmxCmdlineWithPrefix(initPrefix, "vmx-winsize"))
+	if err != nil {
+		t.Fatalf("Failed to start VM: %v", err)
+	}
+	defer session.cleanup()
+
+	if _, err := session.waitForVshd(15 * time.Second); err != nil {
+		t.Fatalf("VM did not become ready: %v", err)
+	}
+
+	// Open an interactive PTY shell sized 40 rows x 100 cols.
+	pty, err := startVshdPTY(session.vsockSock, "frame1", "root",
+		vshdproto.Winsize{Rows: 40, Cols: 100}, "/bin/sh", "-i")
+	if err != nil {
+		t.Fatalf("start PTY session: %v", err)
+	}
+	defer pty.close()
+
+	// `stty size` prints "rows cols" for the controlling terminal. The marker
+	// is printed by concatenating two literals so the marker string never
+	// appears in the PTY's echo of the typed command line — only in the real
+	// command output. (Otherwise readUntil would match the echoed input.)
+	if err := pty.sendStdin(`stty size; printf '%s\n' SIZE1''DONE` + "\n"); err != nil {
+		t.Fatalf("send stdin: %v", err)
+	}
+	out, err := pty.readUntil("SIZE1DONE", 15*time.Second)
+	if err != nil {
+		t.Fatalf("read initial size: %v\noutput so far: %q", err, out)
+	}
+	if !strings.Contains(out, "40 100") {
+		t.Errorf("initial winsize: expected pty to report '40 100', got: %q", out)
+	}
+
+	// Resize mid-session to 50 rows x 120 cols and re-check.
+	if err := pty.resize(vshdproto.Winsize{Rows: 50, Cols: 120}); err != nil {
+		t.Fatalf("resize: %v", err)
+	}
+	// Give the guest a moment to apply the resize before asking again.
+	time.Sleep(200 * time.Millisecond)
+	if err := pty.sendStdin(`stty size; printf '%s\n' SIZE2''DONE` + "\n"); err != nil {
+		t.Fatalf("send stdin after resize: %v", err)
+	}
+	out2, err := pty.readUntil("SIZE2DONE", 15*time.Second)
+	if err != nil {
+		t.Fatalf("read resized size: %v\noutput so far: %q", err, out2)
+	}
+	if !strings.Contains(out2, "50 120") {
+		t.Errorf("resized winsize: expected pty to report '50 120', got: %q", out2)
+	}
+
+	t.Log("VMX PTY winsize works - initial size honoured and mid-session resize propagated")
 }

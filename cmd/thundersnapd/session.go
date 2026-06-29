@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/tailscale/thundersnap/sftpfs"
 	"github.com/tailscale/thundersnap/thundersnap"
 	"github.com/tailscale/thundersnap/tsm"
+	"github.com/tailscale/thundersnap/vshdproto"
 )
 
 // buildSessionCommand constructs the nsenter command that joins the container's
@@ -542,13 +544,14 @@ func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targe
 	}
 	defer conn.Close()
 
-	// Send VMX protocol: VMX\0framePath\0targetUser\0argCount\0args...
+	// Send VMX protocol header: VMX\0framePath\0targetUser\0pty\0argCount\0args...
 	// framePath is the frame's UUID, relative to the virtiofs root (userFsDir,
 	// i.e. fs/<user>): the frame lives at fs/<user>/<uuid> on the host.
-	writeVshdRequest(conn, uuid.String(), targetUser, s.Command())
+	ptyReq, winCh, isPty := s.Pty()
+	writeVshdRequest(conn, uuid.String(), targetUser, isPty, s.Command())
 
-	// Proxy SSH I/O (same as runVMSession)
-	return proxyVMSession(s, conn, ms.done, ms.panicked)
+	// Proxy SSH I/O over the vshdproto TLV stream.
+	return proxyVshdSession(s, conn, isPty, ptyReq, winCh, ms.done, ms.panicked)
 }
 
 // runVMXOuterShell handles a direct shell into the outer VMX VM (no container).
@@ -584,11 +587,12 @@ func runVMXOuterShell(s ssh.Session, tailscaleUser, isolationName, targetUser st
 	}
 	defer conn.Close()
 
-	// Send original vshd protocol (no VMX prefix) - shell directly in VM
-	writeVshdRequest(conn, "", targetUser, s.Command())
+	// Send original vshd protocol header (no VMX prefix) - shell directly in VM
+	ptyReq, winCh, isPty := s.Pty()
+	writeVshdRequest(conn, "", targetUser, isPty, s.Command())
 
-	// Proxy SSH I/O
-	return proxyVMSession(s, conn, ms.done, ms.panicked)
+	// Proxy SSH I/O over the vshdproto TLV stream.
+	return proxyVshdSession(s, conn, isPty, ptyReq, winCh, ms.done, ms.panicked)
 }
 
 // makeVMXControlHandler creates the HTTP handler for VMX control requests.
@@ -599,40 +603,102 @@ func makeVMXControlHandler(frameRootFS string) http.Handler {
 	return mux
 }
 
-// writeVshdRequest writes a vshd session request to conn using the null-delimited
-// wire protocol. When framePath is non-empty it emits the VMX form
-// ("VMX\0framePath\0user\0argc\0args...") which spawns a container at framePath
-// inside the VM; when framePath is empty it emits the plain form
-// ("user\0argc\0args...") for a shell directly in the VM.
-func writeVshdRequest(conn net.Conn, framePath, targetUser string, cmdArgs []string) {
+// writeVshdRequest writes a vshd session request header to conn using the
+// null-delimited wire protocol. When framePath is non-empty it emits the VMX
+// form ("VMX\0framePath\0user\0pty\0argc\0args...") which spawns a container at
+// framePath inside the VM; when framePath is empty it emits the plain form
+// ("user\0pty\0argc\0args...") for a shell directly in the VM. pty signals
+// whether the client requested a terminal. After this header the connection
+// carries vshdproto TLV frames in both directions.
+func writeVshdRequest(conn net.Conn, framePath, targetUser string, pty bool, cmdArgs []string) {
 	if framePath != "" {
 		fmt.Fprintf(conn, "VMX\x00%s\x00", framePath)
 	}
-	fmt.Fprintf(conn, "%s\x00%d\x00", targetUser, len(cmdArgs))
+	ptyFlag := "0"
+	if pty {
+		ptyFlag = "1"
+	}
+	fmt.Fprintf(conn, "%s\x00%s\x00%d\x00", targetUser, ptyFlag, len(cmdArgs))
 	for _, arg := range cmdArgs {
 		fmt.Fprintf(conn, "%s\x00", arg)
 	}
 }
 
-// proxyVMSession proxies SSH I/O to/from a vshd connection.
-// This is shared between runVMSession and runVMX* functions.
-func proxyVMSession(s ssh.Session, conn net.Conn, done <-chan struct{}, panicked <-chan struct{}) error {
+// proxyVshdSession proxies an SSH session to/from a vshd connection using the
+// vshdproto TLV framing. Host -> guest: SSH stdin is framed as FrameStdin and,
+// for PTY sessions, the initial window size plus every winCh change is sent as
+// FrameWinsize. Guest -> host: FrameStdout/FrameStderr are written to the SSH
+// stdout/stderr channels and FrameExit carries the real exit status.
+//
+// It is shared by all vshd-backed sessions (VMX container, VMX outer shell, and
+// any future host-vshd shim).
+func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, winCh <-chan ssh.Window, done <-chan struct{}, panicked <-chan struct{}) error {
+	// Stdin and winsize frames are written from independent goroutines; a
+	// mutex keeps each frame's header+payload contiguous on the wire.
+	var writeMu sync.Mutex
+	writeFrame := func(typ uint8, payload []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return vshdproto.WriteFrame(conn, typ, payload)
+	}
+
+	// For PTY sessions, send the initial window size first so the guest pty is
+	// created/resized to the client's terminal rather than the default 80x24.
+	if isPty {
+		writeFrame(vshdproto.FrameWinsize, vshdproto.EncodeWinsize(vshdproto.Winsize{
+			Rows: uint16(ptyReq.Window.Height),
+			Cols: uint16(ptyReq.Window.Width),
+		}))
+	}
+
 	copyDone := make(chan struct{}, 2)
 
-	// SSH stdin -> vshd
+	// Host -> guest: frame SSH stdin as FrameStdin; relay winsize changes.
 	go func() {
-		n, err := io.Copy(conn, s)
-		log.Printf("SSH proxy: stdin->vshd finished: %d bytes, err=%v", n, err)
-		if tc, ok := conn.(*net.TCPConn); ok {
-			tc.CloseWrite()
+		if isPty {
+			go func() {
+				for win := range winCh {
+					writeFrame(vshdproto.FrameWinsize, vshdproto.EncodeWinsize(vshdproto.Winsize{
+						Rows: uint16(win.Height),
+						Cols: uint16(win.Width),
+					}))
+				}
+			}()
+		}
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := s.Read(buf)
+			if n > 0 {
+				if werr := writeFrame(vshdproto.FrameStdin, buf[:n]); werr != nil {
+					break
+				}
+			}
+			if rerr != nil {
+				break
+			}
 		}
 		copyDone <- struct{}{}
 	}()
 
-	// vshd -> SSH stdout
+	// Guest -> host: decode TLV frames; route stdout/stderr/exit.
+	exitCode := 0
 	go func() {
-		n, err := io.Copy(s, conn)
-		log.Printf("SSH proxy: vshd->stdout finished: %d bytes, err=%v", n, err)
+		for {
+			typ, payload, err := vshdproto.ReadFrame(conn)
+			if err != nil {
+				break
+			}
+			switch typ {
+			case vshdproto.FrameStdout:
+				s.Write(payload)
+			case vshdproto.FrameStderr:
+				s.Stderr().Write(payload)
+			case vshdproto.FrameExit:
+				if code, derr := vshdproto.DecodeExit(payload); derr == nil {
+					exitCode = int(code)
+				}
+			}
+		}
 		copyDone <- struct{}{}
 	}()
 
@@ -650,10 +716,9 @@ func proxyVMSession(s ssh.Session, conn net.Conn, done <-chan struct{}, panicked
 
 	conn.Close()
 
-	// Closing conn unblocks the io.Copy goroutines; wait briefly for both to
-	// finish, but don't block the session teardown if one is wedged (e.g. the
-	// SSH side of the copy not unblocking). The shared deadline bounds the total
-	// wait at ~100ms regardless of how many goroutines have already returned.
+	// Closing conn unblocks the proxy goroutines; wait briefly for both to
+	// finish, but don't block teardown if one is wedged. The shared deadline
+	// bounds the total wait at ~100ms.
 	deadline := time.After(100 * time.Millisecond)
 drain:
 	for i := 0; i < 2; i++ {
@@ -664,6 +729,6 @@ drain:
 		}
 	}
 
-	s.Exit(0)
+	s.Exit(exitCode)
 	return nil
 }

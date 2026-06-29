@@ -4,12 +4,9 @@
 package e2e
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -786,59 +783,10 @@ func TestVMUserSwitching(t *testing.T) {
 	t.Log("VM user switching (root) works")
 }
 
-// runVshCommandWithStdin runs a command in the VM with input data.
+// runVshCommandWithStdin runs a non-PTY command in the VM with input data,
+// returning combined stdout+stderr via the shared vshdproto TLV helper.
 func runVshCommandWithStdin(vsockSock, user, stdin string, args ...string) (string, error) {
-	conn, err := net.Dial("unix", vsockSock)
-	if err != nil {
-		return "", fmt.Errorf("dial vsock socket: %w", err)
-	}
-	defer conn.Close()
-
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	// Cloud-hypervisor vsock protocol: send "CONNECT <port>\n"
-	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", 5222); err != nil {
-		return "", fmt.Errorf("send CONNECT: %w", err)
-	}
-
-	// Read response - should be "OK <port>\n"
-	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		return "", fmt.Errorf("read handshake response: %w", err)
-	}
-	response = strings.TrimSpace(response)
-	if !strings.HasPrefix(response, "OK") {
-		return "", fmt.Errorf("vsock handshake failed: %s", response)
-	}
-
-	// Send vshd protocol
-	if _, err := conn.Write([]byte(user + "\x00")); err != nil {
-		return "", fmt.Errorf("send user: %w", err)
-	}
-	if _, err := conn.Write([]byte(fmt.Sprintf("%d\x00", len(args)))); err != nil {
-		return "", fmt.Errorf("send arg count: %w", err)
-	}
-	for _, arg := range args {
-		if _, err := conn.Write([]byte(arg + "\x00")); err != nil {
-			return "", fmt.Errorf("send arg: %w", err)
-		}
-	}
-
-	// Send stdin data and close write side
-	if stdin != "" {
-		conn.Write([]byte(stdin))
-	}
-	// For Unix sockets, we need to use CloseWrite if available
-	if tcpConn, ok := conn.(*net.UnixConn); ok {
-		tcpConn.CloseWrite()
-	}
-
-	// Read response
-	var buf bytes.Buffer
-	io.Copy(&buf, reader)
-
-	return buf.String(), nil
+	return runVshdCommand(vsockSock, "", user, stdin, args...)
 }
 
 // vmEventMonitor is used by tests to detect VM events.
