@@ -17,9 +17,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/tailscale/thundersnap/btrfsutil"
 )
 
 // idDirName is the per-frame directory holding per-ref identity subvolumes.
@@ -44,33 +45,15 @@ func validateRefName(refName string) error {
 	return nil
 }
 
-// isSubvolume reports whether path is a btrfs subvolume.
-//
-// It treats ANY error from "btrfs subvolume show" as "not a subvolume",
-// including the btrfs binary being absent, a permission error, or the path not
-// existing. This conflation is intentional: callers use isSubvolume only to
-// decide whether a btrfs delete (vs a plain RemoveAll) is appropriate, and in
-// every such case the safe fallback is to treat the path as a plain directory.
-func isSubvolume(path string) bool {
-	return exec.Command("btrfs", "subvolume", "show", path).Run() == nil
-}
-
-// createSubvol creates a btrfs subvolume at path with 0700 permissions.
+// createSubvol creates a btrfs subvolume at path with 0700 permissions. The
+// 0700 chmod is what distinguishes it from btrfsutil.CreateSubvol: identity
+// subvolumes hold per-ref private state and must not be world-readable.
 func createSubvol(path string) error {
-	if out, err := exec.Command("btrfs", "subvolume", "create", path).CombinedOutput(); err != nil {
-		return fmt.Errorf("create subvolume %s: %w\n%s", path, err, out)
+	if err := btrfsutil.CreateSubvol(path); err != nil {
+		return err
 	}
 	if err := os.Chmod(path, 0700); err != nil {
 		return fmt.Errorf("chmod subvolume %s: %w", path, err)
-	}
-	return nil
-}
-
-// deleteSubvol deletes the btrfs subvolume at path. The caller is responsible
-// for having established that path is a subvolume.
-func deleteSubvol(path string) error {
-	if out, err := exec.Command("btrfs", "subvolume", "delete", path).CombinedOutput(); err != nil {
-		return fmt.Errorf("delete subvolume %s: %w\n%s", path, err, out)
 	}
 	return nil
 }
@@ -80,7 +63,7 @@ func deleteSubvol(path string) error {
 // not recreate nested subvolumes, leaving an empty or plain directory in their
 // place. A path that is already a subvolume, or does not exist, is left alone.
 func removeIfPlainDir(path string) error {
-	if isSubvolume(path) {
+	if btrfsutil.IsSubvolume(path) {
 		return nil
 	}
 	if fi, err := os.Stat(path); err == nil && fi.IsDir() {
@@ -107,7 +90,7 @@ func Path(framePath, refName string) string {
 // is replaced with a fresh subvolume.
 func ensureIDSubvol(framePath string) error {
 	idPath := IDDir(framePath)
-	if isSubvolume(idPath) {
+	if btrfsutil.IsSubvolume(idPath) {
 		return nil
 	}
 	// Not (yet) a subvolume: drop any leftover plain directory, then create it.
@@ -129,7 +112,7 @@ func Ensure(framePath, refName string) error {
 		return err
 	}
 	refPath := Path(framePath, refName)
-	if isSubvolume(refPath) {
+	if btrfsutil.IsSubvolume(refPath) {
 		return nil
 	}
 	// A leftover plain directory (e.g. from an older layout) is replaced so the
@@ -155,7 +138,7 @@ func Move(srcFramePath, dstFramePath, refName string) error {
 	src := Path(srcFramePath, refName)
 	dst := Path(dstFramePath, refName)
 
-	if !isSubvolume(src) {
+	if !btrfsutil.IsSubvolume(src) {
 		// The ref had no prior identity state (its source subvolume was never
 		// created, e.g. the ref was only ever attached to an empty frame), so
 		// there is nothing to relocate. Give the destination a fresh, empty
@@ -165,8 +148,8 @@ func Move(srcFramePath, dstFramePath, refName string) error {
 
 	// Clear any existing destination so the rename can land. Delete it as a
 	// subvolume if it is one, otherwise drop a leftover plain directory.
-	if isSubvolume(dst) {
-		if err := deleteSubvol(dst); err != nil {
+	if btrfsutil.IsSubvolume(dst) {
+		if err := btrfsutil.DeleteSubvol(dst); err != nil {
 			return err
 		}
 	} else if err := removeIfPlainDir(dst); err != nil {
@@ -187,12 +170,12 @@ func Remove(framePath, refName string) error {
 		return err
 	}
 	refPath := Path(framePath, refName)
-	if !isSubvolume(refPath) {
+	if !btrfsutil.IsSubvolume(refPath) {
 		// Fall back to removing a plain directory if one exists.
 		if err := os.RemoveAll(refPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove ref id dir: %w", err)
 		}
 		return nil
 	}
-	return deleteSubvol(refPath)
+	return btrfsutil.DeleteSubvol(refPath)
 }

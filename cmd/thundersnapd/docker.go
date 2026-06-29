@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -20,6 +19,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	"github.com/tailscale/thundersnap/btrfsutil"
 	"golang.org/x/sys/unix"
 )
 
@@ -201,15 +201,13 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 	}
 	extractPath := filepath.Join(*flagSnapsDir, tmpID+".extract")
 
-	cmd := exec.Command("btrfs", "subvolume", "create", extractPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", false, fmt.Errorf("btrfs subvolume create: %w\noutput: %s", err, string(output))
+	if err := btrfsutil.CreateSubvol(extractPath); err != nil {
+		return "", false, err
 	}
 
 	// Cleanup on error
 	cleanup := func() {
-		exec.Command("btrfs", "subvolume", "delete", extractPath).Run()
+		btrfsutil.DeleteSubvol(extractPath) // best effort
 	}
 
 	if progress != nil {

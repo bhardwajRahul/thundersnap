@@ -32,6 +32,7 @@ import (
 	"github.com/gliderlabs/ssh"
 	"github.com/pborman/getopt/v2"
 	"github.com/pkg/sftp"
+	"github.com/tailscale/thundersnap/btrfsutil"
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/frames"
 	"github.com/tailscale/thundersnap/snaphash"
@@ -1401,36 +1402,20 @@ func configureContainerResources(pid int, cgroupName string) {
 	setupContainerCgroup(pid, cgroupName)
 }
 
-// btrfsCreateSubvol creates a new empty btrfs subvolume at path, wrapping the
-// command's combined output into the error on failure.
+// btrfsCreateSubvol creates a new empty btrfs subvolume at path.
 func btrfsCreateSubvol(path string) error {
-	if output, err := exec.Command("btrfs", "subvolume", "create", path).CombinedOutput(); err != nil {
-		return fmt.Errorf("btrfs subvolume create %s: %w\noutput: %s", path, err, string(output))
-	}
-	return nil
+	return btrfsutil.CreateSubvol(path)
 }
 
 // btrfsSnapshot creates a btrfs snapshot of src at dst. When readonly is true
 // the snapshot is created with -r (used for the immutable snaps-dir entries).
 func btrfsSnapshot(src, dst string, readonly bool) error {
-	args := []string{"subvolume", "snapshot"}
-	if readonly {
-		args = append(args, "-r")
-	}
-	args = append(args, src, dst)
-	if output, err := exec.Command("btrfs", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("btrfs subvolume snapshot %s -> %s: %w\noutput: %s", src, dst, err, string(output))
-	}
-	return nil
+	return btrfsutil.Snapshot(src, dst, readonly)
 }
 
-// btrfsDeleteSubvol deletes the btrfs subvolume at path, wrapping the command's
-// combined output into the error on failure.
+// btrfsDeleteSubvol deletes the btrfs subvolume at path.
 func btrfsDeleteSubvol(path string) error {
-	if output, err := exec.Command("btrfs", "subvolume", "delete", path).CombinedOutput(); err != nil {
-		return fmt.Errorf("btrfs subvolume delete %s: %w\noutput: %s", path, err, string(output))
-	}
-	return nil
+	return btrfsutil.DeleteSubvol(path)
 }
 
 // deriveDataDirs splits the single --data-dir into the live-filesystem
@@ -2744,9 +2729,7 @@ func ensureFrameFS(rootFS string, meta *FrameMeta) error {
 
 // isSubvolume returns true if the path is a btrfs subvolume.
 func isSubvolume(path string) bool {
-	cmd := exec.Command("btrfs", "subvolume", "show", path)
-	err := cmd.Run()
-	return err == nil
+	return btrfsutil.IsSubvolume(path)
 }
 
 // isDirEmpty returns true if the directory contains no files (ignoring . and ..).
@@ -4802,7 +4785,7 @@ func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*t
 
 		// Clean up using btrfs subvolume delete since we created a subvolume
 		CleanupTargetDir: func(path string) {
-			exec.Command("btrfs", "subvolume", "delete", path).Run()
+			btrfsutil.DeleteSubvol(path) // best effort
 		},
 
 		// Delete files that exist in the cloned parent but not in the new snapshot
@@ -5099,7 +5082,7 @@ func createSnapshotWithTaintsSubdir(source, subdir, parentStampID string, taints
 
 	// Cleanup helper
 	cleanupTmp := func() {
-		exec.Command("btrfs", "subvolume", "delete", tmpPath).Run()
+		btrfsutil.DeleteSubvol(tmpPath) // best effort
 		os.Remove(tmpPath + ".stamp")
 		os.Remove(tmpTSMPath)
 		os.Remove(tmpTSCPath)

@@ -9,9 +9,10 @@ package snapsubdir
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/tailscale/thundersnap/btrfsutil"
 )
 
 // promoteDirName is the temporary directory the requested subtree is moved to
@@ -34,21 +35,6 @@ func Validate(subdir string) (string, error) {
 		return "", fmt.Errorf("subdir resolves to the subvolume root; snap the whole frame instead")
 	}
 	return clean, nil
-}
-
-// btrfsCmd runs a btrfs subcommand, wrapping any failure with the combined
-// output for diagnosis.
-func btrfsCmd(args ...string) error {
-	out, err := exec.Command("btrfs", args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("btrfs %s: %w\n%s", strings.Join(args, " "), err, out)
-	}
-	return nil
-}
-
-// isSubvolume reports whether path is a btrfs subvolume.
-func isSubvolume(path string) bool {
-	return exec.Command("btrfs", "subvolume", "show", path).Run() == nil
 }
 
 // removeChildren recursively removes every entry within dir (handling nested
@@ -83,8 +69,8 @@ func removePathRecursive(path string) error {
 		if err := removeChildren(path); err != nil {
 			return err
 		}
-		if isSubvolume(path) {
-			return btrfsCmd("subvolume", "delete", path)
+		if btrfsutil.IsSubvolume(path) {
+			return btrfsutil.DeleteSubvol(path)
 		}
 		return os.Remove(path)
 	}
@@ -103,7 +89,7 @@ func Snapshot(source, subdir, dstPath string) error {
 	}
 
 	// Writable snapshot of the whole subvolume for atomicity.
-	if err := btrfsCmd("subvolume", "snapshot", source, dstPath); err != nil {
+	if err := btrfsutil.Snapshot(source, dstPath, false); err != nil {
 		return err
 	}
 
@@ -161,7 +147,7 @@ func Snapshot(source, subdir, dstPath string) error {
 	}
 
 	// Make the resulting subvolume read-only before indexing.
-	if err := btrfsCmd("property", "set", dstPath, "ro", "true"); err != nil {
+	if err := btrfsutil.Run("property", "set", dstPath, "ro", "true"); err != nil {
 		return err
 	}
 	return nil
