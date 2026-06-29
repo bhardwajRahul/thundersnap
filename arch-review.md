@@ -642,7 +642,42 @@ DELIBERATELY NOT CHANGED (with rationale):
 
 ---
 
-## cmd/ts/  (in-container client + daemon-invoked helper modes)
+## cmd/ts/  (in-container client + daemon-invoked helper modes)  [DONE]
+
+> **RESOLUTION (todo #11).** Client-side dedup, the NDJSON unification, the
+> octal bug, and the new unit tests are done; the deeper namespace/exec
+> decomposition is intentionally deferred to the cross-module refactor pass
+> (todo #13), since it touches container setup shared with cmd/thundersnapd.
+>
+> - **§2 HTTP client (~19×):** extracted `newThunderClient(sockPath) *http.Client`;
+>   all inline `&http.Client{Transport: …dialThunder…}` blocks now call it
+>   (`doDownloadDocker` keeps its 30-min `client.Timeout` override).
+> - **§2 POST-JSON-and-decode (~8×):** added generic
+>   `postJSON[Req, Resp any](sockPath, path, req) (Resp, error)` (marshal → POST →
+>   decode). `doDeleteSnap`/`doTaint` call it directly; ref ops fold into one
+>   `doRefRequest(sockPath, path, RefRequest)`; autorun set/stop fold into one
+>   `doAutorun(sockPath, refName, argv)`.
+> - **§2/§3 NDJSON streaming loops (4×) + the latent bug:** extracted a
+>   `progressRenderer` (`newProgressRenderer` probes stderr TTY + width; `progress`
+>   does TTY truncate/pad-erase or non-TTY per-line; `finish` clears the TTY line).
+>   `doSnap`, `doCreate`, `doDownloadDocker`, `doDownloadSnap` all use it. **Fixed
+>   the divergence:** `doSnap` now also handles `Type=="" && Status!=""`
+>   (previously it alone reported "no result received" for a non-streaming error),
+>   and the contorted empty-`if`/`else if` in `doDownloadSnap` (old §3) collapsed to
+>   a single `render.tty && lastProgressMsg != ""`. Non-TTY progress is now
+>   uniformly per-line across all four.
+> - **§4 octal bug:** `os.MkdirAll("/dev/shm", 1777)` → `0o1777` with a comment.
+> - **§1 shell detection:** extracted `isShellInvocation(base) bool` (`sh`/`-sh`).
+> - **§1 tests:** new `helpers_test.go` covers `isShellInvocation`,
+>   `resolveSnapSubdir` (abs strips `/`, rel-vs-cwd, file-not-dir, missing,
+>   root-rejected), `findExecutable` (abs, missing-slashed, PATH found,
+>   non-exec skipped, first-match-wins, not-found), and the `progressRenderer`
+>   (non-TTY per-line, TTY truncate+clear, TTY shorter-line padding).
+>
+> **Deferred to #13:** §3 `cmdDropCapsAndRun` decomposition, the
+> `cmdContainerInit`+`cmdDropCapsAndRun` shared `setupContainerNamespace`, the
+> three exec strategies, the `su`→`/bin/sh` fallback extraction + its tests, the
+> hand-rolled flag parsers, `inVM()` memoization, and the DTO-unexport stylistics.
 
 ### 1. Edge cases for unit tests
 The existing tests (`snap_test.go`) only round-trip JSON structs and **re-implement** the

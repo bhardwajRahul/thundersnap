@@ -65,12 +65,17 @@ func usage() {
 	os.Exit(1)
 }
 
+// isShellInvocation reports whether argv0's basename indicates ts is being run
+// as the container shell. thundersnapd symlinks /bin/sh -> /bin/ts for
+// containers that lack a real shell; a login shell is exec'd with a leading
+// dash ("-sh"), which we must also recognize.
+func isShellInvocation(base string) bool {
+	return base == "sh" || base == "-sh"
+}
+
 func main() {
-	// Check if we're being invoked as a shell (argv[0] is "sh" or "-sh")
-	// This happens when thundersnapd symlinks /bin/sh -> /bin/ts for
-	// containers that lack a shell.
-	base := filepath.Base(os.Args[0])
-	if base == "sh" || base == "-sh" {
+	// Check if we're being invoked as a shell (argv[0] is "sh" or "-sh").
+	if isShellInvocation(filepath.Base(os.Args[0])) {
 		runAsShell()
 		return
 	}
@@ -225,14 +230,96 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 	return c.reader.Read(p)
 }
 
-func doPing(sockPath string) error {
-	client := &http.Client{
+// newThunderClient returns an *http.Client whose transport dials thundersnapd's
+// control socket via dialThunder (vsock in a VM, the unix socket otherwise).
+// The host part of any request URL is ignored; use "http://localhost/<path>".
+func newThunderClient(sockPath string) *http.Client {
+	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return dialThunder(ctx, sockPath)
 			},
 		},
 	}
+}
+
+// postJSON marshals req as JSON, POSTs it to path on the thunder control socket,
+// and decodes the JSON response into a value of type Resp. path is the URL path
+// only (e.g. "/delete-snap"); the localhost host is supplied here. Status/error
+// fields are response-specific, so callers inspect the returned Resp themselves.
+func postJSON[Req any, Resp any](sockPath, path string, req Req) (Resp, error) {
+	var result Resp
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return result, fmt.Errorf("marshal request: %w", err)
+	}
+
+	client := newThunderClient(sockPath)
+	resp, err := client.Post("http://localhost"+path, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return result, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return result, fmt.Errorf("parse response: %w", err)
+	}
+	return result, nil
+}
+
+// progressRenderer renders NDJSON "progress" events to stderr for the four
+// streaming subcommands (snap, create, download-docker, download-snap). On a
+// TTY it overwrites a single line (truncating to the terminal width and padding
+// to erase the previous, longer line); otherwise it prints each message on its
+// own line. Finish clears the in-progress TTY line at end of stream.
+type progressRenderer struct {
+	tty         bool
+	width       int
+	lastLineLen int
+}
+
+// newProgressRenderer probes stderr for a terminal and its width (defaulting to
+// 80 columns when the width is unavailable).
+func newProgressRenderer() *progressRenderer {
+	r := &progressRenderer{width: 80}
+	if term.IsTerminal(int(os.Stderr.Fd())) {
+		r.tty = true
+		if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w > 0 {
+			r.width = w
+		}
+	}
+	return r
+}
+
+// progress renders a single progress message. On a TTY it overwrites the
+// current line; otherwise it prints the message on its own line.
+func (r *progressRenderer) progress(msg string) {
+	if !r.tty {
+		fmt.Fprintln(os.Stderr, msg)
+		return
+	}
+	if len(msg) > r.width {
+		msg = msg[:r.width]
+	}
+	padding := ""
+	if len(msg) < r.lastLineLen {
+		padding = strings.Repeat(" ", r.lastLineLen-len(msg))
+	}
+	fmt.Fprintf(os.Stderr, "\r%s%s", msg, padding)
+	r.lastLineLen = len(msg)
+}
+
+// finish erases the in-progress TTY line (a no-op on non-TTY or when nothing
+// was rendered) so subsequent output starts on a clean line.
+func (r *progressRenderer) finish() {
+	if r.tty && r.lastLineLen > 0 {
+		fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", r.lastLineLen))
+	}
+}
+
+func doPing(sockPath string) error {
+	client := newThunderClient(sockPath)
 
 	req := ControlRequest{Command: "ping"}
 	body, err := json.Marshal(req)
@@ -384,28 +471,12 @@ type SnapStreamEvent struct {
 }
 
 func doSnap(sockPath, subdir string) (string, error) {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
-
-	// Detect if stderr is a TTY for progress display
-	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
-
-	// Get terminal width for formatting
-	termWidth := 80 // default
-	if isTTY {
-		if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w > 0 {
-			termWidth = w
-		}
-	}
+	client := newThunderClient(sockPath)
+	render := newProgressRenderer()
 
 	// Build URL with streaming enabled
 	url := "http://localhost/snap?stream=1"
-	if isTTY {
+	if render.tty {
 		url += "&tty=1"
 	}
 	if subdir != "" {
@@ -422,7 +493,6 @@ func doSnap(sockPath, subdir string) (string, error) {
 	scanner := bufio.NewScanner(resp.Body)
 	var lastEvent SnapStreamEvent
 	var lastProgressMsg string
-	var lastLineLen int
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -435,25 +505,17 @@ func doSnap(sockPath, subdir string) (string, error) {
 			return "", fmt.Errorf("parse stream event: %w (line: %q)", err, string(line))
 		}
 
-		if event.Type == "progress" {
+		switch {
+		case event.Type == "progress":
 			lastProgressMsg = event.Message
-			// Write progress to stderr
-			if isTTY {
-				// Truncate message to terminal width if needed
-				msg := event.Message
-				if len(msg) > termWidth {
-					msg = msg[:termWidth]
-				}
-				// Pad with spaces to clear previous longer line
-				padding := ""
-				if len(msg) < lastLineLen {
-					padding = strings.Repeat(" ", lastLineLen-len(msg))
-				}
-				fmt.Fprintf(os.Stderr, "\r%s%s", msg, padding)
-				lastLineLen = len(msg)
-			}
-		} else if event.Type == "result" {
+			render.progress(event.Message)
+		case event.Type == "result":
 			lastEvent = event
+		case event.Type == "" && event.Status != "":
+			// Non-streaming error response (e.g., emitted before the stream
+			// started). Treat it as the result so the status check below fires.
+			lastEvent = event
+			lastEvent.Type = "result"
 		}
 	}
 
@@ -461,12 +523,10 @@ func doSnap(sockPath, subdir string) (string, error) {
 		return "", fmt.Errorf("read stream: %w", err)
 	}
 
-	// Clear the progress line if TTY
-	if isTTY && lastLineLen > 0 {
-		fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", lastLineLen))
-	}
-	// Print the final summary (works for both TTY and non-TTY since it's the "done" line)
-	if lastProgressMsg != "" {
+	render.finish()
+	// On a TTY the progress line was overwritten in place, so re-print the final
+	// "done" message; on non-TTY it was already printed on its own line.
+	if render.tty && lastProgressMsg != "" {
 		fmt.Fprintln(os.Stderr, lastProgressMsg)
 	}
 
@@ -494,35 +554,14 @@ type DeleteSnapResponse struct {
 }
 
 func doDeleteSnap(sockPath, snapshotID string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
-
-	req := DeleteSnapRequest{SnapshotID: snapshotID}
-	body, err := json.Marshal(req)
+	result, err := postJSON[DeleteSnapRequest, DeleteSnapResponse](sockPath, "/delete-snap",
+		DeleteSnapRequest{SnapshotID: snapshotID})
 	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
+		return err
 	}
-
-	resp, err := client.Post("http://localhost/delete-snap", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var result DeleteSnapResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("decode response: %w", err)
-	}
-
 	if result.Status != "ok" {
 		return fmt.Errorf("%s", result.Message)
 	}
-
 	return nil
 }
 
@@ -540,13 +579,7 @@ type SnapInfo struct {
 }
 
 func doListSnaps(sockPath string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
+	client := newThunderClient(sockPath)
 
 	resp, err := client.Get("http://localhost/list-snaps")
 	if err != nil {
@@ -679,28 +712,12 @@ type CreateStreamEvent struct {
 }
 
 func doCreate(sockPath, snapshotSpec, isolation, refName string) (string, error) {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
-
-	// Detect if stderr is a TTY for progress display
-	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
-
-	// Get terminal width for formatting
-	termWidth := 80 // default
-	if isTTY {
-		if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w > 0 {
-			termWidth = w
-		}
-	}
+	client := newThunderClient(sockPath)
+	render := newProgressRenderer()
 
 	// Build URL with streaming enabled
 	url := "http://localhost/create?stream=1"
-	if isTTY {
+	if render.tty {
 		url += "&tty=1"
 	}
 
@@ -723,7 +740,6 @@ func doCreate(sockPath, snapshotSpec, isolation, refName string) (string, error)
 	// Parse NDJSON stream
 	scanner := bufio.NewScanner(resp.Body)
 	var lastEvent CreateStreamEvent
-	var lastLineLen int
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -736,30 +752,14 @@ func doCreate(sockPath, snapshotSpec, isolation, refName string) (string, error)
 			return "", fmt.Errorf("parse stream event: %w (line: %q)", err, string(line))
 		}
 
-		if event.Type == "progress" {
-			// Write progress to stderr
-			if isTTY {
-				// Truncate message to terminal width if needed
-				msg := event.Message
-				if len(msg) > termWidth {
-					msg = msg[:termWidth]
-				}
-				// Pad with spaces to clear previous longer line
-				padding := ""
-				if len(msg) < lastLineLen {
-					padding = strings.Repeat(" ", lastLineLen-len(msg))
-				}
-				fmt.Fprintf(os.Stderr, "\r%s%s", msg, padding)
-				lastLineLen = len(msg)
-			} else {
-				// Non-TTY: print each progress message on its own line
-				fmt.Fprintln(os.Stderr, event.Message)
-			}
-		} else if event.Type == "result" {
+		switch {
+		case event.Type == "progress":
+			render.progress(event.Message)
+		case event.Type == "result":
 			lastEvent = event
-		} else if event.Type == "" && event.Status != "" {
-			// Non-streaming error response (e.g., frame already exists)
-			// Convert to a result event for consistent handling
+		case event.Type == "" && event.Status != "":
+			// Non-streaming error response (e.g., frame already exists).
+			// Convert to a result event for consistent handling.
 			lastEvent = event
 			lastEvent.Type = "result"
 		}
@@ -769,10 +769,7 @@ func doCreate(sockPath, snapshotSpec, isolation, refName string) (string, error)
 		return "", fmt.Errorf("read stream: %w", err)
 	}
 
-	// Clear the progress line if TTY
-	if isTTY && lastLineLen > 0 {
-		fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", lastLineLen))
-	}
+	render.finish()
 
 	// Check result
 	if lastEvent.Type != "result" {
@@ -798,13 +795,7 @@ type DeleteFrameResponse struct {
 }
 
 func doDeleteFrame(sockPath, uuid string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
+	client := newThunderClient(sockPath)
 
 	req := DeleteFrameRequest{UUID: uuid}
 	body, err := json.Marshal(req)
@@ -844,13 +835,7 @@ type FrameInfo struct {
 }
 
 func doListFrames(sockPath string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
+	client := newThunderClient(sockPath)
 
 	resp, err := client.Get("http://localhost/list-frames")
 	if err != nil {
@@ -953,13 +938,7 @@ type WhoHasPeerInfo struct {
 }
 
 func doWhoHas(sockPath, snapshotID string) ([]tsm.PeerResult, error) {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
+	client := newThunderClient(sockPath)
 
 	req := WhoHasRequest{SnapshotID: snapshotID}
 	body, err := json.Marshal(req)
@@ -1035,31 +1014,10 @@ type TaintResponse struct {
 }
 
 func doTaint(sockPath, taintName string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
-
-	req := TaintRequest{
-		TaintName: taintName,
-	}
-	body, err := json.Marshal(req)
+	result, err := postJSON[TaintRequest, TaintResponse](sockPath, "/taint",
+		TaintRequest{TaintName: taintName})
 	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
-	}
-
-	resp, err := client.Post("http://localhost/taint", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var result TaintResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
+		return err
 	}
 
 	if result.Status != "ok" {
@@ -1122,30 +1080,13 @@ type DownloadDockerStreamEvent struct {
 }
 
 func doDownloadDocker(sockPath, imageRef string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-		// Docker downloads can be slow
-		Timeout: 30 * time.Minute,
-	}
-
-	// Detect if stderr is a TTY for progress display
-	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
-
-	// Get terminal width for formatting
-	termWidth := 80 // default
-	if isTTY {
-		if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w > 0 {
-			termWidth = w
-		}
-	}
+	client := newThunderClient(sockPath)
+	client.Timeout = 30 * time.Minute // Docker downloads can be slow
+	render := newProgressRenderer()
 
 	// Build URL with streaming enabled
 	url := "http://localhost/download-docker?stream=1"
-	if isTTY {
+	if render.tty {
 		url += "&tty=1"
 	}
 
@@ -1166,7 +1107,6 @@ func doDownloadDocker(sockPath, imageRef string) error {
 	// Parse NDJSON stream
 	scanner := bufio.NewScanner(resp.Body)
 	var lastEvent DownloadDockerStreamEvent
-	var lastLineLen int
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -1181,21 +1121,8 @@ func doDownloadDocker(sockPath, imageRef string) error {
 
 		lastEvent = event
 
-		if event.Type == "progress" && isTTY {
-			// Clear line and show progress
-			msg := event.Message
-			if len(msg) > termWidth-2 {
-				msg = msg[:termWidth-5] + "..."
-			}
-			// Pad to clear previous line
-			padding := ""
-			if len(msg) < lastLineLen {
-				padding = strings.Repeat(" ", lastLineLen-len(msg))
-			}
-			fmt.Fprintf(os.Stderr, "\r%s%s", msg, padding)
-			lastLineLen = len(msg)
-		} else if event.Type == "progress" {
-			fmt.Fprintf(os.Stderr, "%s\n", event.Message)
+		if event.Type == "progress" {
+			render.progress(event.Message)
 		}
 	}
 
@@ -1203,10 +1130,7 @@ func doDownloadDocker(sockPath, imageRef string) error {
 		return fmt.Errorf("read stream: %w", err)
 	}
 
-	// Clear progress line
-	if isTTY && lastLineLen > 0 {
-		fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", lastLineLen))
-	}
+	render.finish()
 
 	if lastEvent.Status == "error" {
 		return fmt.Errorf("server error: %s", lastEvent.Message)
@@ -1310,28 +1234,12 @@ type DownloadSnapStreamEvent struct {
 }
 
 func doDownloadSnap(sockPath, snapshotID string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
-
-	// Detect if stderr is a TTY for progress display
-	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
-
-	// Get terminal width for formatting
-	termWidth := 80 // default
-	if isTTY {
-		if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w > 0 {
-			termWidth = w
-		}
-	}
+	client := newThunderClient(sockPath)
+	render := newProgressRenderer()
 
 	// Build URL with streaming enabled
 	url := "http://localhost/download-snap?stream=1"
-	if isTTY {
+	if render.tty {
 		url += "&tty=1"
 	}
 
@@ -1353,7 +1261,6 @@ func doDownloadSnap(sockPath, snapshotID string) error {
 	scanner := bufio.NewScanner(resp.Body)
 	var lastEvent DownloadSnapStreamEvent
 	var lastProgressMsg string
-	var lastLineLen int
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -1368,24 +1275,7 @@ func doDownloadSnap(sockPath, snapshotID string) error {
 
 		if event.Type == "progress" {
 			lastProgressMsg = event.Message
-			// Write progress to stderr
-			if isTTY {
-				// Truncate message to terminal width if needed
-				msg := event.Message
-				if len(msg) > termWidth {
-					msg = msg[:termWidth]
-				}
-				// Pad with spaces to clear previous longer line
-				padding := ""
-				if len(msg) < lastLineLen {
-					padding = strings.Repeat(" ", lastLineLen-len(msg))
-				}
-				fmt.Fprintf(os.Stderr, "\r%s%s", msg, padding)
-				lastLineLen = len(msg)
-			} else {
-				// Non-TTY: print each progress message on its own line
-				fmt.Fprintln(os.Stderr, event.Message)
-			}
+			render.progress(event.Message)
 		} else if event.Type == "result" {
 			lastEvent = event
 		}
@@ -1395,14 +1285,10 @@ func doDownloadSnap(sockPath, snapshotID string) error {
 		return fmt.Errorf("read stream: %w", err)
 	}
 
-	// Clear the progress line if TTY
-	if isTTY && lastLineLen > 0 {
-		fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", lastLineLen))
-	}
-	// Print the final progress message (the "done" line)
-	if lastProgressMsg != "" && !isTTY {
-		// Already printed for non-TTY
-	} else if lastProgressMsg != "" {
+	render.finish()
+	// On a TTY the progress line was overwritten in place, so re-print the final
+	// "done" message; on non-TTY it was already printed on its own line.
+	if render.tty && lastProgressMsg != "" {
 		fmt.Fprintln(os.Stderr, lastProgressMsg)
 	}
 
@@ -1930,8 +1816,11 @@ func setupDev() {
 	// Create /dev/ptmx symlink to /dev/pts/ptmx for the newinstance mount
 	os.Symlink("pts/ptmx", "/dev/ptmx")
 
-	// Create /dev/shm for shared memory
-	os.MkdirAll("/dev/shm", 1777)
+	// Create /dev/shm for shared memory. 0o1777 = sticky + world-writable, the
+	// standard mode for shared scratch space (the decimal literal 1777 would be
+	// octal 03561, a wrong mode); the immediately following tmpfs mount with
+	// mode=1777 is what users actually see, but keep the mkdir mode correct too.
+	os.MkdirAll("/dev/shm", 0o1777)
 	unix.Mount("tmpfs", "/dev/shm", "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "mode=1777,size=65536k")
 
 	// Create /dev/mqueue for POSIX message queues (optional but some programs expect it)
@@ -2561,100 +2450,30 @@ type RefResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-func doRefCreate(sockPath, name, uuid string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
-
-	req := RefRequest{Name: name, UUID: uuid}
-	body, err := json.Marshal(req)
+// doRefRequest POSTs a RefRequest to one of the /ref/* endpoints and checks the
+// standard {status,message} response. It backs doRefCreate/Move/Delete, which
+// differ only in the endpoint path and which RefRequest fields they populate.
+func doRefRequest(sockPath, path string, req RefRequest) error {
+	result, err := postJSON[RefRequest, RefResponse](sockPath, path, req)
 	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
+		return err
 	}
-
-	resp, err := client.Post("http://localhost/ref/create", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var result RefResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
-	}
-
 	if result.Status != "ok" {
 		return fmt.Errorf("server error: %s", result.Message)
 	}
 	return nil
+}
+
+func doRefCreate(sockPath, name, uuid string) error {
+	return doRefRequest(sockPath, "/ref/create", RefRequest{Name: name, UUID: uuid})
 }
 
 func doRefMove(sockPath, name, uuid string, force bool) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
-
-	req := RefRequest{Name: name, UUID: uuid, Force: force}
-	body, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
-	}
-
-	resp, err := client.Post("http://localhost/ref/move", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var result RefResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
-	}
-
-	if result.Status != "ok" {
-		return fmt.Errorf("server error: %s", result.Message)
-	}
-	return nil
+	return doRefRequest(sockPath, "/ref/move", RefRequest{Name: name, UUID: uuid, Force: force})
 }
 
 func doRefDelete(sockPath, name string, force bool) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
-
-	req := RefRequest{Name: name, Force: force}
-	body, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
-	}
-
-	resp, err := client.Post("http://localhost/ref/delete", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var result RefResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
-	}
-
-	if result.Status != "ok" {
-		return fmt.Errorf("server error: %s", result.Message)
-	}
-	return nil
+	return doRefRequest(sockPath, "/ref/delete", RefRequest{Name: name, Force: force})
 }
 
 func cmdRefs(args []string) {
@@ -2688,13 +2507,7 @@ type RefListResponse struct {
 }
 
 func doListRefs(sockPath string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
+	client := newThunderClient(sockPath)
 
 	resp, err := client.Get("http://localhost/refs")
 	if err != nil {
@@ -2760,13 +2573,7 @@ type ReflogResponse struct {
 }
 
 func doReflog(sockPath, name string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
+	client := newThunderClient(sockPath)
 
 	resp, err := client.Get("http://localhost/reflog?name=" + name)
 	if err != nil {
@@ -2826,13 +2633,7 @@ type LogResponse struct {
 }
 
 func doLog(sockPath, uuid string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
+	client := newThunderClient(sockPath)
 
 	url := "http://localhost/log"
 	if uuid != "" {
@@ -2919,66 +2720,24 @@ type AutorunResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-func doAutorunSet(sockPath, refName string, argv []string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
-
-	req := AutorunRequest{RefName: refName, Argv: argv}
-	body, err := json.Marshal(req)
+// doAutorun POSTs an AutorunRequest to /autorun and checks the standard
+// {status,message} response. A nil argv clears the ref's autorun.
+func doAutorun(sockPath, refName string, argv []string) error {
+	result, err := postJSON[AutorunRequest, AutorunResponse](sockPath, "/autorun",
+		AutorunRequest{RefName: refName, Argv: argv})
 	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
+		return err
 	}
-
-	resp, err := client.Post("http://localhost/autorun", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var result AutorunResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
-	}
-
 	if result.Status != "ok" {
 		return fmt.Errorf("server error: %s", result.Message)
 	}
 	return nil
 }
 
+func doAutorunSet(sockPath, refName string, argv []string) error {
+	return doAutorun(sockPath, refName, argv)
+}
+
 func doAutorunStop(sockPath, refName string) error {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialThunder(ctx, sockPath)
-			},
-		},
-	}
-
-	req := AutorunRequest{RefName: refName, Argv: nil}
-	body, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
-	}
-
-	resp, err := client.Post("http://localhost/autorun", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var result AutorunResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
-	}
-
-	if result.Status != "ok" {
-		return fmt.Errorf("server error: %s", result.Message)
-	}
-	return nil
+	return doAutorun(sockPath, refName, nil)
 }
