@@ -347,7 +347,7 @@ func parseIsolationOutput(output string) isolationCheckResult {
 func TestContainerSharedPIDNamespace(t *testing.T) {
 	env := newTestEnv(t)
 	absFramePath, ns, initPid := setupSharedNsFrame(t, env, "sharedpidtest")
-	defer ns.ReleaseContainerNs(absFramePath)
+	defer ns.Release(absFramePath)
 
 	// The base snapshot's /bin/sh is the ts binary, not a real shell; install a
 	// static busybox so the sessions can run echo/sleep/read and a /proc glob.

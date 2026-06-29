@@ -149,11 +149,11 @@ func runContainerSession(s ssh.Session, tailscaleUser, frameName, targetUser str
 	// A single "init" process per rootFS creates and anchors the namespaces;
 	// all sessions join these existing namespaces rather than creating new ones.
 	// This allows processes from different sessions to see each other via /proc.
-	initPid, err := containerNs.getOrCreateContainerNs(rootFS, hostname, domainname)
+	initPid, err := containerNs.GetOrCreate(rootFS, hostname, domainname)
 	if err != nil {
 		return fmt.Errorf("create container namespace: %w", err)
 	}
-	defer containerNs.releaseContainerNs(rootFS)
+	defer containerNs.Release(rootFS)
 
 	// Use nsenter to join the existing namespaces, then exec ts drop-caps-and-run.
 	// We use nsenter instead of trying to do setns() in Go because:

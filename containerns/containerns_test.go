@@ -1,27 +1,27 @@
-package thundersnap
+package containerns
 
 import (
 	"os/exec"
 	"testing"
 )
 
-// TestReleaseContainerNsUnknown verifies releasing a rootFS that was never
-// registered is a no-op (does not panic, does not underflow).
-func TestReleaseContainerNsUnknown(t *testing.T) {
-	m := NewContainerNsManager()
-	m.ReleaseContainerNs("/never/registered") // must not panic
+// TestReleaseUnknown verifies releasing a rootFS that was never registered is a
+// no-op (does not panic, does not underflow).
+func TestReleaseUnknown(t *testing.T) {
+	m := New()
+	m.Release("/never/registered") // must not panic
 	if len(m.entries) != 0 {
 		t.Errorf("entries = %d, want 0", len(m.entries))
 	}
 }
 
-// TestReleaseContainerNsRefcount verifies the refcount lifecycle: two
-// references must be released twice before init is shut down and the entry
-// removed. A real child process (cat) stands in for container-init: like the
-// real init it exits when its stdin is closed, so the shutdown path
-// (close stdin, Wait) is exercised for real and completes promptly.
-func TestReleaseContainerNsRefcount(t *testing.T) {
-	m := NewContainerNsManager()
+// TestReleaseRefcount verifies the refcount lifecycle: two references must be
+// released twice before init is shut down and the entry removed. A real child
+// process (cat) stands in for container-init: like the real init it exits when
+// its stdin is closed, so the shutdown path (close stdin, Wait) is exercised
+// for real and completes promptly.
+func TestReleaseRefcount(t *testing.T) {
+	m := New()
 
 	cmd := exec.Command("cat") // reads stdin; exits on EOF when stdin closes
 	stdin, err := cmd.StdinPipe()
@@ -37,7 +37,7 @@ func TestReleaseContainerNsRefcount(t *testing.T) {
 	}()
 
 	const key = "/fake/rootfs"
-	m.entries[key] = &containerNsEntry{
+	m.entries[key] = &entry{
 		initPid:   cmd.Process.Pid,
 		initStdin: stdin,
 		initCmd:   cmd,
@@ -45,7 +45,7 @@ func TestReleaseContainerNsRefcount(t *testing.T) {
 	}
 
 	// First release: refcount 2 -> 1, entry stays.
-	m.ReleaseContainerNs(key)
+	m.Release(key)
 	if _, ok := m.entries[key]; !ok {
 		t.Fatal("entry removed after first release (refcount should be 1)")
 	}
@@ -54,7 +54,7 @@ func TestReleaseContainerNsRefcount(t *testing.T) {
 	}
 
 	// Second release: refcount 1 -> 0, init shut down and entry removed.
-	m.ReleaseContainerNs(key)
+	m.Release(key)
 	if _, ok := m.entries[key]; ok {
 		t.Error("entry not removed after final release")
 	}

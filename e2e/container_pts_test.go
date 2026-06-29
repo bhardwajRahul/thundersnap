@@ -13,7 +13,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/tailscale/thundersnap/thundersnap"
+	"github.com/tailscale/thundersnap/containerns"
 )
 
 // openContainerPTSNumber opens the container's ptmx (via /proc/<pid>/root, the
@@ -49,14 +49,14 @@ func openContainerPTSNumber(t *testing.T, initPid int) (*os.File, int) {
 func TestContainerSharedDevpts(t *testing.T) {
 	env := newTestEnv(t)
 	absFramePath, ns, initPid := setupSharedNsFrame(t, env, "shareddevpts")
-	defer ns.ReleaseContainerNs(absFramePath)
+	defer ns.Release(absFramePath)
 
 	// A second GetOrCreate for the same rootFS must reuse the same init PID.
-	initPid2, err := ns.GetOrCreateContainerNs(absFramePath, "", "")
+	initPid2, err := ns.GetOrCreate(absFramePath, "", "")
 	if err != nil {
-		t.Fatalf("second GetOrCreateContainerNs: %v", err)
+		t.Fatalf("second GetOrCreate: %v", err)
 	}
-	defer ns.ReleaseContainerNs(absFramePath)
+	defer ns.Release(absFramePath)
 	if initPid2 != initPid {
 		t.Fatalf("sessions did not share the container namespace: initPid %d != %d", initPid2, initPid)
 	}
@@ -103,7 +103,7 @@ func TestContainerSharedDevpts(t *testing.T) {
 func TestContainerConcurrentSessionDistinctPTS(t *testing.T) {
 	env := newTestEnv(t)
 	absFramePath, ns, initPid := setupSharedNsFrame(t, env, "concurrentpts")
-	defer ns.ReleaseContainerNs(absFramePath)
+	defer ns.Release(absFramePath)
 
 	// busybox provides a static /bin/sh with `tty`, `ls`, `sleep`, and a fifo
 	// so each session can report its tty and then block until released.
@@ -191,7 +191,7 @@ func TestContainerConcurrentSessionDistinctPTS(t *testing.T) {
 // setupSharedNsFrame creates a frame from the base snapshot, copies ts into it,
 // and starts a single shared container namespace, returning the abs frame path,
 // the namespace manager, and the container-init PID.
-func setupSharedNsFrame(t *testing.T, env *testEnv, name string) (string, *thundersnap.ContainerNsManager, int) {
+func setupSharedNsFrame(t *testing.T, env *testEnv, name string) (string, *containerns.Manager, int) {
 	t.Helper()
 	baseSnap := env.createBaseSnapshot()
 	framePath := filepath.Join(env.fsDir, "testuser", name)
@@ -209,10 +209,10 @@ func setupSharedNsFrame(t *testing.T, env *testEnv, name string) (string, *thund
 	if err != nil {
 		t.Fatalf("abs: %v", err)
 	}
-	ns := thundersnap.NewContainerNsManager()
-	initPid, err := ns.GetOrCreateContainerNs(absFramePath, "", "")
+	ns := containerns.New()
+	initPid, err := ns.GetOrCreate(absFramePath, "", "")
 	if err != nil {
-		t.Fatalf("GetOrCreateContainerNs: %v", err)
+		t.Fatalf("GetOrCreate: %v", err)
 	}
 	return absFramePath, ns, initPid
 }
