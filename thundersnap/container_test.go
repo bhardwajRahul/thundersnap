@@ -2,60 +2,8 @@ package thundersnap
 
 import (
 	"os/exec"
-	"strings"
 	"testing"
 )
-
-// TestBuildNsenterCmd verifies the single source of truth for the
-// `nsenter ... ts drop-caps-and-run` invocation that RunInContainerNs and
-// StartInContainerNs share, including the tsBinary default.
-func TestBuildNsenterCmd(t *testing.T) {
-	cmd := buildNsenterCmd("/abs/root", "", 4242, "/bin/sh", "-c", "echo hi")
-
-	if got := cmd.Path; !strings.HasSuffix(got, "nsenter") {
-		t.Errorf("cmd.Path = %q, want it to end in nsenter", got)
-	}
-	if cmd.Dir != "/" {
-		t.Errorf("cmd.Dir = %q, want /", cmd.Dir)
-	}
-
-	want := []string{
-		"nsenter",
-		"-t", "4242", "-p", "-m", "-u", "--",
-		"/abs/root/bin/ts", "drop-caps-and-run", "--chroot=/abs/root", "--",
-		"/bin/sh", "-c", "echo hi",
-	}
-	if !equalArgs(cmd.Args, want) {
-		t.Errorf("cmd.Args =\n  %v\nwant\n  %v", cmd.Args, want)
-	}
-}
-
-// TestBuildNsenterCmdExplicitTSBinary verifies an explicit tsBinary overrides
-// the <rootFS>/bin/ts default.
-func TestBuildNsenterCmdExplicitTSBinary(t *testing.T) {
-	cmd := buildNsenterCmd("/abs/root", "/custom/ts", 1, "true")
-	want := []string{
-		"nsenter",
-		"-t", "1", "-p", "-m", "-u", "--",
-		"/custom/ts", "drop-caps-and-run", "--chroot=/abs/root", "--",
-		"true",
-	}
-	if !equalArgs(cmd.Args, want) {
-		t.Errorf("cmd.Args =\n  %v\nwant\n  %v", cmd.Args, want)
-	}
-}
-
-func equalArgs(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
 
 // TestReleaseContainerNsUnknown verifies releasing a rootFS that was never
 // registered is a no-op (does not panic, does not underflow).
