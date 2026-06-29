@@ -1259,6 +1259,10 @@ RESOLUTION:
 >     was reattached in passing.
 >   - **cmd/ts/shell.go** — the `runAsShell`/`runShell*` POSIX-shell mode out of
 >     cmd/ts/main.go.
+>   - **cmd/ts/container_setup.go** — the PTY/namespace/container-init cluster
+>     (`cmdDropCapsAndRun`, `runWithPty`/`runWithExternalPty`, `ptsname`/`unlockpt`/
+>     `applyWinsize`/`setWinsize`, `setupDev`, `cmdContainerInit`, `cmdCheckDev`,
+>     `cmdCheckIsolation`) out of cmd/ts/main.go.
 > Still DEFERRED within #13 (behavior-bearing refactors, not mechanical lifts): the
 > *true importable* **session** package (the `sessionSpec`/`enterSession`
 > unification, which also absorbs the dead `thundersnap.RunInContainerNs`/
