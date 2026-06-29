@@ -190,10 +190,12 @@ func rechecksumTSC(b []byte) {
 }
 
 // TestChunkDataReaderParity asserts that ChunkData (whole-buffer) and
-// ChunkReader (streaming) produce identical chunk boundaries and hashes for the
-// same input, across sizes that span buffer boundaries. They are two
-// independent implementations of the same content-defined chunker, so this
-// guards against drift.
+// ChunkReader (streaming) produce identical chunk boundaries, hashes, AND
+// hierarchical levels for the same input, across sizes that span buffer
+// boundaries. Both now delegate to the canonical chunkStream, so this is a
+// guard against any future divergence reintroducing two real implementations.
+// Comparing level (not just sha/size) closes the gap where the old whole-buffer
+// path could have computed a different level than the streaming path.
 func TestChunkDataReaderParity(t *testing.T) {
 	sizes := []int{0, 1, 100, BLOB_MAX - 1, BLOB_MAX, BLOB_MAX + 1, BLOB_MAX*3 + 777, BLOB_READ_SIZE + 4096}
 	for _, n := range sizes {
@@ -204,18 +206,19 @@ func TestChunkDataReaderParity(t *testing.T) {
 		}
 
 		type chunk struct {
-			sha  [32]byte
-			size uint32
+			sha   [32]byte
+			size  uint32
+			level uint16
 		}
 		var fromData, fromReader []chunk
-		if err := ChunkData(data, func(sha [32]byte, size uint32, _ uint16) error {
-			fromData = append(fromData, chunk{sha, size})
+		if err := ChunkData(data, func(sha [32]byte, size uint32, level uint16) error {
+			fromData = append(fromData, chunk{sha, size, level})
 			return nil
 		}); err != nil {
 			t.Fatalf("ChunkData(n=%d): %v", n, err)
 		}
-		if err := ChunkReader(bytes.NewReader(data), int64(n), func(sha [32]byte, size uint32, _ uint16) error {
-			fromReader = append(fromReader, chunk{sha, size})
+		if err := ChunkReader(bytes.NewReader(data), int64(n), func(sha [32]byte, size uint32, level uint16) error {
+			fromReader = append(fromReader, chunk{sha, size, level})
 			return nil
 		}, nil); err != nil {
 			t.Fatalf("ChunkReader(n=%d): %v", n, err)
@@ -228,8 +231,9 @@ func TestChunkDataReaderParity(t *testing.T) {
 		var totalData, totalReader uint32
 		for i := range fromData {
 			if fromData[i] != fromReader[i] {
-				t.Errorf("n=%d chunk %d: ChunkData=%x/%d ChunkReader=%x/%d", n, i,
-					fromData[i].sha[:4], fromData[i].size, fromReader[i].sha[:4], fromReader[i].size)
+				t.Errorf("n=%d chunk %d: ChunkData=%x/%d/L%d ChunkReader=%x/%d/L%d", n, i,
+					fromData[i].sha[:4], fromData[i].size, fromData[i].level,
+					fromReader[i].sha[:4], fromReader[i].size, fromReader[i].level)
 			}
 			totalData += fromData[i].size
 			totalReader += fromReader[i].size

@@ -1,6 +1,7 @@
 package tsm
 
 import (
+	"bytes"
 	"io"
 	"os"
 )
@@ -91,8 +92,32 @@ func ChunkFile(filename string, callback ChunkCallback, progress func(int64, int
 	return ChunkReader(f, fileSize, callback, progress)
 }
 
-// ChunkReader splits data from a reader into content-defined chunks using SHA-256
+// ChunkReader splits data from a reader into content-defined chunks using
+// SHA-256. It is a thin wrapper over the canonical chunkStream implementation.
 func ChunkReader(r io.Reader, fileSize int64, callback ChunkCallback, progress func(int64, int64)) error {
+	return chunkStream(r, fileSize, callback, progress)
+}
+
+// ChunkData splits a byte slice into content-defined chunks using SHA-256. It
+// is a thin wrapper that streams the in-memory buffer through the canonical
+// chunkStream implementation, so byte-slice and reader inputs always produce
+// identical chunk boundaries and hashes.
+func ChunkData(data []byte, callback ChunkCallback) error {
+	return chunkStream(bytes.NewReader(data), int64(len(data)), callback, nil)
+}
+
+// chunkStream is the single canonical content-defined chunker. Both ChunkData
+// (whole-buffer) and ChunkReader/ChunkFile (streaming) delegate here so the
+// chunk-boundary logic lives in exactly one place and the on-disk chunk hashes
+// can never drift between the two entry points.
+//
+// It reads through a fixed BLOB_READ_SIZE buffer, scanning for content-defined
+// split points with findSplitPoint. When no split is found it carries the
+// unconsumed tail ("leftover") into the next read; a run that reaches BLOB_MAX
+// without a natural boundary is force-split at BLOB_MAX (level 0) so memory use
+// stays bounded. progress, when non-nil, is called after each chunk with the
+// running byte total and the caller-supplied fileSize.
+func chunkStream(r io.Reader, fileSize int64, callback ChunkCallback, progress func(int64, int64)) error {
 	buf := make([]byte, BLOB_READ_SIZE)
 	var leftover []byte
 	totalBytes := int64(0)
@@ -185,48 +210,5 @@ func ChunkReader(r io.Reader, fileSize int64, callback ChunkCallback, progress f
 		}
 	}
 
-	return nil
-}
-
-// ChunkData splits a byte slice into content-defined chunks using SHA-256
-func ChunkData(data []byte, callback ChunkCallback) error {
-	offset := 0
-	for offset < len(data) {
-		remaining := len(data) - offset
-		ofs, bits := findSplitPoint(data[offset:])
-
-		var chunkSize int
-		var level int
-
-		if ofs > 0 && ofs <= remaining {
-			chunkSize = ofs
-			if chunkSize > BLOB_MAX {
-				chunkSize = BLOB_MAX
-				level = 0
-			} else {
-				level = (bits - BUP_BLOBBITS) / FANOUT_BITS
-			}
-		} else {
-			// No split point found - take remaining or BLOB_MAX
-			if remaining > BLOB_MAX {
-				chunkSize = BLOB_MAX
-				level = 0
-			} else {
-				chunkSize = remaining
-				level = 0
-			}
-		}
-
-		if chunkSize > 0 {
-			chunk := data[offset : offset+chunkSize]
-			sha := BlobSHA256(chunk)
-
-			if err := callback(sha, uint32(chunkSize), uint16(level)); err != nil {
-				return err
-			}
-
-			offset += chunkSize
-		}
-	}
 	return nil
 }
