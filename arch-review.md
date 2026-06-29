@@ -1231,9 +1231,9 @@ RESOLUTION:
 
 ---
 
-# Cross-module architecture review  [partially DONE — todo #13 in progress]
+# Cross-module architecture review  [todo #13 — bounded work DONE; behavior-bearing lifts DEFERRED]
 
-> RESOLUTION (todo #13, in progress): the smaller, well-bounded extractions are
+> RESOLUTION (todo #13): the smaller, well-bounded extractions are
 > done, each in its own commit with unit tests, make test + make e2e green:
 >   - **btrfsutil** DONE — `Run/IsSubvolume/CreateSubvol/DeleteSubvol/Snapshot`;
 >     snapsubdir, refid, docker.go, and the daemon's wrappers all delegate to it;
