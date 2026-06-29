@@ -1352,11 +1352,21 @@ Highest-value extractions, roughly in priority order:
    with no daemon-specific state beyond a root path. It belongs in its own package and is
    independently testable.
 
-4. **[DEFERRED→#13 rootfs work] A `rootfs` package.** `prepareContainerRootFS`, `ensureRootFS`, `ensureFrameFS`,
+4. **[DONE as a file split — full package deferred] A `rootfs` package.** `prepareContainerRootFS`, `ensureRootFS`, `ensureFrameFS`,
    `setupMinimalRootfs`, `copy*Binary`, `ensureResolvConf`, `ensureTmpDir`, and the
    `finalizeFrameRootfs` helper proposed in the per-module review form a coherent "build/prepare
    a frame's root filesystem" unit. Extracting it untangles rootfs construction from HTTP
    handling and gives the snapshot/create paths a clean dependency.
+   RESOLUTION: these ~570 lines are now in their own file `cmd/thundersnapd/rootfs.go` (still
+   `package main`), giving the cohesion/navigability win at zero API/behavior risk. A *true*
+   importable package is deliberately NOT done: the block has a 126-reference coupling surface to
+   daemon internals — three package globals (`*flagSnapsDir`, `*flagFsDir`, `fsDirLibexec`) plus
+   the snapshot pipeline (`createSnapshotWithTaints`, `btrfsSnapshot`), frame metadata
+   (`FrameMeta`, `readFrameMeta`/`writeFrameMeta`, `getSnapTaints`, `UnionTaints`), and stamp
+   files (`read`/`writeStampFile`). Lifting it cleanly would require either dragging the
+   snapshot+frame-meta core along or a large injected-dependency struct — premature given current
+   needs. The file split is the right-sized step and makes a later package extraction tractable.
+   The shared btrfs helpers `isSubvolume`/`isDirEmpty` stay in main.go (used daemon-wide).
 
 5. **[DONE] A `cgroup` package.** The cgroup/OOM/memory block (~lines 1249-1410) is pure Linux
    resource-control plumbing with zero coupling to the rest of the daemon. Easy, clean lift.
