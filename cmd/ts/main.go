@@ -111,6 +111,11 @@ func main() {
 	case "container-init":
 		// Hidden command - starts a minimal init process for container namespaces
 		cmdContainerInit(cmdArgs)
+	case "session-serve":
+		// Hidden command - in-container vshd session endpoint. Runs after chroot
+		// so the pty it opens lands in the container's devpts; speaks vshdproto
+		// TLV on stdin/stdout, which vshd splices to the client connection.
+		cmdSessionServe(cmdArgs)
 	case "nsenter":
 		// Hidden command - CGO-free in-binary nsenter(1) used by vshd to join a
 		// shared container namespace identically on the host and inside a VM.

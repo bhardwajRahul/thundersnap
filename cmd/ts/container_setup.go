@@ -36,7 +36,6 @@ func cmdDropCapsAndRun(args []string) {
 	var hostname, domainname, chrootPath string
 	var skipMountSetup bool
 	var usePty bool
-	var ptyHandshakeFd int = -1 // fd for PTY handshake with thundersnapd
 	var cmdArgs []string
 
 	for i := 0; i < len(args); i++ {
@@ -61,14 +60,6 @@ func cmdDropCapsAndRun(args []string) {
 			skipMountSetup = true
 		} else if args[i] == "--pty" {
 			usePty = true
-		} else if strings.HasPrefix(args[i], "--pty-handshake-fd=") {
-			fdStr := strings.TrimPrefix(args[i], "--pty-handshake-fd=")
-			fd, err := strconv.Atoi(fdStr)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error: invalid --pty-handshake-fd value: %s\n", fdStr)
-				os.Exit(1)
-			}
-			ptyHandshakeFd = fd
 		} else if args[i] == "--" {
 			cmdArgs = args[i+1:]
 			break
@@ -156,28 +147,6 @@ func cmdDropCapsAndRun(args []string) {
 		}
 	}
 
-	// If thundersnapd requested a PTY handshake, signal that devpts is ready
-	// and wait for the PTY slave path. This allows thundersnapd to allocate
-	// the PTY from outside the namespace using our devpts mount.
-	var ptySlavePath string
-	if ptyHandshakeFd >= 0 {
-		handshakeFile := os.NewFile(uintptr(ptyHandshakeFd), "pty-handshake")
-		// Signal that devpts is ready
-		if _, err := handshakeFile.WriteString("READY\n"); err != nil {
-			fmt.Fprintf(os.Stderr, "error: pty handshake write: %v\n", err)
-			os.Exit(1)
-		}
-		// Read the PTY slave path
-		buf := make([]byte, 256)
-		n, err := handshakeFile.Read(buf)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: pty handshake read: %v\n", err)
-			os.Exit(1)
-		}
-		ptySlavePath = strings.TrimSpace(string(buf[:n]))
-		handshakeFile.Close()
-	}
-
 	// Capabilities to drop from the bounding set
 	capsToDrop := []uintptr{
 		unix.CAP_NET_ADMIN,
@@ -236,10 +205,7 @@ func cmdDropCapsAndRun(args []string) {
 		}
 	}
 
-	if ptySlavePath != "" {
-		// thundersnapd allocated the PTY from outside - use the provided slave
-		runWithExternalPty(executable, cmdArgs, ptySlavePath)
-	} else if usePty {
+	if usePty {
 		// Allocate a PTY inside the container (after devpts is mounted)
 		// and run the command with it, proxying I/O to our stdin/stdout.
 		runWithPty(executable, cmdArgs)
@@ -354,46 +320,6 @@ func runWithPty(executable string, cmdArgs []string) {
 		os.Exit(128 + int(status.Signal()))
 	}
 	os.Exit(1)
-}
-
-// runWithExternalPty runs the command using a PTY slave that was allocated by
-// thundersnapd from outside the namespace. Since thundersnapd holds the master,
-// we just open the slave, set it as controlling terminal, and exec the command.
-// No I/O proxying is needed - thundersnapd handles that directly.
-func runWithExternalPty(executable string, cmdArgs []string, slavePath string) {
-	// Open the PTY slave
-	pts, err := os.OpenFile(slavePath, os.O_RDWR, 0)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: open pty slave %s: %v\n", slavePath, err)
-		os.Exit(1)
-	}
-
-	// Create a new session and set the PTY as controlling terminal.
-	// We need to do this before exec so the child process gets proper job control.
-	if _, err := syscall.Setsid(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: setsid: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Set the PTY as controlling terminal (TIOCSCTTY)
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, pts.Fd(), syscall.TIOCSCTTY, 0); errno != 0 {
-		fmt.Fprintf(os.Stderr, "error: TIOCSCTTY: %v\n", errno)
-		os.Exit(1)
-	}
-
-	// Redirect stdin/stdout/stderr to the PTY slave
-	unix.Dup2(int(pts.Fd()), 0)
-	unix.Dup2(int(pts.Fd()), 1)
-	unix.Dup2(int(pts.Fd()), 2)
-	if pts.Fd() > 2 {
-		pts.Close()
-	}
-
-	// Exec the command - this replaces the current process
-	if err := syscall.Exec(executable, cmdArgs, os.Environ()); err != nil {
-		fmt.Fprintf(os.Stderr, "error: exec %s: %v\n", cmdArgs[0], err)
-		os.Exit(1)
-	}
 }
 
 // ptsname returns the name of the PTY slave device for the given PTY master.

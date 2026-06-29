@@ -26,15 +26,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
-	"syscall"
 
-	"github.com/creack/pty"
 	"github.com/mdlayher/vsock"
 	"github.com/tailscale/thundersnap/cgroup"
 	"github.com/tailscale/thundersnap/containerns"
 	"github.com/tailscale/thundersnap/vshdproto"
+	"github.com/tailscale/thundersnap/vshdsession"
 )
 
 // containerNs anchors the shared PID/mount/UTS namespaces for container
@@ -246,7 +244,84 @@ func handleConnection(conn io.ReadWriteCloser) {
 		}
 	}
 
-	serveSession(id, conn, reader, cmd, wantPTY, postStart)
+	logf := func(format string, args ...any) {
+		log.Printf("[conn %d] "+format, append([]any{id}, args...)...)
+	}
+
+	if rootPrefix != "" {
+		// Container session: the wrapped inner `ts session-serve` (which runs
+		// after nsenter+chroot, inside the container's mount namespace) is the
+		// TLV endpoint. vshd just splices the raw TLV bytes through in both
+		// directions; it does not interpret the protocol. This is what lets the
+		// pty be opened from inside the container so /dev/pts/N is visible there.
+		spliceContainerSession(id, conn, reader, cmd, postStart)
+		return
+	}
+
+	// Direct VM/host session (no container): vshd is the TLV endpoint.
+	vshdsession.Serve(conn, reader, cmd, wantPTY, postStart, logf)
+}
+
+// spliceContainerSession runs the wrapped inner `ts session-serve` command and
+// splices the raw vshdproto byte stream between the network connection and the
+// child's stdin/stdout. The inner ts is the protocol endpoint (it opens the pty
+// inside the container, frames stdout/stderr, and sends FrameExit), so vshd
+// performs no framing here. postStart, when non-nil, applies cgroup limits to
+// the child once started.
+func spliceContainerSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int)) {
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		log.Printf("[conn %d] stdin pipe: %v", id, err)
+		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: %v\n", err)))
+		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
+		return
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("[conn %d] stdout pipe: %v", id, err)
+		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: %v\n", err)))
+		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
+		return
+	}
+	// The inner ts owns stderr framing only for its own startup diagnostics; the
+	// session's stderr travels as FrameStderr inside the spliced stdout stream.
+	// Surface any raw inner-ts stderr to vshd's log to aid debugging.
+	cmd.Stderr = &logWriter{id: id}
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("[conn %d] start command: %v", id, err)
+		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: %v\n", err)))
+		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
+		return
+	}
+	if postStart != nil {
+		postStart(cmd.Process.Pid)
+	}
+	log.Printf("[conn %d] container session started with PID %d", id, cmd.Process.Pid)
+
+	// Client -> inner ts: copy the raw TLV byte stream to the child's stdin.
+	go func() {
+		io.Copy(stdin, reader)
+		stdin.Close()
+	}()
+
+	// Inner ts -> client: copy the raw TLV byte stream (stdout, stderr frames,
+	// and the final FrameExit) back to the client.
+	io.Copy(conn, stdout)
+
+	// The inner ts already framed and sent FrameExit before closing stdout, so
+	// just reap the child.
+	cmd.Wait()
+	log.Printf("[conn %d] container session exited", id)
+}
+
+// logWriter forwards a child's raw stderr to vshd's log, line-buffered loosely
+// (each Write is logged as-is).
+type logWriter struct{ id uint64 }
+
+func (w *logWriter) Write(p []byte) (int, error) {
+	log.Printf("[conn %d] inner-ts stderr: %s", w.id, strings.TrimRight(string(p), "\n"))
+	return len(p), nil
 }
 
 // buildSessionCmd constructs the *exec.Cmd for a session and, for container
@@ -299,13 +374,28 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 
 	// The inner ts lives in the frame rootfs; nsenter is run by the outer ts
 	// (tsBinaryPath) which is always present on the host/outer-VM filesystem.
+	//
+	// Inside the container we exec `ts session-serve` rather than the shell
+	// directly: session-serve runs AFTER chroot, so when it opens the pty the
+	// slave is allocated from the container's own devpts instance and is visible
+	// as /dev/pts/N inside the container. vshd then just splices the TLV byte
+	// stream to/from this inner ts (see spliceContainerSession). The pty flag and
+	// the final argv are passed through to session-serve.
 	innerTs := filepath.Join(rootPrefix, "bin", "ts")
+	ptyFlag := "0"
+	if wantPTY {
+		ptyFlag = "1"
+	}
+	serveArgs := append([]string{
+		"session-serve", ptyFlag, strconv.Itoa(len(argv)),
+	}, argv...)
 	dropCapsArgs := append([]string{
 		"drop-caps-and-run",
 		"--chroot=" + rootPrefix,
 		"--skip-mount-setup",
 		"--",
-	}, argv...)
+		"/bin/ts",
+	}, serveArgs...)
 	nsenterArgs := append([]string{
 		"nsenter",
 		"-t", strconv.Itoa(initPid), "-p", "-m", "-u", "--",
@@ -361,179 +451,6 @@ func readArgs(reader *bufio.Reader) ([]string, error) {
 		cmdArgs = append(cmdArgs, arg)
 	}
 	return cmdArgs, nil
-}
-
-// serveSession runs cmd, proxying it to the client over conn using vshdproto TLV
-// framing. For a PTY session (wantPTY) the command is started on a pty whose
-// size tracks FrameWinsize frames from the client; for a non-PTY session stdin
-// is fed from FrameStdin frames and stdout/stderr are framed separately. In both
-// cases the child's exit code is sent as a FrameExit frame before the connection
-// is closed.
-// postStart, when non-nil, is invoked with the started child's PID immediately
-// after the command starts (used to apply cgroup limits in host mode).
-func serveSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, wantPTY bool, postStart func(pid int)) {
-	if wantPTY {
-		servePTYSession(id, conn, reader, cmd, postStart)
-	} else {
-		servePipeSession(id, conn, reader, cmd, postStart)
-	}
-}
-
-// servePTYSession starts cmd on a pty and bridges it to the TLV stream:
-// FrameStdin -> pty, FrameWinsize -> pty.Setsize, pty output -> FrameStdout.
-func servePTYSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int)) {
-	ptmx, err := pty.Start(cmd)
-	if err != nil {
-		log.Printf("[conn %d] failed to start pty: %v", id, err)
-		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: failed to start shell: %v\n", err)))
-		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
-		return
-	}
-	defer ptmx.Close()
-	if postStart != nil {
-		postStart(cmd.Process.Pid)
-	}
-	log.Printf("[conn %d] pty session started with PID %d", id, cmd.Process.Pid)
-
-	// Client -> child: decode TLV frames, route stdin to the pty and winsize to
-	// the pty size. Runs until the client closes (EOF) or sends a malformed frame.
-	go func() {
-		for {
-			typ, payload, err := vshdproto.ReadFrame(reader)
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("[conn %d] read frame: %v", id, err)
-				}
-				return
-			}
-			switch typ {
-			case vshdproto.FrameStdin:
-				if _, werr := ptmx.Write(payload); werr != nil {
-					return
-				}
-			case vshdproto.FrameWinsize:
-				ws, derr := vshdproto.DecodeWinsize(payload)
-				if derr != nil {
-					log.Printf("[conn %d] bad winsize: %v", id, derr)
-					continue
-				}
-				pty.Setsize(ptmx, &pty.Winsize{Rows: ws.Rows, Cols: ws.Cols, X: ws.X, Y: ws.Y})
-			}
-		}
-	}()
-
-	// Child -> client: frame pty output as FrameStdout.
-	done := make(chan struct{})
-	go func() {
-		buf := make([]byte, 32*1024)
-		for {
-			n, rerr := ptmx.Read(buf)
-			if n > 0 {
-				if werr := vshdproto.WriteFrame(conn, vshdproto.FrameStdout, buf[:n]); werr != nil {
-					break
-				}
-			}
-			if rerr != nil {
-				break
-			}
-		}
-		close(done)
-	}()
-
-	<-done
-	log.Printf("[conn %d] signaling pty session to exit", id)
-	cmd.Process.Signal(syscall.SIGHUP)
-	code := waitExitCode(cmd)
-	vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(code))
-	log.Printf("[conn %d] pty session exited (code %d)", id, code)
-}
-
-// servePipeSession runs cmd without a pty, feeding FrameStdin frames to the
-// child's stdin and framing its stdout/stderr separately (FrameStdout/
-// FrameStderr), then sending FrameExit.
-func servePipeSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int)) {
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		log.Printf("[conn %d] stdin pipe: %v", id, err)
-		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: %v\n", err)))
-		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
-		return
-	}
-	// stdout and stderr are framed onto the same connection from independent
-	// goroutines; a shared mutex keeps each frame's header+payload contiguous.
-	var writeMu sync.Mutex
-	cmd.Stdout = &frameWriter{conn: conn, typ: vshdproto.FrameStdout, mu: &writeMu}
-	cmd.Stderr = &frameWriter{conn: conn, typ: vshdproto.FrameStderr, mu: &writeMu}
-
-	if err := cmd.Start(); err != nil {
-		log.Printf("[conn %d] start command: %v", id, err)
-		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: %v\n", err)))
-		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
-		return
-	}
-	if postStart != nil {
-		postStart(cmd.Process.Pid)
-	}
-	log.Printf("[conn %d] command started with PID %d", id, cmd.Process.Pid)
-
-	// Client -> child stdin: decode FrameStdin frames. Other frame types (e.g.
-	// stray winsize) are ignored in pipe mode. Close stdin on EOF.
-	go func() {
-		defer stdin.Close()
-		for {
-			typ, payload, err := vshdproto.ReadFrame(reader)
-			if err != nil {
-				return
-			}
-			if typ == vshdproto.FrameStdin {
-				if _, werr := stdin.Write(payload); werr != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	code := waitExitCode(cmd)
-	vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(code))
-	log.Printf("[conn %d] command exited (code %d)", id, code)
-}
-
-// waitExitCode waits for cmd and returns its exit code (0 on success, the
-// process exit status on a normal non-zero exit, or 1 for other failures).
-func waitExitCode(cmd *exec.Cmd) int32 {
-	err := cmd.Wait()
-	if err == nil {
-		return 0
-	}
-	if ee, ok := err.(*exec.ExitError); ok {
-		if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
-			if ws.Signaled() {
-				return int32(128 + int(ws.Signal()))
-			}
-			return int32(ws.ExitStatus())
-		}
-		return int32(ee.ExitCode())
-	}
-	return 1
-}
-
-// frameWriter wraps a connection so that each Write is emitted as one vshdproto
-// frame of a fixed type. Used to frame a child's stdout/stderr in pipe mode.
-type frameWriter struct {
-	conn io.Writer
-	typ  uint8
-	mu   *sync.Mutex // optional; serialises frames sharing one conn
-}
-
-func (fw *frameWriter) Write(p []byte) (int, error) {
-	if fw.mu != nil {
-		fw.mu.Lock()
-		defer fw.mu.Unlock()
-	}
-	if err := vshdproto.WriteFrame(fw.conn, fw.typ, p); err != nil {
-		return 0, err
-	}
-	return len(p), nil
 }
 
 func main() {

@@ -27,7 +27,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/gliderlabs/ssh"
 	"github.com/pborman/getopt/v2"
@@ -3931,73 +3930,4 @@ func parseRangeHeader(header string, fileSize int64) (start, end int64, err erro
 	}
 
 	return start, end, nil
-}
-
-// PTY helper functions for allocating PTYs from outside the container namespace.
-// These allow thundersnapd to open the container's devpts ptmx directly, giving
-// it the master fd for direct I/O and window size control.
-
-// openContainerPTY opens a PTY on the container's devpts mount and returns
-// the master fd and the slave device path (e.g., "/dev/pts/0").
-// The pid is the container's init process - we access its mount namespace
-// via /proc/<pid>/root to see the devpts mount.
-func openContainerPTY(pid int) (*os.File, string, error) {
-	// Access the container's filesystem through /proc/<pid>/root
-	// This gives us a view into the container's mount namespace
-	ptmxPath := fmt.Sprintf("/proc/%d/root/dev/pts/ptmx", pid)
-
-	ptmx, err := os.OpenFile(ptmxPath, os.O_RDWR, 0)
-	if err != nil {
-		return nil, "", fmt.Errorf("open %s: %w", ptmxPath, err)
-	}
-
-	// Get the slave device number
-	slavePath, err := ptsnameFromMaster(ptmx)
-	if err != nil {
-		ptmx.Close()
-		return nil, "", fmt.Errorf("ptsname: %w", err)
-	}
-
-	// Unlock the slave device
-	if err := unlockPTY(ptmx); err != nil {
-		ptmx.Close()
-		return nil, "", fmt.Errorf("unlockpt: %w", err)
-	}
-
-	return ptmx, slavePath, nil
-}
-
-// ptsnameFromMaster returns the slave device path for the given PTY master.
-// This is the Go equivalent of glibc's ptsname(3): TIOCGPTN reads the pty
-// number directly off the master fd. We reimplement it (rather than call
-// ptsname) because the master was opened from the *container's* ptmx via
-// /proc/<pid>/root, so the slave lives under the container's /dev/pts.
-func ptsnameFromMaster(ptmx *os.File) (string, error) {
-	var ptyno uint32
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&ptyno)))
-	if errno != 0 {
-		return "", errno
-	}
-	return fmt.Sprintf("/dev/pts/%d", ptyno), nil
-}
-
-// unlockPTY unlocks the PTY slave device. This is the Go equivalent of glibc's
-// unlockpt(3): TIOCSPTLCK with 0 clears the slave's lock so it can be opened.
-func unlockPTY(ptmx *os.File) error {
-	var unlock int32 = 0
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&unlock)))
-	if errno != 0 {
-		return errno
-	}
-	return nil
-}
-
-// setPTYWinsize sets the window size on the PTY master.
-func setPTYWinsize(ptmx *os.File, width, height int) error {
-	ws := struct{ row, col, xpixel, ypixel uint16 }{uint16(height), uint16(width), 0, 0}
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(&ws)))
-	if errno != 0 {
-		return errno
-	}
-	return nil
 }

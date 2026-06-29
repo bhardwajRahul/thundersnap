@@ -59,7 +59,7 @@ func TestMain(m *testing.M) {
 		{"refs-errors", `^Test(Error|Ref|CorruptedSnapshotMetadata).*$`},
 
 		// Tier 4: container isolation primitives.
-		{"container", `^Test(BlankContainer|Container|NestedThundersnap|Cgroup|TsNsenter).*$`},
+		{"container", `^Test(BlankContainer|Container|NestedThundersnap|Cgroup|TsNsenter|Vshd).*$`},
 
 		// Tier 5: frames, taints, integration, mesh, streaming, uid, docker.
 		{"frames", `^Test(Frame|MultipleTaintsOnFrame|Taint|Integration|Workflow|CrossFrame|Mesh|Metrics|Streaming|NDJSON|HTTPRange|Vsock|UID|Id|Docker|MultipleConcurrentSessions|LongRunningProgressUpdates|QueryFrameTaints|DeleteRunningFrame).*$`},
