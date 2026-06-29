@@ -3394,21 +3394,41 @@ type SnapStreamEvent struct {
 }
 
 // snapProgressWriter wraps an http.ResponseWriter to write progress events
-type snapProgressWriter struct {
-	w       http.ResponseWriter
+// progressEmitter is the shared machinery for the NDJSON streaming progress
+// writers (/snap, /create, /download-snap, /download-docker). It owns the JSON
+// encoder and the optional flusher, and emits each event as a line of NDJSON
+// followed by a flush. Each endpoint embeds it and supplies its own typed event
+// structs.
+type progressEmitter struct {
 	flusher http.Flusher
 	encoder *json.Encoder
 }
 
-func newSnapProgressWriter(w http.ResponseWriter) *snapProgressWriter {
-	pw := &snapProgressWriter{
-		w:       w,
-		encoder: json.NewEncoder(w),
-	}
+func newProgressEmitter(w http.ResponseWriter) progressEmitter {
+	pe := progressEmitter{encoder: json.NewEncoder(w)}
 	if f, ok := w.(http.Flusher); ok {
-		pw.flusher = f
+		pe.flusher = f
 	}
-	return pw
+	return pe
+}
+
+// emit writes v as one NDJSON line and flushes if possible.
+func (pe *progressEmitter) emit(v any) error {
+	if err := pe.encoder.Encode(v); err != nil {
+		return err
+	}
+	if pe.flusher != nil {
+		pe.flusher.Flush()
+	}
+	return nil
+}
+
+type snapProgressWriter struct {
+	progressEmitter
+}
+
+func newSnapProgressWriter(w http.ResponseWriter) *snapProgressWriter {
+	return &snapProgressWriter{newProgressEmitter(w)}
 }
 
 func (pw *snapProgressWriter) Write(p []byte) (n int, err error) {
@@ -3417,15 +3437,8 @@ func (pw *snapProgressWriter) Write(p []byte) (n int, err error) {
 	if msg == "" {
 		return len(p), nil
 	}
-	event := SnapStreamEvent{
-		Type:    "progress",
-		Message: msg,
-	}
-	if err := pw.encoder.Encode(event); err != nil {
+	if err := pw.emit(SnapStreamEvent{Type: "progress", Message: msg}); err != nil {
 		return 0, err
-	}
-	if pw.flusher != nil {
-		pw.flusher.Flush()
 	}
 	return len(p), nil
 }
@@ -4252,10 +4265,7 @@ func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, fra
 		f.Flush()
 	}
 
-	pw := &createProgressWriter{w: w, encoder: json.NewEncoder(w)}
-	if f, ok := w.(http.Flusher); ok {
-		pw.flusher = f
-	}
+	pw := &createProgressWriter{newProgressEmitter(w)}
 
 	// Parse frame spec
 	rootfsSpec, homeSpec, workSpec := parseFrameSpec(req.SnapshotSpec)
@@ -4343,10 +4353,7 @@ func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, framePath s
 		f.Flush()
 	}
 
-	pw := &createProgressWriter{w: w, encoder: json.NewEncoder(w)}
-	if f, ok := w.(http.Flusher); ok {
-		pw.flusher = f
-	}
+	pw := &createProgressWriter{newProgressEmitter(w)}
 
 	// Check if rootfs snapshot exists locally (parse frame spec if needed)
 	rootfsSnap := req.SnapshotID
@@ -4397,9 +4404,7 @@ func handleCreateStreaming(w http.ResponseWriter, req CreateRequest, framePath s
 
 // createProgressWriter wraps ResponseWriter to write progress events
 type createProgressWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-	encoder *json.Encoder
+	progressEmitter
 }
 
 func (pw *createProgressWriter) Write(p []byte) (n int, err error) {
@@ -4412,41 +4417,26 @@ func (pw *createProgressWriter) Write(p []byte) (n int, err error) {
 }
 
 func (pw *createProgressWriter) writeProgress(msg string) {
-	event := CreateStreamEvent{
-		Type:    "progress",
-		Message: msg,
-	}
-	pw.encoder.Encode(event)
-	if pw.flusher != nil {
-		pw.flusher.Flush()
-	}
+	pw.emit(CreateStreamEvent{Type: "progress", Message: msg})
 }
 
 func (pw *createProgressWriter) writeResult(status, path, message string) {
-	event := CreateStreamEvent{
+	pw.emit(CreateStreamEvent{
 		Type:    "result",
 		Status:  status,
 		Path:    path,
 		Message: message,
-	}
-	pw.encoder.Encode(event)
-	if pw.flusher != nil {
-		pw.flusher.Flush()
-	}
+	})
 }
 
 func (pw *createProgressWriter) writeResultWithUUID(status, uuid, message, path string) {
-	event := CreateStreamEvent{
+	pw.emit(CreateStreamEvent{
 		Type:    "result",
 		Status:  status,
 		UUID:    uuid,
 		Path:    path,
 		Message: message,
-	}
-	pw.encoder.Encode(event)
-	if pw.flusher != nil {
-		pw.flusher.Flush()
-	}
+	})
 }
 
 // createFrameFromSnapshot creates a new frame by cloning from a snapshot.
@@ -4718,10 +4708,7 @@ func handleDownloadSnapStreaming(w http.ResponseWriter, snapshotID string, isTTY
 		f.Flush()
 	}
 
-	pw := &downloadProgressWriter{w: w, encoder: json.NewEncoder(w)}
-	if f, ok := w.(http.Flusher); ok {
-		pw.flusher = f
-	}
+	pw := &downloadProgressWriter{newProgressEmitter(w)}
 
 	result, err := doDownloadSnap(snapshotID, pw, isTTY)
 	if err != nil {
@@ -4744,9 +4731,7 @@ func handleDownloadSnapStreaming(w http.ResponseWriter, snapshotID string, isTTY
 
 // downloadProgressWriter wraps ResponseWriter to write progress events
 type downloadProgressWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-	encoder *json.Encoder
+	progressEmitter
 }
 
 func (pw *downloadProgressWriter) Write(p []byte) (n int, err error) {
@@ -4754,15 +4739,8 @@ func (pw *downloadProgressWriter) Write(p []byte) (n int, err error) {
 	if msg == "" {
 		return len(p), nil
 	}
-	event := DownloadSnapStreamEvent{
-		Type:    "progress",
-		Message: msg,
-	}
-	if err := pw.encoder.Encode(event); err != nil {
+	if err := pw.emit(DownloadSnapStreamEvent{Type: "progress", Message: msg}); err != nil {
 		return 0, err
-	}
-	if pw.flusher != nil {
-		pw.flusher.Flush()
 	}
 	return len(p), nil
 }

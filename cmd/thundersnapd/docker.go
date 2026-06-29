@@ -101,10 +101,7 @@ func handleDownloadDockerStreaming(w http.ResponseWriter, req DownloadDockerRequ
 		f.Flush()
 	}
 
-	pw := &dockerProgressWriter{w: w, encoder: json.NewEncoder(w)}
-	if f, ok := w.(http.Flusher); ok {
-		pw.flusher = f
-	}
+	pw := &dockerProgressWriter{newProgressEmitter(w)}
 
 	snapshotID, cached, err := downloadDockerImage(req.ImageRef, pw)
 	if err != nil {
@@ -118,9 +115,7 @@ func handleDownloadDockerStreaming(w http.ResponseWriter, req DownloadDockerRequ
 
 // dockerProgressWriter wraps ResponseWriter to write progress events
 type dockerProgressWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-	encoder *json.Encoder
+	progressEmitter
 }
 
 func (pw *dockerProgressWriter) Write(p []byte) (n int, err error) {
@@ -133,28 +128,17 @@ func (pw *dockerProgressWriter) Write(p []byte) (n int, err error) {
 }
 
 func (pw *dockerProgressWriter) writeProgress(msg string) {
-	event := DownloadDockerStreamEvent{
-		Type:    "progress",
-		Message: msg,
-	}
-	pw.encoder.Encode(event)
-	if pw.flusher != nil {
-		pw.flusher.Flush()
-	}
+	pw.emit(DownloadDockerStreamEvent{Type: "progress", Message: msg})
 }
 
 func (pw *dockerProgressWriter) writeResult(status, snapshotID string, cached bool, message string) {
-	event := DownloadDockerStreamEvent{
+	pw.emit(DownloadDockerStreamEvent{
 		Type:       "result",
 		Status:     status,
 		SnapshotID: snapshotID,
 		Cached:     cached,
 		Message:    message,
-	}
-	pw.encoder.Encode(event)
-	if pw.flusher != nil {
-		pw.flusher.Flush()
-	}
+	})
 }
 
 // downloadDockerImage downloads a Docker image and creates a snap from it.
