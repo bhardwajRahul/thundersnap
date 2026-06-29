@@ -28,15 +28,13 @@ import (
 
 	"github.com/mdlayher/vsock"
 	"github.com/pborman/getopt/v2"
+	"github.com/tailscale/thundersnap/thunderproto"
 	"github.com/tailscale/thundersnap/tsm"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
 )
-
-// thunderPort is the vsock port used for the thunder control protocol.
-const thunderPort = 5223
 
 // hostCID is the vsock CID for the host (used in VMs).
 const hostCID = 2
@@ -181,7 +179,7 @@ func dialThunder(ctx context.Context, sockPath string) (net.Conn, error) {
 
 	if inVM() {
 		// In a VM: connect directly via vsock to host
-		conn, err = vsock.Dial(hostCID, thunderPort, nil)
+		conn, err = vsock.Dial(hostCID, thunderproto.Port, nil)
 		if err != nil {
 			return nil, fmt.Errorf("vsock dial: %w", err)
 		}
@@ -197,23 +195,11 @@ func dialThunder(ctx context.Context, sockPath string) (net.Conn, error) {
 		return nil, err
 	}
 
-	// Send vsock-style CONNECT handshake
-	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", thunderPort); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("send CONNECT: %w", err)
-	}
-
-	// Read response - should be "OK <port>\n"
+	// Emulate the vsock CONNECT/OK handshake over the Unix socket.
 	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
-	if err != nil {
+	if err := thunderproto.WriteClientHandshake(conn, reader); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("read handshake response: %w", err)
-	}
-	response = strings.TrimSpace(response)
-	if !strings.HasPrefix(response, "OK") {
-		conn.Close()
-		return nil, fmt.Errorf("handshake failed: %s", response)
+		return nil, err
 	}
 
 	// Return a conn that uses the buffered reader (in case there's buffered data)

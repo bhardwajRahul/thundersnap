@@ -38,6 +38,7 @@ import (
 	"github.com/tailscale/thundersnap/frames"
 	"github.com/tailscale/thundersnap/snaphash"
 	"github.com/tailscale/thundersnap/snapsubdir"
+	"github.com/tailscale/thundersnap/thunderproto"
 	"github.com/tailscale/thundersnap/thundersnap"
 	"github.com/tailscale/thundersnap/tsm"
 	gossh "golang.org/x/crypto/ssh"
@@ -2840,12 +2841,6 @@ func copyBinaryToRootFS(rootFS, binaryName, destPath string) error {
 	return nil
 }
 
-// thunderPort is the vsock port used for the thunder control protocol (snap,
-// ping, etc.). It is one past VshPort (5222) so the two protocols don't collide
-// on the same vsock CID. This value MUST match the CONNECT port hardcoded in the
-// in-container `ts` client, which dials it to reach the control socket.
-const thunderPort = 5223
-
 // controlServer wraps the HTTP server and listener for cleanup.
 type controlServer struct {
 	handler  http.Handler
@@ -2940,31 +2935,11 @@ func (c *controlServer) handleConn(conn net.Conn) {
 	// a "CONNECT <port>\n" / "OK <port>\n" text handshake before the real stream,
 	// so we emulate that handshake here over the Unix socket and only then speak
 	// HTTP, letting the client be oblivious to which transport it actually got.
-	// Read vsock-style CONNECT handshake
 	reader := bufio.NewReader(conn)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		log.Printf("control socket: failed to read handshake: %v", err)
+	if err := thunderproto.ReadServerHandshake(conn, reader); err != nil {
+		log.Printf("control socket: handshake failed: %v", err)
 		return
 	}
-
-	// Parse "CONNECT <port>\n"
-	line = strings.TrimSpace(line)
-	if !strings.HasPrefix(line, "CONNECT ") {
-		log.Printf("control socket: invalid handshake: %s", line)
-		fmt.Fprintf(conn, "ERROR invalid handshake\n")
-		return
-	}
-	portStr := strings.TrimPrefix(line, "CONNECT ")
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port != thunderPort {
-		log.Printf("control socket: invalid port: %s", portStr)
-		fmt.Fprintf(conn, "ERROR invalid port\n")
-		return
-	}
-
-	// Send OK response
-	fmt.Fprintf(conn, "OK %d\n", port)
 
 	// Now serve HTTP on this connection
 	for {
