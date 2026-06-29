@@ -1599,6 +1599,62 @@ func selectTargetUser(rootFS, targetUser string) string {
 // runContainerSession handles a container-based SSH session.
 // targetUser specifies the Unix user to run as. If empty, auto-detect from
 // [ubuntu, user] based on which /home/<user> exists, or fall back to root.
+// buildSessionCommand constructs the nsenter command that joins the container's
+// PID/mount/UTS namespaces (anchored by initPid) and execs "ts drop-caps-and-run"
+// to chroot into absRootFS, drop capabilities, and launch a login shell as
+// runAsUser. When rawCmd is non-empty it is run via "su - <user> -c <rawCmd>";
+// otherwise an interactive login shell is started. When ptyHandshake is true the
+// --pty-handshake-fd=3 flag is added so the caller can complete the PTY handshake
+// over fd 3.
+//
+// IMPORTANT: nsenter is used (not Go setns) because setns(CLONE_NEWNS) fails on
+// multithreaded processes and the Go runtime is always multithreaded. We do NOT
+// pass -F (--no-fork): Go programs fail to start in a joined PID namespace
+// without the fork that places them in the namespace (EINVAL creating threads).
+func buildSessionCommand(initPid int, tsBinary, absRootFS, runAsUser, rawCmd string, ptyHandshake bool) *exec.Cmd {
+	tsArgs := []string{
+		tsBinary, "drop-caps-and-run",
+		"--chroot=" + absRootFS,
+		"--skip-mount-setup",
+	}
+	if ptyHandshake {
+		// The fd number is 3 (after stdin=0, stdout=1, stderr=2).
+		tsArgs = append(tsArgs, "--pty-handshake-fd=3")
+	}
+	// Run as the target user via a login shell ("su -") so HOME and the working
+	// directory are the user's home; without it commands run from "/" with the
+	// wrong HOME, which breaks tools like rsync that start in $HOME.
+	tsArgs = append(tsArgs, "--", "su", "-", runAsUser)
+	if rawCmd != "" {
+		tsArgs = append(tsArgs, "-c", rawCmd)
+	}
+
+	// nsenter joins the PID (-p), mount (-m), and UTS (-u) namespaces of initPid.
+	nsenterArgs := append([]string{
+		"-t", fmt.Sprintf("%d", initPid),
+		"-p", "-m", "-u",
+		"--",
+	}, tsArgs...)
+
+	cmd := exec.Command("nsenter", nsenterArgs...)
+	cmd.Dir = "/"
+	return cmd
+}
+
+// sessionEnv builds the environment for a container session command. When term
+// is non-empty a TERM entry is appended (PTY sessions); otherwise it is omitted.
+func sessionEnv(sshUser, tailscaleUser, term string) []string {
+	env := []string{
+		"SSH_USER=" + sshUser,
+		"TAILSCALE_USER=" + tailscaleUser,
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	}
+	if term != "" {
+		env = append(env, "TERM="+term)
+	}
+	return env
+}
+
 func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser string, logErr func(string, ...any)) error {
 	// Sanitize usernames for filesystem paths (replace unsafe chars)
 	safeTailscaleUser := sanitizeForPath(tailscaleUser)
@@ -1671,52 +1727,10 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	// - Exec the final command
 	tsBinary := filepath.Join(absRootFS, "bin", "ts")
 
-	// Build the command that nsenter will exec
-	var tsArgs []string
-	if rawCmd != "" {
-		// Execute the requested command as the target user via a login shell
-		// ("su -") so that HOME and the working directory are set to the user's
-		// home. Without the login shell the command would run from "/" with the
-		// wrong HOME, which breaks tools like rsync that start in $HOME.
-		tsArgs = []string{
-			tsBinary, "drop-caps-and-run",
-			"--chroot=" + absRootFS,
-			"--skip-mount-setup",
-			"--", "su", "-", runAsUser, "-c", rawCmd,
-		}
-	} else {
-		// Launch interactive login shell as the target user
-		tsArgs = []string{
-			tsBinary, "drop-caps-and-run",
-			"--chroot=" + absRootFS,
-			"--skip-mount-setup",
-			"--", "su", "-", runAsUser,
-		}
-	}
-
-	// nsenter joins the PID, mount, and UTS namespaces of the init process.
-	// IMPORTANT: We do NOT use -F (--no-fork) because Go programs fail to start
-	// in a joined PID namespace without the fork that properly places them in
-	// the namespace. Without the fork, Go's runtime fails with EINVAL when
-	// trying to create OS threads.
-	// -t: target process to get namespaces from
-	// -p: join PID namespace
-	// -m: join mount namespace
-	// -u: join UTS namespace
-	nsenterArgs := []string{
-		"-t", fmt.Sprintf("%d", initPid),
-		"-p", "-m", "-u",
-		"--",
-	}
-	nsenterArgs = append(nsenterArgs, tsArgs...)
-
-	cmd := exec.Command("nsenter", nsenterArgs...)
-	cmd.Dir = "/"
-	cmd.Env = []string{
-		"SSH_USER=" + sshUser,
-		"TAILSCALE_USER=" + tailscaleUser,
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-	}
+	// Build the nsenter command that joins the container namespaces and execs
+	// the login shell. For non-PTY sessions there is no handshake fd.
+	cmd := buildSessionCommand(initPid, tsBinary, absRootFS, runAsUser, rawCmd, false)
+	cmd.Env = sessionEnv(sshUser, tailscaleUser, "")
 
 	// Build cgroup name for this container (used for OOM group killing)
 	// Uses parentCgroupName which includes daemon PID to avoid conflicts with other instances
@@ -1745,45 +1759,10 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 		handshakeTheirs := os.NewFile(uintptr(fds[1]), "handshake-theirs")
 		defer handshakeOurs.Close()
 
-		// Build ts command with --pty-handshake-fd flag
-		// The fd number will be 3 (after stdin=0, stdout=1, stderr=2)
-		var ptyTsArgs []string
-		if rawCmd != "" {
-			// Login shell ("su -") so HOME and cwd are the user's home; see the
-			// non-PTY branch above for rationale (rsync/cwd correctness).
-			ptyTsArgs = []string{
-				tsBinary, "drop-caps-and-run",
-				"--chroot=" + absRootFS,
-				"--skip-mount-setup",
-				"--pty-handshake-fd=3",
-				"--", "su", "-", runAsUser, "-c", rawCmd,
-			}
-		} else {
-			ptyTsArgs = []string{
-				tsBinary, "drop-caps-and-run",
-				"--chroot=" + absRootFS,
-				"--skip-mount-setup",
-				"--pty-handshake-fd=3",
-				"--", "su", "-", runAsUser,
-			}
-		}
-
-		// Build nsenter command (no -F flag - see comment above)
-		ptyNsenterArgs := []string{
-			"-t", fmt.Sprintf("%d", initPid),
-			"-p", "-m", "-u",
-			"--",
-		}
-		ptyNsenterArgs = append(ptyNsenterArgs, ptyTsArgs...)
-
-		cmd = exec.Command("nsenter", ptyNsenterArgs...)
-		cmd.Dir = "/"
-		cmd.Env = []string{
-			"SSH_USER=" + sshUser,
-			"TAILSCALE_USER=" + tailscaleUser,
-			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-			"TERM=" + ptyReq.Term,
-		}
+		// Same command as the non-PTY branch but with the PTY handshake fd so ts
+		// waits for the slave path; TERM is added to the environment.
+		cmd = buildSessionCommand(initPid, tsBinary, absRootFS, runAsUser, rawCmd, true)
+		cmd.Env = sessionEnv(sshUser, tailscaleUser, ptyReq.Term)
 
 		// Pass their end of the socket as extra fd (fd 3)
 		cmd.ExtraFiles = []*os.File{handshakeTheirs}
