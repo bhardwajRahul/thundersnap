@@ -788,9 +788,26 @@ regression. Untested pure, root-free functions:
 
 ---
 
-## cmd/thundersnapd/  (the daemon — core of the review)
+## cmd/thundersnapd/  (the daemon — core of the review)  [DONE]
 
-### 1. Edge cases for unit tests (pure-logic helpers)
+> RESOLUTION (#12 per-module pass): the contained, low-risk cleanups are done
+> and committed (see per-item notes below). The remaining items are *large*
+> structural refactors (VMX session-setup unification §2c, btrfs-exec wrappers
+> §2g, the handleCreate* reporter-interface collapse §3e, the deeper sessionSpec
+> form of §3b, DTO-unexporting §5, and the main.go file split) and are
+> intentionally deferred to #13 (cross-module package extractions), where they
+> belong with the btrfsutil/session/apitypes package work. Each deferred item is
+> marked DEFERRED→#13 below. make test + make e2e pass at every commit.
+
+### 1. Edge cases for unit tests (pure-logic helpers)  [DONE]
+> RESOLUTION: `deriveDataDirs`, `sanitizeForPath`, `stripDomain`, `parseFrameSpec`/
+> `hasBlankRootfs` (incl. >3-part drop, empty spec, literal "nil", "::"), and
+> `parseRangeHeader` (all listed cases) are covered in helpers_test.go;
+> `selectTargetUser` (explicit-user early return) and `tailscaleUserFromRootFS`
+> (single-component error, @domain) added this pass. `framePathForUUID`'s nil
+> guard is exercised by the unit-test refStore path (no fsDir). The ref-handler
+> matrix (create/dup/list/reflog/move/move-not-found/autorun set+clear/delete/
+> validation/wrong-method) is covered by refs_handlers_test.go.
 - `parseFrameSpec` / `hasBlankRootfs` / `isFrameSpec` (main.go:3979-4026): `parseFrameSpec("")`;
   `>3` colon parts (4th silently dropped); `hasBlankRootfs` interaction with literal `"nil"`;
   `"::"` (empty rootfs, drives the error branch at 4123/4406).
@@ -812,7 +829,8 @@ regression. Untested pure, root-free functions:
   unit test.
 
 ### 2. Duplicated code (the headline)
-- **2a. The 4 session-command forms in `runContainerSession` (1622-1735)** — four nearly
+> RESOLUTION: 2a/2b/2d/2e/2f/2h/2i DONE; 2c/2g DEFERRED→#13.
+- **2a. [DONE]** The 4 session-command forms in `runContainerSession` (1622-1735)** — four nearly
   identical `[]string` builders for `ts drop-caps-and-run ... su - <user> [-c cmd]`, differing
   only by PTY-vs-non-PTY (`--pty-handshake-fd=3`) and command-vs-interactive (`-c rawCmd`):
   non-PTY+cmd (1629-1634), non-PTY+interactive (1637-1642), PTY+cmd (1702-1708),
@@ -820,71 +838,101 @@ regression. Untested pure, root-free functions:
   byte-for-byte identical; the two `cmd.Env` blocks (1663-1667, 1729-1734) differ only by
   `TERM=`. Collapse to one `buildSessionCommand(initPid, tsBinary, absRootFS, runAsUser,
   rawCmd, pty, term)`. Removes ~60 lines and the class of bug already hit twice (#10, #11).
-- **2b. VMX vsock protocol writing** duplicated in `runVMXSession` (2302-2305) and
+  RESOLUTION: extracted `buildSessionCommand(initPid, tsBinary, absRootFS, runAsUser, rawCmd,
+  ptyHandshake)` + `sessionEnv(...)`; both PTY and non-PTY branches now build via the one helper.
+- **2b. [DONE]** VMX vsock protocol writing** duplicated in `runVMXSession` (2302-2305) and
   `runVMXOuterShell` (2346-2350); only the `VMX\x00framePath\x00` prefix differs → one
-  `writeVshdRequest(conn, framePath, targetUser, args)`.
-- **2c. VMX session setup boilerplate** duplicated in `runVMXSession` (2258-2289) and
-  `runVMXOuterShell` (2313-2335): sanitize → `userFsDir` → `.vmx-`+iso → `prepareVMXRootFS` →
+  `writeVshdRequest(conn, framePath, targetUser, args)`. RESOLUTION: extracted `writeVshdRequest`.
+- **2c. [DEFERRED→#13]** VMX session setup boilerplate** duplicated in `runVMXSession` (2258-2289)
+  and `runVMXOuterShell` (2313-2335): sanitize → `userFsDir` → `.vmx-`+iso → `prepareVMXRootFS` →
   `makeVMXControlHandler` → `getOrCreateVMX` → `connectToVshd` → `defer releaseVMX`. ~90% same.
-- **2d. JSON error responses — two parallel idioms:** `refs_handlers.go`/`frames_handlers.go`
+  DEFERRED: belongs with the session-package extraction in #13.
+- **2d. [DONE]** JSON error responses — two parallel idioms:** `refs_handlers.go`/`frames_handlers.go`
   use clean `jsonError`/`jsonResponse` (refs_handlers.go:358-368), but main.go inlines the
   4-line `Header().Set("Content-Type") + WriteHeader + Encode({Status:"error", Message:...})`
   ~30×. Every typed response is just `{Status, Message, ...}`; consolidate on a generic
-  `writeJSON(w, code, v)`.
-- **2e. "method not allowed" preamble** (`if r.Method != POST {...}`) repeated ~15×; a
-  `requirePost(w,r) bool` or a mux middleware would remove all of them.
-- **2f. "extract tailscale user from rootFS path"** identical block in `handleCreate`
+  `writeJSON(w, code, v)`. RESOLUTION: added generic `writeJSON(w, code, v any)`; main.go,
+  docker.go, refs_handlers.go (via jsonError/jsonResponse) and frames_handlers.go all route
+  through it (frames_handlers.go's now-unused `encoding/json` import removed).
+- **2e. [DONE]** "method not allowed" preamble** (`if r.Method != POST {...}`) repeated ~15×; a
+  `requirePost(w,r) bool` or a mux middleware would remove all of them. RESOLUTION: added
+  `requireMethod(w, r, method) bool`; all method checks converted to `if !requireMethod(...) {return}`.
+- **2f. [DONE]** "extract tailscale user from rootFS path"** identical block in `handleCreate`
   (4078-4091) and `handleDeleteFrame` (3726-3738) → one `tailscaleUserFromRootFS(rootFS)`.
-- **2g. btrfs `subvolume snapshot/create/delete` invocations** repeated ≥8× with the same
+  RESOLUTION: extracted `tailscaleUserFromRootFS`; both call sites use it (now unit-tested).
+- **2g. [DEFERRED→#13]** btrfs `subvolume snapshot/create/delete` invocations** repeated ≥8× with the same
   `CombinedOutput()` + `fmt.Errorf("...: %w\noutput: %s")` wrap (ensureRootFS 2535, ensureFrameFS
   2594/2602/2630/2638/2665/2673/2740, handleDeleteFrame 3774/3781/3788/3795,
   createSnapshotWithTaintsSubdir 5219, cleanup 5211). Thin `btrfsSnapshot/CreateSubvol/
   DeleteSubvol` wrappers would centralize error formatting + make them mockable.
-- **2h. Three progress-writer types** (`snapProgressWriter` 3366-3401, `createProgressWriter`
+  DEFERRED: belongs with the btrfsutil package extraction in #13 (`btrfsSnapshot` already
+  exists; the full wrapper set + adoption is the #13 work).
+- **2h. [DONE]** Three progress-writer types** (`snapProgressWriter` 3366-3401, `createProgressWriter`
   4445-4497, `downloadProgressWriter` 4817) implement the same `Write` → trim → NDJSON →
-  flush, differing only in the event struct. Share a generic streaming writer.
-- **2i. Frame-rootfs post-setup** ("ensure user in passwd → EnsureSudoers → ensureResolvConf →
+  flush, differing only in the event struct. Share a generic streaming writer. RESOLUTION:
+  added embedded `progressEmitter` (encoder+flusher, `emit(v any)`); all four writers (incl.
+  docker.go's `dockerProgressWriter`) now embed it and route through `emit`.
+- **2i. [DONE]** Frame-rootfs post-setup** ("ensure user in passwd → EnsureSudoers → ensureResolvConf →
   ensureTmpDir") repeated in `ensureRootFS` (2549-2566), `ensureFrameFS` (2711-2727),
-  `createFrame` (4568-4584) → one `finalizeFrameRootfs(rootFS)`.
+  `createFrame` (4568-4584) → one `finalizeFrameRootfs(rootFS)`. RESOLUTION: extracted
+  `finalizeFrameRootfs(rootFS)` + `frameRootFSPaths(tailscaleUser, frameName)`.
 
 ### 3. Overly complicated / redundant code paths (session-entry focus)
-- **3a. Three session-routing cases that converge to two.** `switch cap.Isolation`
+> RESOLUTION: 3a (none-fold) DONE, 3c/3d DONE, 3f DONE; 3a's SFTP-reuse and 3b's deeper
+> sessionSpec form + 3e DEFERRED→#13.
+- **3a. [DONE/part-DEFERRED]** Three session-routing cases that converge to two.** `switch cap.Isolation`
   (693-723) has `vmx`, `none`, default(`container`) — but `none` and `container` both call
   `runContainerSession` (713, 719); the only difference is the greeting string. Fold `none`
   into default with a greeting chosen from a small map. The SFTP subsystem handler (745-775)
   re-implements its own `@` parsing + rootFS setup instead of reusing `parseSSHUser`/
-  `prepareContainerRootFS`.
-- **3b. `runContainerSession` is ~290 lines with a duplicated PTY/non-PTY split.** It builds
+  `prepareContainerRootFS`. RESOLUTION: `none` folded into the default container case with a
+  greeting suffix; the SFTP-handler reuse is DEFERRED→#13 (touches the session-package work).
+- **3b. [DONE/part-DEFERRED]** `runContainerSession` is ~290 lines with a duplicated PTY/non-PTY split.** It builds
   `cmd` for the non-PTY case (1661-1667) then **throws it away and rebuilds it** inside the
   `if isPty` branch (1727-1734) — the initial `exec.Command` is dead work when `isPty`. Build
   args + `cmd` once via the unified builder, then branch only on I/O plumbing. Roughly halves
-  the function.
+  the function. RESOLUTION: the dead-cmd rebuild is gone — each branch builds via
+  `buildSessionCommand`. The deeper `sessionSpec`/`enterSession` unification is DEFERRED→#13.
   - **Unified shape for the whole session layer:** a `sessionSpec{kind, rootFS, runAsUser,
     rawCmd, pty, term, win}` + `enterSession(s, spec)`. Container kinds → one nsenter+drop-caps
     builder + one `runWithIO(cmd, s, pty)` (PTY-handshake vs pipes). VMX kinds → one
     `connectVMX` + `writeVshdRequest` + the already-shared `proxyVMSession`. **Note: empty vs
     non-empty frames are already unified** below the session layer (ensureRootFS→ensureFrameFS);
     the redundancy is purely in command-construction + I/O-plumbing.
-- **3c. Snapshot pipeline is a chain of thin forwarders:** `createSnapshot` (5036) →
+- **3c. [DONE]** Snapshot pipeline is a chain of thin forwarders:** `createSnapshot` (5036) →
   `createSnapshotSubdir` → `createSnapshotWithTaints` (5186, one-line) →
   `createSnapshotWithTaintsSubdir` (real impl); plus `createSnapshotWithFidx` (5159) one-lines
   into `createSnapshotWithTaints` with `taints=nil`. Three trivial wrappers default one param.
-  `createSnapshot` appears to have **no remaining callers** — likely dead code.
-- **3d. `makeSnapHandler` non-streaming branch (3422-3442)** duplicates the error/success JSON
+  `createSnapshot` appears to have **no remaining callers** — likely dead code. RESOLUTION:
+  `createSnapshotWithFidx` removed (inlined at its single call site as `createSnapshotWithTaints`,
+  and its 7-step process doc relocated onto the real impl `createSnapshotWithTaintsSubdir`).
+  `createSnapshot` is NOT dead — it is the whole-frame entry point used by the e2e tests
+  (e2e_test.go, full_e2e_test.go); kept with a clarified doc. `createSnapshotSubdir`/
+  `createSnapshotWithTaints` are meaningful default-providing layers, kept.
+- **3d. [DONE]** `makeSnapHandler` non-streaming branch (3422-3442)** duplicates the error/success JSON
   writing; the client always passes `stream=1` (per MEMORY), so it's effectively unused — keep
-  with a comment or remove.
-- **3e. `handleCreate*` cluster doubles everything (4036-4443):** legacy (`frame_name`+
+  with a comment or remove. RESOLUTION: kept (it is the public-API fallback for plain HTTP
+  clients that omit stream=1) with a comment saying the in-tree `ts` client always streams.
+- **3e. [DEFERRED→#13]** `handleCreate*` cluster doubles everything (4036-4443):** legacy (`frame_name`+
   `snapshot_id`) vs new (`snapshot_spec`→UUID), each split into streaming/non-streaming —
   `handleCreate`, `handleCreateWithUUID` (4171), `handleCreateStreamingWithUUID` (4295),
   `handleCreateStreaming` (4385). They duplicate blank-rootfs validation, snapshot-existence
   `os.Stat`, `createFrame`, metadata storage, ref creation. `handleCreateWithUUID` and its
   streaming twin are ~80% identical. Reduce to one create core + a "reporter" interface
-  (buffered JSON vs streaming `createProgressWriter`).
-- **3f. `proxyVMSession` drain loop (2400-2409)** uses `goto done` out of a `for`/`select` to
+  (buffered JSON vs streaming `createProgressWriter`). DEFERRED: the reporter-interface
+  refactor is a larger structural change scoped to #13.
+- **3f. [DONE]** `proxyVMSession` drain loop (2400-2409)** uses `goto done` out of a `for`/`select` to
   wait ≤2 goroutines with a 100ms timeout; a `sync.WaitGroup` (or just not draining, since the
-  goroutines exit when `conn.Close()` unblocks `io.Copy`) is clearer.
+  goroutines exit when `conn.Close()` unblocks `io.Copy`) is clearer. RESOLUTION: replaced the
+  `goto done` with a labeled `break drain` for clarity (behavior unchanged).
 
-### 4. Unclear / unexplained code
+### 4. Unclear / unexplained code  [DONE]
+> RESOLUTION: comments added for thunderPort (5223 + must match client CONNECT), btrfsMagic
+> (BTRFS_SUPER_MAGIC from <linux/magic.h>), the handleConn vsock CONNECT/OK handshake emulation,
+> --skip-mount-setup (bug #11 devpts stacking), ptsnameFromMaster/unlockPTY (ptsname(3)/
+> unlockpt(3) Go equivalents on the container's ptmx), the createSnapshotWithTaintsSubdir
+> subdir-prune rationale, and the prepareVMXRootFS /bin/sh→ts symlink (ts is the shell via argv0
+> "sh"). The Chinese toHostPath comment and the `su -` comment were already English/present.
 - **`controlServer` vsock handshake (handleConn, 3132-3159):** *why* an HTTP server on a Unix
   socket first speaks a `CONNECT <port>` / `OK <port>` text handshake — because the same client
   talks to both a real cloud-hypervisor vsock (VM) and this Unix socket (container), so the
@@ -907,7 +955,11 @@ regression. Untested pure, root-free functions:
 - **`sftpHandler.toHostPath` (main.go:1931) has a Chinese-language comment** (`防止目录遍历攻击`
   = "prevent directory traversal attack") — presumably unintentional; make it English.
 
-### 5. Godoc accessibility
+### 5. Godoc accessibility  [part-DONE/part-DEFERRED→#13]
+> RESOLUTION: the concrete go-lint bug (`ReflogEntryResponse` doc) is already correct
+> (`// ReflogEntryResponse is ...`). The bulk DTO-unexporting is DEFERRED→#13 because those
+> response types move into the planned `apitypes` package (and several are shared across the
+> client/daemon boundary), so unexporting them in place would be churn we'd immediately redo.
 - `main` package, so exported is misleading. Many response DTOs are exported only by
   convention and could be unexported: `RefRequest/Response`, `RefListEntry/Response`,
   `ReflogEntryResponse`, `ReflogResponse`, `AutorunRequest/Response` (refs_handlers.go);
