@@ -45,8 +45,7 @@ type RefResponse struct {
 
 // handleRefCreate handles POST /ref/create
 func handleRefCreate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -98,8 +97,7 @@ func handleRefCreate(w http.ResponseWriter, r *http.Request) {
 
 // handleRefMove handles POST /ref/move
 func handleRefMove(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -162,8 +160,7 @@ func handleRefMove(w http.ResponseWriter, r *http.Request) {
 
 // handleRefDelete handles POST /ref/delete
 func handleRefDelete(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -226,8 +223,7 @@ type RefListResponse struct {
 
 // handleListRefs handles GET /refs
 func handleListRefs(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 
@@ -270,8 +266,7 @@ type ReflogResponse struct {
 
 // handleReflog handles GET /reflog?name=<name>
 func handleReflog(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 
@@ -320,8 +315,7 @@ type AutorunResponse struct {
 
 // handleAutorun handles POST /autorun
 func handleAutorun(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -356,13 +350,10 @@ func handleAutorun(w http.ResponseWriter, r *http.Request) {
 
 // jsonError sends a JSON error response.
 func jsonError(w http.ResponseWriter, message string, code int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(RefResponse{Status: "error", Message: message})
+	writeJSON(w, code, RefResponse{Status: "error", Message: message})
 }
 
 // jsonResponse sends a JSON response.
 func jsonResponse(w http.ResponseWriter, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
+	writeJSON(w, http.StatusOK, v)
 }

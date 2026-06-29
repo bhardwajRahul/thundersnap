@@ -47,8 +47,7 @@ type DownloadDockerStreamEvent struct {
 
 // handleDownloadDocker handles POST /download-docker
 func handleDownloadDocker(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -59,9 +58,7 @@ func handleDownloadDocker(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.ImageRef == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(DownloadDockerResponse{
+		writeJSON(w, http.StatusBadRequest, DownloadDockerResponse{
 			Status:  "error",
 			Message: "image_ref is required",
 		})
@@ -81,17 +78,14 @@ func handleDownloadDocker(w http.ResponseWriter, r *http.Request) {
 	snapshotID, cached, err := downloadDockerImage(req.ImageRef, nil)
 	if err != nil {
 		log.Printf("download-docker failed for %s: %v", req.ImageRef, err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(DownloadDockerResponse{
+		writeJSON(w, http.StatusInternalServerError, DownloadDockerResponse{
 			Status:  "error",
 			Message: err.Error(),
 		})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(DownloadDockerResponse{
+	writeJSON(w, http.StatusOK, DownloadDockerResponse{
 		Status:     "ok",
 		SnapshotID: snapshotID,
 		Cached:     cached,

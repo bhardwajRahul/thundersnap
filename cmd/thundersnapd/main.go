@@ -2328,12 +2328,7 @@ func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targe
 
 	// Send VMX protocol: VMX\0framePath\0targetUser\0argCount\0args...
 	// framePath is relative to the virtiofs root (which is userFsDir)
-	framePath := safeFrameName
-	cmdArgs := s.Command()
-	fmt.Fprintf(conn, "VMX\x00%s\x00%s\x00%d\x00", framePath, targetUser, len(cmdArgs))
-	for _, arg := range cmdArgs {
-		fmt.Fprintf(conn, "%s\x00", arg)
-	}
+	writeVshdRequest(conn, safeFrameName, targetUser, s.Command())
 
 	// Proxy SSH I/O (same as runVMSession)
 	return proxyVMSession(s, conn, ms.done, ms.panicked)
@@ -2373,12 +2368,7 @@ func runVMXOuterShell(s ssh.Session, tailscaleUser, isolationName, targetUser st
 	defer conn.Close()
 
 	// Send original vshd protocol (no VMX prefix) - shell directly in VM
-	cmdArgs := s.Command()
-	fmt.Fprintf(conn, "%s\x00", targetUser)
-	fmt.Fprintf(conn, "%d\x00", len(cmdArgs))
-	for _, arg := range cmdArgs {
-		fmt.Fprintf(conn, "%s\x00", arg)
-	}
+	writeVshdRequest(conn, "", targetUser, s.Command())
 
 	// Proxy SSH I/O
 	return proxyVMSession(s, conn, ms.done, ms.panicked)
@@ -2390,6 +2380,21 @@ func makeVMXControlHandler(frameRootFS string) http.Handler {
 	mux.HandleFunc("/ping", handlePing)
 	mux.HandleFunc("/snap", makeSnapHandler(frameRootFS))
 	return mux
+}
+
+// writeVshdRequest writes a vshd session request to conn using the null-delimited
+// wire protocol. When framePath is non-empty it emits the VMX form
+// ("VMX\0framePath\0user\0argc\0args...") which spawns a container at framePath
+// inside the VM; when framePath is empty it emits the plain form
+// ("user\0argc\0args...") for a shell directly in the VM.
+func writeVshdRequest(conn net.Conn, framePath, targetUser string, cmdArgs []string) {
+	if framePath != "" {
+		fmt.Fprintf(conn, "VMX\x00%s\x00", framePath)
+	}
+	fmt.Fprintf(conn, "%s\x00%d\x00", targetUser, len(cmdArgs))
+	for _, arg := range cmdArgs {
+		fmt.Fprintf(conn, "%s\x00", arg)
+	}
 }
 
 // proxyVMSession proxies SSH I/O to/from a vshd connection.
@@ -3328,9 +3333,30 @@ type ControlResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-func handlePing(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+// requireMethod enforces the HTTP method for a handler. It writes a 405 and
+// returns false when the method does not match, in which case the caller should
+// return immediately.
+func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
+	if r.Method != method {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return false
+	}
+	return true
+}
+
+// writeJSON writes v as a JSON response with the given status code. A status of
+// 0 or http.StatusOK leaves the default 200 in place (no explicit WriteHeader),
+// matching the success paths that never called WriteHeader.
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	if code != 0 && code != http.StatusOK {
+		w.WriteHeader(code)
+	}
+	json.NewEncoder(w).Encode(v)
+}
+
+func handlePing(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -3345,13 +3371,10 @@ func handlePing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := ControlResponse{
+	writeJSON(w, http.StatusOK, ControlResponse{
 		Status:  "ok",
 		Message: "pong",
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	})
 }
 
 // SnapResponse is the response from the /snap endpoint
@@ -3411,8 +3434,7 @@ func (pw *snapProgressWriter) Write(p []byte) (n int, err error) {
 // This is used by both container (controlServer) and VM handlers.
 func makeSnapHandler(rootFS string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		if !requireMethod(w, r, http.MethodPost) {
 			return
 		}
 
@@ -3430,9 +3452,7 @@ func makeSnapHandler(rootFS string) http.HandlerFunc {
 		snapshotID, err := createSnapshotSubdir(rootFS, subdir, nil, false)
 		if err != nil {
 			log.Printf("snap failed for %s: %v", rootFS, err)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(SnapResponse{
+			writeJSON(w, http.StatusInternalServerError, SnapResponse{
 				Status:  "error",
 				Message: err.Error(),
 			})
@@ -3441,8 +3461,7 @@ func makeSnapHandler(rootFS string) http.HandlerFunc {
 
 		log.Printf("Created snapshot %s from %s", snapshotID, rootFS)
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(SnapResponse{
+		writeJSON(w, http.StatusOK, SnapResponse{
 			Status:     "ok",
 			SnapshotID: snapshotID,
 		})
@@ -3499,8 +3518,7 @@ type TaintResponse struct {
 
 // handleTaint handles POST /taint - add a taint to the current frame
 func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -3511,9 +3529,7 @@ func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.TaintName == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(TaintResponse{
+		writeJSON(w, http.StatusBadRequest, TaintResponse{
 			Status:  "error",
 			Message: "taint_name is required",
 		})
@@ -3523,9 +3539,7 @@ func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
 	// Read existing frame metadata
 	frameMeta, err := readFrameMeta(c.rootFS)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(TaintResponse{
+		writeJSON(w, http.StatusInternalServerError, TaintResponse{
 			Status:  "error",
 			Message: fmt.Sprintf("read frame meta: %v", err),
 		})
@@ -3555,9 +3569,7 @@ func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
 
 	// Write updated frame metadata
 	if err := writeFrameMeta(c.rootFS, frameMeta); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(TaintResponse{
+		writeJSON(w, http.StatusInternalServerError, TaintResponse{
 			Status:  "error",
 			Message: fmt.Sprintf("write frame meta: %v", err),
 		})
@@ -3566,8 +3578,7 @@ func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Added taint %q to %s, taints now: %v", req.TaintName, c.rootFS, frameMeta.Taints)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(TaintResponse{
+	writeJSON(w, http.StatusOK, TaintResponse{
 		Status: "ok",
 		Taints: frameMeta.Taints,
 	})
@@ -3588,8 +3599,7 @@ type DeleteSnapResponse struct {
 // When deleting a snap that has children, updates the children to point
 // to the deleted snap's parent, maintaining the parent chain integrity.
 func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -3600,9 +3610,7 @@ func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.SnapshotID == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(DeleteSnapResponse{
+		writeJSON(w, http.StatusBadRequest, DeleteSnapResponse{
 			Status:  "error",
 			Message: "snapshot_id is required",
 		})
@@ -3612,9 +3620,7 @@ func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
 	// Check that the snapshot exists
 	snapPath := filepath.Join(*flagSnapsDir, req.SnapshotID)
 	if _, err := os.Stat(snapPath); os.IsNotExist(err) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(DeleteSnapResponse{
+		writeJSON(w, http.StatusNotFound, DeleteSnapResponse{
 			Status:  "error",
 			Message: fmt.Sprintf("snapshot %q not found", req.SnapshotID),
 		})
@@ -3635,9 +3641,7 @@ func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
 
 	// Delete the snapshot directory (btrfs subvolume)
 	if err := btrfsDeleteSubvol(snapPath); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(DeleteSnapResponse{
+		writeJSON(w, http.StatusInternalServerError, DeleteSnapResponse{
 			Status:  "error",
 			Message: err.Error(),
 		})
@@ -3652,8 +3656,7 @@ func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Deleted snapshot %s", req.SnapshotID)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(DeleteSnapResponse{
+	writeJSON(w, http.StatusOK, DeleteSnapResponse{
 		Status: "ok",
 	})
 }
@@ -3707,8 +3710,7 @@ type DeleteFrameResponse struct {
 
 // handleDeleteFrame handles POST /delete-frame - delete a frame
 func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -3719,9 +3721,7 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 	}
 
 	if req.FrameName == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(DeleteFrameResponse{
+		writeJSON(w, http.StatusBadRequest, DeleteFrameResponse{
 			Status:  "error",
 			Message: "frame_name is required",
 		})
@@ -3731,9 +3731,7 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 	// Extract tailscale user from rootFS path: /fs-dir/<tailscale-user>/<frame>
 	safeTailscaleUser, err := tailscaleUserFromRootFS(c.rootFS)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(DeleteFrameResponse{
+		writeJSON(w, http.StatusInternalServerError, DeleteFrameResponse{
 			Status:  "error",
 			Message: err.Error(),
 		})
@@ -3748,9 +3746,7 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 
 	// Check if frame exists
 	if _, err := os.Stat(framePath); os.IsNotExist(err) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(DeleteFrameResponse{
+		writeJSON(w, http.StatusNotFound, DeleteFrameResponse{
 			Status:  "error",
 			Message: fmt.Sprintf("frame %q not found", req.FrameName),
 		})
@@ -3759,9 +3755,7 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 
 	// Prevent deleting the current frame
 	if framePath == c.rootFS {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(DeleteFrameResponse{
+		writeJSON(w, http.StatusBadRequest, DeleteFrameResponse{
 			Status:  "error",
 			Message: "cannot delete the currently active frame",
 		})
@@ -3793,9 +3787,7 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 
 	// Delete the frame directory (btrfs subvolume)
 	if err := btrfsDeleteSubvol(framePath); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(DeleteFrameResponse{
+		writeJSON(w, http.StatusInternalServerError, DeleteFrameResponse{
 			Status:  "error",
 			Message: err.Error(),
 		})
@@ -3807,8 +3799,7 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 
 	log.Printf("Deleted frame %s", framePath)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(DeleteFrameResponse{
+	writeJSON(w, http.StatusOK, DeleteFrameResponse{
 		Status: "ok",
 	})
 }
@@ -3828,16 +3819,13 @@ type SnapInfo struct {
 
 // handleListSnaps handles GET /list-snaps - list all snapshots with sizes
 func handleListSnaps(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 
 	entries, err := os.ReadDir(*flagSnapsDir)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ListSnapsResponse{
+		writeJSON(w, http.StatusInternalServerError, ListSnapsResponse{
 			Status: "error",
 			Error:  fmt.Sprintf("read snapshots dir: %v", err),
 		})
@@ -3867,8 +3855,7 @@ func handleListSnaps(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(ListSnapsResponse{
+	writeJSON(w, http.StatusOK, ListSnapsResponse{
 		Status: "ok",
 		Snaps:  snaps,
 	})
@@ -3889,8 +3876,7 @@ type FrameInfo struct {
 
 // handleListFrames handles GET /list-frames - list all frames with status
 func handleListFrames(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 
@@ -3900,9 +3886,7 @@ func handleListFrames(w http.ResponseWriter, r *http.Request) {
 
 	userEntries, err := os.ReadDir(*flagFsDir)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ListFramesResponse{
+		writeJSON(w, http.StatusInternalServerError, ListFramesResponse{
 			Status: "error",
 			Error:  fmt.Sprintf("read fs dir: %v", err),
 		})
@@ -3947,8 +3931,7 @@ func handleListFrames(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(ListFramesResponse{
+	writeJSON(w, http.StatusOK, ListFramesResponse{
 		Status: "ok",
 		Frames: frames,
 	})
@@ -4033,8 +4016,7 @@ type CreateResponse struct {
 
 // handleCreate handles POST /create - create a new frame from a snapshot
 func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -4064,9 +4046,7 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.FrameName == "" || req.SnapshotID == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(CreateResponse{
+		writeJSON(w, http.StatusBadRequest, CreateResponse{
 			Status:  "error",
 			Message: "frame_name and snapshot_id (or rootfs) are required",
 		})
@@ -4076,9 +4056,7 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// Extract tailscale user from rootFS path: /fs-dir/<tailscale-user>/<frame>
 	safeTailscaleUser, err := tailscaleUserFromRootFS(c.rootFS)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(CreateResponse{
+		writeJSON(w, http.StatusInternalServerError, CreateResponse{
 			Status:  "error",
 			Message: err.Error(),
 		})
@@ -4093,9 +4071,7 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	// Check if frame already exists
 	if _, err := os.Stat(framePath); err == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(CreateResponse{
+		writeJSON(w, http.StatusConflict, CreateResponse{
 			Status:  "error",
 			Message: fmt.Sprintf("frame %q already exists", req.FrameName),
 		})
@@ -4117,9 +4093,7 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	isBlank, isExplicitNil := hasBlankRootfs(req.SnapshotID)
 	if isBlank && !isExplicitNil {
 		// Empty rootfs component (e.g., from "::") without explicit "nil" is an error
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(CreateResponse{
+		writeJSON(w, http.StatusBadRequest, CreateResponse{
 			Status:  "error",
 			Message: "rootfs component is required (use 'nil' for blank container)",
 		})
@@ -4130,9 +4104,7 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if !isBlank {
 		snapshotPath := filepath.Join(*flagSnapsDir, rootfsSnap)
 		if _, err := os.Stat(snapshotPath); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(CreateResponse{
+			writeJSON(w, http.StatusNotFound, CreateResponse{
 				Status:  "error",
 				Message: fmt.Sprintf("snapshot %q not found", rootfsSnap),
 			})
@@ -4143,9 +4115,7 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// Create frame from the snapshot/frame spec
 	if err := createFrame(framePath, req.SnapshotID, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
 		log.Printf("create frame failed: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(CreateResponse{
+		writeJSON(w, http.StatusInternalServerError, CreateResponse{
 			Status:  "error",
 			Message: err.Error(),
 		})
@@ -4154,8 +4124,7 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Created frame %s from snapshot %s", framePath, req.SnapshotID)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(CreateResponse{
+	writeJSON(w, http.StatusOK, CreateResponse{
 		Status: "ok",
 		Path:   framePath,
 	})
@@ -4170,9 +4139,7 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 	// Check if this is a blank container request
 	isBlank, isExplicitNil := hasBlankRootfs(req.SnapshotSpec)
 	if isBlank && !isExplicitNil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(CreateResponse{
+		writeJSON(w, http.StatusBadRequest, CreateResponse{
 			Status:  "error",
 			Message: "rootfs component is required (use 'nil' for blank container)",
 		})
@@ -4183,9 +4150,7 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 	if !isBlank {
 		snapshotPath := filepath.Join(*flagSnapsDir, rootfsSpec)
 		if _, err := os.Stat(snapshotPath); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(CreateResponse{
+			writeJSON(w, http.StatusNotFound, CreateResponse{
 				Status:  "error",
 				Message: fmt.Sprintf("rootfs snapshot %q not found", rootfsSpec),
 			})
@@ -4196,9 +4161,7 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 	// If a ref name is provided, validate it and check it doesn't already exist
 	if req.RefName != "" {
 		if refStore.Exists(req.RefName) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(CreateResponse{
+			writeJSON(w, http.StatusConflict, CreateResponse{
 				Status:  "error",
 				Message: fmt.Sprintf("ref %q already exists", req.RefName),
 			})
@@ -4210,9 +4173,7 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 	uuid, err := frameid.New()
 	if err != nil {
 		log.Printf("failed to generate UUID: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(CreateResponse{
+		writeJSON(w, http.StatusInternalServerError, CreateResponse{
 			Status:  "error",
 			Message: "failed to generate frame UUID",
 		})
@@ -4231,9 +4192,7 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 	// Create the frame
 	if err := createFrame(framePath, req.SnapshotSpec, req.HomeSnap, req.WorkSnap, req.Isolation); err != nil {
 		log.Printf("create frame failed: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(CreateResponse{
+		writeJSON(w, http.StatusInternalServerError, CreateResponse{
 			Status:  "error",
 			Message: err.Error(),
 		})
@@ -4278,8 +4237,7 @@ func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequ
 
 	log.Printf("Created frame %s (UUID: %s) from snapshot spec %s", framePath, uuid, req.SnapshotSpec)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(CreateResponse{
+	writeJSON(w, http.StatusOK, CreateResponse{
 		Status: "ok",
 		UUID:   uuid.String(),
 		Path:   framePath,
@@ -4583,21 +4541,18 @@ func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) er
 var globalMeshState *meshState
 
 func handleServersJSONControl(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 
 	if globalMeshState == nil {
 		// Mesh not enabled, return empty list
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]meshPeer{})
+		writeJSON(w, http.StatusOK, []meshPeer{})
 		return
 	}
 
 	peers := globalMeshState.getPeersIncludingSelf()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(peers)
+	writeJSON(w, http.StatusOK, peers)
 }
 
 // WhoHasRequest is the request body for /who-has
@@ -4620,8 +4575,7 @@ type WhoHasPeerInfo struct {
 
 // handleWhoHas handles POST /who-has - find which peers have a snapshot
 func handleWhoHas(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -4632,9 +4586,7 @@ func handleWhoHas(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.SnapshotID == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(WhoHasResponse{
+		writeJSON(w, http.StatusBadRequest, WhoHasResponse{
 			Status: "error",
 			Error:  "snapshot_id is required",
 		})
@@ -4643,8 +4595,7 @@ func handleWhoHas(w http.ResponseWriter, r *http.Request) {
 
 	// Get mesh peers
 	if globalMeshState == nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(WhoHasResponse{
+		writeJSON(w, http.StatusOK, WhoHasResponse{
 			Status: "error",
 			Error:  "mesh not enabled",
 		})
@@ -4653,8 +4604,7 @@ func handleWhoHas(w http.ResponseWriter, r *http.Request) {
 
 	meshPeers := globalMeshState.getPeersIncludingSelf()
 	if len(meshPeers) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(WhoHasResponse{
+		writeJSON(w, http.StatusOK, WhoHasResponse{
 			Status: "error",
 			Error:  "no mesh peers available",
 		})
@@ -4684,8 +4634,7 @@ func handleWhoHas(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(WhoHasResponse{
+	writeJSON(w, http.StatusOK, WhoHasResponse{
 		Status: "ok",
 		Peers:  peersWithSnap,
 	})
@@ -4715,8 +4664,7 @@ type DownloadSnapStreamEvent struct {
 
 // handleDownloadSnap handles POST /download-snap - download a snapshot from mesh peers
 func handleDownloadSnap(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -4727,9 +4675,7 @@ func handleDownloadSnap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.SnapshotID == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(DownloadSnapResponse{
+		writeJSON(w, http.StatusBadRequest, DownloadSnapResponse{
 			Status:  "error",
 			Message: "snapshot_id is required",
 		})
@@ -4749,17 +4695,14 @@ func handleDownloadSnap(w http.ResponseWriter, r *http.Request) {
 	result, err := doDownloadSnap(req.SnapshotID, nil, false)
 	if err != nil {
 		log.Printf("download-snap failed for %s: %v", req.SnapshotID, err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(DownloadSnapResponse{
+		writeJSON(w, http.StatusInternalServerError, DownloadSnapResponse{
 			Status:  "error",
 			Message: err.Error(),
 		})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(DownloadSnapResponse{
+	writeJSON(w, http.StatusOK, DownloadSnapResponse{
 		Status:       "ok",
 		SnapshotPath: result.SnapshotPath,
 		AlreadyHad:   result.AlreadyExists,
@@ -5395,8 +5338,7 @@ func (m *meshState) getPeersIncludingSelf() []meshPeer {
 
 // handleTsPing handles POST /ts/ping - receive a ping from another node
 func (m *meshState) handleTsPing(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
@@ -5421,20 +5363,17 @@ func (m *meshState) handleTsPing(w http.ResponseWriter, r *http.Request) {
 		Hostname: m.myFQDN,
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleServersJSON handles GET /ts/servers.json - list known peers
 func (m *meshState) handleServersJSON(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 
 	peers := m.getPeers()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(peers)
+	writeJSON(w, http.StatusOK, peers)
 }
 
 // handleIndex handles GET / - show web UI

@@ -2,7 +2,6 @@
 package main
 
 import (
-	"encoding/json"
 	"log"
 	"net/http"
 
@@ -36,8 +35,7 @@ type LogResponse struct {
 // handleLog handles GET /log?uuid=<uuid>
 // If uuid is not provided, it returns the log for the current frame.
 func handleLog(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 
@@ -75,8 +73,7 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(LogResponse{
+	writeJSON(w, http.StatusOK, LogResponse{
 		Status:  "ok",
 		UUID:    uuidStr,
 		History: entries,
