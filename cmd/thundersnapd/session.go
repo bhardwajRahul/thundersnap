@@ -85,7 +85,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, frameName, targetUser str
 	defer conn.Close()
 
 	ptyReq, winCh, isPty := s.Pty()
-	writeVshdRequest(conn, framePathHdr, targetUser, isPty, s.Command())
+	writeVshdRequest(conn, framePathHdr, targetUser, isPty, sessionCommand(s))
 
 	return proxyVshdSession(s, conn, isPty, ptyReq, winCh, nil, nil)
 }
@@ -323,7 +323,7 @@ func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targe
 	// framePath is the frame's UUID, relative to the virtiofs root (userFsDir,
 	// i.e. fs/<user>): the frame lives at fs/<user>/<uuid> on the host.
 	ptyReq, winCh, isPty := s.Pty()
-	writeVshdRequest(conn, uuid.String(), targetUser, isPty, s.Command())
+	writeVshdRequest(conn, uuid.String(), targetUser, isPty, sessionCommand(s))
 
 	// Proxy SSH I/O over the vshdproto TLV stream.
 	return proxyVshdSession(s, conn, isPty, ptyReq, winCh, ms.done, ms.panicked)
@@ -364,7 +364,7 @@ func runVMXOuterShell(s ssh.Session, tailscaleUser, isolationName, targetUser st
 
 	// Send original vshd protocol header (no VMX prefix) - shell directly in VM
 	ptyReq, winCh, isPty := s.Pty()
-	writeVshdRequest(conn, "", targetUser, isPty, s.Command())
+	writeVshdRequest(conn, "", targetUser, isPty, sessionCommand(s))
 
 	// Proxy SSH I/O over the vshdproto TLV stream.
 	return proxyVshdSession(s, conn, isPty, ptyReq, winCh, ms.done, ms.panicked)
@@ -376,6 +376,21 @@ func makeVMXControlHandler(frameRootFS string) http.Handler {
 	mux.HandleFunc("/ping", handlePing)
 	mux.HandleFunc("/snap", makeSnapHandler(frameRootFS))
 	return mux
+}
+
+// sessionCommand maps an SSH session's command to the argv sent to vshd. SSH
+// exec semantics run the supplied command through the user's login shell
+// (sh -c "<command>"), so a non-empty command is wrapped as ["sh","-c",raw]
+// rather than naively word-split: this preserves shell metacharacters such as
+// redirections (>), pipes (|) and operators (&&) instead of passing them as
+// literal argv elements. An empty command (interactive login) yields nil, which
+// tells vshd to start a login shell.
+func sessionCommand(s ssh.Session) []string {
+	raw := s.RawCommand()
+	if raw == "" {
+		return nil
+	}
+	return []string{"sh", "-c", raw}
 }
 
 // writeVshdRequest writes a vshd session request header to conn using the
