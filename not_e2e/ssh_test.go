@@ -374,46 +374,6 @@ func createTestRef(t *testing.T, env *testEnv, refName, frameUUID string) {
 	}
 }
 
-// installBusyboxShell replaces /bin/sh with busybox so PTY tests can drive a
-// real shell with coreutils-style commands (stty, printf, etc.)
-func installBusyboxShell(t *testing.T, framePath string) {
-	t.Helper()
-	busybox, err := exec.LookPath("busybox")
-	if err != nil {
-		t.Fatalf("busybox required: %v", err)
-	}
-	shDst := filepath.Join(framePath, "bin/sh")
-	if err := os.Remove(shDst); err != nil && !os.IsNotExist(err) {
-		t.Fatalf("remove sh: %v", err)
-	}
-	if err := copyFile(busybox, shDst); err != nil {
-		t.Fatalf("copy busybox sh: %v", err)
-	}
-	if err := os.Chmod(shDst, 0755); err != nil {
-		t.Fatalf("chmod sh: %v", err)
-	}
-}
-
-// installBusyboxApplet installs a busybox applet (e.g. "stty", "printf") into
-// the frame's /bin directory.
-func installBusyboxApplet(t *testing.T, framePath, name string) {
-	t.Helper()
-	busybox, err := exec.LookPath("busybox")
-	if err != nil {
-		t.Fatalf("busybox required: %v", err)
-	}
-	dst := filepath.Join(framePath, "bin", name)
-	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-		t.Fatalf("remove %s: %v", name, err)
-	}
-	if err := copyFile(busybox, dst); err != nil {
-		t.Fatalf("copy busybox %s: %v", name, err)
-	}
-	if err := os.Chmod(dst, 0755); err != nil {
-		t.Fatalf("chmod %s: %v", name, err)
-	}
-}
-
 // TestSSHContainerBasic is a true end-to-end test: start daemon, SSH in,
 // create a frame via `ts frame`, then exercise ts snap/snaps/log/frames.
 // No manual frame/ref creation - everything goes through the daemon.
@@ -742,6 +702,28 @@ func (b *safeBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// installBusyboxFor installs a real busybox /bin/sh plus an applet symlink for
+// `name` (e.g. "stty", "printf") into the frame so PTY tests can drive a real
+// shell and run real coreutils-style commands. The fixture /bin/sh is just the
+// ts binary and cannot honour `stty` or termios changes.
+func installBusyboxApplet(t *testing.T, framePath, name string) {
+	t.Helper()
+	busybox, err := exec.LookPath("busybox")
+	if err != nil {
+		t.Fatalf("busybox required: %v", err)
+	}
+	dst := filepath.Join(framePath, "bin", name)
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove %s: %v", name, err)
+	}
+	if err := copyFile(busybox, dst); err != nil {
+		t.Fatalf("copy busybox %s: %v", name, err)
+	}
+	if err := os.Chmod(dst, 0755); err != nil {
+		t.Fatalf("chmod %s: %v", name, err)
+	}
 }
 
 // TestSSHContainerPtyRawNoCRInjection verifies that a PTY session does NOT

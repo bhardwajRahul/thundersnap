@@ -22,7 +22,7 @@ OUT ?= dist
 # Output directory for local binaries
 BIN ?= ./bin
 
-.PHONY: all test e2e binaries ts vsh vshd thundersnapd bupdate tsm fidx slab \
+.PHONY: all test e2e not_e2e binaries ts vsh vshd thundersnapd bupdate tsm fidx slab \
         list build build-deb build-rpm build-tgz clean
 
 all: build
@@ -42,6 +42,7 @@ test:
 	@echo "gofmt OK"
 
 # Run e2e tests (requires root and btrfs)
+# These are true end-to-end tests that start a real thundersnapd and SSH into it.
 # Compiles the test binary and dependencies as the current user, then runs with sudo.
 # TMPDIR must be on btrfs (not /tmp which is typically tmpfs).
 E2E_TMPDIR ?= $(CURDIR)/.tmp-e2e
@@ -54,6 +55,18 @@ e2e: ts vshd thundersnapd
 		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
 		THUNDERSNAPD_BINARY="$(CURDIR)/$(BIN)/thundersnapd" \
 		$(BIN)/e2e.test -test.v -test.failfast
+
+# Run legacy "e2e" tests (not actually e2e - see not-e2e-enough.md)
+# These tests exercise individual components but don't go through the SSH front door.
+not_e2e: ts vshd thundersnapd
+	@mkdir -p $(E2E_TMPDIR)
+	CGO_ENABLED=0 go test -tags e2e -c -o $(BIN)/not_e2e.test ./not_e2e
+	sudo -E env \
+		TMPDIR="$(E2E_TMPDIR)" \
+		TS_BINARY="$(CURDIR)/$(BIN)/ts" \
+		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
+		THUNDERSNAPD_BINARY="$(CURDIR)/$(BIN)/thundersnapd" \
+		$(BIN)/not_e2e.test -test.v -test.failfast
 
 # Build all binaries for local development
 binaries: ts vsh vshd thundersnapd bupdate tsm fidx slab

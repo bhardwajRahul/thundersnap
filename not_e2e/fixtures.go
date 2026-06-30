@@ -1,8 +1,12 @@
 //go:build e2e
 
+// Package e2e provides test fixtures for end-to-end testing.
 package e2e
 
 import (
+	"archive/tar"
+	"compress/gzip"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -110,6 +114,7 @@ func DefaultTestContainerSpec() *TestContainerSpec {
 }
 
 // CreateOnDisk creates the test container filesystem on disk at the given path.
+// This is used when we need to create a btrfs subvolume directly.
 func (spec *TestContainerSpec) CreateOnDisk(t *testing.T, dir string) {
 	t.Helper()
 
@@ -189,7 +194,198 @@ func (spec *TestContainerSpec) CreateOnDisk(t *testing.T, dir string) {
 	}
 }
 
-// CreateTestContainer creates a test container filesystem on disk.
+// CreateDockerTarball creates a Docker-compatible image tarball.
+// The tarball contains:
+// - manifest.json with image metadata
+// - A single layer tarball with the filesystem contents
+// - config.json with image configuration
+//
+// This can be loaded with "docker load" or extracted manually.
+func (spec *TestContainerSpec) CreateDockerTarball(t *testing.T, w io.Writer) {
+	t.Helper()
+
+	// Create the outer tar (Docker image format)
+	tw := tar.NewWriter(w)
+	defer tw.Close()
+
+	// Create layer tarball in memory
+	layerTarGz, layerDigest := spec.createLayerTarball(t)
+
+	// Write layer tarball
+	layerPath := layerDigest + "/layer.tar"
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     layerDigest + "/",
+		Mode:     0755,
+		Size:     0,
+		Typeflag: tar.TypeDir,
+	}); err != nil {
+		t.Fatalf("write layer dir header: %v", err)
+	}
+
+	if err := tw.WriteHeader(&tar.Header{
+		Name: layerPath,
+		Mode: 0644,
+		Size: int64(len(layerTarGz)),
+	}); err != nil {
+		t.Fatalf("write layer tar header: %v", err)
+	}
+	if _, err := tw.Write(layerTarGz); err != nil {
+		t.Fatalf("write layer tar: %v", err)
+	}
+
+	// Create config.json
+	config := map[string]interface{}{
+		"architecture": "amd64",
+		"os":           "linux",
+		"config": map[string]interface{}{
+			"Env":        []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+			"WorkingDir": "/",
+		},
+		"rootfs": map[string]interface{}{
+			"type":     "layers",
+			"diff_ids": []string{"sha256:" + layerDigest},
+		},
+	}
+	configBytes, _ := json.Marshal(config)
+	configDigest := "testconfig123"
+
+	if err := tw.WriteHeader(&tar.Header{
+		Name: configDigest + ".json",
+		Mode: 0644,
+		Size: int64(len(configBytes)),
+	}); err != nil {
+		t.Fatalf("write config header: %v", err)
+	}
+	if _, err := tw.Write(configBytes); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	// Create manifest.json
+	manifest := []map[string]interface{}{
+		{
+			"Config":   configDigest + ".json",
+			"RepoTags": []string{"test:latest"},
+			"Layers":   []string{layerPath},
+		},
+	}
+	manifestBytes, _ := json.Marshal(manifest)
+
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "manifest.json",
+		Mode: 0644,
+		Size: int64(len(manifestBytes)),
+	}); err != nil {
+		t.Fatalf("write manifest header: %v", err)
+	}
+	if _, err := tw.Write(manifestBytes); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+}
+
+// createLayerTarball creates a gzipped tar of the layer contents.
+func (spec *TestContainerSpec) createLayerTarball(t *testing.T) ([]byte, string) {
+	t.Helper()
+
+	// Create uncompressed tar first (Docker expects uncompressed layer.tar)
+	var buf []byte
+	tw := tar.NewWriter(writerFunc(func(p []byte) (int, error) {
+		buf = append(buf, p...)
+		return len(p), nil
+	}))
+
+	for _, f := range spec.Files {
+		hdr := &tar.Header{
+			Name: f.Path,
+			Uid:  f.UID,
+			Gid:  f.GID,
+		}
+
+		switch {
+		case f.Mode&os.ModeDir != 0:
+			hdr.Typeflag = tar.TypeDir
+			hdr.Mode = int64(f.Mode.Perm())
+			if f.Mode&os.ModeSticky != 0 {
+				hdr.Mode |= 01000
+			}
+
+		case f.Mode&os.ModeSymlink != 0:
+			hdr.Typeflag = tar.TypeSymlink
+			hdr.Linkname = f.LinkTo
+			hdr.Mode = 0777
+
+		case f.Mode&os.ModeCharDevice != 0:
+			hdr.Typeflag = tar.TypeChar
+			hdr.Devmajor = int64(f.DevMaj)
+			hdr.Devminor = int64(f.DevMin)
+			hdr.Mode = int64(f.Mode.Perm())
+
+		case f.Mode&os.ModeDevice != 0:
+			hdr.Typeflag = tar.TypeBlock
+			hdr.Devmajor = int64(f.DevMaj)
+			hdr.Devminor = int64(f.DevMin)
+			hdr.Mode = int64(f.Mode.Perm())
+
+		default:
+			hdr.Typeflag = tar.TypeReg
+			hdr.Size = int64(len(f.Content))
+			hdr.Mode = int64(f.Mode.Perm())
+			if f.Mode&os.ModeSetuid != 0 {
+				hdr.Mode |= 04000
+			}
+			if f.Mode&os.ModeSetgid != 0 {
+				hdr.Mode |= 02000
+			}
+		}
+
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write tar header for %s: %v", f.Path, err)
+		}
+
+		if hdr.Typeflag == tar.TypeReg && len(f.Content) > 0 {
+			if _, err := tw.Write(f.Content); err != nil {
+				t.Fatalf("write tar content for %s: %v", f.Path, err)
+			}
+		}
+	}
+
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close layer tar: %v", err)
+	}
+
+	// Return uncompressed tar (Docker layer.tar is not gzipped)
+	return buf, "abc123testlayer"
+}
+
+// writerFunc adapts a function to io.Writer.
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) {
+	return f(p)
+}
+
+// CreateHardlinkTest creates a test file and a hardlink to it.
+// This is separate because hardlinks require the target to exist first.
+func CreateHardlinkTest(t *testing.T, dir string) {
+	t.Helper()
+
+	// Create original file
+	original := filepath.Join(dir, "var/log/original.log")
+	if err := os.MkdirAll(filepath.Dir(original), 0755); err != nil {
+		t.Fatalf("mkdir for hardlink test: %v", err)
+	}
+	if err := os.WriteFile(original, []byte("hardlink test content\n"), 0644); err != nil {
+		t.Fatalf("write original for hardlink: %v", err)
+	}
+
+	// Create hardlink
+	hardlink := filepath.Join(dir, "var/log/hardlink.log")
+	if err := os.Link(original, hardlink); err != nil {
+		t.Fatalf("create hardlink: %v", err)
+	}
+}
+
+// CreateTestContainer creates a test container filesystem on disk and returns the path.
+// The caller should have already created the parent directory.
 // If tsBinaryPath is non-empty, the ts binary is copied to /bin/ts and
 // /bin/sh is hardlinked to it (ts acts as a shell when invoked as "sh").
 func CreateTestContainer(t *testing.T, dir string, tsBinaryPath string) {
@@ -197,6 +393,9 @@ func CreateTestContainer(t *testing.T, dir string, tsBinaryPath string) {
 
 	spec := DefaultTestContainerSpec()
 	spec.CreateOnDisk(t, dir)
+
+	// Add hardlink test
+	CreateHardlinkTest(t, dir)
 
 	// Copy ts binary if provided
 	if tsBinaryPath != "" {
@@ -237,3 +436,6 @@ func copyFilePreserveMode(src, dst string) error {
 	_, err = io.Copy(out, in)
 	return err
 }
+
+// unused, silence linter
+var _ = gzip.NewWriter
