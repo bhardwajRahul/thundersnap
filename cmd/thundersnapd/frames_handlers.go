@@ -54,17 +54,22 @@ func (c *controlServer) handleLog(w http.ResponseWriter, r *http.Request) {
 	frameStore := userFrameStore(user)
 
 	uuidStr := r.URL.Query().Get("uuid")
+	var uuid frameid.ID
 	if uuidStr == "" {
-		// TODO: Get current frame UUID from context
-		// For now, require uuid parameter
-		jsonError(w, "uuid parameter is required", http.StatusBadRequest)
-		return
-	}
-
-	uuid, err := frameid.Parse(uuidStr)
-	if err != nil {
-		jsonError(w, "invalid uuid: "+err.Error(), http.StatusBadRequest)
-		return
+		// No uuid provided: use the current frame's UUID from the control
+		// server's rootFS path (<fs-dir>/<user>/<uuid>).
+		uuid, err = frameUUIDFromRootFS(c.rootFS)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		uuidStr = uuid.String()
+	} else {
+		uuid, err = frameid.Parse(uuidStr)
+		if err != nil {
+			jsonError(w, "invalid uuid: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 
 	frame, err := frameStore.Get(uuid)

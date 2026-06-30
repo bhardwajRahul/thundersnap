@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/tailscale/thundersnap/frameid"
+)
 
 func TestSelectTargetUserExplicit(t *testing.T) {
 	// A non-empty targetUser is returned verbatim without touching the
@@ -40,6 +44,63 @@ func TestTailscaleUserFromRootFS(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("tailscaleUserFromRootFS(%q) = %q, want %q", tt.rootFS, got, tt.want)
 		}
+	}
+}
+
+func TestFrameUUIDFromRootFS(t *testing.T) {
+	fsDir := "/var/lib/thundersnap/fs"
+	old := flagFsDir
+	flagFsDir = &fsDir
+	defer func() { flagFsDir = old }()
+
+	// Valid UUIDs (UUIDv4 format)
+	validUUID := "01234567-89ab-cdef-0123-456789abcdef"
+
+	tests := []struct {
+		rootFS  string
+		want    string
+		wantErr bool
+	}{
+		{"/var/lib/thundersnap/fs/alice/" + validUUID, validUUID, false},
+		{"/var/lib/thundersnap/fs/bob@example.com/" + validUUID, validUUID, false},
+		{"/var/lib/thundersnap/fs/alice", "", true},                         // only one component
+		{"/var/lib/thundersnap/fs/alice/not-a-uuid", "", true},              // invalid UUID
+		{"/var/lib/thundersnap/fs/alice/01234567-89ab-cdef-0123", "", true}, // truncated UUID
+	}
+	for _, tt := range tests {
+		got, err := frameUUIDFromRootFS(tt.rootFS)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("frameUUIDFromRootFS(%q) = (%s,nil), want error", tt.rootFS, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("frameUUIDFromRootFS(%q): %v", tt.rootFS, err)
+			continue
+		}
+		if got.String() != tt.want {
+			t.Errorf("frameUUIDFromRootFS(%q) = %s, want %s", tt.rootFS, got, tt.want)
+		}
+	}
+}
+
+func TestFrameUUIDFromRootFSValidUUID(t *testing.T) {
+	fsDir := "/var/lib/thundersnap/fs"
+	old := flagFsDir
+	flagFsDir = &fsDir
+	defer func() { flagFsDir = old }()
+
+	// Generate a real UUID and verify round-trip
+	uuid := frameid.MustNew()
+	rootFS := "/var/lib/thundersnap/fs/testuser/" + uuid.String()
+
+	got, err := frameUUIDFromRootFS(rootFS)
+	if err != nil {
+		t.Fatalf("frameUUIDFromRootFS(%q): %v", rootFS, err)
+	}
+	if got != uuid {
+		t.Errorf("frameUUIDFromRootFS(%q) = %s, want %s", rootFS, got, uuid)
 	}
 }
 

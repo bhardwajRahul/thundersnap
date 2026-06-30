@@ -1265,7 +1265,7 @@ func sanitizeForPath(s string) string {
 }
 
 // tailscaleUserFromRootFS extracts the tailscale user from a frame's rootFS
-// path, which has the shape "<fsDir>/<tailscale-user>/<frame>". The user is the
+// path, which has the shape "<fsDir>/<tailscale-user>/<uuid>". The user is the
 // first path component relative to flagFsDir; an error is returned when the
 // relative path has fewer than two components (so the user can't be determined).
 func tailscaleUserFromRootFS(rootFS string) (string, error) {
@@ -1275,6 +1275,23 @@ func tailscaleUserFromRootFS(rootFS string) (string, error) {
 		return "", fmt.Errorf("cannot determine tailscale user from rootFS path")
 	}
 	return parts[0], nil
+}
+
+// frameUUIDFromRootFS extracts the frame UUID from a frame's rootFS path, which
+// has the shape "<fsDir>/<tailscale-user>/<uuid>". The UUID is the second path
+// component relative to flagFsDir; an error is returned when the relative path
+// has fewer than two components or the UUID cannot be parsed.
+func frameUUIDFromRootFS(rootFS string) (frameid.ID, error) {
+	rootFSRel, _ := filepath.Rel(*flagFsDir, rootFS)
+	parts := strings.Split(rootFSRel, string(filepath.Separator))
+	if len(parts) < 2 {
+		return frameid.Nil, fmt.Errorf("cannot determine frame UUID from rootFS path")
+	}
+	uuid, err := frameid.Parse(parts[1])
+	if err != nil {
+		return frameid.Nil, fmt.Errorf("invalid frame UUID in rootFS path: %w", err)
+	}
+	return uuid, nil
 }
 
 // stripDomain removes the @domain part from a username (e.g., "user@example.com" -> "user")
