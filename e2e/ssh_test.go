@@ -292,52 +292,6 @@ func sshInteractive(t *testing.T, d *daemonInstance, user string) (*ssh.Client, 
 	return client, session, nil
 }
 
-// createTestFrame creates a test frame (btrfs subvolume) with the given name
-// in the daemon's fs directory. Returns the path to the frame.
-func createTestFrame(t *testing.T, env *testEnv, frameUUID string) string {
-	t.Helper()
-
-	// Frame layout is fs/<user>/<uuid>
-	userDir := filepath.Join(env.fsDir, sanitizeUser(testUser))
-	if err := os.MkdirAll(userDir, 0755); err != nil {
-		t.Fatalf("mkdir user dir: %v", err)
-	}
-
-	framePath := filepath.Join(userDir, frameUUID)
-
-	// Create as btrfs subvolume
-	cmd := exec.Command("btrfs", "subvolume", "create", framePath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("btrfs subvolume create %s: %v\n%s", framePath, err, out)
-	}
-
-	// Create minimal container structure
-	CreateTestContainer(t, framePath, env.tsBinary)
-
-	// Install busybox as /bin/su (required for vshd to switch users). The shell
-	// itself is ts (its built-in POSIX shell handles echo/pwd/touch-less tests),
-	// so we deliberately do NOT install coreutils: the tests probe identity by
-	// side effect (who can write to /) rather than by running `id`/`whoami`.
-	busybox, err := exec.LookPath("busybox")
-	if err != nil {
-		t.Fatalf("busybox required for SSH tests: %v", err)
-	}
-	suDst := filepath.Join(framePath, "bin/su")
-	if err := copyFile(busybox, suDst); err != nil {
-		t.Fatalf("copy busybox to /bin/su: %v", err)
-	}
-
-	// Create the .jsonc metadata sidecar that frameStore.List() looks for.
-	// This is required for `ts frames` to see this frame.
-	metaPath := framePath + ".jsonc"
-	metaContent := `{"isolation": "container"}`
-	if err := os.WriteFile(metaPath, []byte(metaContent), 0644); err != nil {
-		t.Fatalf("write frame metadata: %v", err)
-	}
-
-	return framePath
-}
-
 // sanitizeUser mimics cmd/thundersnapd/main.go:sanitizeForPath.
 func sanitizeUser(user string) string {
 	// Replace / and null bytes, collapse ..
@@ -355,63 +309,69 @@ func sanitizeUser(user string) string {
 	return result
 }
 
-// createTestRef creates a ref pointing to a frame UUID.
-func createTestRef(t *testing.T, env *testEnv, refName, frameUUID string) {
+// createFrameViaDaemon creates a frame by running `ts frame` over SSH to the daemon.
+// This is the proper e2e way to create frames - through the daemon, not by manipulating
+// data structures directly. Returns the frame UUID.
+func createFrameViaDaemon(t *testing.T, d *daemonInstance, refName string) string {
 	t.Helper()
 
-	// Refs are stored in <data-dir>/refs/<user>/<refname>.jsonc
-	userRefsDir := filepath.Join(env.root, "refs", sanitizeUser(testUser))
-	if err := os.MkdirAll(userRefsDir, 0755); err != nil {
-		t.Fatalf("mkdir refs dir: %v", err)
-	}
-
-	refPath := filepath.Join(userRefsDir, refName+".jsonc")
-	// The ref file is JSON with uuid and reflog
-	now := time.Now().UTC().Format(time.RFC3339)
-	refContent := fmt.Sprintf(`{"uuid":%q,"reflog":[{"uuid":%q,"time":%q}]}`, frameUUID, frameUUID, now)
-	if err := os.WriteFile(refPath, []byte(refContent), 0644); err != nil {
-		t.Fatalf("write ref file: %v", err)
-	}
-}
-
-// installBusyboxShell replaces /bin/sh with busybox so PTY tests can drive a
-// real shell with coreutils-style commands (stty, printf, etc.)
-func installBusyboxShell(t *testing.T, framePath string) {
-	t.Helper()
-	busybox, err := exec.LookPath("busybox")
+	// Create a new frame using ts frame via SSH
+	cmd := fmt.Sprintf("ts frame --ref=%s nil:nil:nil", refName)
+	output, exitCode, err := sshExec(t, d, "root@", cmd)
 	if err != nil {
-		t.Fatalf("busybox required: %v", err)
+		t.Fatalf("createFrameViaDaemon: sshExec failed: %v", err)
 	}
-	shDst := filepath.Join(framePath, "bin/sh")
-	if err := os.Remove(shDst); err != nil && !os.IsNotExist(err) {
-		t.Fatalf("remove sh: %v", err)
+	if exitCode != 0 {
+		t.Fatalf("createFrameViaDaemon: ts frame returned exit code %d: %s", exitCode, output)
 	}
-	if err := copyFile(busybox, shDst); err != nil {
-		t.Fatalf("copy busybox sh: %v", err)
+
+	// Parse the UUID from output like "Created frame <uuid> with ref <refname>"
+	// or "Created frame <uuid>"
+	output = strings.TrimSpace(output)
+	parts := strings.Fields(output)
+	for i, p := range parts {
+		if p == "frame" && i+1 < len(parts) {
+			uuid := parts[i+1]
+			t.Logf("Created frame %s with ref %s", uuid, refName)
+			return uuid
+		}
 	}
-	if err := os.Chmod(shDst, 0755); err != nil {
-		t.Fatalf("chmod sh: %v", err)
-	}
+	t.Fatalf("createFrameViaDaemon: could not parse UUID from output: %q", output)
+	return ""
 }
 
-// installBusyboxApplet installs a busybox applet (e.g. "stty", "printf") into
+// framePathForUUID returns the filesystem path for a frame given its UUID.
+// The daemon stores frames at <data-dir>/fs/<sanitized-user>/<uuid>.
+func framePathForUUID(d *daemonInstance, uuid string) string {
+	return filepath.Join(d.dataDir, "fs", sanitizeUser(testUser), uuid)
+}
+
+// installBusyboxAppletInFrame installs a busybox applet into a frame.
+// This is a workaround for tests that need external commands (like stty) that
+// can't be replaced with shell builtins. It copies busybox from the host into
 // the frame's /bin directory.
-func installBusyboxApplet(t *testing.T, framePath, name string) {
+//
+// NOTE: This is a transitional helper. Ideally, tests should not need to
+// manipulate frame contents directly. Once busybox is added to the daemon's
+// libexec and auto-copied to frames, this function should be removed.
+func installBusyboxAppletInFrame(t *testing.T, framePath, applet string) {
 	t.Helper()
+
+	// Find busybox on the host
 	busybox, err := exec.LookPath("busybox")
 	if err != nil {
-		t.Fatalf("busybox required: %v", err)
+		t.Fatalf("busybox required for this test: %v", err)
 	}
-	dst := filepath.Join(framePath, "bin", name)
-	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-		t.Fatalf("remove %s: %v", name, err)
-	}
+
+	// Copy busybox to the frame's /bin directory as the applet name
+	dst := filepath.Join(framePath, "bin", applet)
 	if err := copyFile(busybox, dst); err != nil {
-		t.Fatalf("copy busybox %s: %v", name, err)
+		t.Fatalf("copy busybox as %s: %v", applet, err)
 	}
 	if err := os.Chmod(dst, 0755); err != nil {
-		t.Fatalf("chmod %s: %v", name, err)
+		t.Fatalf("chmod %s: %v", applet, err)
 	}
+	t.Logf("Installed busybox applet %s in %s", applet, framePath)
 }
 
 // TestSSHContainerBasic is a true end-to-end test: start daemon, SSH in,
@@ -610,12 +570,10 @@ func TestSSHContainerBasic(t *testing.T) {
 // under / (mode 0755, owned by root), so a successful write proves we are root.
 func TestSSHContainerUserRoot(t *testing.T) {
 	env := newTestEnv(t)
-
-	frameUUID := "00000000-0000-0000-0000-000000000002"
-	createTestFrame(t, env, frameUUID)
-	createTestRef(t, env, "rootframe", frameUUID)
-
 	d := startDaemon(t, env)
+
+	// Create frame via daemon (true e2e - no manual data structure manipulation)
+	createFrameViaDaemon(t, d, "rootframe")
 
 	// SSH as root@frame and try to create a file in /. Root may write to /,
 	// so this should succeed and echo OK.
@@ -635,14 +593,21 @@ func TestSSHContainerUserRoot(t *testing.T) {
 // TestSSHContainerUserNonRoot tests SSH as a non-root user to a container frame.
 // Identity is probed by side effect: a non-root user cannot create a file
 // directly under / (which is owned by root, mode 0755), so the write must fail.
+//
+// NOTE: This test requires busybox for su (vshd needs su to switch users).
+// Until su is added to libexec and auto-copied to frames by the daemon,
+// this test must install it directly.
 func TestSSHContainerUserNonRoot(t *testing.T) {
 	env := newTestEnv(t)
-
-	frameUUID := "00000000-0000-0000-0000-000000000003"
-	createTestFrame(t, env, frameUUID)
-	createTestRef(t, env, "userframe", frameUUID)
-
 	d := startDaemon(t, env)
+
+	// Create frame via daemon (true e2e - no manual data structure manipulation)
+	frameUUID := createFrameViaDaemon(t, d, "userframe")
+	framePath := framePathForUUID(d, frameUUID)
+
+	// Install busybox as su (required for vshd to switch to non-root users).
+	// TODO: Once su is in libexec and auto-copied to frames, remove this.
+	installBusyboxAppletInFrame(t, framePath, "su")
 
 	// SSH as user@frame (runs as the unprivileged "user" account) and try to
 	// create a file in /. This must FAIL: a non-root user cannot write to /.
@@ -660,14 +625,21 @@ func TestSSHContainerUserNonRoot(t *testing.T) {
 }
 
 // TestSSHContainerWorkingDir tests that SSH sessions start in the correct working directory.
+//
+// NOTE: This test requires busybox for su (vshd needs su to switch users).
+// Until su is added to libexec and auto-copied to frames by the daemon,
+// this test must install it directly.
 func TestSSHContainerWorkingDir(t *testing.T) {
 	env := newTestEnv(t)
-
-	frameUUID := "00000000-0000-0000-0000-000000000004"
-	createTestFrame(t, env, frameUUID)
-	createTestRef(t, env, "cwdframe", frameUUID)
-
 	d := startDaemon(t, env)
+
+	// Create frame via daemon (true e2e - no manual data structure manipulation)
+	frameUUID := createFrameViaDaemon(t, d, "cwdframe")
+	framePath := framePathForUUID(d, frameUUID)
+
+	// Install busybox as su (required for vshd to switch to non-root users).
+	// TODO: Once su is in libexec and auto-copied to frames, remove this.
+	installBusyboxAppletInFrame(t, framePath, "su")
 
 	// SSH as user@frame and check pwd
 	output, exitCode, err := sshExec(t, d, "user@cwdframe", "pwd")
@@ -691,14 +663,21 @@ func TestSSHContainerWorkingDir(t *testing.T) {
 // session's stdout and the stderr marker only in its stderr. If the daemon
 // (incorrectly) folds stderr into stdout, the stderr marker leaks into the
 // stdout buffer and this test fails.
+//
+// NOTE: This test requires busybox for su (vshd needs su to switch users).
+// Until su is added to libexec and auto-copied to frames by the daemon,
+// this test must install it directly.
 func TestSSHContainerStdoutStderrSeparate(t *testing.T) {
 	env := newTestEnv(t)
-
-	frameUUID := "00000000-0000-0000-0000-000000000005"
-	createTestFrame(t, env, frameUUID)
-	createTestRef(t, env, "streamframe", frameUUID)
-
 	d := startDaemon(t, env)
+
+	// Create frame via daemon (true e2e - no manual data structure manipulation)
+	frameUUID := createFrameViaDaemon(t, d, "streamframe")
+	framePath := framePathForUUID(d, frameUUID)
+
+	// Install busybox as su (required for vshd to switch to non-root users).
+	// TODO: Once su is in libexec and auto-copied to frames, remove this.
+	installBusyboxAppletInFrame(t, framePath, "su")
 
 	// Emit OUTMARK on stdout and ERRMARK on stderr (fd 2).
 	stdout, stderr, exitCode, err := sshExecSplit(t, d, "user@streamframe",
@@ -760,20 +739,25 @@ func (b *safeBuffer) String() string {
 // Equivalent to the user-observed repro:
 //
 //	ssh -t deb@host 'stty raw; echo foo' | hd   # should be foo\n, not foo\r\n
+//
+// NOTE: This test requires busybox for stty (external command to manipulate tty).
+// Unlike other tests that use shell builtins, there's no pure-shell way to set
+// raw mode. Until busybox is added to libexec and auto-copied to frames by the daemon,
+// this test must install it directly. This is a known exception to the "no manual
+// data structure manipulation" rule.
 func TestSSHContainerPtyRawNoCRInjection(t *testing.T) {
 	env := newTestEnv(t)
-
-	frameUUID := "00000000-0000-0000-0000-000000000006"
-	framePath := createTestFrame(t, env, frameUUID)
-	createTestRef(t, env, "rawframe", frameUUID)
-
-	// A real /bin/sh, plus stty and printf applets, so the session can put the
-	// pty into raw mode and emit a bare newline deterministically.
-	installBusyboxShell(t, framePath)
-	installBusyboxApplet(t, framePath, "stty")
-	installBusyboxApplet(t, framePath, "printf")
-
 	d := startDaemon(t, env)
+
+	// Create frame via daemon
+	frameUUID := createFrameViaDaemon(t, d, "rawframe")
+	framePath := framePathForUUID(d, frameUUID)
+
+	// Install busybox applets needed for this test. We need stty (to set raw mode)
+	// which is an external command - no shell builtin can do this.
+	// TODO: Once busybox is in libexec and auto-copied to frames, remove this.
+	installBusyboxAppletInFrame(t, framePath, "stty")
+	installBusyboxAppletInFrame(t, framePath, "printf")
 
 	// Open an interactive PTY session as root (root runs /bin/sh -l directly).
 	client, session, err := sshInteractive(t, d, "root@rawframe")
