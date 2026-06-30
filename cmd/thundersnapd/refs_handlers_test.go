@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/tailscale/thundersnap/frameid"
+	"github.com/tailscale/thundersnap/frames"
 	"github.com/tailscale/thundersnap/refid"
 	"github.com/tailscale/thundersnap/refs"
 )
@@ -337,9 +338,10 @@ func TestRefHandlersValidation(t *testing.T) {
 }
 
 // TestResolveFrameForUser drives the real production resolver
-// (resolveFrameForUser) against a real per-user ref store. It pins the four
+// (resolveFrameForUser) against a real per-user ref store. It pins the five
 // resolution branches the canonical fs/<user>/<uuid> layout depends on:
 //   - a named ref resolves to its bound UUID and the fs/<user>/<uuid> path,
+//   - a raw UUID for an existing frame resolves directly (no ref needed),
 //   - an empty name (or the bare-login username) resolves the reserved
 //     "default" ref when bound,
 //   - the default with no ref bound returns a fresh, UNATTACHED frame,
@@ -350,6 +352,7 @@ func TestResolveFrameForUser(t *testing.T) {
 	dataDir := t.TempDir()
 	fsDir := filepath.Join(dataDir, "fs")
 	initRefStore(dataDir)
+	initFrameStore(dataDir)
 	old := flagFsDir
 	flagFsDir = &fsDir
 	t.Cleanup(func() { flagFsDir = old })
@@ -399,6 +402,39 @@ func TestResolveFrameForUser(t *testing.T) {
 			}
 		})
 	}
+
+	// A raw UUID for an existing frame resolves directly without needing a ref.
+	// Create a frame with no ref binding and verify it can be resolved by UUID.
+	t.Run("raw_uuid", func(t *testing.T) {
+		rawUUID := frameid.MustNew()
+		frameStore := userFrameStore(user)
+		if err := frameStore.Create(rawUUID, &frames.Frame{}); err != nil {
+			t.Fatalf("create frame: %v", err)
+		}
+		uuid, path, attached, err := resolveFrameForUser(user, rawUUID.String())
+		if err != nil {
+			t.Fatalf("resolve raw uuid: %v", err)
+		}
+		if uuid != rawUUID {
+			t.Errorf("uuid = %s, want %s", uuid, rawUUID)
+		}
+		if want := filepath.Join(fsDir, user, rawUUID.String()); path != want {
+			t.Errorf("path = %q, want %q", path, want)
+		}
+		// UUID lookups are unattached (no ref binding)
+		if attached {
+			t.Error("attached = true, want false for UUID lookup")
+		}
+	})
+
+	// A UUID that doesn't exist as a frame is an error (not a ref fallback).
+	t.Run("uuid_not_found", func(t *testing.T) {
+		nonExistentUUID := frameid.MustNew()
+		_, _, _, err := resolveFrameForUser(user, nonExistentUUID.String())
+		if err == nil {
+			t.Error("resolve non-existent UUID should error")
+		}
+	})
 
 	// An unknown name is a hard error: no implicit frame creation.
 	t.Run("unknown", func(t *testing.T) {

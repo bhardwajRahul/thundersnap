@@ -60,6 +60,8 @@ const defaultRefName = "default"
 // frame; framePath is its on-disk location (<fs-dir>/<user>/<uuid>).
 //
 // Resolution rules:
+//   - If the name is a valid UUID and a frame with that UUID exists for the
+//     user, return it directly (unattached, since there's no ref binding).
 //   - An empty name, or a name equal to the tailscale username (a bare login,
 //     where tsnet inserts the username as the SSH user), resolves the reserved
 //     "default" ref.
@@ -70,9 +72,20 @@ const defaultRefName = "default"
 //     create.
 //
 // attached reports whether the returned uuid is bound to an existing ref. When
-// false (only possible for the default case), the caller should create/connect
-// to an empty frame without binding a ref.
+// false (only possible for the default case or UUID lookups), the caller should
+// create/connect to an empty frame without binding a ref.
 func resolveFrameForUser(tailscaleUser, name string) (uuid frameid.ID, framePath string, attached bool, err error) {
+	// First, check if the name is a valid UUID that exists as a frame. This
+	// allows SSH directly into a frame by UUID even if it has no refs.
+	if parsed, perr := frameid.Parse(name); perr == nil {
+		frameStore := userFrameStore(tailscaleUser)
+		if frameStore.Exists(parsed) {
+			return parsed, framePathForUserUUID(tailscaleUser, parsed), false, nil
+		}
+		// UUID parses but frame doesn't exist - fall through to ref lookup
+		// in case a ref happens to be named like a UUID (unlikely but allowed).
+	}
+
 	store := userRefStore(tailscaleUser)
 
 	isDefault := name == "" || name == tailscaleUser
