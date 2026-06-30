@@ -104,7 +104,7 @@ func TestDecodeInvalidLength(t *testing.T) {
 	testCases := []string{
 		"",
 		"abc",
-		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn",   // 42 chars
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn", // 42 chars
 		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop", // 44 chars
 	}
 
@@ -258,7 +258,7 @@ func TestDecodeAdversarialInput(t *testing.T) {
 		{"contains space", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "},
 		{"contains newline", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"},
 		{"null bytes", string(make([]byte, 43))},
-		{"unicode", "🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉"},                                      // emoji is multi-byte
+		{"unicode", "🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉"}, // emoji is multi-byte
 		{"standard base64 chars", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+"}, // + is base64, not base64url
 	}
 
@@ -295,12 +295,12 @@ func TestDecodeValidButCrafted(t *testing.T) {
 // TestJSONUnmarshalAdversarial tests JSON unmarshaling with adversarial input.
 func TestJSONUnmarshalAdversarial(t *testing.T) {
 	testCases := []string{
-		`""`,                  // empty string
-		`"abc"`,               // too short
-		`null`,                // null
-		`123`,                 // number
-		`true`,                // boolean
-		`{"evil": "payload"}`, // object
+		`""`,                         // empty string
+		`"abc"`,                      // too short
+		`null`,                       // null
+		`123`,                        // number
+		`true`,                       // boolean
+		`{"evil": "payload"}`,        // object
 		`"` + strings.Repeat("A", 43) + `"` + strings.Repeat("A", 100), // trailing data in JSON
 	}
 

@@ -288,11 +288,11 @@ func (w *TSMWriter) Write(path string, tscSHA [32]byte, indexMap []uint32) ([32]
 
 // TSMReader reads a .tsm file
 type TSMReader struct {
-	Header        TSMHeader
-	Entries       []TSMEntry
+	Header       TSMHeader
+	Entries      []TSMEntry
 	ChunkRefTable []uint32 // Chunk reference table: TSC indices
-	SHA256        [32]byte // SHA-256 of the file (excluding footer)
-	TSCSHA        [32]byte // Expected SHA-256 of the corresponding .tsc file
+	SHA256       [32]byte  // SHA-256 of the file (excluding footer)
+	TSCSHA       [32]byte  // Expected SHA-256 of the corresponding .tsc file
 }
 
 // ReadTSM reads and parses a .tsm file

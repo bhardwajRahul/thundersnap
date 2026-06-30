@@ -52,8 +52,8 @@ type PolicyFile struct {
 
 // PolicyGrant represents a single grant in the policy file.
 type PolicyGrant struct {
-	Src []string                    `json:"src"` // user identities or tags
-	Dst []string                    `json:"dst"` // ignored locally (for Tailscale compat)
+	Src []string                     `json:"src"` // user identities or tags
+	Dst []string                     `json:"dst"` // ignored locally (for Tailscale compat)
 	App map[string][]ThundersnapCap `json:"app"`
 }
 

@@ -186,14 +186,14 @@ func Download(opts DownloadOptions) (*DownloadResult, error) {
 	}
 
 	if err := downloadFiles(downloadFilesOpts{
-		targetDir:   tmpSnapshotDir,
-		baseURL:     baseURL,
-		snapshotID:  opts.SnapshotID,
-		tsm:         tsmReader,
-		tsc:         tscReader,
-		localChunks: localChunks,
-		client:      client,
-		progress:    opts.ProgressWriter,
+		targetDir:     tmpSnapshotDir,
+		baseURL:       baseURL,
+		snapshotID:    opts.SnapshotID,
+		tsm:           tsmReader,
+		tsc:           tscReader,
+		localChunks:   localChunks,
+		client:        client,
+		progress:      opts.ProgressWriter,
 	}); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("downloading files: %w", err)
@@ -266,13 +266,13 @@ func downloadFiles(opts downloadFilesOpts) error {
 
 		// Download the file
 		if err := downloadFile(downloadFileOpts{
-			outputPath:  tmpPath,
-			remotePath:  "/bupdate/" + opts.snapshotID + "/" + entry.Path,
-			entry:       &entry,
-			tsc:         opts.tsc,
-			localChunks: opts.localChunks,
-			baseURL:     opts.baseURL,
-			client:      opts.client,
+			outputPath:   tmpPath,
+			remotePath:   "/bupdate/" + opts.snapshotID + "/" + entry.Path,
+			entry:        &entry,
+			tsc:          opts.tsc,
+			localChunks:  opts.localChunks,
+			baseURL:      opts.baseURL,
+			client:       opts.client,
 		}); err != nil {
 			os.Remove(tmpPath)
 			return fmt.Errorf("downloading %s: %w", entry.Path, err)

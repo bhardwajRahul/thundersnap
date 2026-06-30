@@ -95,10 +95,10 @@ func (h *billyHandler) Change(fs billy.Filesystem) billy.Change {
 // FSStat returns filesystem statistics.
 func (h *billyHandler) FSStat(ctx context.Context, fs billy.Filesystem, req *nfs.FSStat) error {
 	// Return large values to indicate no limits
-	req.TotalSize = 1 << 60 // ~1 exabyte
+	req.TotalSize = 1 << 60   // ~1 exabyte
 	req.FreeSize = 1 << 60
 	req.AvailableSize = 1 << 60
-	req.TotalFiles = 1 << 30 // ~1 billion files
+	req.TotalFiles = 1 << 30  // ~1 billion files
 	req.FreeFiles = 1 << 30
 	req.AvailableFiles = 1 << 30
 	req.CacheHint = 0 // No cache policy hint
@@ -238,11 +238,11 @@ func makeProgMismatch(xid uint32, lowVers, highVers uint32) []byte {
 	binary.BigEndian.PutUint32(resp[0:4], 32|0x80000000)
 
 	binary.BigEndian.PutUint32(resp[4:8], xid)
-	binary.BigEndian.PutUint32(resp[8:12], 1)  // REPLY
-	binary.BigEndian.PutUint32(resp[12:16], 0) // MSG_ACCEPTED
-	binary.BigEndian.PutUint32(resp[16:20], 0) // AUTH_NULL
-	binary.BigEndian.PutUint32(resp[20:24], 0) // verf length 0
-	binary.BigEndian.PutUint32(resp[24:28], 2) // PROG_MISMATCH
+	binary.BigEndian.PutUint32(resp[8:12], 1)      // REPLY
+	binary.BigEndian.PutUint32(resp[12:16], 0)     // MSG_ACCEPTED
+	binary.BigEndian.PutUint32(resp[16:20], 0)     // AUTH_NULL
+	binary.BigEndian.PutUint32(resp[20:24], 0)     // verf length 0
+	binary.BigEndian.PutUint32(resp[24:28], 2)     // PROG_MISMATCH
 	binary.BigEndian.PutUint32(resp[28:32], lowVers)
 	binary.BigEndian.PutUint32(resp[32:36], highVers)
 

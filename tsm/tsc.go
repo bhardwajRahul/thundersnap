@@ -64,8 +64,8 @@ func (w *TSCWriter) GetChunkIndex(sha [32]byte) int {
 
 // sortedChunks holds the sorted chunks and original-to-sorted index mapping
 type sortedChunks struct {
-	entries  []TSCEntry
-	indexMap []uint32 // original index -> sorted index
+	entries    []TSCEntry
+	indexMap   []uint32 // original index -> sorted index
 }
 
 // sortChunks sorts chunks by SHA and returns the sorted list with index mapping

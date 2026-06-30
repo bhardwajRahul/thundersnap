@@ -5,184 +5,7 @@ Thundersnap is a container and VM orchestration daemon built on
 It provides instant-clone filesystem isolation where each incoming SSH
 connection gets its own copy-on-write workspace, identified by the caller's
 Tailscale identity. No SSH keys, no manual user provisioning — just
-`ssh <ref>@thundersnap` on your tailnet.
-
-## Quick Start: Your First Frame from Docker
-
-This guide sets up a basic frame using a Debian Docker image — no manual rootfs
-preparation needed.
-
-### 1. Install and start thundersnapd
-
-```sh
-# Build (requires Go 1.25+)
-make binaries
-
-# Create btrfs directories (must be on a btrfs filesystem)
-sudo mkdir -p /var/lib/thundersnap/fs /var/lib/thundersnap/snaps
-
-# Start the daemon
-sudo ./bin/thundersnapd \
-  --fs-dir=/var/lib/thundersnap/fs \
-  --snaps-dir=/var/lib/thundersnap/snaps
-```
-
-On first run, thundersnapd prints a Tailscale auth URL. Visit it to join your
-tailnet.
-
-### 2. Create a frame from a Docker image
-
-SSH in and download a Docker image as a snap:
-
-```sh
-# SSH into thundersnap (creates a temporary blank session)
-ssh root@thundersnap
-
-# Download debian:latest as a snap (returns the snap ID)
-ts download-docker debian:latest
-# Output: abc123def456...
-
-# Create a frame from the snap with a ref name
-ts frame abc123def456:nil:nil --ref mydev
-# Output: Created frame 550e8400-... with ref mydev
-```
-
-### 3. Connect to your frame
-
-```sh
-# Exit the temporary session and reconnect to your ref
-exit
-ssh mydev@thundersnap
-```
-
-You now have a persistent Debian environment. Any changes you make are saved
-to your frame. Use `ts snap` to create point-in-time snapshots.
-
-## Core Concepts
-
-### Snaps
-
-A **snap** is an immutable, content-addressed snapshot of a filesystem tree.
-Snaps are identified by SHA-256 hashes (e.g., `abc123def456...`) and stored in
-`snaps-dir/`. They serve as the building blocks for frames.
-
-Create snaps from:
-- Docker images: `ts download-docker ubuntu:24.04`
-- Mesh peers: `ts download-snap <snap-id>`
-- The current frame: `ts snap`
-
-### Frames
-
-A **frame** is a running filesystem environment composed of three layers:
-
-| Layer | Purpose | Mount Point |
-|-------|---------|-------------|
-| **rootfs** | Base OS, packages, system configuration | `/` |
-| **home** | User dotfiles, shell config, personal settings | `/home` |
-| **work** | Project files, source code, application data | `/work` |
-
-Each layer is a btrfs subvolume that can be snapshotted and restored
-independently. When creating a frame, specify all three components using the
-`rootfs:home:work` format:
-
-```sh
-# Full frame spec
-ts frame abc123:def456:ghi789 --ref prod
-
-# Rootfs only, empty home and work
-ts frame abc123:nil:nil --ref dev
-
-# Rootfs with existing home, empty work
-ts frame abc123:def456:nil --ref test
-```
-
-Frames are identified by UUIDs and stored at `fs-dir/<uuid>/`. The frame's
-metadata lives in `fs-dir/<uuid>.jsonc`.
-
-### Refs
-
-A **ref** is a mutable pointer from a name to a frame UUID, similar to a git
-branch. Refs provide stable SSH targets that can be moved between frames.
-
-```sh
-# Create a ref
-ts ref create prod 550e8400-e29b-41d4-a716-446655440000
-
-# Move a ref to a different frame
-ts ref move prod 660f9500-f39c-52e5-b827-557766551111
-
-# Delete a ref
-ts ref delete staging
-
-# List all refs
-ts refs
-```
-
-Each ref maintains a reflog of which UUIDs it has pointed to over time:
-
-```sh
-ts reflog prod
-# 660f9500-...  2024-01-15T10:30:00Z
-# 550e8400-...  2024-01-14T09:00:00Z
-```
-
-### Directory Structure
-
-Thundersnap uses three main directories within your state directory:
-
-```
-/var/lib/thundersnap/
-├── fs/                     # Frame filesystems
-│   ├── <uuid>/            # A frame's root (contains /home, /work subvolumes)
-│   └── <uuid>.jsonc       # Frame metadata (rootfs, home, work snap hashes)
-├── snaps/                  # Immutable snapshots
-│   ├── <hash>/            # A snap's filesystem tree
-│   └── <hash>.jsonc       # Snap metadata (source, taints, size)
-├── refs/                   # Ref configurations
-│   └── <name>.jsonc       # Ref -> UUID mapping, autorun config, reflog
-└── id/                     # Per-ref private state
-    └── <name>/            # Identity-specific data (keys, tsnet state)
-```
-
-**`/home` vs `/work` vs `/id`**:
-
-- **`/home`** (inside a frame at `fs/<uuid>/home/`): User-specific configuration
-  that travels with the frame — shell dotfiles, editor settings, SSH keys. This
-  is a btrfs subvolume that can be snapshotted separately from rootfs.
-
-- **`/work`** (inside a frame at `fs/<uuid>/work/`): Project and application
-  data — source code, databases, build artifacts. Also a separate btrfs
-  subvolume for independent snapshotting.
-
-- **`/id`** (outside frames at `id/<refname>/`): Per-ref identity state that
-  persists across frame changes — Tailscale tsnet keys, service credentials,
-  anything tied to the ref's identity rather than its filesystem. This is
-  *not* a btrfs subvolume and is not snapshotted.
-
-### Autorun Services
-
-Refs can have an **autorun** command that thundersnapd keeps running whenever
-the ref's frame exists:
-
-```sh
-# Set autorun for a ref
-ts autorun --ref mydev /usr/bin/my-daemon --port 8080
-
-# Clear autorun
-ts autorun --ref mydev --stop
-
-# View autorun configuration
-ts refs
-# mydev -> 550e8400-... [autorun: /usr/bin/my-daemon --port 8080]
-```
-
-Autorun processes are started when the daemon starts and restarted if they
-exit. This is useful for:
-
-- Long-running development servers
-- Database processes
-- Background workers
-- Any service that should always be available in a frame
+`ssh <username>@thundersnap` on your tailnet.
 
 ## Key Features
 
@@ -190,50 +13,113 @@ exit. This is useful for:
   Snapshotting and cloning are O(1) metadata operations — you can fork a
   multi-gigabyte filesystem in milliseconds.
 
-- **Three-layer frame model.** Separate rootfs, home, and work means you can
-  upgrade your OS without losing dotfiles, or share a home config across
-  multiple projects.
+- **One SSH connection = one isolated environment.** SSH into any username
+  and thundersnap creates (or resumes) an isolated container namespace for
+  that name, chrooted into its own filesystem tree. Different usernames
+  get different workspaces; same username resumes the same workspace.
 
-- **Content-addressable indexing.** Filesystem contents are indexed into
-  `.tsm` (manifest) and `.tsc` (chunk index) files using a bupsplit rolling
-  hash. Chunks are SHA-256 addressed, enabling deduplication, incremental
-  snapshots, and efficient peer-to-peer transfer.
+- **Namespace separation by Tailscale identity.** Your Tailscale login
+  determines your top-level directory. Within that, each SSH username maps
+  to a separate workspace. User `alice@example.com` SSHing as `dev` and
+  `test` gets two independent filesystems; user `bob@example.com` SSHing
+  as `dev` gets his own, separate `dev`.
 
-- **Tight Tailscale integration.** Runs as a
-  [tsnet](https://pkg.go.dev/tailscale.com/tsnet) application — joins your
-  tailnet directly. Authentication is via Tailscale WhoIs (no passwords, no
-  SSH keys).
+- **Content-addressable indexing and replication.** Thundersnap uses a
+  content-defined chunking system inspired by [bup](https://bup.github.io/).
+  Filesystem contents are indexed into `.tsm` (manifest) and `.tsc` (chunk
+  index) files using a bupsplit rolling hash. Chunks are SHA-256 addressed,
+  enabling deduplication, incremental snapshots, and efficient peer-to-peer
+  transfer across a mesh of thundersnap nodes.
 
-- **Mesh replication.** Enable `--mesh` to share snapshots across multiple
-  thundersnap nodes. Discover peers via Tailscale; transfer only changed
-  chunks.
+- **Tight Tailscale integration.** Thundersnap runs as a
+  [tsnet](https://pkg.go.dev/tailscale.com/tsnet) application — it joins
+  your tailnet directly, with no separate Tailscale daemon required.
+  Authentication is via Tailscale WhoIs (no passwords, no SSH keys). Mesh
+  discovery finds other thundersnap nodes on the tailnet for distributed
+  snapshot storage and retrieval.
 
-- **VM mode (experimental).** SSH into `vm/<name>@thundersnap` to get a real
-  [cloud-hypervisor](https://www.cloudhypervisor.org/) VM with
-  [virtiofs](https://virtio-fs.gitlab.io/) filesystem sharing.
+- **Btrfs keeps things fast and simple.** Rather than layered union
+  filesystems or disk images, thundersnap relies on btrfs copy-on-write
+  subvolumes. Clone, snapshot, and delete are all kernel-level btrfs
+  operations. This removes an entire class of complexity.
 
-## Building
+- **VM mode (experimental).** In addition to container namespaces,
+  thundersnap can launch [cloud-hypervisor](https://www.cloudhypervisor.org/)
+  VMs with [virtiofs](https://virtio-fs.gitlab.io/) filesystem sharing and
+  [passt](https://passt.top/) user-space networking. SSH into
+  `vm/<name>@thundersnap` to get a real VM instead of a container namespace.
+
+## How It Works
+
+1. A user runs `ssh myworkspace@thundersnap` from their tailnet.
+2. `thundersnapd` identifies the caller via Tailscale WhoIs.
+3. If the workspace doesn't exist, thundersnap clones it from a base
+   snapshot (or from the user's default workspace) using `btrfs subvolume
+   snapshot`.
+4. The session enters a container namespace: private mount namespace,
+   chroot, `/proc` and `/sys` mounted, dangerous capabilities dropped.
+5. The user gets a shell. Their changes are isolated to their btrfs
+   subvolume.
+6. `ts snap` creates a named, content-addressed snapshot. `ts create
+   <name> <snap-id>` forks a new workspace from any snapshot.
+
+## Getting Started
+
+### Prerequisites
+
+- A Linux host with a **btrfs** filesystem
+- A [Tailscale](https://tailscale.com) account (the host does *not* need a
+  separate `tailscaled` — thundersnap embeds tsnet)
+- Go 1.25+ to build from source
+
+### Building
 
 ```sh
 # Build all packages (deb, rpm, tgz) for amd64 and arm64:
 make build
 
-# Build just the binaries:
-make binaries    # outputs to bin/
-make ts          # just the ts binary
-
-# Run tests:
-make test
+# Or build just what you need:
+make build-deb          # .deb packages only
+make build-amd64        # amd64 only, all formats
+make list               # show available targets
 ```
 
-Packages include:
-- `thundersnapd` — the main daemon (`/usr/sbin/thundersnapd`)
-- `ts` — the in-container client tool (`/usr/libexec/thundersnap/ts`)
+Packages include two binaries:
+- `thundersnapd` — the main daemon (installed to `/usr/sbin/thundersnapd`)
+- `ts` — the in-container client tool (installed to `/usr/libexec/thundersnap/ts`)
 
-## Running
+### Setting Up a Base Snapshot
+
+Thundersnap needs at least one base filesystem snapshot named `1` in
+`--snaps-dir` before it can create workspaces. This should be an
+extracted Linux root filesystem (a full directory tree with `/bin`,
+`/etc`, `/usr`, etc.).
+
+The easiest way to get one is to export a Docker/OCI container image:
 
 ```sh
-# Create required btrfs directories
+# Create the snaps directory on your btrfs filesystem
+sudo btrfs subvolume create /var/lib/thundersnap/snaps/1
+
+# Export an Ubuntu image (or Debian, Alpine, etc.)
+docker export $(docker create ubuntu:24.04) | \
+  sudo tar -xf - -C /var/lib/thundersnap/snaps/1
+
+# Or use debootstrap directly:
+sudo debootstrap noble /var/lib/thundersnap/snaps/1
+```
+
+Good sources for base images:
+- **Docker Hub**: `docker pull ubuntu:24.04`, `docker pull debian:bookworm`
+- **LXC images**: https://images.linuxcontainers.org/ — pre-built rootfs
+  tarballs for many distros
+- **debootstrap**: `debootstrap <suite> <target>` for Debian/Ubuntu
+- **Alpine**: https://alpinelinux.org/downloads/ — "Mini root filesystem"
+
+### Running
+
+```sh
+# Create the required btrfs directories
 sudo mkdir -p /var/lib/thundersnap/fs /var/lib/thundersnap/snaps
 
 # Run directly:
@@ -243,68 +129,39 @@ sudo thundersnapd \
 
 # Or install the .deb and use systemd:
 sudo dpkg -i dist/thundersnap_*_amd64.deb
+# Edit /etc/default/thundersnapd if needed, then:
 sudo systemctl start thundersnapd
 ```
 
-## In-Container Commands
-
-Once inside a thundersnap frame, use the `ts` tool:
-
-```sh
-# Frame management
-ts snap                          # snapshot current frame (returns rootfs:home:work)
-ts snaps                         # list all snapshots with sizes
-ts frame <spec> [--ref=name]     # create a new frame from snap spec
-ts frames                        # list all frames with status
-
-# Ref management
-ts refs                          # list all refs
-ts ref create <name> <uuid>      # create a new ref
-ts ref move <name> <uuid>        # move ref to different frame
-ts ref delete <name>             # delete a ref
-ts reflog <name>                 # show ref history
-
-# Docker images
-ts download-docker <image>       # download Docker image as a snap
-
-# Mesh operations (requires --mesh)
-ts who-has <snap-id>             # find which peers have a snap
-ts download-snap <snap-id>       # download a snap from the mesh
-
-# Services
-ts autorun --ref <name> <cmd>    # configure autorun for a ref
-
-# Frame history
-ts log [uuid]                    # show frame's snapshot history
-
-# Taints (for tracking sensitive data)
-ts taint <name>                  # mark frame as containing sensitive data
-```
-
-## Setting Up Base Snapshots
-
-### From Docker Hub
-
-The easiest way to get started:
+On first run, thundersnapd will print a Tailscale login URL. Authenticate,
+and then any device on your tailnet can SSH in:
 
 ```sh
-ssh root@thundersnap
-ts download-docker debian:bookworm   # or ubuntu:24.04, alpine:latest, etc.
-ts frame <snap-id>:nil:nil --ref myenv
+ssh myworkspace@thundersnap
 ```
 
-### From debootstrap
+### In-Container Commands
 
-For a minimal Debian/Ubuntu without Docker:
+Once inside a thundersnap workspace, use the `ts` tool:
 
 ```sh
-sudo btrfs subvolume create /var/lib/thundersnap/snaps/mybase
-sudo debootstrap bookworm /var/lib/thundersnap/snaps/mybase
+ts ping                              # health check
+ts snap                              # snapshot current workspace
+ts frame newname <snapshot-id>       # fork a new workspace from a snapshot
+ts who-has <snapshot-id>             # find which mesh peers have a snapshot
+ts download-snap <snapshot-id>       # download a snapshot from the mesh
 ```
 
-### From LXC images
+### Mesh Mode
 
-Download pre-built rootfs tarballs from https://images.linuxcontainers.org/
+Enable mesh discovery to share snapshots across multiple thundersnap nodes:
+
+```sh
+thundersnapd --mesh --fs-dir=... --snaps-dir=...
+```
+
+Mesh nodes discover each other via Tailscale and can transfer snapshots
+using content-defined chunking — only changed chunks are transferred.
 
 ## Architecture
 
@@ -318,10 +175,10 @@ Download pre-built rootfs tarballs from https://images.linuxcontainers.org/
 │  (chroot +   │  virtiofs +  │   content-addressed       │
 │  drop-caps)  │  passt)      │   chunking)               │
 ├──────────────┴──────────────┴───────────────────────────┤
-│                    btrfs filesystem                     │
-│  fs/<uuid>/             snaps/<hash>/                   │
-│    (live frames with      (immutable snapshots)         │
-│     /home, /work)                                       │
+│                    btrfs filesystem                      │
+│  snaps-dir/          fs-dir/<tailscale-user>/<name>/ │
+│    1/  (base)              (live workspaces)             │
+│    <snap-hash>/                                         │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -329,43 +186,101 @@ Download pre-built rootfs tarballs from https://images.linuxcontainers.org/
 
 | Binary | Description |
 |--------|-------------|
-| `thundersnapd` | Main daemon: tsnet SSH server, container/VM orchestration, mesh discovery |
-| `ts` | In-container client: snapshots, frame creation, mesh queries, autorun |
-| `tsm` | Generates `.tsm`/`.tsc` manifest and chunk index files |
-| `vshd` | Shell server inside VMs (vsock) |
-| `vsh` | Client for connecting to vshd |
+| `thundersnapd` | Main daemon: tsnet SSH server, container/VM orchestration, mesh discovery, NFS export |
+| `ts` | In-container client: snapshots, frame creation, mesh queries, capability dropping |
+| `tsm` | Generates `.tsm`/`.tsc` manifest and chunk index files for content-addressed storage |
+| `vshd` | Shell server that runs inside VMs, accepts vsock connections |
+| `vsh` | Client for connecting to vshd inside VMs via vsock |
+| `trivial-httpd` | Static file server with HTTP range support (for mesh chunk serving) |
+
+## Current Limitations
+
+This is early-stage software. Notable gaps:
+
+- **No end-to-end integration tests.** The individual pieces work, but
+  there is no automated test suite that stands up a thundersnapd, SSHes
+  in, creates snapshots, and verifies the full flow.
+
+- **No garbage collection of old snapshots.** Snapshots accumulate in
+  `snaps-dir` indefinitely. There is no policy for expiring old or
+  unreferenced snapshots — you'll need to clean them up manually.
+
+- **No RAM/resource isolation between containers.** All containers share
+  the host's memory and CPU without cgroup limits. One runaway process can
+  starve others. VM mode has a fixed 512MB allocation but no dynamic
+  adjustment.
+
+- **Container init is your shell, not /sbin/init.** Thundersnap does not
+  run the container image's init system (e.g., systemd). You get a login
+  shell in a chroot with capabilities dropped. This means no systemd
+  services, no proper process supervision, no `/tmp` cleanup, etc. Whether
+  this is a feature or a bug depends on your use case — it's fast and
+  simple, but you won't get a full "machine" experience without VM mode.
+
+- **Lots of rough edges in session semantics.** Reconnecting to an
+  existing workspace, handling multiple concurrent sessions to the same
+  workspace, and cleanup on disconnect all have edge cases that need more
+  work.
+
+- **Capability dropping is not a full security boundary.** The container
+  uses chroot and drops a set of dangerous capabilities, but it does not
+  use full user namespaces, seccomp filters, or AppArmor/SELinux profiles.
+  For stronger isolation, use VM mode.
 
 ## Use Case: Isolating AI Coding Agents
 
 Thundersnap is well-suited as an isolation layer for autonomous AI coding
-agents. Each agent gets its own frame:
+agents — tools like [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+with `--dangerously-skip-permissions` or
+[OpenClaw](https://github.com/openclaw/openclaw) (formerly Clawdbot).
 
-```sh
-# Create a frame for each agent task
-ts download-docker ubuntu:24.04
-ts frame abc123:nil:nil --ref agent-task-42
+**The problem:** Running an AI agent with full system access is risky.
+`claude --dangerously-skip-permissions` bypasses all confirmation prompts,
+giving the agent unrestricted shell access. The community consensus is
+"containers or don't bother" — but setting up proper per-session isolation
+with Docker is manual and doesn't naturally map to "one agent = one
+environment."
 
-# Agent SSHes in and works
-ssh agent-task-42@thundersnap
+**What thundersnap provides:**
 
-# Snapshot before risky operations
-ts snap
+- **Instant per-agent isolation.** SSH in as a unique username and the
+  agent gets its own filesystem. No Dockerfile, no volume mounts, no
+  cleanup scripts. `ssh agent-task-42@thundersnap` creates a fresh,
+  isolated workspace.
 
-# Fork to experiment
-ts frame abc123:def456:nil --ref agent-experiment
-```
+- **Fork and experiment cheaply.** An agent can `ts snap` before a risky
+  operation and `ts create` to fork a workspace. If the experiment fails,
+  the original is untouched. Btrfs makes this essentially free.
 
-The blast radius of any agent mistake is limited to a disposable btrfs
-subvolume. Combined with [Tailscale Aperture](https://aperture.tailscale.com/)
-for API access control, you get defense-in-depth isolation.
+- **Identity-based access via Tailscale.** No API keys to distribute to
+  containers. Tailscale identity determines who can access what.
 
-## Current Limitations
+- **Mesh replication for base images.** Pre-built environments (with the
+  right toolchains, dependencies, etc.) can be snapshotted once and
+  distributed to any thundersnap node on the mesh.
 
-- **No garbage collection.** Snapshots accumulate indefinitely.
-- **No cgroup limits.** All containers share host resources.
-- **Container init is your shell.** No systemd, no process supervision.
-- **Capability dropping is not a full security boundary.** Use VM mode for
-  stronger isolation.
+**Combined with [Aperture](https://aperture.tailscale.com/):** Tailscale's
+Aperture is an AI gateway that sits on your tailnet and provides
+identity-based access control, session logging, and policy enforcement for
+LLM API calls. Pairing thundersnap with Aperture gives you both halves of
+the agent isolation problem:
+
+- **Aperture** controls *what the agent can say* — which models it can
+  call, what tools it can invoke, with full audit logs of every LLM
+  interaction. API keys stay on the gateway, never in the sandbox.
+- **Thundersnap** controls *what the agent can do* — filesystem isolation,
+  capability dropping, and (in VM mode) hardware-level separation.
+
+Together, they provide a defense-in-depth setup: even if a prompt injection
+attack convinces the agent to run malicious commands, the blast radius is
+limited to a disposable btrfs subvolume with no access to the host, other
+agents, or sensitive credentials. Aperture's session logs provide the audit
+trail to detect and investigate incidents.
+
+This is not a theoretical concern. AI agents have been demonstrated to be
+vulnerable to prompt injection via innocuous-looking files that exfiltrate
+data. Disposable, isolated filesystems with network policy enforcement are
+a practical mitigation.
 
 ## License
 

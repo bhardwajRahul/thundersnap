@@ -6,12 +6,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -55,14 +55,14 @@ func init() {
 }
 
 var (
-	flagFsDir      *string
-	flagSnapsDir   *string
-	flagVmDir      *string
-	flagLibexecDir *string
-	flagPolicyPath *string
-	flagMesh       *bool
-	flagNfsd       *bool
-	flagNfsPort    *int
+	flagFsDir        *string
+	flagSnapsDir *string
+	flagVmDir        *string
+	flagLibexecDir   *string
+	flagPolicyPath   *string
+	flagMesh         *bool
+	flagNfsd         *bool
+	flagNfsPort      *int
 
 	// globalPolicy holds the loaded policy file for grant matching
 	globalPolicy *PolicyFile
@@ -549,12 +549,10 @@ func main() {
 	}
 
 	// Initialize ref and frame stores for the new UUID-based API.
-	// The stores treat their stateDir as the PARENT of fs/ (they Join
-	// stateDir+"fs"). --fs-dir IS the fs/ directory, so the correct state
-	// dir is its parent; otherwise we'd create a nested fs/fs/ tree.
-	storeStateDir := filepath.Dir(*flagFsDir)
-	initRefStore(storeStateDir)
-	initFrameStore(storeStateDir)
+	// These use the fs-dir as the state directory since that's where
+	// frames and refs are stored.
+	initRefStore(*flagFsDir)
+	initFrameStore(*flagFsDir)
 
 	// Create tsnet server
 	srv := &tsnet.Server{
@@ -745,24 +743,12 @@ func main() {
 				safeContainerName := sanitizeForPath(containerName)
 				homeUser := stripDomain(safeTailscaleUser)
 
-				// Set up the root filesystem (same setup as container sessions).
-				// Resolve a named frame through the per-user ref store so SFTP
-				// targets the same frame an interactive SSH session would.
-				var rootFS string
-				if containerName != "" {
-					var err error
-					rootFS, err = resolveFrameRootFS(tailscaleUser, containerName)
-					if err != nil {
-						log.Printf("SFTP session failed: %v", err)
-						return
-					}
-				} else {
-					rootFS = filepath.Join(*flagFsDir, safeTailscaleUser, safeContainerName)
-					baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
-					if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
-						log.Printf("SFTP session failed: %v", err)
-						return
-					}
+				// Set up the root filesystem (same setup as container sessions)
+				rootFS := filepath.Join(*flagFsDir, safeTailscaleUser, safeContainerName)
+				baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
+				if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
+					log.Printf("SFTP session failed: %v", err)
+					return
 				}
 
 				if err := runSFTPSession(s, rootFS, targetUser); err != nil {
@@ -1537,28 +1523,13 @@ func runContainerSession(s ssh.Session, tailscaleUser, sshUser, targetUser strin
 	// For home directory, strip @host from username for a cleaner look
 	homeUser := stripDomain(safeTailscaleUser)
 
-	// Set up the root filesystem for this user.
-	//
-	// When a frame name is given (e.g. `ssh root@deb@host`), resolve it through
-	// the per-user ref store: an existing ref reuses the frame UUID it points
-	// at (fs/<user>/<uuid>), and a missing ref auto-creates an empty frame+ref.
-	// This avoids creating a stray fs/<user>/<frameName> directory.
-	//
-	// When no frame name is given, fall back to the legacy per-user clone
-	// behavior (clone from the base user's filesystem or the clean snapshot).
-	var rootFS string
-	if sshUser != "" {
-		var err error
-		rootFS, err = resolveFrameRootFS(tailscaleUser, sshUser)
-		if err != nil {
-			return err
-		}
-	} else {
-		rootFS = filepath.Join(*flagFsDir, safeTailscaleUser, safeSSHUser)
-		baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
-		if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
-			return err
-		}
+	// Set up the root filesystem for this user
+	// If this is not the "base" user (stripped username), try to clone from
+	// the base user's filesystem first, falling back to the clean snapshot
+	rootFS := filepath.Join(*flagFsDir, safeTailscaleUser, safeSSHUser)
+	baseUserFS := filepath.Join(*flagFsDir, safeTailscaleUser, homeUser)
+	if err := prepareContainerRootFS(rootFS, baseUserFS); err != nil {
+		return err
 	}
 
 	// Get or create shared control socket server for this container
@@ -2380,10 +2351,9 @@ func writeStampFile(path, snapshotID string) error {
 }
 
 // prepareContainerRootFS sets up a container's root filesystem for use.
-// It ensures the rootFS exists (creating an empty frame if needed),
+// It ensures the rootFS exists (cloning from baseUserFS or a base snapshot),
 // creates required mount points (/proc), and copies the ts binary.
 // This is the common setup needed before running any container session.
-// The baseUserFS parameter is kept for API compatibility but is no longer used.
 func prepareContainerRootFS(rootFS, baseUserFS string) error {
 	if err := ensureRootFS(rootFS, baseUserFS); err != nil {
 		return fmt.Errorf("set up root filesystem: %w", err)
@@ -2404,19 +2374,20 @@ func prepareContainerRootFS(rootFS, baseUserFS string) error {
 }
 
 // ensureRootFS ensures the root filesystem exists at the given path.
+// If it doesn't exist, it first creates an intermediate snapshot in snaps-dir,
+// then clones from that to the destination. This ensures snaps-dir contains
+// stable reference points while fs-dir contains the live, changing filesystems.
 //
 // If a frame.jsonc file exists at rootFS+".jsonc", the frame model is used:
 // - The rootfs, home, and work snaps are cloned to create a three-component frame
 // - Nested /home and /work subvolumes are created within the rootfs
 // - Taints are computed as the union of all component snaps' taints
 //
-// If no frame.jsonc exists, an empty frame is created:
-// - A new UUID is generated for the frame
-// - An empty rootfs, home, and work are created (nil:nil:nil spec)
-// - A ref is created using the user.frameName pattern
-//
-// This means frames always start empty unless explicitly created with 'ts frame'
-// specifying a snapshot to clone from. The baseUserFS parameter is no longer used.
+// The snapshotting flow (legacy single-component):
+// 1. Determine source: baseUserFS (if exists) or $snaps-dir/1
+// 2. Create intermediate snapshot in $snaps-dir with random hex ID
+// 3. Clone from intermediate snapshot to rootFS in $fs-dir
+// 4. Create .stamp files tracking the base snapshot ID
 func ensureRootFS(rootFS, baseUserFS string) error {
 	// Check if the directory already exists
 	if _, err := os.Stat(rootFS); err == nil {
@@ -2431,69 +2402,85 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		return fmt.Errorf("reading frame meta: %w", err)
 	}
 
-	if frameMeta != nil {
-		// Use the new three-component frame model (handles both non-empty and nil:nil:nil specs)
+	if frameMeta != nil && frameMeta.Rootfs != "" {
+		// Use the new three-component frame model
 		return ensureFrameFS(rootFS, frameMeta)
 	}
 
-	// No frame.jsonc exists - create an empty frame with a UUID.
-	// This replaces the legacy behavior of cloning from snaps/1.
-
-	// Generate a UUID for this new frame
-	uuid, err := frameid.New()
-	if err != nil {
-		return fmt.Errorf("generate frame UUID: %w", err)
-	}
-
-	log.Printf("Creating empty frame at %s with UUID %s (no frame.jsonc found)", rootFS, uuid)
-
-	// Create an empty frame metadata with the UUID
-	emptyMeta := &FrameMeta{
-		UUID:      uuid.String(),
-		Rootfs:    "", // nil - empty rootfs
-		Home:      "", // nil - empty home
-		Work:      "", // nil - empty work
-		Isolation: "container",
-	}
-
+	// Legacy single-component mode
 	// Ensure the parent directory exists
 	parentDir := filepath.Dir(rootFS)
 	if err := os.MkdirAll(parentDir, 0755); err != nil {
 		return fmt.Errorf("creating parent directory: %w", err)
 	}
 
-	// Write the frame.jsonc first so ensureFrameFS can find it
-	if err := writeFrameMeta(rootFS, emptyMeta); err != nil {
-		return fmt.Errorf("write frame meta for empty frame: %w", err)
-	}
+	// Determine which source to clone from and what stamp ID to use:
+	// 1. If baseUserFS exists and is different from rootFS, use it
+	//    (inherit the stamp from the source's .stamp file)
+	// 2. Otherwise fall back to $snaps-dir/1 (stamp ID = "1")
+	defaultSnapshot := filepath.Join(*flagSnapsDir, "1")
+	snapshotSource := defaultSnapshot
+	baseStampID := "1" // default base is "1"
 
-	// Create the empty frame using the three-component model
-	if err := ensureFrameFS(rootFS, emptyMeta); err != nil {
-		return err
-	}
-
-	// Copy ts binary into the frame
-	if err := copyTsBinary(rootFS); err != nil {
-		log.Printf("Warning: failed to copy ts binary to %s: %v", rootFS, err)
-	}
-
-	// Create a ref for this frame using the frame name (last component of path)
-	// The ref name is derived from the frame path: fs/<user>/<frameName> -> <user>.<frameName>
-	// This allows looking up frames by name later.
-	pathParts := strings.Split(rootFS, string(filepath.Separator))
-	if len(pathParts) >= 2 {
-		// Extract user and frame name from path like .../fs/<user>/<frameName>
-		frameName := pathParts[len(pathParts)-1]
-		userName := pathParts[len(pathParts)-2]
-		refName := userName + "." + frameName
-		if refStore != nil {
-			if err := refStore.Create(refName, uuid); err != nil {
-				// Don't fail if ref creation fails - the frame was still created
-				log.Printf("Warning: failed to create ref %s for frame %s: %v", refName, uuid, err)
-			} else {
-				log.Printf("Created ref %s -> %s", refName, uuid)
+	if baseUserFS != rootFS {
+		if _, err := os.Stat(baseUserFS); err == nil {
+			snapshotSource = baseUserFS
+			// Inherit stamp from the source (fs-dir has .stamp files)
+			if stamp := readStampFile(baseUserFS); stamp != "" {
+				baseStampID = stamp
 			}
 		}
+	}
+
+	// Verify the snapshot source exists before trying to clone it.
+	if _, err := os.Stat(snapshotSource); err != nil {
+		if os.IsNotExist(err) && snapshotSource == defaultSnapshot {
+			return fmt.Errorf("%s does not exist; create a base filesystem snapshot there before starting", snapshotSource)
+		}
+		return fmt.Errorf("snapshot source %s: %w", snapshotSource, err)
+	}
+
+	// Step 1: Create intermediate snapshot in snaps-dir with fidx
+	// (no progress reporting for ensureRootFS - happens at SSH login time)
+	// The snapshot ID is based on the TSM SHA-256, so duplicates are detected.
+	intermediateID, err := createSnapshotWithFidx(snapshotSource, baseStampID, nil, false)
+	if err != nil {
+		return fmt.Errorf("create intermediate snapshot from %s: %w", snapshotSource, err)
+	}
+	intermediatePath := filepath.Join(*flagSnapsDir, intermediateID)
+
+	// Step 2: Clone from intermediate snapshot to rootFS
+	cmd := exec.Command("btrfs", "subvolume", "snapshot", intermediatePath, rootFS)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("btrfs snapshot from %s to %s failed: %w\noutput: %s",
+			intermediatePath, rootFS, err, string(output))
+	}
+
+	// Write stamp file for the live filesystem
+	// For fs-dir snapshots, the stamp contains the intermediate snapshot ID
+	// (which is the basename of the snapshot in snaps-dir)
+	if err := writeStampFile(rootFS, intermediateID); err != nil {
+		log.Printf("Warning: failed to write stamp file for %s: %v", rootFS, err)
+	}
+
+	// Ensure a "user" account exists in /etc/passwd for the container.
+	// This creates UID/GID 7575 if "user" doesn't already exist.
+	if _, err := tsm.EnsureUserInPasswd(rootFS); err != nil {
+		log.Printf("Warning: EnsureUserInPasswd on %s: %v", rootFS, err)
+	}
+	if err := tsm.EnsureSudoers(rootFS); err != nil {
+		log.Printf("Warning: EnsureSudoers on %s: %v", rootFS, err)
+	}
+
+	// Ensure resolv.conf exists for DNS resolution inside the frame
+	if err := ensureResolvConf(rootFS); err != nil {
+		log.Printf("Warning: ensure resolv.conf on %s: %v", rootFS, err)
+	}
+
+	// Ensure /tmp has correct permissions (1777 with sticky bit)
+	if err := ensureTmpDir(rootFS); err != nil {
+		log.Printf("Warning: ensure /tmp on %s: %v", rootFS, err)
 	}
 
 	return nil
@@ -3560,10 +3547,10 @@ func handleDeleteSnap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Delete associated files
-	os.Remove(snapPath + ".jsonc") // metadata
-	os.Remove(snapPath + ".stamp") // stamp file
-	os.Remove(snapPath + ".tsm")   // tsm manifest
-	os.Remove(snapPath + ".tsc")   // tsc manifest
+	os.Remove(snapPath + ".jsonc")  // metadata
+	os.Remove(snapPath + ".stamp")  // stamp file
+	os.Remove(snapPath + ".tsm")    // tsm manifest
+	os.Remove(snapPath + ".tsc")    // tsc manifest
 
 	log.Printf("Deleted snapshot %s", req.SnapshotID)
 
@@ -3974,9 +3961,8 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	useNewAPI := req.SnapshotSpec != ""
 
 	if useNewAPI {
-		// New UUID-based API: snapshot_spec is provided, frame gets a UUID.
-		// Frames are isolated per tailscale user at fs/<user>/<uuid>.
-		c.handleCreateWithUUID(w, r, req, stream, isTTY)
+		// New UUID-based API: snapshot_spec is provided, frame gets a UUID
+		handleCreateWithUUID(w, r, req, stream, isTTY)
 		return
 	}
 
@@ -4088,22 +4074,8 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCreateWithUUID handles frame creation using the new UUID-based API.
-// Frames are created at fs/<tailscale-user>/<uuid>/ (per-user isolation) and
-// optionally a per-user ref is created pointing at the new UUID.
-func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequest, stream, isTTY bool) {
-	// Determine the tailscale user owning this control socket so the frame
-	// is created under fs/<user>/, preserving per-user isolation.
-	safeTailscaleUser, err := c.safeTailscaleUser()
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(CreateResponse{
-			Status:  "error",
-			Message: err.Error(),
-		})
-		return
-	}
-
+// Frames are created at fs/<uuid>/ and optionally a ref is created.
+func handleCreateWithUUID(w http.ResponseWriter, r *http.Request, req CreateRequest, stream, isTTY bool) {
 	// Parse the snapshot spec
 	rootfsSpec, homeSpec, workSpec := parseFrameSpec(req.SnapshotSpec)
 
@@ -4133,12 +4105,9 @@ func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// If a ref name is provided, validate it and check it doesn't already
-	// exist for this user. Refs are namespaced per tailscale user.
-	var refKey string
+	// If a ref name is provided, validate it and check it doesn't already exist
 	if req.RefName != "" {
-		refKey = refKeyForUser(safeTailscaleUser, req.RefName)
-		if refStore.Exists(refKey) {
+		if refStore.Exists(req.RefName) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(CreateResponse{
@@ -4162,13 +4131,12 @@ func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Build the frame path using UUID, isolated under the tailscale user:
-	// fs/<tailscale-user>/<uuid>.
-	framePath := filepath.Join(*flagFsDir, safeTailscaleUser, uuid.String())
+	// Build the frame path using UUID
+	framePath := filepath.Join(*flagFsDir, uuid.String())
 
 	// For streaming mode, delegate to the streaming handler
 	if stream {
-		handleCreateStreamingWithUUID(w, req, framePath, uuid, refKey, isTTY)
+		handleCreateStreamingWithUUID(w, req, framePath, uuid, isTTY)
 		return
 	}
 
@@ -4211,12 +4179,12 @@ func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Create the ref if requested
-	if refKey != "" {
-		if err := refStore.Create(refKey, uuid); err != nil {
-			log.Printf("failed to create ref %s: %v", refKey, err)
+	if req.RefName != "" {
+		if err := refStore.Create(req.RefName, uuid); err != nil {
+			log.Printf("failed to create ref %s: %v", req.RefName, err)
 			// Frame was created but ref failed - log warning
 		} else {
-			log.Printf("Created ref %s -> %s", refKey, uuid)
+			log.Printf("Created ref %s -> %s", req.RefName, uuid)
 		}
 	}
 
@@ -4231,7 +4199,7 @@ func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, r *http.Requ
 }
 
 // handleCreateStreamingWithUUID handles streaming create for UUID-based frames.
-func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, framePath string, uuid frameid.ID, refKey string, isTTY bool) {
+func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, framePath string, uuid frameid.ID, isTTY bool) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 
 	if f, ok := w.(http.Flusher); ok {
@@ -4298,12 +4266,12 @@ func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, fra
 		log.Printf("failed to store frame metadata: %v", err)
 	}
 
-	// Create the ref if requested (per-user namespaced key)
-	if refKey != "" {
-		if err := refStore.Create(refKey, uuid); err != nil {
-			log.Printf("failed to create ref %s: %v", refKey, err)
+	// Create the ref if requested
+	if req.RefName != "" {
+		if err := refStore.Create(req.RefName, uuid); err != nil {
+			log.Printf("failed to create ref %s: %v", req.RefName, err)
 		} else {
-			log.Printf("Created ref %s -> %s", refKey, uuid)
+			log.Printf("Created ref %s -> %s", req.RefName, uuid)
 		}
 	}
 
@@ -4461,11 +4429,6 @@ func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) er
 			Home:      homeSnap,
 			Work:      workSnap,
 			Isolation: isolation,
-		}
-		// Ensure the parent directory (e.g. fs/<user>/) exists before writing
-		// the frame.jsonc sidecar next to the frame subvolume.
-		if err := os.MkdirAll(filepath.Dir(framePath), 0755); err != nil {
-			return fmt.Errorf("creating parent directory: %w", err)
 		}
 		// Write the frame.jsonc first so ensureFrameFS can find it
 		if err := writeFrameMeta(framePath, meta); err != nil {
@@ -5131,7 +5094,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 		cleanupTmp()
 		return "", fmt.Errorf("read tsm for checksum: %w", err)
 	}
-	snapshotID := snaphash.Encode(snaphash.FromBytes(tsmReader.SHA256[:]))
+	snapshotID := hex.EncodeToString(tsmReader.SHA256[:])
 
 	finalPath := filepath.Join(*flagSnapsDir, snapshotID)
 	finalTSMPath := finalPath + ".tsm"
@@ -5214,10 +5177,10 @@ type meshPeer struct {
 
 // meshState tracks mesh discovery state
 type meshState struct {
-	mu     sync.Mutex
-	myURL  string
-	myFQDN string
-	peers  map[string]*meshPeer // keyed by hostname
+	mu      sync.Mutex
+	myURL   string
+	myFQDN  string
+	peers   map[string]*meshPeer // keyed by hostname
 }
 
 func newMeshState(myFQDN string) *meshState {

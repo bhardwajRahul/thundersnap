@@ -25,37 +25,37 @@ const (
 	TSCMagic = "TSC\x03"
 
 	// Header sizes
-	TSMHeaderSize = 64
-	TSCHeaderSize = 64
-	TSMFooterSize = 64
-	TSCFooterSize = 32
-	TSCEntrySize  = 40 // Without slab locations
-	TSCEntrySlab  = 48 // With slab locations
-	SHA256Size    = 32
+	TSMHeaderSize  = 64
+	TSCHeaderSize  = 64
+	TSMFooterSize  = 64
+	TSCFooterSize  = 32
+	TSCEntrySize   = 40 // Without slab locations
+	TSCEntrySlab   = 48 // With slab locations
+	SHA256Size     = 32
 
 	// Content-defined chunking parameters (from bupdate)
-	BUP_BLOBBITS        = 13
-	BUP_BLOBSIZE        = 1 << BUP_BLOBBITS // 8192
-	BUP_WINDOWBITS      = 7
-	BUP_WINDOWSIZE      = 1 << (BUP_WINDOWBITS - 1) // 64
-	BLOB_MAX            = 8192 * 4                  // 32768 bytes
-	BLOB_READ_SIZE      = 1024 * 1024
+	BUP_BLOBBITS   = 13
+	BUP_BLOBSIZE   = 1 << BUP_BLOBBITS // 8192
+	BUP_WINDOWBITS = 7
+	BUP_WINDOWSIZE = 1 << (BUP_WINDOWBITS - 1) // 64
+	BLOB_MAX       = 8192 * 4                   // 32768 bytes
+	BLOB_READ_SIZE = 1024 * 1024
 	ROLLSUM_CHAR_OFFSET = 31
-	FANOUT_BITS         = 4
+	FANOUT_BITS    = 4
 )
 
 // EntryType represents the type of a filesystem entry
 type EntryType uint8
 
 const (
-	EntryTypeFile     EntryType = 0
-	EntryTypeDir      EntryType = 1
-	EntryTypeSymlink  EntryType = 2
+	EntryTypeFile    EntryType = 0
+	EntryTypeDir     EntryType = 1
+	EntryTypeSymlink EntryType = 2
 	EntryTypeHardlink EntryType = 3
 	EntryTypeBlockDev EntryType = 4
 	EntryTypeCharDev  EntryType = 5
-	EntryTypeFifo     EntryType = 6
-	EntryTypeSocket   EntryType = 7
+	EntryTypeFifo    EntryType = 6
+	EntryTypeSocket  EntryType = 7
 )
 
 func (t EntryType) String() string {
@@ -83,14 +83,14 @@ func (t EntryType) String() string {
 
 // TSMHeader is the 64-byte header of a .tsm file
 type TSMHeader struct {
-	Magic        [4]byte  // "TSM\x02"
-	Flags        uint32   // Bit flags
-	FileCount    uint64   // Number of file entries
-	TotalSize    uint64   // Total size of all files
-	ChunkFileRef [8]byte  // First 8 bytes of .tsc SHA-256
-	CreationTime int64    // Unix nanoseconds
-	SourceFSUUID [8]byte  // Filesystem UUID (e.g., btrfs)
-	Reserved     [16]byte // Reserved for future use
+	Magic           [4]byte  // "TSM\x02"
+	Flags           uint32   // Bit flags
+	FileCount       uint64   // Number of file entries
+	TotalSize       uint64   // Total size of all files
+	ChunkFileRef    [8]byte  // First 8 bytes of .tsc SHA-256
+	CreationTime    int64    // Unix nanoseconds
+	SourceFSUUID    [8]byte  // Filesystem UUID (e.g., btrfs)
+	Reserved        [16]byte // Reserved for future use
 }
 
 // TSMFlags bit definitions
@@ -102,52 +102,52 @@ const (
 
 // TSMEntry represents a file entry in the manifest
 type TSMEntry struct {
-	Path       string    // File path (UTF-8)
-	Type       EntryType // Entry type (file, dir, symlink, etc.)
-	Flags      uint16    // Entry flags
-	Mode       uint32    // Full st_mode including type bits
-	UID        uint32    // Owner user ID
-	GID        uint32    // Owner group ID
-	Size       uint64    // File size in bytes
-	Mtime      int64     // Modification time (Unix nanos)
-	Ctime      int64     // Change time (Unix nanos)
-	Atime      int64     // Access time (Unix nanos)
-	ChunkStart uint32    // Offset into chunk reference table
-	ChunkCount uint32    // Number of chunks
+	Path        string    // File path (UTF-8)
+	Type        EntryType // Entry type (file, dir, symlink, etc.)
+	Flags       uint16    // Entry flags
+	Mode        uint32    // Full st_mode including type bits
+	UID         uint32    // Owner user ID
+	GID         uint32    // Owner group ID
+	Size        uint64    // File size in bytes
+	Mtime       int64     // Modification time (Unix nanos)
+	Ctime       int64     // Change time (Unix nanos)
+	Atime       int64     // Access time (Unix nanos)
+	ChunkStart  uint32    // Offset into chunk reference table
+	ChunkCount  uint32    // Number of chunks
 
 	// ChunkRefs contains the TSC indices for this file's chunks, in order.
 	// This is populated during indexing and on read from the chunk ref table.
 	// Not serialized directly in the entry — stored in a separate section.
-	ChunkRefs []uint32
+	ChunkRefs   []uint32
 
 	// Type-specific data
-	LinkTarget string // For symlinks: target path
-	LinkIndex  uint32 // For hardlinks: target entry index
-	DevMajor   uint32 // For devices: major number
-	DevMinor   uint32 // For devices: minor number
+	LinkTarget  string    // For symlinks: target path
+	LinkIndex   uint32    // For hardlinks: target entry index
+	DevMajor    uint32    // For devices: major number
+	DevMinor    uint32    // For devices: minor number
 }
 
 // TSMEntryFlags bit definitions
 const (
-	TSMEntryFlagHasXattr = 1 << 4
-	TSMEntryFlagIsSparse = 1 << 5
+	TSMEntryFlagHasXattr  = 1 << 4
+	TSMEntryFlagIsSparse  = 1 << 5
 )
 
 // TSMFooter is the 64-byte footer of a .tsm file
 type TSMFooter struct {
-	SHA256  [32]byte // SHA-256 of all preceding bytes
-	TSCHash [32]byte // SHA-256 of the corresponding .tsc file
+	SHA256      [32]byte // SHA-256 of all preceding bytes
+	TSCHash     [32]byte // SHA-256 of the corresponding .tsc file
 }
 
 // TSCHeader is the 64-byte header of a .tsc file
 type TSCHeader struct {
-	Magic           [4]byte  // "TSC\x02"
-	Flags           uint32   // Bit flags
-	ChunkCount      uint64   // Number of chunk entries
-	TotalChunkSize  uint64   // Total size of all chunk data
-	SlabCount       uint32   // Number of slabs (0 if no slab locations)
-	SlabTableOffset uint32   // Offset to slab name table
-	Reserved        [32]byte // Reserved for future use
+	Magic            [4]byte  // "TSC\x02"
+	Flags            uint32   // Bit flags
+	ChunkCount       uint64   // Number of chunk entries
+	TotalChunkSize   uint64   // Total size of all chunk data
+	SlabCount        uint32   // Number of slabs (0 if no slab locations)
+	SlabTableOffset  uint32   // Offset to slab name table
+	Reserved         [32]byte // Reserved for future use
 }
 
 // TSCFlags bit definitions
