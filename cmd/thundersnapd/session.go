@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gliderlabs/ssh"
 	"github.com/pkg/sftp"
+	ssh "github.com/tailscale/gliderssh"
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/sftpfs"
 	"github.com/tailscale/thundersnap/thundersnap"
@@ -423,6 +423,14 @@ func writeVshdRequest(conn net.Conn, framePath, targetUser string, pty bool, cmd
 // It is shared by all vshd-backed sessions (VMX container, VMX outer shell, and
 // any future host-vshd shim).
 func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, winCh <-chan ssh.Window, done <-chan struct{}, panicked <-chan struct{}) error {
+	// The session's pty (line discipline, OPOST/ONLCR cooking, raw mode) lives
+	// inside the container/VM. gliderlabs/ssh's default "minimal PTY emulation"
+	// would re-cook our output host-side, rewriting \n -> \r\n on every
+	// FrameStdout write and ignoring raw mode. Disable it so this relay is a
+	// transparent byte pipe and the guest pty owns line discipline (classic
+	// ssh behaviour). Must precede any s.Write below.
+	s.DisablePTYEmulation()
+
 	// Stdin and winsize frames are written from independent goroutines; a
 	// mutex keeps each frame's header+payload contiguous on the wire.
 	var writeMu sync.Mutex

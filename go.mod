@@ -4,7 +4,6 @@ go 1.26.2
 
 require (
 	github.com/creack/pty v1.1.24
-	github.com/gliderlabs/ssh v0.3.8
 	github.com/go-git/go-billy/v5 v5.7.0
 	github.com/google/go-containerregistry v0.21.5
 	github.com/google/uuid v1.6.0
@@ -13,6 +12,7 @@ require (
 	github.com/pborman/getopt/v2 v2.1.0
 	github.com/pkg/sftp v1.13.10
 	github.com/prometheus/client_golang v1.23.2
+	github.com/tailscale/gliderssh v0.3.4-0.20260330083525-c1389c70ff89
 	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd
 	github.com/willscott/go-nfs v0.0.4
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00
@@ -64,6 +64,7 @@ require (
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/gaissmai/bart v0.26.1 // indirect
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
+	github.com/gliderlabs/ssh v0.3.8 // indirect
 	github.com/go-git/go-git/v5 v5.16.5 // indirect
 	github.com/go-json-experiment/json v0.0.0-20250813024750-ebf49471dced // indirect
 	github.com/gobwas/glob v0.2.3 // indirect

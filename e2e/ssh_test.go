@@ -5,6 +5,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -512,4 +513,137 @@ func TestSSHContainerStdoutStderrSeparate(t *testing.T) {
 	}
 
 	t.Logf("stdout: %q stderr: %q", stdout, stderr)
+}
+
+// safeBuffer is a goroutine-safe bytes accumulator: the SSH session's I/O
+// goroutine writes into it while the test reads it.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// installBusyboxFor installs a real busybox /bin/sh plus an applet symlink for
+// `name` (e.g. "stty", "printf") into the frame so PTY tests can drive a real
+// shell and run real coreutils-style commands. The fixture /bin/sh is just the
+// ts binary and cannot honour `stty` or termios changes.
+func installBusyboxApplet(t *testing.T, framePath, name string) {
+	t.Helper()
+	busybox, err := exec.LookPath("busybox")
+	if err != nil {
+		t.Fatalf("busybox required: %v", err)
+	}
+	dst := filepath.Join(framePath, "bin", name)
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove %s: %v", name, err)
+	}
+	if err := copyFile(busybox, dst); err != nil {
+		t.Fatalf("copy busybox %s: %v", name, err)
+	}
+	if err := os.Chmod(dst, 0755); err != nil {
+		t.Fatalf("chmod %s: %v", name, err)
+	}
+}
+
+// TestSSHContainerPtyRawNoCRInjection verifies that a PTY session does NOT
+// inject a carriage return into the byte stream when the application has put
+// the terminal into raw mode. This reproduces the "joe redraws the current
+// line" bug: an interactive editor sets its tty to raw (-opost -onlcr), so a
+// bare "\n" it writes must reach the SSH client as a bare "\n". If the relay
+// path adds a "\r" (turning "\n" into "\r\n") the editor's cursor model and the
+// actual terminal disagree and the current line corrupts.
+//
+// The minimal oracle is: over a real PTY SSH session run `stty raw` and then
+// emit a known marker followed by a single "\n". Because raw mode disables the
+// inner pty's OPOST/ONLCR, the bytes after the marker must be exactly "\n" with
+// no preceding "\r". If a "\r" appears, the relay injected it.
+//
+// Equivalent to the user-observed repro:
+//
+//	ssh -t deb@host 'stty raw; echo foo' | hd   # should be foo\n, not foo\r\n
+func TestSSHContainerPtyRawNoCRInjection(t *testing.T) {
+	env := newTestEnv(t)
+
+	frameUUID := "00000000-0000-0000-0000-000000000006"
+	framePath := createTestFrame(t, env, frameUUID)
+	createTestRef(t, env, "rawframe", frameUUID)
+
+	// A real /bin/sh, plus stty and printf applets, so the session can put the
+	// pty into raw mode and emit a bare newline deterministically.
+	installBusyboxShell(t, framePath)
+	installBusyboxApplet(t, framePath, "stty")
+	installBusyboxApplet(t, framePath, "printf")
+
+	d := startDaemon(t, env)
+
+	// Open an interactive PTY session as root (root runs /bin/sh -l directly).
+	client, session, err := sshInteractive(t, d, "root@rawframe")
+	if err != nil {
+		t.Fatalf("sshInteractive: %v", err)
+	}
+	defer client.Close()
+	defer session.Close()
+
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	var outBuf safeBuffer
+	session.Stdout = &outBuf
+	session.Stderr = &outBuf
+
+	if err := session.Shell(); err != nil {
+		t.Fatalf("start shell: %v", err)
+	}
+
+	// MARKER is split across two literals so the shell's echo of the typed
+	// command line (before `stty raw` silences echo) never itself contains the
+	// assembled marker string — only the real printf output does.
+	const marker = "RAWMARK"
+	// `stty raw` disables OPOST/ONLCR + echo on the inner pty. After it, printf
+	// writes the marker and a single bare \n. We then exit to end the session.
+	script := `stty raw; printf '` + "RAW''MARK" + `\n'; exit` + "\n"
+	if _, err := io.WriteString(stdin, script); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	// Wait for the session to finish (exit was sent) or time out.
+	done := make(chan error, 1)
+	go func() { done <- session.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("timeout waiting for session; output so far: %q", outBuf.String())
+	}
+
+	out := outBuf.String()
+	t.Logf("raw pty output: %q", out)
+
+	idx := strings.Index(out, marker)
+	if idx < 0 {
+		t.Fatalf("marker %q not found in output: %q", marker, out)
+	}
+	rest := out[idx+len(marker):]
+	if len(rest) == 0 {
+		t.Fatalf("no bytes after marker; output: %q", out)
+	}
+	// In raw mode the byte immediately following the marker must be the bare
+	// "\n" emitted by printf. A leading "\r" means the relay injected a CR.
+	if rest[0] == '\r' {
+		t.Errorf("relay injected a carriage return after a raw-mode newline: bytes after marker = %q (full output %q)", rest, out)
+	}
+	if rest[0] != '\n' {
+		t.Errorf("expected bare newline after marker, got %q (full output %q)", rest, out)
+	}
 }

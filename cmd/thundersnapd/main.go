@@ -28,8 +28,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gliderlabs/ssh"
 	"github.com/pborman/getopt/v2"
+	ssh "github.com/tailscale/gliderssh"
 	"github.com/tailscale/thundersnap/btrfsutil"
 	"github.com/tailscale/thundersnap/cgroup"
 	"github.com/tailscale/thundersnap/frameid"
