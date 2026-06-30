@@ -767,7 +767,7 @@ func testDevSetupVM(t *testing.T) {
 	// panic=1 ensures the VM reboots (and thus terminates) on kernel panic.
 	// Use kernel IP autoconfiguration (ip=) instead of manual ip commands because
 	// the test container doesn't have the ip binary.
-	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
+	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run --vsock /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
 
 	// Create pipe for event monitor to detect panics
 	eventReadPipe, eventWritePipe, err := os.Pipe()

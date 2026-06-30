@@ -192,7 +192,12 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	}
 	// Note: In VMX mode, we don't chroot the init process. vshd runs at the virtiofs
 	// root so it can access /dev/vsock and spawn containers with chroot into frame paths.
-	cmdline := fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=%s -- -c "exec %s drop-caps-and-run %s -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec %s'"`, hostname, shBin, tsBin, shBin, vshdBin)
+	//
+	// --vsock tells drop-caps-and-run to expose /dev/vsock in the controlled /dev
+	// it builds: the vshd that runs as this VM's init listens on AF_VSOCK. (The
+	// kernel does not auto-mount devtmpfs in the guest, so /dev/vsock would
+	// otherwise be absent.) Containers never get this flag.
+	cmdline := fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=%s -- -c "exec %s drop-caps-and-run --vsock %s -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec %s'"`, hostname, shBin, tsBin, shBin, vshdBin)
 
 	// Create pipe for event monitor - cloud-hypervisor writes events, we read them
 	eventReadPipe, eventWritePipe, err := os.Pipe()

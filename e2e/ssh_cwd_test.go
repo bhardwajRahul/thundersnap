@@ -147,7 +147,7 @@ func TestSSHCommandWorkingDirectory(t *testing.T) {
 	chvPath := filepath.Join(vmDir, "cloud-hypervisor")
 	kernelPath := filepath.Join(vmDir, "vmlinux")
 
-	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
+	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run --vsock /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
 
 	chvCmd := exec.Command(chvPath,
 		"--kernel", kernelPath,

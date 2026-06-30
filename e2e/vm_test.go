@@ -276,7 +276,7 @@ func standardVMCmdline() string {
 // The hostname is passed via the kernel IP autoconfig ip= parameter:
 // ip=<client-ip>::<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>
 func vmCmdlineWithHostname(hostname string) string {
-	return fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`, hostname)
+	return fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run --vsock /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`, hostname)
 }
 
 // TestVMLaunchSuccess tests that a VM launches successfully with sufficient memory.

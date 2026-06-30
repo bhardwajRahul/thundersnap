@@ -140,7 +140,7 @@ func vmxCmdlineWithPrefix(initPrefix, hostname string) string {
 	shBin := "/" + initPrefix + "/bin/sh"
 	tsBin := "/" + initPrefix + "/bin/ts"
 	vshdBin := "/" + initPrefix + "/sbin/vshd"
-	return fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=%s -- -c "exec %s drop-caps-and-run %s -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec %s'"`, hostname, shBin, tsBin, shBin, vshdBin)
+	return fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=%s -- -c "exec %s drop-caps-and-run --vsock %s -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec %s'"`, hostname, shBin, tsBin, shBin, vshdBin)
 }
 
 // dialVsock connects to a VM's vsock port with the cloud-hypervisor handshake.

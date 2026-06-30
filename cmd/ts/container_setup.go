@@ -36,6 +36,7 @@ func cmdDropCapsAndRun(args []string) {
 	var hostname, domainname, chrootPath string
 	var skipMountSetup bool
 	var usePty bool
+	var mountVsock bool
 	var cmdArgs []string
 
 	for i := 0; i < len(args); i++ {
@@ -60,6 +61,10 @@ func cmdDropCapsAndRun(args []string) {
 			skipMountSetup = true
 		} else if args[i] == "--pty" {
 			usePty = true
+		} else if args[i] == "--vsock" {
+			// Set by the VM init cmdline: the vshd that runs as init needs
+			// /dev/vsock to listen on AF_VSOCK. Containers never pass this.
+			mountVsock = true
 		} else if args[i] == "--" {
 			cmdArgs = args[i+1:]
 			break
@@ -128,7 +133,7 @@ func cmdDropCapsAndRun(args []string) {
 		// - Symlinks for stdin/stdout/stderr and /dev/fd
 		// - /dev/pts for pseudoterminals
 		// - /dev/shm for shared memory
-		setupDev()
+		setupDev(mountVsock)
 
 		// Set hostname if provided (only when creating namespace, not joining)
 		if hostname != "" {
@@ -370,38 +375,17 @@ func setWinsize(f *os.File, w, h int) {
 	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(&ws)))
 }
 
-// setupDev creates a minimal /dev filesystem like Docker/containerd.
-// This creates a tmpfs at /dev with essential device nodes, symlinks,
-// /dev/pts for pseudoterminals, and /dev/shm for shared memory.
-func setupDev() {
-	// Check if /dev/vsock exists on devtmpfs before we mount over it.
-	// In VMs, /dev/vsock is a misc device that only works when backed by devtmpfs -
-	// creating it via mknod on a different filesystem doesn't work. We'll bind-mount
-	// it from devtmpfs after setting up our tmpfs.
-	//
-	// To preserve access to the original devtmpfs vsock, we mount a fresh
-	// devtmpfs at a temporary location first and look for vsock there.
-	//
-	// We must NOT gate this on /dev/vsock already existing: when vshd runs as
-	// the VM's init the kernel does not auto-mount devtmpfs at /dev (the boot
-	// log shows "devtmpfs: error mounting"), so /dev/vsock is absent at this
-	// point even though the host exposed a vsock device. Mounting a fresh
-	// devtmpfs ourselves surfaces the kernel's vsock node so we can bind-mount
-	// it across the tmpfs we put on /dev below. If there is no vsock device
-	// (e.g. host/container mode), /tmp/.devtmpfs/vsock simply won't exist and
-	// vsockSource stays empty.
-	var vsockSource string
-	os.MkdirAll("/tmp/.devtmpfs", 0755)
-	if err := unix.Mount("devtmpfs", "/tmp/.devtmpfs", "devtmpfs", 0, ""); err == nil {
-		if _, err := os.Stat("/tmp/.devtmpfs/vsock"); err == nil {
-			vsockSource = "/tmp/.devtmpfs/vsock"
-		} else {
-			// No vsock here; drop the temp mount so we don't leak it.
-			unix.Unmount("/tmp/.devtmpfs", 0)
-			os.Remove("/tmp/.devtmpfs")
-		}
-	}
-
+// setupDev builds a minimal, controlled /dev for a container or VM: a tmpfs at
+// /dev with a fixed set of device nodes, the std{in,out,err}/fd symlinks, and
+// devpts/shm/mqueue. It deliberately does NOT expose the kernel's full devtmpfs
+// (no disks, kmsg, console, etc.).
+//
+// mountVsock is set only by the VM init process: the vshd that runs as init in
+// a cloud-hypervisor guest listens on AF_VSOCK and so needs /dev/vsock, a misc
+// device that only works when backed by devtmpfs. Containers never need vsock
+// (sessions reach vshd via the shared namespace / /thunder.sock, not vsock), so
+// they pass false and get no vsock node at all.
+func setupDev(mountVsock bool) {
 	// Ensure /dev exists (blank containers may not have it)
 	os.MkdirAll("/dev", 0755)
 
@@ -414,7 +398,7 @@ func setupDev() {
 	// Create essential device nodes
 	// Format: name, mode, major, minor
 	// Note: vsock is NOT included here - it's a misc device that only works via
-	// devtmpfs, so we bind-mount it separately if it existed before.
+	// devtmpfs, so it is bind-mounted separately below when mountVsock is set.
 	devices := []struct {
 		name  string
 		mode  uint32
@@ -466,18 +450,27 @@ func setupDev() {
 	os.MkdirAll("/dev/mqueue", 0755)
 	unix.Mount("mqueue", "/dev/mqueue", "mqueue", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "")
 
-	// Bind-mount /dev/vsock from devtmpfs if it was available.
-	// This is necessary because vsock is a misc device that only works via devtmpfs.
-	if vsockSource != "" {
-		// Create the mount point
-		f, err := os.OpenFile("/dev/vsock", os.O_CREATE|os.O_WRONLY, 0666)
-		if err == nil {
-			f.Close()
-			unix.Mount(vsockSource, "/dev/vsock", "", unix.MS_BIND, "")
+	// Expose /dev/vsock for the VM init's vshd. vsock is a misc device that only
+	// works when backed by devtmpfs, so we can't just mknod it onto our tmpfs.
+	// Mount a throwaway devtmpfs at a scratch dir inside /dev, bind its vsock
+	// node onto /dev/vsock, then drop the scratch mount so the rest of /dev
+	// stays the controlled tmpfs (no disks/kmsg/console leaking in).
+	//
+	// We don't condition this on /dev/vsock pre-existing: when vshd runs as the
+	// guest's init the kernel does not auto-mount devtmpfs at /dev, so /dev/vsock
+	// is absent here even though the host exposed the device. The VM always has a
+	// vsock, so mountVsock==true unconditionally surfaces it.
+	if mountVsock {
+		scratch := "/dev/.devtmpfs"
+		os.MkdirAll(scratch, 0755)
+		if err := unix.Mount("devtmpfs", scratch, "devtmpfs", 0, ""); err == nil {
+			if f, err := os.OpenFile("/dev/vsock", os.O_CREATE|os.O_WRONLY, 0666); err == nil {
+				f.Close()
+				unix.Mount(scratch+"/vsock", "/dev/vsock", "", unix.MS_BIND, "")
+			}
+			unix.Unmount(scratch, 0)
 		}
-		// Clean up the temporary devtmpfs mount
-		unix.Unmount("/tmp/.devtmpfs", 0)
-		os.Remove("/tmp/.devtmpfs")
+		os.Remove(scratch)
 	}
 }
 
@@ -553,8 +546,9 @@ func cmdContainerInit(args []string) {
 		_ = err // Ignore - /sys might already be mounted
 	}
 
-	// Set up /dev (tmpfs with device nodes, devpts, etc.)
-	setupDev()
+	// Set up /dev (tmpfs with device nodes, devpts, etc.). Containers never need
+	// vsock, so pass false.
+	setupDev(false)
 
 	// Set hostname if provided
 	if hostname != "" {
