@@ -62,6 +62,8 @@ func requireBtrfsRoot(t *testing.T) string {
 	}
 
 	root := t.TempDir()
+	// Ensure absolute path (TMPDIR may be relative)
+	root, _ = filepath.Abs(root)
 	cmd := exec.Command("stat", "-f", "-c", "%T", root)
 	out, err := cmd.Output()
 	if err != nil {
