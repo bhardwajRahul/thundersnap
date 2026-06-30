@@ -249,6 +249,12 @@ func (c *controlServer) handleRefMove(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// If the ref has autorun configured and we're moving to a different frame,
+	// restart the autorun process in the new frame.
+	if globalAutorun != nil && len(currentRef.Autorun) > 0 && oldUUID != uuid {
+		globalAutorun.restartProcess(user, req.Name, uuid, currentRef.Autorun)
+	}
+
 	log.Printf("Moved ref %s -> %s", req.Name, req.UUID)
 	jsonResponse(w, RefResponse{Status: "ok"})
 }
@@ -304,6 +310,11 @@ func (c *controlServer) handleRefDelete(w http.ResponseWriter, r *http.Request) 
 		log.Printf("ref delete failed: %v", err)
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Stop any autorun process for this ref
+	if globalAutorun != nil {
+		globalAutorun.stopProcess(user, req.Name)
 	}
 
 	// Also remove identity state if force. RemoveIDDir clears the state-dir id
@@ -487,7 +498,7 @@ func (c *controlServer) handleAutorun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	refStore, _, err := c.userRefStore()
+	refStore, user, err := c.userRefStore()
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -504,20 +515,32 @@ func (c *controlServer) handleAutorun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := refStore.SetAutorun(req.RefName, req.Argv); err != nil {
+	// Get the ref to find its current UUID (needed to start the process in the right frame)
+	ref, err := refStore.Get(req.RefName)
+	if err != nil {
 		if err == refs.ErrRefNotFound {
 			jsonError(w, "ref not found", http.StatusNotFound)
 			return
 		}
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := refStore.SetAutorun(req.RefName, req.Argv); err != nil {
 		log.Printf("set autorun failed: %v", err)
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	if len(req.Argv) > 0 {
-		log.Printf("Set autorun for ref %s: %v", req.RefName, req.Argv)
-	} else {
-		log.Printf("Cleared autorun for ref %s", req.RefName)
+	// Start or stop the autorun process
+	if globalAutorun != nil {
+		if len(req.Argv) > 0 {
+			globalAutorun.startProcess(user, req.RefName, ref.UUID, req.Argv)
+			log.Printf("Set autorun for ref %s: %v", req.RefName, req.Argv)
+		} else {
+			globalAutorun.stopProcess(user, req.RefName)
+			log.Printf("Cleared autorun for ref %s", req.RefName)
+		}
 	}
 	jsonResponse(w, AutorunResponse{Status: "ok"})
 }

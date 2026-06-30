@@ -491,6 +491,10 @@ func main() {
 	initRefStore(*flagDataDir)
 	initFrameStore(*flagDataDir)
 
+	// Initialize the autorun manager and start any autorun processes.
+	initAutorunManager(*flagDataDir)
+	defer shutdownAutorunManager()
+
 	// In test mode (--test-listen), skip tsnet and listen on local TCP.
 	// testModeUser will be used for identity instead of WhoIs.
 	if *testListen != "" {
