@@ -74,14 +74,27 @@ func startDaemon(t *testing.T, env *testEnv) *daemonInstance {
 		t.Fatalf("write policy file: %v", err)
 	}
 
-	cmd := exec.Command(env.daemonBinary,
-		"--test-listen="+addr,
-		"--test-user="+testUser,
-		"--data-dir="+env.root, // Uses env.root; fs/ and snaps/ are created inside
-		"--state-dir="+stateDir,
-		"--libexec-dir="+env.libexecDir,
-		"--policy="+policyPath,
-	)
+	daemonArgs := []string{
+		"--test-listen=" + addr,
+		"--test-user=" + testUser,
+		"--data-dir=" + env.root, // Uses env.root; fs/ and snaps/ are created inside
+		"--state-dir=" + stateDir,
+		"--libexec-dir=" + env.libexecDir,
+		"--policy=" + policyPath,
+	}
+
+	// Point the daemon at the cloud-hypervisor + vmlinux directory so VM (vmx)
+	// sessions can boot. The daemon's CWD is env.root, so an absolute path is
+	// required. Resolve via the same discovery the low-level VM tests use; if
+	// the VM deps are absent the daemon simply never uses this and only the
+	// container tests work (the VM tests fail their own requireVMDeps).
+	if dir := vmDir(); dir != "" {
+		if abs, err := filepath.Abs(dir); err == nil {
+			daemonArgs = append(daemonArgs, "--vm-dir="+abs)
+		}
+	}
+
+	cmd := exec.Command(env.daemonBinary, daemonArgs...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	cmd.Dir = env.root
