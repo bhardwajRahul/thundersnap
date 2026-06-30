@@ -426,9 +426,16 @@ func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, 
 		}))
 	}
 
-	copyDone := make(chan struct{}, 2)
+	// guestDone fires when the guest->host direction ends (FrameExit received or
+	// the guest closed the connection). This is the authoritative signal that the
+	// session is over: the remote command has exited and all its output has been
+	// delivered. The host->guest stdin copy ending (e.g. immediate EOF for a
+	// non-interactive exec with no stdin) must NOT tear the session down, or we
+	// race the command's output frames.
+	guestDone := make(chan struct{})
 
-	// Host -> guest: frame SSH stdin as FrameStdin; relay winsize changes.
+	// Host -> guest: frame SSH stdin as FrameStdin; relay winsize changes. This
+	// goroutine exits when SSH stdin EOFs; it does not signal session end.
 	go func() {
 		if isPty {
 			go func() {
@@ -452,12 +459,13 @@ func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, 
 				break
 			}
 		}
-		copyDone <- struct{}{}
 	}()
 
-	// Guest -> host: decode TLV frames; route stdout/stderr/exit.
+	// Guest -> host: decode TLV frames; route stdout/stderr/exit. Closing
+	// guestDone signals the session is complete.
 	exitCode := 0
 	go func() {
+		defer close(guestDone)
 		for {
 			typ, payload, err := vshdproto.ReadFrame(conn)
 			if err != nil {
@@ -474,12 +482,11 @@ func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, 
 				}
 			}
 		}
-		copyDone <- struct{}{}
 	}()
 
 	// Wait for session end
 	select {
-	case <-copyDone:
+	case <-guestDone:
 		log.Printf("SSH proxy: vshd connection closed")
 	case <-done:
 		log.Printf("SSH proxy: VM exited")
@@ -491,17 +498,13 @@ func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, 
 
 	conn.Close()
 
-	// Closing conn unblocks the proxy goroutines; wait briefly for both to
-	// finish, but don't block teardown if one is wedged. The shared deadline
-	// bounds the total wait at ~100ms.
-	deadline := time.After(100 * time.Millisecond)
-drain:
-	for i := 0; i < 2; i++ {
-		select {
-		case <-copyDone:
-		case <-deadline:
-			break drain
-		}
+	// Closing conn unblocks the guest->host reader if it is still running (e.g.
+	// when we exited the select via done/panicked/client-close rather than
+	// guestDone). Wait briefly so any in-flight output is flushed, bounded so a
+	// wedged reader cannot block teardown.
+	select {
+	case <-guestDone:
+	case <-time.After(100 * time.Millisecond):
 	}
 
 	s.Exit(exitCode)
