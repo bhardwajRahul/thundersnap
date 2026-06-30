@@ -1437,16 +1437,15 @@ func doListRefs(sockPath string) error {
 func cmdReflog(args []string) {
 	opts := getopt.New()
 	opts.SetProgram("ts reflog")
-	opts.SetParameters("<ref-name>")
+	opts.SetParameters("[ref-name]")
 	opts.Parse(append([]string{"ts reflog"}, args...))
 
-	if opts.NArgs() != 1 {
-		fmt.Fprintln(os.Stderr, "error: reflog requires ref name")
-		fmt.Fprintln(os.Stderr, "usage: ts reflog <ref-name>")
-		os.Exit(1)
+	var name string
+	if opts.NArgs() > 0 {
+		name = opts.Arg(0)
 	}
-
-	name := opts.Arg(0)
+	// If name is empty, the server will default to the unique ref for the
+	// current frame (if exactly one exists) or return an error with suggestions.
 
 	if err := doReflog(*sockPath, name); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -1462,15 +1461,21 @@ type ReflogEntry struct {
 
 // ReflogResponse is the response from /reflog
 type ReflogResponse struct {
-	Status string        `json:"status"`
-	Name   string        `json:"name"`
-	Reflog []ReflogEntry `json:"reflog"`
+	Status  string        `json:"status"`
+	Message string        `json:"message,omitempty"`
+	Name    string        `json:"name"`
+	Reflog  []ReflogEntry `json:"reflog"`
 }
 
 func doReflog(sockPath, name string) error {
 	client := thunderclient.NewHTTPClient(sockPath)
 
-	resp, err := client.Get("http://localhost/reflog?name=" + name)
+	url := "http://localhost/reflog"
+	if name != "" {
+		url += "?name=" + name
+	}
+
+	resp, err := client.Get(url)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
@@ -1482,6 +1487,9 @@ func doReflog(sockPath, name string) error {
 	}
 
 	if result.Status != "ok" {
+		if result.Message != "" {
+			return fmt.Errorf("%s", result.Message)
+		}
 		return fmt.Errorf("server error")
 	}
 

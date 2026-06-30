@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tailscale/thundersnap/frameid"
@@ -461,6 +462,106 @@ func TestResolveFrameForUser(t *testing.T) {
 		}
 		if want := filepath.Join(fsDir, "bob", uuid.String()); path != want {
 			t.Errorf("path = %q, want %q", path, want)
+		}
+	})
+}
+
+// TestHandleReflogDefaultsToUniqueRef verifies that /reflog without a name
+// parameter defaults to the unique ref for the current frame (if exactly one),
+// or returns an error with suggestions if zero or multiple refs match.
+func TestHandleReflogDefaultsToUniqueRef(t *testing.T) {
+	const user = "testuser"
+	dataDir := t.TempDir()
+	fsDir := filepath.Join(dataDir, "fs")
+	initRefStore(dataDir)
+	initFrameStore(dataDir)
+	old := flagFsDir
+	flagFsDir = &fsDir
+	defer func() { flagFsDir = old }()
+
+	uuid := frameid.MustNew()
+	cs := &controlServer{rootFS: filepath.Join(fsDir, user, uuid.String())}
+	refStore := userRefStore(user)
+
+	// Create a single ref pointing to this frame
+	if err := refStore.Create("myref", uuid); err != nil {
+		t.Fatalf("create ref: %v", err)
+	}
+
+	t.Run("unique_ref_default", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodGet, "/reflog", nil)
+		w := httptest.NewRecorder()
+		cs.handleReflog(w, r)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+		}
+
+		var result ReflogResponse
+		if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if result.Status != "ok" {
+			t.Errorf("status = %q, want ok", result.Status)
+		}
+		if result.Name != "myref" {
+			t.Errorf("name = %q, want myref", result.Name)
+		}
+	})
+
+	// Add a second ref pointing to the same frame
+	if err := refStore.Create("otherref", uuid); err != nil {
+		t.Fatalf("create otherref: %v", err)
+	}
+
+	t.Run("multiple_refs_error", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodGet, "/reflog", nil)
+		w := httptest.NewRecorder()
+		cs.handleReflog(w, r)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+		}
+
+		var result RefResponse
+		if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if result.Status != "error" {
+			t.Errorf("status = %q, want error", result.Status)
+		}
+		// Should suggest both refs
+		if !strings.Contains(result.Message, "myref") || !strings.Contains(result.Message, "otherref") {
+			t.Errorf("message = %q, should mention myref and otherref", result.Message)
+		}
+	})
+
+	// Delete both refs, so zero refs point to the frame
+	if err := refStore.Delete("myref"); err != nil {
+		t.Fatalf("delete myref: %v", err)
+	}
+	if err := refStore.Delete("otherref"); err != nil {
+		t.Fatalf("delete otherref: %v", err)
+	}
+
+	t.Run("no_refs_error", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodGet, "/reflog", nil)
+		w := httptest.NewRecorder()
+		cs.handleReflog(w, r)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+		}
+
+		var result RefResponse
+		if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if result.Status != "error" {
+			t.Errorf("status = %q, want error", result.Status)
+		}
+		if !strings.Contains(result.Message, "no refs") {
+			t.Errorf("message = %q, should mention 'no refs'", result.Message)
 		}
 	})
 }

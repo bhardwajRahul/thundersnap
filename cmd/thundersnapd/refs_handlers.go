@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"strings"
 
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/refid"
@@ -387,6 +388,8 @@ type ReflogResponse struct {
 }
 
 // handleReflog handles GET /reflog?name=<name>
+// If name is not provided, it defaults to the unique ref for the current frame
+// (if exactly one ref points to it), or returns an error suggesting available refs.
 func (c *controlServer) handleReflog(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
@@ -400,8 +403,45 @@ func (c *controlServer) handleReflog(w http.ResponseWriter, r *http.Request) {
 
 	name := r.URL.Query().Get("name")
 	if name == "" {
-		jsonError(w, "name parameter is required", http.StatusBadRequest)
-		return
+		// No ref name provided: find refs pointing to the current frame and
+		// default to the unique one (if any), or suggest available refs.
+		frameUUID, err := frameUUIDFromRootFS(c.rootFS)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		names, err := refStore.List()
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Find refs pointing to this frame
+		var matchingRefs []string
+		for _, n := range names {
+			ref, err := refStore.Get(n)
+			if err != nil {
+				continue
+			}
+			if ref.UUID == frameUUID {
+				matchingRefs = append(matchingRefs, n)
+			}
+		}
+
+		switch len(matchingRefs) {
+		case 0:
+			jsonError(w, "no refs point to this frame", http.StatusBadRequest)
+			return
+		case 1:
+			name = matchingRefs[0]
+		default:
+			// Multiple refs - suggest them
+			msg := fmt.Sprintf("multiple refs point to this frame, specify one: %s",
+				strings.Join(matchingRefs, ", "))
+			jsonError(w, msg, http.StatusBadRequest)
+			return
+		}
 	}
 
 	ref, err := refStore.Get(name)
