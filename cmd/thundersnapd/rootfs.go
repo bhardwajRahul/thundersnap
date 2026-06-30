@@ -64,69 +64,14 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 		return fmt.Errorf("reading frame meta: %w", err)
 	}
 
-	if frameMeta != nil && frameMeta.Rootfs != "" {
-		// Use the new three-component frame model
+	if frameMeta != nil {
+		// Use the three-component frame model (may be nil:nil:nil for empty frame)
 		return ensureFrameFS(rootFS, frameMeta)
 	}
 
-	// Legacy single-component mode
-	// Ensure the parent directory exists
-	parentDir := filepath.Dir(rootFS)
-	if err := os.MkdirAll(parentDir, 0755); err != nil {
-		return fmt.Errorf("creating parent directory: %w", err)
-	}
-
-	// Determine which source to clone from and what stamp ID to use:
-	// 1. If baseUserFS exists and is different from rootFS, use it
-	//    (inherit the stamp from the source's .stamp file)
-	// 2. Otherwise fall back to $snaps-dir/1 (stamp ID = "1")
-	defaultSnapshot := filepath.Join(*flagSnapsDir, "1")
-	snapshotSource := defaultSnapshot
-	baseStampID := "1" // default base is "1"
-
-	if baseUserFS != rootFS {
-		if _, err := os.Stat(baseUserFS); err == nil {
-			snapshotSource = baseUserFS
-			// Inherit stamp from the source (fs-dir has .stamp files)
-			if stamp := readStampFile(baseUserFS); stamp != "" {
-				baseStampID = stamp
-			}
-		}
-	}
-
-	// Verify the snapshot source exists before trying to clone it.
-	if _, err := os.Stat(snapshotSource); err != nil {
-		if os.IsNotExist(err) && snapshotSource == defaultSnapshot {
-			return fmt.Errorf("%s does not exist; create a base filesystem snapshot there before starting", snapshotSource)
-		}
-		return fmt.Errorf("snapshot source %s: %w", snapshotSource, err)
-	}
-
-	// Step 1: Create intermediate snapshot in snaps-dir with fidx
-	// (no progress reporting for ensureRootFS - happens at SSH login time)
-	// The snapshot ID is based on the TSM SHA-256, so duplicates are detected.
-	intermediateID, err := createSnapshotWithTaints(snapshotSource, baseStampID, nil, nil, false)
-	if err != nil {
-		return fmt.Errorf("create intermediate snapshot from %s: %w", snapshotSource, err)
-	}
-	intermediatePath := filepath.Join(*flagSnapsDir, intermediateID)
-
-	// Step 2: Clone from intermediate snapshot to rootFS
-	if err := btrfsSnapshot(intermediatePath, rootFS, false); err != nil {
-		return err
-	}
-
-	// Write stamp file for the live filesystem
-	// For fs-dir snapshots, the stamp contains the intermediate snapshot ID
-	// (which is the basename of the snapshot in snaps-dir)
-	if err := writeStampFile(rootFS, intermediateID); err != nil {
-		log.Printf("Warning: failed to write stamp file for %s: %v", rootFS, err)
-	}
-
-	// Ensure the "user" account, sudoers, resolv.conf, and /tmp are set up.
-	finalizeFrameRootfs(rootFS)
-
-	return nil
+	// No sidecar exists: treat as an empty frame (nil:nil:nil).
+	// This is the default for fresh unattached frames (e.g., first SSH login).
+	return ensureFrameFS(rootFS, &frames.Frame{Isolation: "container"})
 }
 
 // ensureFrameFS creates a three-component frame from the given frame metadata.

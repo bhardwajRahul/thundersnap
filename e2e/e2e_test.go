@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -155,20 +156,35 @@ func (e *testEnv) requireBinary(name string) string {
 }
 
 func (e *testEnv) cleanup() {
-	// Clean up btrfs subvolumes
-	cleanupSubvolumes(e.fsDir)
-	cleanupSubvolumes(e.snapshotsDir)
+	// Clean up all btrfs subvolumes under the test root.
+	// Walk the tree, collect all directories, then delete deepest-first.
+	cleanupAllSubvolumes(e.root)
 }
 
-func cleanupSubvolumes(dir string) {
-	entries, _ := os.ReadDir(dir)
-	for _, entry := range entries {
-		path := filepath.Join(dir, entry.Name())
-		if entry.IsDir() {
-			// Recursively clean nested subvolumes
-			cleanupSubvolumes(path)
-			exec.Command("btrfs", "subvolume", "delete", path).Run()
+func cleanupAllSubvolumes(root string) {
+	// Collect all directories under root (these might be subvolumes)
+	var dirs []string
+	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // continue walking
 		}
+		if d.IsDir() && path != root {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+
+	// Sort by path length descending (deepest first)
+	sort.Slice(dirs, func(i, j int) bool {
+		return len(dirs[i]) > len(dirs[j])
+	})
+
+	// Try to delete each as a subvolume (make writable first for read-only snapshots)
+	for _, path := range dirs {
+		// Make writable in case it's a read-only snapshot
+		exec.Command("btrfs", "property", "set", "-ts", path, "ro", "false").Run()
+		// Try to delete as subvolume (will fail silently if not a subvolume)
+		exec.Command("btrfs", "subvolume", "delete", path).Run()
 	}
 }
 

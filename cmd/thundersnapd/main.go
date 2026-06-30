@@ -168,35 +168,34 @@ func (m *controlServerManager) releaseControlServer(rootFS string) {
 	}
 }
 
-// activeFrames tracks which frames have active control servers (and thus active sessions).
-// Key is the frame path (e.g., /fs/user/framename), value is the number of active sessions.
-var activeFrames = struct {
-	sync.Mutex
-	count map[string]int
-}{count: make(map[string]int)}
-
-// registerActiveFrame increments the active session count for a frame.
-func registerActiveFrame(framePath string) {
-	activeFrames.Lock()
-	activeFrames.count[framePath]++
-	activeFrames.Unlock()
-}
-
-// unregisterActiveFrame decrements the active session count for a frame.
-func unregisterActiveFrame(framePath string) {
-	activeFrames.Lock()
-	activeFrames.count[framePath]--
-	if activeFrames.count[framePath] <= 0 {
-		delete(activeFrames.count, framePath)
-	}
-	activeFrames.Unlock()
-}
-
 // getActiveFrameCount returns the number of active sessions for a frame.
+// This is the refCount of the frame's control server (how many SSH sessions
+// are currently connected to it).
 func getActiveFrameCount(framePath string) int {
-	activeFrames.Lock()
-	defer activeFrames.Unlock()
-	return activeFrames.count[framePath]
+	return controlServers.getSessionCount(framePath)
+}
+
+// getSessionCount returns the number of active sessions for a frame (the
+// refCount of its control server, or 0 if no control server exists).
+func (m *controlServerManager) getSessionCount(rootFS string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ms, ok := m.servers[rootFS]; ok {
+		return ms.refCount
+	}
+	return 0
+}
+
+// countAllSessions returns the total number of active container sessions
+// across all frames.
+func (m *controlServerManager) countAllSessions() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	total := 0
+	for _, ms := range m.servers {
+		total += ms.refCount
+	}
+	return total
 }
 
 // getTsnetHostname returns the current tsnet hostname (FQDN).
@@ -1460,7 +1459,6 @@ func (c *controlServer) Close() error {
 	c.listener.Close()
 	<-c.done
 	os.Remove(c.sockPath)
-	unregisterActiveFrame(c.rootFS)
 	return nil
 }
 
@@ -1531,7 +1529,6 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 
 	go cs.serve()
 
-	registerActiveFrame(rootFS)
 	return cs, nil
 }
 
@@ -1868,11 +1865,32 @@ func makeSnapHandler(rootFS string) http.HandlerFunc {
 		}
 
 		log.Printf("Created snapshot %s from %s", snapshotID, rootFS)
+		addSnapHistory(rootFS, snapshotID)
 
 		writeJSON(w, http.StatusOK, SnapResponse{
 			Status:     "ok",
 			SnapshotID: snapshotID,
 		})
+	}
+}
+
+// addSnapHistory adds a history entry for a new snapshot. It derives the user
+// and frame UUID from the rootFS path and calls frameStore.AddHistoryEntry.
+// Errors are logged but not returned since history is non-critical.
+func addSnapHistory(rootFS, snapshotID string) {
+	user, err := tailscaleUserFromRootFS(rootFS)
+	if err != nil {
+		log.Printf("addSnapHistory: cannot determine user from %s: %v", rootFS, err)
+		return
+	}
+	uuid, err := frameUUIDFromRootFS(rootFS)
+	if err != nil {
+		log.Printf("addSnapHistory: cannot determine UUID from %s: %v", rootFS, err)
+		return
+	}
+	frameStore := userFrameStore(user)
+	if err := frameStore.AddHistoryEntry(uuid, snapshotID, ""); err != nil {
+		log.Printf("addSnapHistory: AddHistoryEntry(%s, %s) failed: %v", uuid, snapshotID, err)
 	}
 }
 
@@ -1900,6 +1918,7 @@ func handleSnapStreaming(w http.ResponseWriter, rootFS, subdir string, isTTY boo
 	}
 
 	log.Printf("Created snapshot %s from %s", snapshotID, rootFS)
+	addSnapHistory(rootFS, snapshotID)
 	encoder.Encode(SnapStreamEvent{
 		Type:       "result",
 		Status:     "ok",
@@ -3279,13 +3298,20 @@ func createSnapshotSubdir(rootFS, subdir string, progressWriter io.Writer, isTTY
 		}
 	}
 
-	// Update frame metadata with new snap IDs
+	// Update frame metadata with new snap IDs. Only update Home/Work if we
+	// actually snapped them (i.e., they were non-empty). This preserves the
+	// previous snap ID for incremental indexing on subsequent snaps when the
+	// subvolume happens to be empty this time.
 	if frameMeta == nil {
 		frameMeta = &frames.Frame{}
 	}
 	frameMeta.Rootfs = rootfsID
-	frameMeta.Home = homeID
-	frameMeta.Work = workID
+	if homeID != "" {
+		frameMeta.Home = homeID
+	}
+	if workID != "" {
+		frameMeta.Work = workID
+	}
 	if err := writeFrameSidecar(rootFS, frameMeta); err != nil {
 		log.Printf("Warning: failed to update frame sidecar for %s: %v", rootFS, err)
 	}

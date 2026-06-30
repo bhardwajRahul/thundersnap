@@ -2,6 +2,8 @@
 .*~
 .tmp-*
 .*.tmp
+*.tmp
+*.tmp-*
 /bin/
 /thundersnapd
 /ts

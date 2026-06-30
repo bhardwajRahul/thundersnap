@@ -727,41 +727,52 @@ func TestListSnapsAndFrames(t *testing.T) {
 		}
 	})
 
-	// Test active frame tracking
+	// Test active frame/session tracking via control server refcounting.
+	// Session count is now the control server's refCount (how many SSH sessions
+	// are connected), not a separate counter.
 	t.Run("active_frame_tracking", func(t *testing.T) {
-		// Initially, no active frames
+		// Initially, no active frames (no control server exists for this rootFS).
 		count := getActiveFrameCount(rootFS)
 		if count != 0 {
 			t.Errorf("expected 0 active frames, got %d", count)
 		}
 
-		// Register a frame as active
-		registerActiveFrame(rootFS)
+		// Create a control server (first "session").
+		cs1, err := controlServers.getOrCreateControlServer(rootFS)
+		if err != nil {
+			t.Fatalf("first getOrCreateControlServer: %v", err)
+		}
 		count = getActiveFrameCount(rootFS)
 		if count != 1 {
-			t.Errorf("expected 1 active frame, got %d", count)
+			t.Errorf("expected 1 active session, got %d", count)
 		}
 
-		// Register again (multiple sessions)
-		registerActiveFrame(rootFS)
+		// Second getOrCreateControlServer simulates another SSH session connecting.
+		_, err = controlServers.getOrCreateControlServer(rootFS)
+		if err != nil {
+			t.Fatalf("second getOrCreateControlServer: %v", err)
+		}
 		count = getActiveFrameCount(rootFS)
 		if count != 2 {
-			t.Errorf("expected 2 active frames, got %d", count)
+			t.Errorf("expected 2 active sessions, got %d", count)
 		}
 
-		// Unregister one
-		unregisterActiveFrame(rootFS)
+		// Release one session.
+		controlServers.releaseControlServer(rootFS)
 		count = getActiveFrameCount(rootFS)
 		if count != 1 {
-			t.Errorf("expected 1 active frame after unregister, got %d", count)
+			t.Errorf("expected 1 active session after release, got %d", count)
 		}
 
-		// Unregister the last one
-		unregisterActiveFrame(rootFS)
+		// Release the last session. Control server closes.
+		controlServers.releaseControlServer(rootFS)
 		count = getActiveFrameCount(rootFS)
 		if count != 0 {
-			t.Errorf("expected 0 active frames after all unregistered, got %d", count)
+			t.Errorf("expected 0 active sessions after all released, got %d", count)
 		}
+
+		// Clean up test socket file if it was created.
+		_ = cs1 // silence unused warning
 	})
 }
 

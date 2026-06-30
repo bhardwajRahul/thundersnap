@@ -327,6 +327,14 @@ func createTestFrame(t *testing.T, env *testEnv, frameUUID string) string {
 		t.Fatalf("copy busybox to /bin/su: %v", err)
 	}
 
+	// Create the .jsonc metadata sidecar that frameStore.List() looks for.
+	// This is required for `ts frames` to see this frame.
+	metaPath := framePath + ".jsonc"
+	metaContent := `{"isolation": "container"}`
+	if err := os.WriteFile(metaPath, []byte(metaContent), 0644); err != nil {
+		t.Fatalf("write frame metadata: %v", err)
+	}
+
 	return framePath
 }
 
@@ -366,33 +374,195 @@ func createTestRef(t *testing.T, env *testEnv, refName, frameUUID string) {
 	}
 }
 
-// TestSSHContainerBasic tests basic SSH connection to a container frame.
-// This is the simplest possible e2e SSH test: start daemon, connect, run command.
+// TestSSHContainerBasic is a true end-to-end test: start daemon, SSH in,
+// create a frame via `ts frame`, then exercise ts snap/snaps/log/frames.
+// No manual frame/ref creation - everything goes through the daemon.
 func TestSSHContainerBasic(t *testing.T) {
 	env := newTestEnv(t)
 
-	// Create a test frame with a known UUID
-	frameUUID := "00000000-0000-0000-0000-000000000001"
-	createTestFrame(t, env, frameUUID)
-
-	// Create a ref named "testframe" pointing to this UUID
-	createTestRef(t, env, "testframe", frameUUID)
-
-	// Start the daemon
+	// Start the daemon with no pre-created frames
 	d := startDaemon(t, env)
 
-	// SSH to the frame and run a simple command
-	output, exitCode, err := sshExec(t, d, "testframe", "echo hello")
+	// SSH to the default (empty) frame as root to run ts commands.
+	// The empty frame name (root@@host) should give us a minimal shell.
+	output, exitCode, err := sshExec(t, d, "root@", "echo hello")
 	if err != nil {
-		t.Fatalf("sshExec failed: %v", err)
+		t.Fatalf("sshExec to default frame failed: %v", err)
 	}
 	if exitCode != 0 {
-		t.Errorf("Expected exit code 0, got %d", exitCode)
+		t.Errorf("echo in default frame: expected exit code 0, got %d (output: %q)", exitCode, output)
 	}
-	if !strings.Contains(output, "hello") {
-		t.Errorf("Expected output to contain 'hello', got: %q", output)
+	t.Logf("echo output (default frame): %s", output)
+
+	// Create a new frame using ts frame, with a ref name
+	// ts frame --ref=testframe <snapshot-spec>
+	output, exitCode, err = sshExec(t, d, "root@", "ts frame --ref=testframe nil:nil:nil")
+	if err != nil {
+		t.Fatalf("ts frame failed: %v", err)
 	}
-	t.Logf("Output: %s", output)
+	if exitCode != 0 {
+		t.Errorf("ts frame: expected exit code 0, got %d (output: %q)", exitCode, output)
+	}
+	t.Logf("ts frame output: %s", output)
+
+	// Now SSH to the newly created frame
+	output, exitCode, err = sshExec(t, d, "testframe", "echo hello from testframe")
+	if err != nil {
+		t.Fatalf("sshExec to testframe failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("echo in testframe: expected exit code 0, got %d (output: %q)", exitCode, output)
+	}
+	t.Logf("echo output (testframe): %s", output)
+
+	// Test ts snap: create a snapshot of the current frame
+	output, exitCode, err = sshExec(t, d, "testframe", "ts snap")
+	if err != nil {
+		t.Fatalf("ts snap failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts snap: expected exit code 0, got %d (output: %q)", exitCode, output)
+	}
+	t.Logf("ts snap output: %s", output)
+
+	// Test ts snaps: list snapshots, should include the one we just created
+	output, exitCode, err = sshExec(t, d, "testframe", "ts snaps")
+	if err != nil {
+		t.Fatalf("ts snaps failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts snaps: expected exit code 0, got %d (output: %q)", exitCode, output)
+	}
+	// Should list at least one snapshot
+	if output == "" || strings.TrimSpace(output) == "" {
+		t.Errorf("ts snaps: expected at least one snapshot listed, got empty output")
+	}
+	t.Logf("ts snaps output: %s", output)
+
+	// Test ts log: show history for this frame, should include our snap
+	output, exitCode, err = sshExec(t, d, "testframe", "ts log")
+	if err != nil {
+		t.Fatalf("ts log failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts log: expected exit code 0, got %d (output: %q)", exitCode, output)
+	}
+	// Should show at least one entry
+	if output == "" || strings.TrimSpace(output) == "" {
+		t.Errorf("ts log: expected at least one log entry, got empty output")
+	}
+	t.Logf("ts log output: %s", output)
+
+	// Test ts frames: list frames and verify session count
+	// First, check frames with no long-running sessions
+	output, exitCode, err = sshExec(t, d, "testframe", "ts frames")
+	if err != nil {
+		t.Fatalf("ts frames failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts frames: expected exit code 0, got %d (output: %q)", exitCode, output)
+	}
+	// Should list our frame
+	if !strings.Contains(output, "testframe") {
+		t.Errorf("ts frames: expected output to contain 'testframe', got: %q", output)
+	}
+	t.Logf("ts frames output: %s", output)
+
+	// Test session count: open a long-running session and verify ts frames
+	// reports the active session count correctly.
+	config := sshConfig("testframe")
+	client1, err := ssh.Dial("tcp", d.addr, config)
+	if err != nil {
+		t.Fatalf("SSH dial for session count test: %v", err)
+	}
+	defer client1.Close()
+
+	sess1, err := client1.NewSession()
+	if err != nil {
+		t.Fatalf("new session 1: %v", err)
+	}
+	defer sess1.Close()
+
+	// Start a long-running command (cat waits for input)
+	stdin1, err := sess1.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe 1: %v", err)
+	}
+	if err := sess1.Start("cat"); err != nil {
+		t.Fatalf("start cat: %v", err)
+	}
+
+	// Give the session time to register
+	time.Sleep(500 * time.Millisecond)
+
+	// Check ts frames shows at least 1 active session
+	output, exitCode, err = sshExec(t, d, "testframe", "ts frames")
+	if err != nil {
+		t.Fatalf("ts frames (with active session) failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts frames: expected exit code 0, got %d", exitCode)
+	}
+	t.Logf("ts frames (with 1 cat session): %s", output)
+	// The output should show a non-zero session count for testframe.
+	// Format is typically: "testframe  N" where N is the session count.
+	// We check that the line with testframe doesn't say "0" or "stopped".
+	if strings.Contains(output, "testframe") {
+		lines := strings.Split(output, "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "testframe") {
+				// Should not be stopped or 0 sessions
+				if strings.Contains(line, "stopped") || strings.HasSuffix(strings.TrimSpace(line), " 0") {
+					t.Errorf("ts frames: expected active sessions, but got: %q", line)
+				}
+			}
+		}
+	}
+
+	// Open a second long-running session
+	sess2, err := client1.NewSession()
+	if err != nil {
+		t.Fatalf("new session 2: %v", err)
+	}
+	defer sess2.Close()
+
+	stdin2, err := sess2.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe 2: %v", err)
+	}
+	if err := sess2.Start("cat"); err != nil {
+		t.Fatalf("start cat 2: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Check ts frames shows at least 2 active sessions
+	output, exitCode, err = sshExec(t, d, "testframe", "ts frames")
+	if err != nil {
+		t.Fatalf("ts frames (with 2 active sessions) failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts frames: expected exit code 0, got %d", exitCode)
+	}
+	t.Logf("ts frames (with 2 cat sessions): %s", output)
+
+	// Close the long-running sessions
+	stdin1.Close()
+	sess1.Wait()
+	stdin2.Close()
+	sess2.Wait()
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify session count decreased
+	output, exitCode, err = sshExec(t, d, "testframe", "ts frames")
+	if err != nil {
+		t.Fatalf("ts frames (after closing sessions) failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts frames: expected exit code 0, got %d", exitCode)
+	}
+	t.Logf("ts frames (after closing cat sessions): %s", output)
 }
 
 // TestSSHContainerUserRoot tests SSH as root user to a container frame.

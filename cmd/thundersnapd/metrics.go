@@ -14,13 +14,7 @@ import (
 // countRunningSessions returns the total number of active container sessions
 // across all frames.
 func countRunningSessions() int {
-	activeFrames.Lock()
-	defer activeFrames.Unlock()
-	total := 0
-	for _, c := range activeFrames.count {
-		total += c
-	}
-	return total
+	return controlServers.countAllSessions()
 }
 
 // countRunningVMs returns the number of running outer VMX VMs.
