@@ -379,16 +379,26 @@ func setupDev() {
 	// creating it via mknod on a different filesystem doesn't work. We'll bind-mount
 	// it from devtmpfs after setting up our tmpfs.
 	//
-	// To preserve access to the original devtmpfs vsock, we mount devtmpfs at a
-	// temporary location first.
+	// To preserve access to the original devtmpfs vsock, we mount a fresh
+	// devtmpfs at a temporary location first and look for vsock there.
+	//
+	// We must NOT gate this on /dev/vsock already existing: when vshd runs as
+	// the VM's init the kernel does not auto-mount devtmpfs at /dev (the boot
+	// log shows "devtmpfs: error mounting"), so /dev/vsock is absent at this
+	// point even though the host exposed a vsock device. Mounting a fresh
+	// devtmpfs ourselves surfaces the kernel's vsock node so we can bind-mount
+	// it across the tmpfs we put on /dev below. If there is no vsock device
+	// (e.g. host/container mode), /tmp/.devtmpfs/vsock simply won't exist and
+	// vsockSource stays empty.
 	var vsockSource string
-	if _, err := os.Stat("/dev/vsock"); err == nil {
-		// vsock exists - mount devtmpfs at a temp location so we can bind-mount it later
-		os.MkdirAll("/tmp/.devtmpfs", 0755)
-		if err := unix.Mount("devtmpfs", "/tmp/.devtmpfs", "devtmpfs", 0, ""); err == nil {
-			if _, err := os.Stat("/tmp/.devtmpfs/vsock"); err == nil {
-				vsockSource = "/tmp/.devtmpfs/vsock"
-			}
+	os.MkdirAll("/tmp/.devtmpfs", 0755)
+	if err := unix.Mount("devtmpfs", "/tmp/.devtmpfs", "devtmpfs", 0, ""); err == nil {
+		if _, err := os.Stat("/tmp/.devtmpfs/vsock"); err == nil {
+			vsockSource = "/tmp/.devtmpfs/vsock"
+		} else {
+			// No vsock here; drop the temp mount so we don't leak it.
+			unix.Unmount("/tmp/.devtmpfs", 0)
+			os.Remove("/tmp/.devtmpfs")
 		}
 	}
 
