@@ -224,6 +224,41 @@ func sshExec(t *testing.T, d *daemonInstance, user string, cmd string) (string, 
 	return string(output), exitCode, nil
 }
 
+// sshExecSplit is like sshExec but captures the session's stdout and stderr
+// into separate buffers instead of combining them. This is what lets a test
+// observe whether the daemon keeps the two streams distinct end to end.
+func sshExecSplit(t *testing.T, d *daemonInstance, user string, cmd string) (stdout, stderr string, exitCode int, err error) {
+	t.Helper()
+
+	config := sshConfig(user)
+	client, err := ssh.Dial("tcp", d.addr, config)
+	if err != nil {
+		return "", "", -1, fmt.Errorf("dial: %w", err)
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return "", "", -1, fmt.Errorf("new session: %w", err)
+	}
+	defer session.Close()
+
+	var outBuf, errBuf strings.Builder
+	session.Stdout = &outBuf
+	session.Stderr = &errBuf
+
+	exitCode = 0
+	if err := session.Run(cmd); err != nil {
+		if exitErr, ok := err.(*ssh.ExitError); ok {
+			exitCode = exitErr.ExitStatus()
+		} else {
+			return outBuf.String(), errBuf.String(), -1, fmt.Errorf("run command: %w", err)
+		}
+	}
+
+	return outBuf.String(), errBuf.String(), exitCode, nil
+}
+
 // sshInteractive connects to the daemon via SSH with a PTY for interactive use.
 // It returns the SSH session which the caller must close.
 func sshInteractive(t *testing.T, d *daemonInstance, user string) (*ssh.Client, *ssh.Session, error) {
@@ -436,4 +471,45 @@ func TestSSHContainerWorkingDir(t *testing.T) {
 		t.Errorf("Expected pwd to be /home/user, got: %q", output)
 	}
 	t.Logf("Output: %s", output)
+}
+
+// TestSSHContainerStdoutStderrSeparate verifies that the daemon keeps a
+// session's stdout and stderr on distinct channels rather than merging them
+// onto stdout. The command writes a known marker to each stream; with the
+// streams properly separated, the stdout marker lands only in the SSH
+// session's stdout and the stderr marker only in its stderr. If the daemon
+// (incorrectly) folds stderr into stdout, the stderr marker leaks into the
+// stdout buffer and this test fails.
+func TestSSHContainerStdoutStderrSeparate(t *testing.T) {
+	env := newTestEnv(t)
+
+	frameUUID := "00000000-0000-0000-0000-000000000005"
+	createTestFrame(t, env, frameUUID)
+	createTestRef(t, env, "streamframe", frameUUID)
+
+	d := startDaemon(t, env)
+
+	// Emit OUTMARK on stdout and ERRMARK on stderr (fd 2).
+	stdout, stderr, exitCode, err := sshExecSplit(t, d, "user@streamframe",
+		"echo OUTMARK; echo ERRMARK 1>&2")
+	if err != nil {
+		t.Fatalf("sshExecSplit failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("Expected exit code 0, got %d (stdout: %q, stderr: %q)", exitCode, stdout, stderr)
+	}
+
+	if !strings.Contains(stdout, "OUTMARK") {
+		t.Errorf("Expected stdout to contain OUTMARK, got: %q", stdout)
+	}
+	if !strings.Contains(stderr, "ERRMARK") {
+		t.Errorf("Expected stderr to contain ERRMARK, got: %q", stderr)
+	}
+	// The bug: stderr gets merged into stdout. If so, ERRMARK shows up on
+	// the SSH client's stdout where it never should.
+	if strings.Contains(stdout, "ERRMARK") {
+		t.Errorf("stderr leaked into stdout: stderr should go to its own channel, but stdout contained ERRMARK (stdout: %q, stderr: %q)", stdout, stderr)
+	}
+
+	t.Logf("stdout: %q stderr: %q", stdout, stderr)
 }
