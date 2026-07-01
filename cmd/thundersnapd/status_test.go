@@ -8,87 +8,53 @@ import (
 )
 
 // TestWriteStatusWaitingForAuth tests that writeStatusWaitingForAuth creates
-// the status files with the correct format in both locations.
+// the status file with the correct format.
 func TestWriteStatusWaitingForAuth(t *testing.T) {
-	// Save original and set up temp status files
-	origStatusFiles := statusFiles
+	// Save original and set up a temp status file
+	origStatusFile := statusFile
 	tmpDir := t.TempDir()
-	statusFiles = []string{
-		filepath.Join(tmpDir, "run", "thundersnap", "status"),
-		filepath.Join(tmpDir, "var", "lib", "thundersnap", "status"),
-	}
-	defer func() { statusFiles = origStatusFiles }()
+	statusFile = filepath.Join(tmpDir, "status")
+	defer func() { statusFile = origStatusFile }()
 
 	testURL := "https://login.tailscale.com/a/abc123"
 	writeStatusWaitingForAuth(testURL)
 
-	// Verify both files were created with correct content
-	for _, path := range statusFiles {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("failed to read status file %s: %v", path, err)
-		}
+	data, err := os.ReadFile(statusFile)
+	if err != nil {
+		t.Fatalf("failed to read status file %s: %v", statusFile, err)
+	}
 
-		content := string(data)
+	content := string(data)
 
-		if !strings.Contains(content, "state: waiting_for_auth") {
-			t.Errorf("status file %s missing 'state: waiting_for_auth', got:\n%s", path, content)
-		}
-		if !strings.Contains(content, "auth_url: "+testURL) {
-			t.Errorf("status file %s missing auth_url, got:\n%s", path, content)
-		}
+	if !strings.Contains(content, "state: waiting_for_auth") {
+		t.Errorf("status file %s missing 'state: waiting_for_auth', got:\n%s", statusFile, content)
+	}
+	if !strings.Contains(content, "auth_url: "+testURL) {
+		t.Errorf("status file %s missing auth_url, got:\n%s", statusFile, content)
 	}
 }
 
-// TestWriteStatusError tests that writeStatusError creates the status files
-// with the error message in the correct format in both locations.
+// TestWriteStatusError tests that writeStatusError creates the status file
+// with the error message in the correct format.
 func TestWriteStatusError(t *testing.T) {
-	// Save original and set up temp status files
-	origStatusFiles := statusFiles
+	// Save original and set up a temp status file
+	origStatusFile := statusFile
 	tmpDir := t.TempDir()
-	statusFiles = []string{
-		filepath.Join(tmpDir, "run", "thundersnap", "status"),
-		filepath.Join(tmpDir, "var", "lib", "thundersnap", "status"),
-	}
-	defer func() { statusFiles = origStatusFiles }()
+	statusFile = filepath.Join(tmpDir, "status")
+	defer func() { statusFile = origStatusFile }()
 
 	testError := "failed to start: missing btrfs filesystem"
 	writeStatusError(testError)
 
-	// Verify both files were created with correct content
-	for _, path := range statusFiles {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("failed to read status file %s: %v", path, err)
-		}
-
-		content := string(data)
-
-		if !strings.Contains(content, "error: "+testError) {
-			t.Errorf("status file %s missing error message, got:\n%s", path, content)
-		}
+	data, err := os.ReadFile(statusFile)
+	if err != nil {
+		t.Fatalf("failed to read status file %s: %v", statusFile, err)
 	}
-}
 
-// TestStatusFileDirectoryCreation tests that status functions create the
-// parent directories if they don't exist.
-func TestStatusFileDirectoryCreation(t *testing.T) {
-	origStatusFiles := statusFiles
-	tmpDir := t.TempDir()
-	// Use deeply nested paths that don't exist
-	statusFiles = []string{
-		filepath.Join(tmpDir, "deeply", "nested", "path1", "status"),
-		filepath.Join(tmpDir, "another", "nested", "path2", "status"),
-	}
-	defer func() { statusFiles = origStatusFiles }()
+	content := string(data)
 
-	writeStatusError("test error")
-
-	// Verify all directories were created and files exist
-	for _, path := range statusFiles {
-		if _, err := os.Stat(path); err != nil {
-			t.Errorf("status file not created at %s: %v", path, err)
-		}
+	if !strings.Contains(content, "error: "+testError) {
+		t.Errorf("status file %s missing error message, got:\n%s", statusFile, content)
 	}
 }
 
