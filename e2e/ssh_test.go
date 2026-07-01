@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -23,7 +24,6 @@ type daemonInstance struct {
 	t       *testing.T
 	cmd     *exec.Cmd
 	addr    string // listen address (e.g., "127.0.0.1:22222")
-	dataDir string
 	mu      sync.Mutex
 	stopped bool
 }
@@ -107,10 +107,9 @@ func startDaemon(t *testing.T, env *testEnv) *daemonInstance {
 	}
 
 	d := &daemonInstance{
-		t:       t,
-		cmd:     cmd,
-		addr:    addr,
-		dataDir: env.root,
+		t:    t,
+		cmd:  cmd,
+		addr: addr,
 	}
 
 	// Wait for daemon to be ready (SSH server accepting connections)
@@ -292,23 +291,6 @@ func sshInteractive(t *testing.T, d *daemonInstance, user string) (*ssh.Client, 
 	return client, session, nil
 }
 
-// sanitizeUser mimics cmd/thundersnapd/main.go:sanitizeForPath.
-func sanitizeUser(user string) string {
-	// Replace / and null bytes, collapse ..
-	replacer := strings.NewReplacer(
-		"/", "_",
-		"\x00", "_",
-		"..", "_",
-	)
-	result := replacer.Replace(user)
-	// Handle leading dots
-	result = strings.TrimLeft(result, ".")
-	if result == "" {
-		result = "_"
-	}
-	return result
-}
-
 // createFrameViaDaemon creates a frame by running `ts frame` over SSH to the daemon.
 // This is the proper e2e way to create frames - through the daemon, not by manipulating
 // data structures directly. Returns the frame UUID.
@@ -340,38 +322,59 @@ func createFrameViaDaemon(t *testing.T, d *daemonInstance, refName string) strin
 	return ""
 }
 
-// framePathForUUID returns the filesystem path for a frame given its UUID.
-// The daemon stores frames at <data-dir>/fs/<sanitized-user>/<uuid>.
-func framePathForUUID(d *daemonInstance, uuid string) string {
-	return filepath.Join(d.dataDir, "fs", sanitizeUser(testUser), uuid)
-}
-
-// installBusyboxAppletInFrame installs a busybox applet into a frame.
-// This is a workaround for tests that need external commands (like stty) that
-// can't be replaced with shell builtins. It copies busybox from the host into
-// the frame's /bin directory.
+// installBusyboxAppletInFrame installs a busybox applet (e.g. "su", "stty")
+// into a frame's /bin directory over the daemon's own SFTP subsystem, the
+// same way a real user's scp/sftp client would. This is a workaround for
+// tests that need external commands that can't be replaced with shell
+// builtins, but it goes through the daemon rather than writing to the
+// frame's underlying btrfs subvolume directly.
 //
 // NOTE: This is a transitional helper. Ideally, tests should not need to
-// manipulate frame contents directly. Once busybox is added to the daemon's
+// install anything into frames at all. Once busybox is added to the daemon's
 // libexec and auto-copied to frames, this function should be removed.
-func installBusyboxAppletInFrame(t *testing.T, framePath, applet string) {
+func installBusyboxAppletInFrame(t *testing.T, d *daemonInstance, refName, applet string) {
 	t.Helper()
 
-	// Find busybox on the host
+	// Find busybox on the host.
 	busybox, err := exec.LookPath("busybox")
 	if err != nil {
 		t.Fatalf("busybox required for this test: %v", err)
 	}
+	data, err := os.ReadFile(busybox)
+	if err != nil {
+		t.Fatalf("read busybox: %v", err)
+	}
 
-	// Copy busybox to the frame's /bin directory as the applet name
-	dst := filepath.Join(framePath, "bin", applet)
-	if err := copyFile(busybox, dst); err != nil {
-		t.Fatalf("copy busybox as %s: %v", applet, err)
+	// Connect as root and upload over SFTP, the same transport a real scp/sftp
+	// client would use.
+	conn, err := ssh.Dial("tcp", d.addr, sshConfig("root@"+refName))
+	if err != nil {
+		t.Fatalf("sftp dial: %v", err)
 	}
-	if err := os.Chmod(dst, 0755); err != nil {
-		t.Fatalf("chmod %s: %v", applet, err)
+	defer conn.Close()
+
+	sc, err := sftp.NewClient(conn)
+	if err != nil {
+		t.Fatalf("sftp client: %v", err)
 	}
-	t.Logf("Installed busybox applet %s in %s", applet, framePath)
+	defer sc.Close()
+
+	dst := "/bin/" + applet
+	f, err := sc.Create(dst)
+	if err != nil {
+		t.Fatalf("sftp create %s: %v", dst, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		t.Fatalf("sftp write %s: %v", dst, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("sftp close %s: %v", dst, err)
+	}
+	if err := sc.Chmod(dst, 0755); err != nil {
+		t.Fatalf("sftp chmod %s: %v", dst, err)
+	}
+	t.Logf("Installed busybox applet %s in frame %s via SFTP", applet, refName)
 }
 
 // TestSSHContainerBasic is a true end-to-end test: start daemon, SSH in,
@@ -602,12 +605,11 @@ func TestSSHContainerUserNonRoot(t *testing.T) {
 	d := startDaemon(t, env)
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
-	frameUUID := createFrameViaDaemon(t, d, "userframe")
-	framePath := framePathForUUID(d, frameUUID)
+	createFrameViaDaemon(t, d, "userframe")
 
 	// Install busybox as su (required for vshd to switch to non-root users).
 	// TODO: Once su is in libexec and auto-copied to frames, remove this.
-	installBusyboxAppletInFrame(t, framePath, "su")
+	installBusyboxAppletInFrame(t, d, "userframe", "su")
 
 	// SSH as user@frame (runs as the unprivileged "user" account) and try to
 	// create a file in /. This must FAIL: a non-root user cannot write to /.
@@ -634,12 +636,11 @@ func TestSSHContainerWorkingDir(t *testing.T) {
 	d := startDaemon(t, env)
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
-	frameUUID := createFrameViaDaemon(t, d, "cwdframe")
-	framePath := framePathForUUID(d, frameUUID)
+	createFrameViaDaemon(t, d, "cwdframe")
 
 	// Install busybox as su (required for vshd to switch to non-root users).
 	// TODO: Once su is in libexec and auto-copied to frames, remove this.
-	installBusyboxAppletInFrame(t, framePath, "su")
+	installBusyboxAppletInFrame(t, d, "cwdframe", "su")
 
 	// SSH as user@frame and check pwd
 	output, exitCode, err := sshExec(t, d, "user@cwdframe", "pwd")
@@ -672,12 +673,11 @@ func TestSSHContainerStdoutStderrSeparate(t *testing.T) {
 	d := startDaemon(t, env)
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
-	frameUUID := createFrameViaDaemon(t, d, "streamframe")
-	framePath := framePathForUUID(d, frameUUID)
+	createFrameViaDaemon(t, d, "streamframe")
 
 	// Install busybox as su (required for vshd to switch to non-root users).
 	// TODO: Once su is in libexec and auto-copied to frames, remove this.
-	installBusyboxAppletInFrame(t, framePath, "su")
+	installBusyboxAppletInFrame(t, d, "streamframe", "su")
 
 	// Emit OUTMARK on stdout and ERRMARK on stderr (fd 2).
 	stdout, stderr, exitCode, err := sshExecSplit(t, d, "user@streamframe",
@@ -750,14 +750,13 @@ func TestSSHContainerPtyRawNoCRInjection(t *testing.T) {
 	d := startDaemon(t, env)
 
 	// Create frame via daemon
-	frameUUID := createFrameViaDaemon(t, d, "rawframe")
-	framePath := framePathForUUID(d, frameUUID)
+	createFrameViaDaemon(t, d, "rawframe")
 
 	// Install busybox applets needed for this test. We need stty (to set raw mode)
 	// which is an external command - no shell builtin can do this.
 	// TODO: Once busybox is in libexec and auto-copied to frames, remove this.
-	installBusyboxAppletInFrame(t, framePath, "stty")
-	installBusyboxAppletInFrame(t, framePath, "printf")
+	installBusyboxAppletInFrame(t, d, "rawframe", "stty")
+	installBusyboxAppletInFrame(t, d, "rawframe", "printf")
 
 	// Open an interactive PTY session as root (root runs /bin/sh -l directly).
 	client, session, err := sshInteractive(t, d, "root@rawframe")

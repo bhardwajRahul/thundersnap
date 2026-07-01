@@ -45,7 +45,11 @@ test:
 # These are true end-to-end tests that start a real thundersnapd and SSH into it.
 # Compiles the test binary and dependencies as the current user, then runs with sudo.
 # TMPDIR must be on btrfs (not /tmp which is typically tmpfs).
+# -test.timeout is intentionally aggressive (well under Go's 10m default): these
+# tests are all fast, so a hang almost always means a real bug, not a slow test.
 E2E_TMPDIR ?= $(CURDIR)/.tmp-e2e
+E2E_TEST_TIMEOUT ?= 2m
+NOT_E2E_TEST_TIMEOUT ?= 3m
 e2e: ts vshd thundersnapd
 	@mkdir -p $(E2E_TMPDIR)
 	CGO_ENABLED=0 go test -tags e2e -c -o $(BIN)/e2e.test ./e2e
@@ -54,7 +58,7 @@ e2e: ts vshd thundersnapd
 		TS_BINARY="$(CURDIR)/$(BIN)/ts" \
 		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
 		THUNDERSNAPD_BINARY="$(CURDIR)/$(BIN)/thundersnapd" \
-		$(BIN)/e2e.test -test.v -test.failfast
+		$(BIN)/e2e.test -test.v -test.failfast -test.timeout=$(E2E_TEST_TIMEOUT)
 
 # Run legacy "e2e" tests (not actually e2e - see not-e2e-enough.md)
 # These tests exercise individual components but don't go through the SSH front door.
@@ -66,7 +70,7 @@ not_e2e: ts vshd thundersnapd
 		TS_BINARY="$(CURDIR)/$(BIN)/ts" \
 		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
 		THUNDERSNAPD_BINARY="$(CURDIR)/$(BIN)/thundersnapd" \
-		$(BIN)/not_e2e.test -test.v -test.failfast
+		$(BIN)/not_e2e.test -test.v -test.failfast -test.timeout=$(NOT_E2E_TEST_TIMEOUT)
 
 # Build all binaries for local development
 binaries: ts vsh vshd thundersnapd bupdate tsm fidx slab
