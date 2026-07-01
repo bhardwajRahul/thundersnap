@@ -6,10 +6,28 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/tailscale/thundersnap/tsm"
 )
+
+// statDebug stats path and logs its raw (nanosecond) mtime/ctime and inode,
+// for correlating with the timestamps embedded in TSM entries. Used to
+// diagnose TestSnapshotHomeWorkIncrementalPreserveParent flakiness.
+func statDebug(t *testing.T, label, path string) (mtimeNs int64) {
+	t.Helper()
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		t.Fatalf("stat %s (%s): %v", path, label, err)
+	}
+	t.Logf("[debug] %s: path=%s ino=%d mtime=%d (%s) ctime=%d (%s)",
+		label, path, st.Ino,
+		st.Mtim.Nano(), time.Unix(0, st.Mtim.Nano()).Format(time.RFC3339Nano),
+		st.Ctim.Nano(), time.Unix(0, st.Ctim.Nano()).Format(time.RFC3339Nano))
+	return st.Mtim.Nano()
+}
 
 // TestSnapshotHomeWorkIncrementalPreserveParent is the regression test for the
 // bug where running `ts snap` repeatedly on a frame with /home and /work nested
@@ -67,6 +85,7 @@ func TestSnapshotHomeWorkIncrementalPreserveParent(t *testing.T) {
 	if err := os.WriteFile(testFile1, []byte("initial content\n"), 0644); err != nil {
 		t.Fatalf("write file1: %v", err)
 	}
+	mtime1Raw := statDebug(t, "after first write", testFile1)
 
 	// Step 1: First snap - this creates the initial home snap and writes frameMeta.Home
 	snap1Path := filepath.Join(env.snapshotsDir, "incr-hw-snap1")
@@ -92,18 +111,48 @@ func TestSnapshotHomeWorkIncrementalPreserveParent(t *testing.T) {
 
 	// Step 2: Empty home and snap again
 	// In the buggy code, this would clear frameMeta.Home to ""
+	removeStart := time.Now()
 	if err := os.RemoveAll(testFile1); err != nil {
 		t.Fatalf("remove file1: %v", err)
 	}
+	t.Logf("[debug] remove took %s", time.Since(removeStart))
 
 	// Home is now empty, so a snap of home would produce no homeID
 	// Simulating what the daemon does: when home is empty, homeID = ""
 	// The buggy code would write frameMeta.Home = "" here, erasing the snap1 ID
 
 	// Step 3: Re-add the same content to home
+	rewriteStart := time.Now()
 	if err := os.WriteFile(testFile1, []byte("initial content\n"), 0644); err != nil {
 		t.Fatalf("re-write file1: %v", err)
 	}
+	t.Logf("[debug] rewrite took %s (wall time since remove start: %s)", time.Since(rewriteStart), time.Since(removeStart))
+	mtime2Raw := statDebug(t, "after rewrite", testFile1)
+
+	// Hypothesis A: mtime granularity/coarsening. Linux's current_time() often
+	// uses a coarse (jiffy-granularity) clock for inode timestamps, so two
+	// writes completing within the same tick can get an identical mtime even
+	// though real wall-clock time has passed between them; crossing a tick
+	// boundary produces a different mtime. Log the raw delta to check this.
+	t.Logf("[debug] mtime delta (rewrite - first write) = %d ns (equal=%v)", mtime2Raw-mtime1Raw, mtime2Raw == mtime1Raw)
+
+	// Hypothesis B: the parent lookup itself (path match) or the size
+	// comparison, not the mtime comparison, is what's causing the miss. Cross
+	// check directly against the entry that ended up in snap1's TSM, using the
+	// same field the indexer's reuseParentChunks will compare against.
+	if parentEntry, ok := snap1TSM.LookupPath("file1.txt"); ok {
+		t.Logf("[debug] parent(snap1) TSM entry: size=%d mtime=%d; fresh stat: mtime=%d; sizeMatch=%v mtimeMatch=%v (predicts reuse=%v)",
+			parentEntry.Size, parentEntry.Mtime, mtime2Raw,
+			parentEntry.Size == uint64(len("initial content\n")), parentEntry.Mtime == mtime2Raw,
+			parentEntry.Type == tsm.EntryTypeFile && parentEntry.Size == uint64(len("initial content\n")) && parentEntry.Mtime == mtime2Raw)
+	} else {
+		t.Logf("[debug] parent(snap1) TSM has no entry for file1.txt (LookupPath miss) - hypothesis: path key mismatch")
+	}
+
+	// Enable the tsm package's internal reuse-decision debug logging (see
+	// tsm/indexer.go reuseParentChunks) for this run, so we get the indexer's
+	// own view of the comparison it performed.
+	t.Setenv("TSM_DEBUG_REUSE", "1")
 
 	// Step 4: Index home again with snap1 as parent
 	// This simulates what SHOULD happen: even though home was temporarily empty,

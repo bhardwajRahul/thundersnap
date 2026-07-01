@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // DownloadOptions configures the TSM/TSC-based snapshot download.
@@ -282,6 +283,18 @@ func downloadFiles(opts downloadFilesOpts) error {
 		// permission/ownership may legitimately fail without root.
 		_ = os.Chmod(tmpPath, os.FileMode(entry.Mode&0xFFF))
 		_ = os.Lchown(tmpPath, int(entry.UID), int(entry.GID))
+
+		// Restore the original mtime recorded in the manifest. This is purely
+		// for display/POSIX-semantics fidelity: mtime is not trusted as a
+		// change-detection signal (see indexer.go's reuseParentChunks, which
+		// relies on ctime instead, precisely because mtime can be freely set
+		// by any process and so must not be trusted for that purpose). ctime
+		// itself cannot be, and is not, restored here - it is intentionally
+		// left as whatever the kernel stamps during this extraction, since
+		// that is the receiving host's own tamper-resistant record of when
+		// the file was actually written locally.
+		mtime := time.Unix(0, entry.Mtime)
+		_ = os.Chtimes(tmpPath, mtime, mtime)
 
 		// Rename to final location
 		if err := os.Rename(tmpPath, outputPath); err != nil {

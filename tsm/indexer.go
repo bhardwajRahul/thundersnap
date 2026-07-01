@@ -310,11 +310,18 @@ func (idx *Indexer) processFileChunks(path string, size int64) ([]uint32, error)
 // filesystem (which equals the parent's mtime precisely because the file is
 // unchanged), so the resulting TSM hash is identical to a full re-index.
 func (idx *Indexer) reuseParentChunks(entry *TSMEntry) ([]uint32, bool) {
+	// TSM_DEBUG_REUSE=1 enables verbose logging of the reuse decision, for
+	// debugging TestSnapshotHomeWorkIncrementalPreserveParent flakiness.
+	debug := os.Getenv("TSM_DEBUG_REUSE") != ""
+
 	if idx.opts.ParentTSM == nil || idx.opts.ParentTSC == nil {
 		return nil, false
 	}
 	parent, ok := idx.opts.ParentTSM.LookupPath(entry.Path)
 	if !ok {
+		if debug {
+			fmt.Fprintf(os.Stderr, "[tsm debug] reuseParentChunks: path=%q no parent entry (LookupPath miss)\n", entry.Path)
+		}
 		return nil, false
 	}
 	// Only reuse when nothing observable about the file content has changed.
@@ -323,7 +330,17 @@ func (idx *Indexer) reuseParentChunks(entry *TSMEntry) ([]uint32, bool) {
 	if parent.Type != EntryTypeFile ||
 		parent.Size != entry.Size ||
 		parent.Mtime != entry.Mtime {
+		if debug {
+			fmt.Fprintf(os.Stderr, "[tsm debug] reuseParentChunks: path=%q MISMATCH typeOK=%v sizeMatch=%v (parent=%d entry=%d) mtimeMatch=%v (parent=%d entry=%d delta=%dns)\n",
+				entry.Path, parent.Type == EntryTypeFile,
+				parent.Size == entry.Size, parent.Size, entry.Size,
+				parent.Mtime == entry.Mtime, parent.Mtime, entry.Mtime, entry.Mtime-parent.Mtime)
+		}
 		return nil, false
+	}
+	if debug {
+		fmt.Fprintf(os.Stderr, "[tsm debug] reuseParentChunks: path=%q MATCH size=%d mtime=%d -> reusing %d chunk(s)\n",
+			entry.Path, entry.Size, entry.Mtime, len(parent.ChunkRefs))
 	}
 
 	chunkRefs := make([]uint32, 0, len(parent.ChunkRefs))

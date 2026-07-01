@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFetchFullFile(t *testing.T) {
@@ -201,6 +202,98 @@ func TestDownloadIntegration(t *testing.T) {
 	}
 
 	t.Log("Download integration test passed")
+}
+
+// TestDownloadRestoresMtime verifies that extracting a downloaded snapshot
+// restores each file's original mtime, as recorded in the manifest at index
+// time - not the time at which the file happened to be extracted.
+func TestDownloadRestoresMtime(t *testing.T) {
+	peerDir := t.TempDir()
+	snapName := "mtimesnap"
+	snapDir := filepath.Join(peerDir, snapName)
+
+	if err := os.MkdirAll(snapDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	testFile := filepath.Join(snapDir, "testfile.txt")
+	if err := os.WriteFile(testFile, []byte("content\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set a distinctive mtime (including a non-zero nanosecond component,
+	// to check restoration is nanosecond-accurate) before indexing, so the
+	// manifest records exactly this value rather than "now".
+	wantMtime := time.Date(2005, time.March, 4, 12, 34, 56, 123456789, time.UTC)
+	if err := os.Chtimes(testFile, wantMtime, wantMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	// Generate TSM/TSC from the file with its pre-set mtime.
+	outBase := filepath.Join(peerDir, snapName)
+	if err := Create(snapDir, outBase, IndexerOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outBase+".stamp", []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Serve the peer's files over HTTP, same as TestDownloadIntegration.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/bupdate/")
+		fullPath := filepath.Join(peerDir, path)
+
+		rangeHeader := r.Header.Get("Range")
+		if rangeHeader != "" {
+			var start, end int64
+			fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+
+			f, err := os.Open(fullPath)
+			if err != nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			defer f.Close()
+
+			stat, _ := f.Stat()
+			if end >= stat.Size() {
+				end = stat.Size() - 1
+			}
+
+			f.Seek(start, 0)
+			data := make([]byte, end-start+1)
+			f.Read(data)
+
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, stat.Size()))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(data)
+			return
+		}
+
+		http.ServeFile(w, r, fullPath)
+	}))
+	defer server.Close()
+
+	// Extract the snapshot into a different directory, simulating extraction
+	// on a completely different host/filesystem.
+	localDir := t.TempDir()
+	if _, err := Download(DownloadOptions{
+		SnapshotID: snapName,
+		SnapsDir:   localDir,
+		BaseURL:    server.URL,
+	}); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+
+	extractedFile := filepath.Join(localDir, snapName, "testfile.txt")
+	info, err := os.Stat(extractedFile)
+	if err != nil {
+		t.Fatalf("stat extracted file: %v", err)
+	}
+
+	if !info.ModTime().Equal(wantMtime) {
+		t.Errorf("extracted file mtime = %s, want %s", info.ModTime(), wantMtime)
+	}
 }
 
 func TestDownloadAlreadyExists(t *testing.T) {
