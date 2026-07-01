@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -35,6 +34,7 @@ import (
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/frames"
 	"github.com/tailscale/thundersnap/refs"
+	"github.com/tailscale/thundersnap/snaphash"
 	"github.com/tailscale/thundersnap/snapsubdir"
 	"github.com/tailscale/thundersnap/thunderproto"
 	"github.com/tailscale/thundersnap/thundersnap"
@@ -3424,7 +3424,7 @@ func createSnapshotWithTaintsSubdir(source, subdir, parentStampID string, taints
 		cleanupTmp()
 		return "", fmt.Errorf("read tsm for checksum: %w", err)
 	}
-	snapshotID := hex.EncodeToString(tsmReader.SHA256[:])
+	snapshotID := snaphash.Encode(snaphash.Hash(tsmReader.SHA256))
 
 	finalPath := filepath.Join(*flagSnapsDir, snapshotID)
 	finalTSMPath := finalPath + ".tsm"

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
+	"github.com/tailscale/thundersnap/snaphash"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -377,6 +378,33 @@ func installBusyboxAppletInFrame(t *testing.T, d *daemonInstance, refName, apple
 	t.Logf("Installed busybox applet %s in frame %s via SFTP", applet, refName)
 }
 
+// verifySnaphashOutput confirms that the value printed by `ts snap` to
+// stdout is a snaphash (or a "rootfs:home:work" frame spec of snaphashes,
+// with "nil" allowed for absent components), not e.g. a raw hex-encoded
+// SHA-256 string.
+func verifySnaphashOutput(t *testing.T, output string) {
+	t.Helper()
+
+	id := strings.TrimSpace(output)
+	if id == "" {
+		t.Fatalf("ts snap: expected a snapshot ID, got empty output")
+	}
+
+	components := strings.Split(id, ":")
+	for _, c := range components {
+		if c == "nil" {
+			continue
+		}
+		if len(c) != snaphash.EncodedSize {
+			t.Errorf("ts snap: component %q has length %d, want %d (snaphash-encoded)", c, len(c), snaphash.EncodedSize)
+			continue
+		}
+		if _, err := snaphash.Decode(c); err != nil {
+			t.Errorf("ts snap: component %q is not a valid snaphash: %v", c, err)
+		}
+	}
+}
+
 // TestSSHContainerBasic is a true end-to-end test: start daemon, SSH in,
 // create a frame via `ts frame`, then exercise ts snap/snaps/log/frames.
 // No manual frame/ref creation - everything goes through the daemon.
@@ -418,15 +446,19 @@ func TestSSHContainerBasic(t *testing.T) {
 	}
 	t.Logf("echo output (testframe): %s", output)
 
-	// Test ts snap: create a snapshot of the current frame
-	output, exitCode, err = sshExec(t, d, "testframe", "ts snap")
+	// Test ts snap: create a snapshot of the current frame. Use sshExecSplit
+	// so progress output on stderr doesn't get mixed into the snapshot ID we
+	// verify on stdout.
+	snapStdout, snapStderr, exitCode, err := sshExecSplit(t, d, "testframe", "ts snap")
 	if err != nil {
 		t.Fatalf("ts snap failed: %v", err)
 	}
 	if exitCode != 0 {
-		t.Errorf("ts snap: expected exit code 0, got %d (output: %q)", exitCode, output)
+		t.Errorf("ts snap: expected exit code 0, got %d (stdout: %q, stderr: %q)", exitCode, snapStdout, snapStderr)
 	}
-	t.Logf("ts snap output: %s", output)
+	t.Logf("ts snap stdout: %s", snapStdout)
+	t.Logf("ts snap stderr: %s", snapStderr)
+	verifySnaphashOutput(t, snapStdout)
 
 	// Test ts snaps: list snapshots, should include the one we just created
 	output, exitCode, err = sshExec(t, d, "testframe", "ts snaps")
