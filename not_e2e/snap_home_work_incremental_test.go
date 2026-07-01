@@ -6,28 +6,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/tailscale/thundersnap/tsm"
 )
-
-// statDebug stats path and logs its raw (nanosecond) mtime/ctime and inode,
-// for correlating with the timestamps embedded in TSM entries. Used to
-// diagnose TestSnapshotHomeWorkIncrementalPreserveParent flakiness.
-func statDebug(t *testing.T, label, path string) (mtimeNs int64) {
-	t.Helper()
-	var st syscall.Stat_t
-	if err := syscall.Stat(path, &st); err != nil {
-		t.Fatalf("stat %s (%s): %v", path, label, err)
-	}
-	t.Logf("[debug] %s: path=%s ino=%d mtime=%d (%s) ctime=%d (%s)",
-		label, path, st.Ino,
-		st.Mtim.Nano(), time.Unix(0, st.Mtim.Nano()).Format(time.RFC3339Nano),
-		st.Ctim.Nano(), time.Unix(0, st.Ctim.Nano()).Format(time.RFC3339Nano))
-	return st.Mtim.Nano()
-}
 
 // TestSnapshotHomeWorkIncrementalPreserveParent is the regression test for the
 // bug where running `ts snap` repeatedly on a frame with /home and /work nested
@@ -39,8 +22,20 @@ func statDebug(t *testing.T, label, path string) (mtimeNs int64) {
 // if home or work was empty during a snap, homeID/workID would be "", which
 // ERASED the previous snap ID needed for incremental indexing on subsequent snaps.
 //
-// This test verifies that the parent snap ID is preserved across snaps even when
-// home/work is temporarily empty.
+// This test operates directly at the tsm indexing layer (below the daemon's
+// frameMeta bookkeeping) to verify the underlying contract that bookkeeping
+// depends on: given a *preserved* parent manifest, re-indexing a directory
+// whose files are otherwise untouched must reuse their chunks rather than
+// re-hashing them. It uses a "persistent" file (never touched, to prove reuse
+// works when the parent is preserved) alongside a "transient" file that is
+// removed and recreated (to simulate home being temporarily empty).
+//
+// Note on the transient file: reuse is keyed on ctime (see indexer.go's
+// reuseParentChunks), which is kernel-controlled and always changes when a
+// file is removed and recreated - even with byte-identical content. So the
+// recreated file is *expected* to be re-hashed, not reused; what matters is
+// that this is done safely (correct content) and does not affect the
+// persistent file's ability to be reused via the preserved parent.
 func TestSnapshotHomeWorkIncrementalPreserveParent(t *testing.T) {
 	env := newTestEnv(t)
 
@@ -80,12 +75,28 @@ func TestSnapshotHomeWorkIncrementalPreserveParent(t *testing.T) {
 		t.Fatalf("btrfs create work subvol: %v\n%s", err, out)
 	}
 
-	// Add some initial content to home so it gets snapped
-	testFile1 := filepath.Join(homePath, "file1.txt")
-	if err := os.WriteFile(testFile1, []byte("initial content\n"), 0644); err != nil {
-		t.Fatalf("write file1: %v", err)
+	// persistentFile is never touched after this initial write, so its
+	// ctime never changes; it's the file that should demonstrate reuse.
+	// transientFile simulates content that briefly disappears (home going
+	// empty) and comes back with identical bytes but a new ctime.
+	persistentFile := filepath.Join(homePath, "persistent.txt")
+	transientFile := filepath.Join(homePath, "transient.txt")
+	transientContent := []byte("transient content\n")
+
+	if err := os.WriteFile(persistentFile, []byte("persistent content\n"), 0644); err != nil {
+		t.Fatalf("write persistent.txt: %v", err)
 	}
-	mtime1Raw := statDebug(t, "after first write", testFile1)
+	if err := os.WriteFile(transientFile, transientContent, 0644); err != nil {
+		t.Fatalf("write transient.txt: %v", err)
+	}
+
+	// Reuse is keyed on ctime (see indexer.go's reuseParentChunks), and a
+	// ctime observed within the racy-ctime window of an indexing run's
+	// start is deliberately treated as unsafe to trust (the "racy git"
+	// technique - see racyAdjustedCtime). Sleep past that window before the
+	// first snap so persistent.txt's recorded ctime is trustworthy and
+	// reuse can happen on the very next snap.
+	time.Sleep(1200 * time.Millisecond)
 
 	// Step 1: First snap - this creates the initial home snap and writes frameMeta.Home
 	snap1Path := filepath.Join(env.snapshotsDir, "incr-hw-snap1")
@@ -109,54 +120,22 @@ func TestSnapshotHomeWorkIncrementalPreserveParent(t *testing.T) {
 		t.Fatalf("read snap1 tsc: %v", err)
 	}
 
-	// Step 2: Empty home and snap again
-	// In the buggy code, this would clear frameMeta.Home to ""
-	removeStart := time.Now()
-	if err := os.RemoveAll(testFile1); err != nil {
-		t.Fatalf("remove file1: %v", err)
+	// Step 2: Simulate the reported bug scenario - transient content goes
+	// away (home would look "empty" of it) and comes back with the same
+	// bytes. In the buggy daemon code, any snap of home while it lacked
+	// content would erase frameMeta.Home, losing the parent ID needed for
+	// incremental indexing on the next real snap.
+	if err := os.RemoveAll(transientFile); err != nil {
+		t.Fatalf("remove transient.txt: %v", err)
 	}
-	t.Logf("[debug] remove took %s", time.Since(removeStart))
-
-	// Home is now empty, so a snap of home would produce no homeID
-	// Simulating what the daemon does: when home is empty, homeID = ""
-	// The buggy code would write frameMeta.Home = "" here, erasing the snap1 ID
-
-	// Step 3: Re-add the same content to home
-	rewriteStart := time.Now()
-	if err := os.WriteFile(testFile1, []byte("initial content\n"), 0644); err != nil {
-		t.Fatalf("re-write file1: %v", err)
-	}
-	t.Logf("[debug] rewrite took %s (wall time since remove start: %s)", time.Since(rewriteStart), time.Since(removeStart))
-	mtime2Raw := statDebug(t, "after rewrite", testFile1)
-
-	// Hypothesis A: mtime granularity/coarsening. Linux's current_time() often
-	// uses a coarse (jiffy-granularity) clock for inode timestamps, so two
-	// writes completing within the same tick can get an identical mtime even
-	// though real wall-clock time has passed between them; crossing a tick
-	// boundary produces a different mtime. Log the raw delta to check this.
-	t.Logf("[debug] mtime delta (rewrite - first write) = %d ns (equal=%v)", mtime2Raw-mtime1Raw, mtime2Raw == mtime1Raw)
-
-	// Hypothesis B: the parent lookup itself (path match) or the size
-	// comparison, not the mtime comparison, is what's causing the miss. Cross
-	// check directly against the entry that ended up in snap1's TSM, using the
-	// same field the indexer's reuseParentChunks will compare against.
-	if parentEntry, ok := snap1TSM.LookupPath("file1.txt"); ok {
-		t.Logf("[debug] parent(snap1) TSM entry: size=%d mtime=%d; fresh stat: mtime=%d; sizeMatch=%v mtimeMatch=%v (predicts reuse=%v)",
-			parentEntry.Size, parentEntry.Mtime, mtime2Raw,
-			parentEntry.Size == uint64(len("initial content\n")), parentEntry.Mtime == mtime2Raw,
-			parentEntry.Type == tsm.EntryTypeFile && parentEntry.Size == uint64(len("initial content\n")) && parentEntry.Mtime == mtime2Raw)
-	} else {
-		t.Logf("[debug] parent(snap1) TSM has no entry for file1.txt (LookupPath miss) - hypothesis: path key mismatch")
+	if err := os.WriteFile(transientFile, transientContent, 0644); err != nil {
+		t.Fatalf("re-write transient.txt: %v", err)
 	}
 
-	// Enable the tsm package's internal reuse-decision debug logging (see
-	// tsm/indexer.go reuseParentChunks) for this run, so we get the indexer's
-	// own view of the comparison it performed.
-	t.Setenv("TSM_DEBUG_REUSE", "1")
-
-	// Step 4: Index home again with snap1 as parent
-	// This simulates what SHOULD happen: even though home was temporarily empty,
-	// the parent ID from the first snap should be preserved for incremental indexing.
+	// Step 3: Index home again with snap1 as parent. This simulates what
+	// SHOULD happen: even though transient.txt briefly disappeared, the
+	// parent ID from the first snap is preserved and passed through for
+	// incremental indexing.
 	snap3Path := filepath.Join(env.snapshotsDir, "incr-hw-snap3")
 	idx3 := tsm.NewIndexer(tsm.IndexerOptions{
 		ParentTSM: snap1TSM,
@@ -168,29 +147,67 @@ func TestSnapshotHomeWorkIncrementalPreserveParent(t *testing.T) {
 	stats3 := idx3.Stats()
 	t.Logf("third home snap (with parent): files=%d, reused=%d", stats3.FileCount, stats3.ReusedFiles)
 
-	// The key assertion: since the content is identical to snap1, the file should
-	// be reused (not re-indexed). If the parent was lost (frameMeta.Home = ""),
-	// this would be 0 reused and we'd have done a full re-hash.
-	regularFiles := 0
-	for i := range snap1TSM.Entries {
-		if snap1TSM.Entries[i].Type == tsm.EntryTypeFile {
-			regularFiles++
-		}
-	}
-	if regularFiles == 0 {
-		t.Fatal("snap1 has no regular files")
-	}
-
-	if stats3.ReusedFiles != regularFiles {
-		t.Errorf("expected all %d files reused, got %d reused; parent snap ID was likely lost", regularFiles, stats3.ReusedFiles)
-	}
-
-	// Verify the manifest SHA matches (content-identical means same hash)
 	snap3TSM, err := tsm.ReadTSM(snap3Path + ".tsm")
 	if err != nil {
 		t.Fatalf("read snap3 tsm: %v", err)
 	}
-	if snap3TSM.SHA256 != snap1TSM.SHA256 {
-		t.Errorf("snap3 SHA differs from snap1: %x != %x", snap3TSM.SHA256, snap1TSM.SHA256)
+	snap3TSC, err := tsm.ReadTSC(snap3Path + ".tsc")
+	if err != nil {
+		t.Fatalf("read snap3 tsc: %v", err)
+	}
+
+	// stats3.FileCount also counts the root directory entry itself (not
+	// just regular files), so check the regular-file count from the TSM
+	// entries directly rather than asserting on FileCount.
+	regularFiles := 0
+	for i := range snap3TSM.Entries {
+		if snap3TSM.Entries[i].Type == tsm.EntryTypeFile {
+			regularFiles++
+		}
+	}
+	if regularFiles != 2 {
+		t.Fatalf("expected 2 regular files (persistent.txt, transient.txt), got %d", regularFiles)
+	}
+
+	// The key assertion for the original bug: persistent.txt was never
+	// touched, so with the parent snap ID correctly preserved, its chunks
+	// must be reused rather than re-hashed. If the parent had been lost
+	// (frameMeta.Home = ""), this would show 0 reused files instead.
+	if stats3.ReusedFiles != 1 {
+		t.Errorf("expected exactly 1 reused file (persistent.txt), got %d reused; parent snap ID was likely lost", stats3.ReusedFiles)
+	}
+
+	persistentEntry, ok := snap3TSM.LookupPath("persistent.txt")
+	if !ok {
+		t.Fatal("snap3 has no entry for persistent.txt")
+	}
+	parentPersistentEntry, ok := snap1TSM.LookupPath("persistent.txt")
+	if !ok {
+		t.Fatal("snap1 has no entry for persistent.txt")
+	}
+	if len(persistentEntry.ChunkRefs) == 0 || len(persistentEntry.ChunkRefs) != len(parentPersistentEntry.ChunkRefs) {
+		t.Fatalf("persistent.txt chunk count mismatch: snap1=%d snap3=%d",
+			len(parentPersistentEntry.ChunkRefs), len(persistentEntry.ChunkRefs))
+	}
+	parentSHAs := tsm.GetFileChunkSHAs(parentPersistentEntry, snap1TSC)
+	gotSHAs := tsm.GetFileChunkSHAs(persistentEntry, snap3TSC)
+	for i := range parentSHAs {
+		if parentSHAs[i] != gotSHAs[i] {
+			t.Errorf("persistent.txt chunk %d SHA differs between snap1 and snap3: %x != %x", i, parentSHAs[i], gotSHAs[i])
+		}
+	}
+
+	// transient.txt was removed and recreated, so its ctime necessarily
+	// changed: it must NOT be falsely reused (that would be indistinguishable
+	// from silently keeping stale/wrong content), but it must still be
+	// correctly re-indexed with the right content.
+	transientEntry, ok := snap3TSM.LookupPath("transient.txt")
+	if !ok {
+		t.Fatal("snap3 has no entry for transient.txt")
+	}
+	transientSHAs := tsm.GetFileChunkSHAs(transientEntry, snap3TSC)
+	wantSHA := tsm.BlobSHA256(transientContent)
+	if len(transientSHAs) != 1 || transientSHAs[0] != wantSHA {
+		t.Errorf("transient.txt content incorrect after recreation: got chunk SHAs %x, want [%x]", transientSHAs, wantSHA)
 	}
 }

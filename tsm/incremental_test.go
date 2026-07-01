@@ -141,6 +141,98 @@ func TestIncrementalRehashChangedFile(t *testing.T) {
 	}
 }
 
+// TestRacyAdjustedCtime verifies the "racy git" adjustment: a ctime observed
+// within racyCtimeWindow of the reference time (the start of the indexing/
+// extraction run) is decremented by one nanosecond so that it can never
+// match a genuine future observation of the same real ctime value, while a
+// ctime safely outside the window is stored unmodified.
+func TestRacyAdjustedCtime(t *testing.T) {
+	ref := time.Unix(1000, 0)
+
+	// Well outside the window: stored as-is.
+	old := ref.Add(-10 * time.Second).UnixNano()
+	if got := racyAdjustedCtime(old, ref); got != old {
+		t.Errorf("ctime outside racy window: got %d, want unmodified %d", got, old)
+	}
+
+	// Exactly at the edge of the window (racyCtimeWindow before ref): the
+	// comparison is a strict "<", so this is not racy and should be
+	// unmodified.
+	edge := ref.Add(-racyCtimeWindow).UnixNano()
+	if got := racyAdjustedCtime(edge, ref); got != edge {
+		t.Errorf("ctime at racy window edge: got %d, want unmodified %d", got, edge)
+	}
+
+	// Inside the window (including exactly at ref, i.e. zero delta): stored
+	// decremented by one nanosecond.
+	for _, delta := range []time.Duration{0, 1 * time.Millisecond, racyCtimeWindow - 1} {
+		racy := ref.Add(-delta).UnixNano()
+		want := racy - 1
+		if got := racyAdjustedCtime(racy, ref); got != want {
+			t.Errorf("ctime %v inside racy window: got %d, want decremented %d", delta, got, want)
+		}
+	}
+}
+
+// TestReuseParentChunksRejectsRacyCollision is a white-box regression test
+// for the scenario racyAdjustedCtime exists to guard against: two distinct
+// writes to the same path, at the same size, whose *real* ctimes are
+// identical due to coarse filesystem/clock timestamp resolution (a "racy"
+// collision). If reuse were keyed on the raw ctime value, the second write's
+// content would be indistinguishable from the first and would be wrongly
+// reused.
+//
+// This is tested deterministically (without depending on actual filesystem
+// timing) by directly constructing a parent manifest whose stored ctime is
+// the racy-adjusted value (realCtime-1, as racyAdjustedCtime would have
+// produced when that entry was originally indexed within the racy window),
+// and calling the unexported reuseParentChunks with a fresh entry carrying
+// the colliding real ctime and identical size. The mismatch (realCtime-1 !=
+// realCtime) must force a rehash rather than a false reuse.
+func TestReuseParentChunksRejectsRacyCollision(t *testing.T) {
+	const path = "colliding.txt"
+	const size = uint64(4096)
+	const realCtime = int64(1_700_000_000_000_000_000) // arbitrary Unix nanos
+
+	parentTSC := &TSCReader{
+		Entries: []TSCEntry{
+			{SHA256: BlobSHA256([]byte("first content")), Size: 32},
+		},
+	}
+	parentTSM := &TSMReader{
+		Entries: []TSMEntry{
+			{
+				Path:       path,
+				Type:       EntryTypeFile,
+				Size:       size,
+				Ctime:      realCtime - 1, // as racyAdjustedCtime would have stored
+				ChunkStart: 0,
+				ChunkCount: 1,
+				ChunkRefs:  []uint32{0},
+			},
+		},
+	}
+
+	idx := NewIndexer(IndexerOptions{
+		ParentTSM: parentTSM,
+		ParentTSC: parentTSC,
+	})
+
+	// Fresh entry: same path and size, but the real (colliding) ctime -
+	// simulating a second, different write that the coarse clock stamped
+	// with the identical timestamp as the first.
+	entry := &TSMEntry{
+		Path:  path,
+		Type:  EntryTypeFile,
+		Size:  size,
+		Ctime: realCtime,
+	}
+
+	if _, ok := idx.reuseParentChunks(entry); ok {
+		t.Fatal("reuseParentChunks falsely reused chunks across a racy ctime collision")
+	}
+}
+
 func mustWrite(t *testing.T, path string, data []byte) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
