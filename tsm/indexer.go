@@ -25,12 +25,45 @@ type IndexerOptions struct {
 	CrossDevice bool
 
 	// ParentTSM and ParentTSC, if both non-nil, enable incremental indexing:
-	// a regular file whose path, size and mtime match the parent snapshot is
+	// a regular file whose path, size and ctime match the parent snapshot is
 	// assumed unchanged, so its chunk hashes are reused from the parent
 	// instead of re-reading and re-hashing the file content. This makes a
 	// second consecutive snap of an unchanged tree avoid all file I/O.
+	//
+	// ctime (not mtime) is used as the change-detection signal because
+	// mtime is freely settable by any unprivileged process (utimensat/
+	// os.Chtimes), so a file's content could be changed and its mtime reset
+	// to an old value, defeating mtime-based detection. ctime is
+	// kernel-controlled and bumped on any metadata change, including a
+	// write, so it cannot be forged the same way.
 	ParentTSM *TSMReader
 	ParentTSC *TSCReader
+}
+
+// racyCtimeWindow is the window (the "racy git" technique) within which an
+// observed ctime is too close to the start of this indexing run to be
+// trusted as final. Some filesystems/clocks (e.g. Linux's jiffy-granularity
+// coarse inode timestamps) can produce identical timestamps for two writes
+// that are microseconds apart in wall-clock time, so a ctime observed within
+// this window of "now" cannot yet be trusted to be stable: a subsequent
+// write landing in the same coarse clock tick could produce an identical
+// ctime and go undetected.
+const racyCtimeWindow = 1 * time.Second
+
+// racyAdjustedCtime returns the ctime value to *store* for change-detection
+// purposes. If ctime is within racyCtimeWindow of referenceTime (the start
+// of the indexing/extraction run that observed it), it is not yet safe to
+// trust, so a deliberately-wrong value (ctime minus one nanosecond) is
+// recorded instead. This guarantees a future comparison against this file's
+// real ctime will always mismatch - forcing a re-hash rather than a
+// possibly-incorrect reuse - until enough wall-clock time has passed that
+// the ctime is no longer racy, at which point it is recorded as-is and safe
+// reuse becomes possible again.
+func racyAdjustedCtime(ctime int64, referenceTime time.Time) int64 {
+	if referenceTime.Sub(time.Unix(0, ctime)) < racyCtimeWindow {
+		return ctime - 1
+	}
+	return ctime
 }
 
 // Indexer creates TSM and TSC files from a filesystem
@@ -43,6 +76,13 @@ type Indexer struct {
 	fileCount  int
 	totalBytes int64
 	lastUpdate time.Time
+
+	// indexStart is when this indexing run began. It is the reference point
+	// for the racy-ctime check (see racyAdjustedCtime): using the start of
+	// the run, rather than the time each individual file happens to be
+	// visited, is the conservative choice recommended by the "racy git"
+	// technique this is modeled on.
+	indexStart time.Time
 
 	// reusedFiles counts files whose chunks were reused from the parent
 	// snapshot (i.e. not re-hashed) during incremental indexing.
@@ -68,6 +108,7 @@ func NewIndexer(opts IndexerOptions) *Indexer {
 
 // Index indexes a filesystem path and writes TSM/TSC files
 func (idx *Indexer) Index(rootPath, outBase string) error {
+	idx.indexStart = time.Now()
 	idx.rootPath = filepath.Clean(rootPath)
 
 	// Get root device ID for filesystem boundary detection
@@ -217,7 +258,7 @@ func (idx *Indexer) processEntry(path, relPath string, info os.FileInfo, entryIn
 		}
 
 		// Incremental fast path: if the parent snapshot has an identical
-		// (path, size, mtime) regular file, reuse its chunks instead of
+		// (path, size, ctime) regular file, reuse its chunks instead of
 		// re-reading and re-hashing the content.
 		if chunkRefs, ok := idx.reuseParentChunks(entry); ok {
 			entry.ChunkRefs = chunkRefs
@@ -232,6 +273,12 @@ func (idx *Indexer) processEntry(path, relPath string, info os.FileInfo, entryIn
 			entry.ChunkRefs = chunkRefs
 			entry.ChunkCount = uint32(len(chunkRefs))
 		}
+
+		// Apply the racy-ctime adjustment to the value that gets *stored*
+		// for future change detection (see racyAdjustedCtime). This must
+		// happen after reuseParentChunks, which needs the real, current
+		// ctime to compare against the parent.
+		entry.Ctime = racyAdjustedCtime(entry.Ctime, idx.indexStart)
 
 	case mode&os.ModeSymlink != 0:
 		entry.Type = EntryTypeSymlink
@@ -300,15 +347,25 @@ func (idx *Indexer) processFileChunks(path string, size int64) ([]uint32, error)
 }
 
 // reuseParentChunks checks whether the given regular-file entry is unchanged
-// since the parent snapshot (same path, size and mtime). If so, it copies the
+// since the parent snapshot (same path, size and ctime). If so, it copies the
 // parent's chunks into this indexer's TSC and returns the new chunk refs,
 // avoiding any read/hash of the file content. The second return value reports
 // whether the fast path was taken.
 //
+// ctime, rather than mtime, is the comparison signal: mtime can be forged by
+// any unprivileged process (e.g. via os.Chtimes) to make changed content look
+// unchanged, whereas ctime is kernel-controlled and always bumped when a
+// file's content or metadata changes. To guard against ctime's coarse
+// resolution on some filesystems/clocks, entries have already had
+// racyAdjustedCtime applied when they were stored as a parent, so a ctime
+// that was too close to "now" at that time will safely fail to match here
+// and force a re-hash.
+//
 // Reusing chunks is safe for snapshot-ID reproducibility: the reused chunks
 // have identical SHA/size/level, and the entry's mtime is taken from the
-// filesystem (which equals the parent's mtime precisely because the file is
-// unchanged), so the resulting TSM hash is identical to a full re-index.
+// filesystem, so the resulting TSM hash (which is computed over mtime, not
+// ctime - see encodeEntryForHash) is identical to a full re-index whenever
+// the file is genuinely unchanged.
 func (idx *Indexer) reuseParentChunks(entry *TSMEntry) ([]uint32, bool) {
 	// TSM_DEBUG_REUSE=1 enables verbose logging of the reuse decision, for
 	// debugging TestSnapshotHomeWorkIncrementalPreserveParent flakiness.
@@ -325,22 +382,20 @@ func (idx *Indexer) reuseParentChunks(entry *TSMEntry) ([]uint32, bool) {
 		return nil, false
 	}
 	// Only reuse when nothing observable about the file content has changed.
-	// btrfs preserves nanosecond mtime, so an exact match means the file was
-	// not rewritten since the parent snapshot was taken.
 	if parent.Type != EntryTypeFile ||
 		parent.Size != entry.Size ||
-		parent.Mtime != entry.Mtime {
+		parent.Ctime != entry.Ctime {
 		if debug {
-			fmt.Fprintf(os.Stderr, "[tsm debug] reuseParentChunks: path=%q MISMATCH typeOK=%v sizeMatch=%v (parent=%d entry=%d) mtimeMatch=%v (parent=%d entry=%d delta=%dns)\n",
+			fmt.Fprintf(os.Stderr, "[tsm debug] reuseParentChunks: path=%q MISMATCH typeOK=%v sizeMatch=%v (parent=%d entry=%d) ctimeMatch=%v (parent=%d entry=%d delta=%dns)\n",
 				entry.Path, parent.Type == EntryTypeFile,
 				parent.Size == entry.Size, parent.Size, entry.Size,
-				parent.Mtime == entry.Mtime, parent.Mtime, entry.Mtime, entry.Mtime-parent.Mtime)
+				parent.Ctime == entry.Ctime, parent.Ctime, entry.Ctime, entry.Ctime-parent.Ctime)
 		}
 		return nil, false
 	}
 	if debug {
-		fmt.Fprintf(os.Stderr, "[tsm debug] reuseParentChunks: path=%q MATCH size=%d mtime=%d -> reusing %d chunk(s)\n",
-			entry.Path, entry.Size, entry.Mtime, len(parent.ChunkRefs))
+		fmt.Fprintf(os.Stderr, "[tsm debug] reuseParentChunks: path=%q MATCH size=%d ctime=%d -> reusing %d chunk(s)\n",
+			entry.Path, entry.Size, entry.Ctime, len(parent.ChunkRefs))
 	}
 
 	chunkRefs := make([]uint32, 0, len(parent.ChunkRefs))

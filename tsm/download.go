@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -61,6 +62,7 @@ type DownloadResult struct {
 // 3. Download .tsc file (chunk index)
 // 4. For each file, fetch chunks via HTTP range requests (with local dedup)
 func Download(opts DownloadOptions) (*DownloadResult, error) {
+	downloadStart := time.Now()
 	snapshotPath := filepath.Join(opts.SnapsDir, opts.SnapshotID)
 
 	// Check if snapshot already exists
@@ -186,15 +188,24 @@ func Download(opts DownloadOptions) (*DownloadResult, error) {
 		fmt.Fprintf(opts.ProgressWriter, "Downloading %d files...\n", fileCount)
 	}
 
+	// localCtimes collects, per file path, the ctime actually observed on
+	// this host after extraction (populated by downloadFiles). These are
+	// patched into the local .tsm below so that this host's own change
+	// detection (see indexer.go's reuseParentChunks) is based on ctimes that
+	// are meaningful here, rather than the sending peer's.
+	localCtimes := make(map[string]int64)
+
 	if err := downloadFiles(downloadFilesOpts{
-		targetDir:   tmpSnapshotDir,
-		baseURL:     baseURL,
-		snapshotID:  opts.SnapshotID,
-		tsm:         tsmReader,
-		tsc:         tscReader,
-		localChunks: localChunks,
-		client:      client,
-		progress:    opts.ProgressWriter,
+		targetDir:     tmpSnapshotDir,
+		baseURL:       baseURL,
+		snapshotID:    opts.SnapshotID,
+		tsm:           tsmReader,
+		tsc:           tscReader,
+		localChunks:   localChunks,
+		client:        client,
+		progress:      opts.ProgressWriter,
+		downloadStart: downloadStart,
+		localCtimes:   localCtimes,
 	}); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("downloading files: %w", err)
@@ -206,12 +217,21 @@ func Download(opts DownloadOptions) (*DownloadResult, error) {
 		return nil, fmt.Errorf("creating non-file entries: %w", err)
 	}
 
+	// Patch the locally-observed ctimes into the manifest we'll keep. This
+	// does not affect the manifest's identity hash (ctime is excluded from
+	// it - see encodeEntryForHash), so it's safe to do purely locally.
+	localTSMData, err := PatchEntryCtimes(tsmData, localCtimes)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("patching local ctimes into tsm: %w", err)
+	}
+
 	// Write temporary metadata files
 	if err := os.WriteFile(tmpStampPath, stampData, 0644); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("writing stamp: %w", err)
 	}
-	if err := os.WriteFile(tmpTSMPath, tsmData, 0644); err != nil {
+	if err := os.WriteFile(tmpTSMPath, localTSMData, 0644); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("writing tsm: %w", err)
 	}
@@ -247,6 +267,13 @@ type downloadFilesOpts struct {
 	localChunks *ChunkMap
 	client      *http.Client
 	progress    io.Writer
+
+	// downloadStart is when this download began, used as the reference
+	// point for the racy-ctime check (see racyAdjustedCtime in indexer.go).
+	downloadStart time.Time
+	// localCtimes is populated with the ctime observed on this host for
+	// each extracted file path, keyed by entry path.
+	localCtimes map[string]int64
 }
 
 // downloadFiles downloads all file entries in the TSM.
@@ -299,6 +326,17 @@ func downloadFiles(opts downloadFilesOpts) error {
 		// Rename to final location
 		if err := os.Rename(tmpPath, outputPath); err != nil {
 			return fmt.Errorf("renaming %s: %w", entry.Path, err)
+		}
+
+		// Capture the ctime the kernel actually stamped on this host during
+		// extraction, so it can be patched into the local .tsm as the
+		// change-detection signal for future incremental indexing (see
+		// indexer.go's reuseParentChunks). The sender's ctime (still present
+		// in the downloaded .tsm bytes at this point) is meaningless here.
+		if fi, err := os.Lstat(outputPath); err == nil {
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+				opts.localCtimes[entry.Path] = racyAdjustedCtime(st.Ctim.Nano(), opts.downloadStart)
+			}
 		}
 
 		fileCount++

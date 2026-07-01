@@ -500,6 +500,64 @@ func decodeEntry(data []byte) (*TSMEntry, error) {
 	return entry, nil
 }
 
+// PatchEntryCtimes returns a copy of tsmData with the Ctime field of each
+// file entry overwritten with the value from ctimes, keyed by path. Entries
+// whose path is not present in ctimes are left unchanged.
+//
+// This is safe post-hoc surgery: ctime is excluded from the TSM's identity
+// hash (see encodeEntryForHash), so patching it does not change the
+// manifest's SHA256/snapshot ID. It exists so a downloaded snapshot's local
+// .tsm can be updated to record the receiving host's own ctimes (observed
+// after extraction) instead of the sending peer's, which are meaningless for
+// local change detection on this host.
+func PatchEntryCtimes(tsmData []byte, ctimes map[string]int64) ([]byte, error) {
+	if len(tsmData) < TSMHeaderSize+TSMFooterSize {
+		return nil, fmt.Errorf("tsm file too short")
+	}
+
+	fileCount := binary.BigEndian.Uint64(tsmData[8:16])
+	contentLen := len(tsmData) - TSMFooterSize
+
+	out := make([]byte, len(tsmData))
+	copy(out, tsmData)
+
+	offset := TSMHeaderSize
+	for seen := uint64(0); seen < fileCount; seen++ {
+		if offset+4 > contentLen {
+			return nil, fmt.Errorf("unexpected end of tsm data at offset %d", offset)
+		}
+
+		entryLen := int(binary.BigEndian.Uint16(tsmData[offset : offset+2]))
+		if entryLen < 58 {
+			return nil, fmt.Errorf("invalid entry length %d at offset %d", entryLen, offset)
+		}
+		if offset+entryLen > contentLen {
+			return nil, fmt.Errorf("entry extends beyond file at offset %d", offset)
+		}
+
+		pathLen := int(binary.BigEndian.Uint16(tsmData[offset+2 : offset+4]))
+		if offset+4+pathLen > contentLen {
+			return nil, fmt.Errorf("path extends beyond entry at offset %d", offset)
+		}
+		path := string(tsmData[offset+4 : offset+4+pathLen])
+
+		if ctime, ok := ctimes[path]; ok {
+			// Ctime field offset within the entry: 2 (entry len) + 2 (path
+			// len) + pathLen + 2 (type+flags) + 4 (mode) + 4 (uid) +
+			// 4 (gid) + 8 (size) + 8 (mtime) = 34 + pathLen.
+			ctimeOffset := offset + 34 + pathLen
+			if ctimeOffset+8 > contentLen {
+				return nil, fmt.Errorf("ctime field extends beyond entry at offset %d", offset)
+			}
+			binary.BigEndian.PutUint64(out[ctimeOffset:ctimeOffset+8], uint64(ctime))
+		}
+
+		offset += entryLen
+	}
+
+	return out, nil
+}
+
 // LookupPath finds an entry by path using binary search.
 // Returns the entry and true if found, or nil and false if not found.
 func (r *TSMReader) LookupPath(path string) (*TSMEntry, bool) {

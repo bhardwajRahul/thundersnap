@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // indexTree indexes rootPath into outBase.{tsm,tsc} using the given parent
@@ -44,6 +45,15 @@ func TestIncrementalReuseUnchangedTree(t *testing.T) {
 	if err := os.Symlink("a.txt", filepath.Join(root, "link")); err != nil {
 		t.Fatal(err)
 	}
+
+	// Reuse is keyed on ctime (see indexer.go's reuseParentChunks), and a
+	// ctime observed within racyCtimeWindow of an indexing run's start is
+	// deliberately treated as unsafe to trust (the "racy git" technique).
+	// Sleep past that window before the first index so the ctimes recorded
+	// in the parent manifest are trustworthy, letting the second index
+	// reuse them immediately rather than needing an extra rehash cycle to
+	// escape raciness.
+	time.Sleep(1200 * time.Millisecond)
 
 	out := t.TempDir()
 	base1 := filepath.Join(out, "snap1")
@@ -98,6 +108,11 @@ func TestIncrementalRehashChangedFile(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, "keep.txt"), bytesRepeat("keep\n", 5000))
 	mustWrite(t, filepath.Join(root, "change.txt"), bytesRepeat("before\n", 5000))
+
+	// See the comment in TestIncrementalReuseUnchangedTree: sleep past the
+	// racy-ctime window before the first index so keep.txt's recorded ctime
+	// is trustworthy for the second index's reuse check.
+	time.Sleep(1200 * time.Millisecond)
 
 	out := t.TempDir()
 	base1 := filepath.Join(out, "snap1")

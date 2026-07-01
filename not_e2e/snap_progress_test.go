@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tailscale/thundersnap/tsm"
 )
@@ -45,6 +46,15 @@ func TestSnapshotProgressReporting(t *testing.T) {
 	if out, err := exec.Command("btrfs", "subvolume", "snapshot", basePath, framePath).CombinedOutput(); err != nil {
 		t.Fatalf("btrfs snapshot frame: %v\n%s", err, out)
 	}
+
+	// Reuse is keyed on ctime (see indexer.go's reuseParentChunks), and a
+	// ctime observed within the racy-ctime window of an indexing run's start
+	// is deliberately treated as unsafe to trust (the "racy git" technique -
+	// see racyAdjustedCtime). The frame's files were just written moments
+	// ago, so sleep past that window before the first index so their
+	// recorded ctimes are trustworthy and reuse can happen on the very next
+	// index.
+	time.Sleep(1200 * time.Millisecond)
 
 	// Step 1: first (full) index with progress capture.
 	var prog1 bytes.Buffer
