@@ -589,15 +589,16 @@ func cmdFrame(args []string) {
 	}
 
 	// Two colons: snap triplet
-	// Special case: :: is a synonym for "ts frame" (print current UUID)
+	// Special case: :: snaps the current frame and creates a new frame from it
 	if spec == "::" {
-		uuid, err := doGetCurrentFrame(*sockPath)
+		// First snap the current state
+		snapTriplet, err := doSnap(*sockPath, "")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "error snapping current frame: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println(uuid)
-		return
+		// The snapshot triplet is already a valid spec (root:home:work)
+		spec = snapTriplet
 	}
 
 	// Handle empty components by inheriting from current frame, then create
@@ -1901,8 +1902,18 @@ func cmdGo(args []string) {
 				os.Exit(1)
 			}
 		} else if spec == "::" {
-			// :: is a synonym for staying in current frame
-			targetUUID = currentUUID
+			// :: snaps current frame and creates a new frame from it
+			snapTriplet, err := doSnap(*sockPath, "")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error snapping current frame: %v\n", err)
+				os.Exit(1)
+			}
+			targetUUID, err = doCreate(*sockPath, snapTriplet, *isolation, "")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+			createdNewFrame = true
 		} else {
 			// Snap triplet - create new frame
 			snapshotSpec, err := resolveSnapTriplet(*sockPath, spec)
