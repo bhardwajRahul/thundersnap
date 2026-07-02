@@ -531,6 +531,16 @@ func cmdContainerInit(args []string) {
 		fmt.Fprintf(os.Stderr, "warning: failed to make mounts private: %v (ok in VM mode)\n", err)
 	}
 
+	// Bind-mount chrootPath to itself to ensure it's explicitly in this mount
+	// namespace's mount table. This is needed for nested containers: when running
+	// inside a container, the outer /work bind mount isn't automatically copied
+	// to our new mount namespace. By explicitly bind-mounting chrootPath, we
+	// ensure processes that later join via setns(CLONE_NEWNS) can see it.
+	if err := unix.Mount(chrootPath, chrootPath, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to bind-mount %s: %v\n", chrootPath, err)
+		os.Exit(1)
+	}
+
 	// Chroot into the container rootfs
 	if err := unix.Chroot(chrootPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to chroot to %s: %v\n", chrootPath, err)
