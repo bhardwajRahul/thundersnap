@@ -412,10 +412,17 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 	serveArgs := append([]string{
 		"session-serve", ptyFlag, strconv.Itoa(len(argv)),
 	}, argv...)
+	// TODO: --keep-dev-caps is currently always passed to allow running
+	// thundersnap recursively inside a thundersnap container (for development).
+	// This retains CAP_MKNOD so nested thundersnap can mount devtmpfs and create
+	// device nodes. This should be made configurable per-frame or per-session
+	// once we have a mechanism to request it (e.g., a frame metadata flag or
+	// SSH user prefix like "dev@frame").
 	dropCapsArgs := append([]string{
 		"drop-caps-and-run",
 		"--chroot=" + rootPrefix,
 		"--skip-mount-setup",
+		"--keep-dev-caps",
 		"--",
 		"/bin/ts",
 	}, serveArgs...)

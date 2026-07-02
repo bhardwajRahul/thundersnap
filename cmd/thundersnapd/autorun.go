@@ -280,7 +280,10 @@ func (m *autorunManager) runOnce(ctx context.Context, proc *autorunProcess) erro
 	}
 
 	// The command is: ts drop-caps-and-run --chroot=<framePath> -- <argv...>
-	args := []string{"drop-caps-and-run", "--chroot=" + framePath, "--"}
+	// TODO: --keep-dev-caps is currently always passed to allow running
+	// thundersnap recursively (for development). See vshd's buildSessionCmd
+	// for the full rationale; this should be made configurable.
+	args := []string{"drop-caps-and-run", "--chroot=" + framePath, "--keep-dev-caps", "--"}
 	args = append(args, proc.argv...)
 
 	cmd := exec.CommandContext(ctx, tsBinary, args...)

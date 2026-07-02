@@ -28,7 +28,7 @@ import (
 //   - CAP_SYS_MODULE: prevents loading kernel modules
 //   - CAP_SYS_BOOT: prevents reboot
 //   - CAP_SYS_TIME: prevents changing system clock
-//   - CAP_MKNOD: prevents creating device nodes
+//   - CAP_MKNOD: prevents creating device nodes (unless --keep-dev-caps)
 //   - CAP_AUDIT_WRITE: prevents writing to audit log
 //   - CAP_SETFCAP: prevents setting file capabilities
 func cmdDropCapsAndRun(args []string) {
@@ -37,6 +37,7 @@ func cmdDropCapsAndRun(args []string) {
 	var skipMountSetup bool
 	var usePty bool
 	var mountVsock bool
+	var keepDevCaps bool
 	var cmdArgs []string
 
 	for i := 0; i < len(args); i++ {
@@ -65,6 +66,10 @@ func cmdDropCapsAndRun(args []string) {
 			// Set by the VM init cmdline: the vshd that runs as init needs
 			// /dev/vsock to listen on AF_VSOCK. Containers never pass this.
 			mountVsock = true
+		} else if args[i] == "--keep-dev-caps" {
+			// Keep CAP_MKNOD so nested thundersnap can mount devtmpfs and create
+			// device nodes. Used when developing thundersnap inside thundersnap.
+			keepDevCaps = true
 		} else if args[i] == "--" {
 			cmdArgs = args[i+1:]
 			break
@@ -152,15 +157,19 @@ func cmdDropCapsAndRun(args []string) {
 		}
 	}
 
-	// Capabilities to drop from the bounding set
+	// Capabilities to drop from the bounding set. When keepDevCaps is true,
+	// we retain CAP_MKNOD so nested thundersnap can mount devtmpfs and create
+	// device nodes for its own containers.
 	capsToDrop := []uintptr{
 		unix.CAP_NET_ADMIN,
 		unix.CAP_SYS_MODULE,
 		unix.CAP_SYS_BOOT,
 		unix.CAP_SYS_TIME,
-		unix.CAP_MKNOD,
 		unix.CAP_AUDIT_WRITE,
 		unix.CAP_SETFCAP,
+	}
+	if !keepDevCaps {
+		capsToDrop = append(capsToDrop, unix.CAP_MKNOD)
 	}
 
 	// Drop each capability from the bounding set
