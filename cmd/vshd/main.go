@@ -418,54 +418,24 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 	// device nodes. This should be made configurable per-frame or per-session
 	// once we have a mechanism to request it (e.g., a frame metadata flag or
 	// SSH user prefix like "dev@frame").
-	// Check if we can join the container-init's mount namespace by testing if
-	// the rootPrefix would be accessible from there. We do this by checking if
-	// the target's root (via /proc/<pid>/root) matches ours. If container-init
-	// has chrooted into rootPrefix and we can see that via /proc, then setns
-	// will work and we can skip mount setup. If not (nested container scenario),
-	// we skip -m and do mount setup ourselves.
-	canJoinMountNs := true
-	targetRootPath := fmt.Sprintf("/proc/%d/root", initPid)
-	if targetRoot, err := os.Readlink(targetRootPath); err == nil {
-		// container-init chrooted to rootPrefix, so targetRoot should be rootPrefix
-		// If we can stat it, the mount ns join should work
-		if _, err := os.Stat(targetRoot); err != nil {
-			canJoinMountNs = false
-		}
-	}
-
-	var dropCapsArgs, nsenterArgs []string
-	if canJoinMountNs {
-		// Normal case: join mount namespace, skip mount setup (container-init did it)
-		dropCapsArgs = append([]string{
-			"drop-caps-and-run",
-			"--chroot=" + rootPrefix,
-			"--skip-mount-setup",
-			"--keep-dev-caps",
-			"--",
-			"/bin/ts",
-		}, serveArgs...)
-		nsenterArgs = append([]string{
-			"nsenter",
-			"-t", strconv.Itoa(initPid), "-p", "-m", "-u", "--",
-			innerTs,
-		}, dropCapsArgs...)
-	} else {
-		// Nested container: can't join mount namespace (outer bind mounts not visible).
-		// Skip -m, do mount setup ourselves after chroot.
-		dropCapsArgs = append([]string{
-			"drop-caps-and-run",
-			"--chroot=" + rootPrefix,
-			"--keep-dev-caps",
-			"--",
-			"/bin/ts",
-		}, serveArgs...)
-		nsenterArgs = append([]string{
-			"nsenter",
-			"-t", strconv.Itoa(initPid), "-p", "-u", "--",
-			innerTs,
-		}, dropCapsArgs...)
-	}
+	//
+	// Always join the container-init's mount namespace. container-init bind-mounts
+	// chrootPath to itself before chroot to ensure it's in the mount table for
+	// processes that later join via setns(CLONE_NEWNS). This approach ensures
+	// identical behavior in all environments (host, nested container, VM).
+	dropCapsArgs := append([]string{
+		"drop-caps-and-run",
+		"--chroot=" + rootPrefix,
+		"--skip-mount-setup",
+		"--keep-dev-caps",
+		"--",
+		"/bin/ts",
+	}, serveArgs...)
+	nsenterArgs := append([]string{
+		"nsenter",
+		"-t", strconv.Itoa(initPid), "-p", "-m", "-u", "--",
+		innerTs,
+	}, dropCapsArgs...)
 
 	cmd := exec.Command(tsBinaryPath, nsenterArgs...)
 	cmd.Env = sessionEnv(wantPTY)
