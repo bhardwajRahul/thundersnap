@@ -126,6 +126,29 @@ const vsockPort = 5222
 
 var connectionID uint64
 
+// monitorLifecycleFd reads from the given fd until EOF (or error), then exits
+// the process. This ties vshd's lifetime to the parent: the parent creates a
+// pipe, passes the read end as lifecycleFd, and keeps the write end open. When
+// the parent exits (or crashes), the write end closes, we see EOF, and exit.
+func monitorLifecycleFd(fd int) {
+	f := os.NewFile(uintptr(fd), "lifecycle-fd")
+	if f == nil {
+		log.Printf("lifecycle-fd %d is invalid, ignoring", fd)
+		return
+	}
+	defer f.Close()
+
+	// Block until EOF or error
+	buf := make([]byte, 1)
+	for {
+		_, err := f.Read(buf)
+		if err != nil {
+			log.Printf("lifecycle-fd closed, exiting")
+			os.Exit(0)
+		}
+	}
+}
+
 // tsBinaryPath is the path to the ts binary, determined at startup.
 // This is set based on where vshd is located (sibling in bin/ directory).
 var tsBinaryPath = "/bin/ts"
@@ -457,9 +480,17 @@ func main() {
 	unixPath := flag.String("unix", "", "listen on this Unix socket path (host mode) instead of vsock (VM mode)")
 	tsPath := flag.String("ts", "", "path to the ts binary used for nsenter (default: derived from vshd's location)")
 	cgroupParent := flag.String("cgroup-parent", "", "parent cgroup name for per-session resource limits (host mode; empty disables)")
+	lifecycleFd := flag.Int("lifecycle-fd", -1, "file descriptor to monitor; vshd exits when this fd closes (used for parent-death cleanup)")
 	flag.Parse()
 
 	log.Printf("vshd starting up")
+
+	// If a lifecycle fd is provided, monitor it in a goroutine and exit when it
+	// closes. This ties vshd's lifetime to the parent process: when the parent
+	// dies (or explicitly closes the fd), we exit cleanly instead of orphaning.
+	if *lifecycleFd >= 0 {
+		go monitorLifecycleFd(*lifecycleFd)
+	}
 
 	// In host mode the daemon passes its cgroup parent name so vshd can apply
 	// per-session memory/pids/cpu limits to each container child. In a VM the

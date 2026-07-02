@@ -326,9 +326,10 @@ func (m *vmxSessionManager) releaseVMX(tailscaleUser, isolationName string) {
 // the VMX request header, and vshd's buildSessionCmd joins/creates that frame's
 // namespace. The process is started lazily on first session and reused.
 type hostVshdManager struct {
-	mu       sync.Mutex
-	cmd      *exec.Cmd
-	sockPath string
+	mu          sync.Mutex
+	cmd         *exec.Cmd
+	sockPath    string
+	lifecycleFd *os.File // write end of lifecycle pipe; kept open to keep vshd alive
 }
 
 var hostVshd = &hostVshdManager{}
@@ -348,6 +349,10 @@ func (m *hostVshdManager) ensure() (sockPath string, err error) {
 		log.Printf("host vshd died, restarting")
 		m.cmd.Wait()
 		m.cmd = nil
+		if m.lifecycleFd != nil {
+			m.lifecycleFd.Close()
+			m.lifecycleFd = nil
+		}
 	}
 
 	vshdBin := filepath.Join(fsDirLibexec, "vshd")
@@ -359,19 +364,35 @@ func (m *hostVshdManager) ensure() (sockPath string, err error) {
 	sockPath = filepath.Join(sockDir, "host-vshd.sock")
 	os.Remove(sockPath)
 
+	// Create a pipe for lifecycle management: vshd monitors the read end and
+	// exits when it closes. We keep the write end open; when thundersnapd exits
+	// (or crashes), the write end closes and vshd exits instead of orphaning.
+	lifecycleR, lifecycleW, err := os.Pipe()
+	if err != nil {
+		return "", fmt.Errorf("create lifecycle pipe: %w", err)
+	}
+
 	// Pass the daemon's cgroup parent so host vshd applies the same per-session
 	// memory/pids/cpu limits the daemon used to apply itself, preserving
 	// fork-bomb/OOM protection now that the session child is spawned by vshd.
+	// The lifecycle fd is passed as fd 3 (ExtraFiles[0]).
 	cmd := exec.Command(vshdBin,
 		"--unix="+sockPath,
 		"--ts="+tsBin,
 		"--cgroup-parent="+cgroupManager.ParentName(),
+		"--lifecycle-fd=3",
 	)
+	cmd.ExtraFiles = []*os.File{lifecycleR}
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
+		lifecycleR.Close()
+		lifecycleW.Close()
 		return "", fmt.Errorf("start host vshd: %w", err)
 	}
+
+	// Close the read end in the parent - vshd has its own copy now.
+	lifecycleR.Close()
 
 	// Wait for the socket to appear (up to ~5s) so the first dial does not race
 	// vshd's listen.
@@ -384,7 +405,8 @@ func (m *hostVshdManager) ensure() (sockPath string, err error) {
 
 	m.cmd = cmd
 	m.sockPath = sockPath
-	log.Printf("host vshd started (pid %d) listening on %s", cmd.Process.Pid, sockPath)
+	m.lifecycleFd = lifecycleW
+	log.Printf("host vshd started (pid %d) listening on %s with lifecycle fd", cmd.Process.Pid, sockPath)
 	return sockPath, nil
 }
 
