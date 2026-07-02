@@ -13,9 +13,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 )
 
 // VMConfig holds configuration for starting a VM session.
@@ -99,6 +101,11 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		"--shared-dir="+cfg.RootFS,
 		"--cache=always",
 	)
+	// Pdeathsig ensures virtiofsd exits when its parent (thundersnapd/test harness)
+	// dies, preventing orphaned virtiofsd processes.
+	virtiofsdCmd.SysProcAttr = &syscall.SysProcAttr{
+		Pdeathsig: unix.SIGTERM,
+	}
 	virtiofsdCmd.Stderr = os.Stderr
 	if err := virtiofsdCmd.Start(); err != nil {
 		return nil, fmt.Errorf("start virtiofsd: %w", err)
@@ -141,6 +148,11 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		"-g", "10.0.2.2", // gateway address
 		"-D", "none", // don't intercept DNS
 	)
+	// Pdeathsig ensures passt exits when its parent (thundersnapd/test harness)
+	// dies, preventing orphaned passt processes.
+	passtCmd.SysProcAttr = &syscall.SysProcAttr{
+		Pdeathsig: unix.SIGTERM,
+	}
 	passtCmd.Stderr = os.Stderr
 	if err := passtCmd.Start(); err != nil {
 		passtCmd = nil // not started; don't let cleanup deref a nil Process
@@ -235,6 +247,11 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// to fd 3 in the child (after stdin/stdout/stderr = 0/1/2), which must match
 	// eventMonitorFd above: keep this slice exactly one element long.
 	chvCmd.ExtraFiles = []*os.File{eventWritePipe}
+	// Pdeathsig ensures cloud-hypervisor exits when its parent (thundersnapd/test
+	// harness) dies, preventing orphaned VMs.
+	chvCmd.SysProcAttr = &syscall.SysProcAttr{
+		Pdeathsig: unix.SIGTERM,
+	}
 
 	session := &VMSession{
 		virtiofsdCmd:   virtiofsdCmd,
