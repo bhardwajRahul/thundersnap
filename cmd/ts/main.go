@@ -23,9 +23,12 @@ import (
 	"syscall"
 	"time"
 
+	"net"
+
 	"github.com/mdlayher/vsock"
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/thunderclient"
+	"github.com/tailscale/thundersnap/thunderproto"
 	"github.com/tailscale/thundersnap/tsm"
 	"github.com/tailscale/thundersnap/vshdproto"
 	"golang.org/x/term"
@@ -1933,19 +1936,61 @@ func cmdGo(args []string) {
 	os.Exit(exitCode)
 }
 
-// vshPort is the vsock port used for vsh shell connections.
-const vshPort = 5222
-
 // hostCID is the vsock context ID of the host.
 const hostCID = 2
 
-// runVsockSession connects to vshd via vsock and runs an interactive session.
+// inVM reports whether we are running inside a VM with vsock support.
+func inVM() bool {
+	_, err := os.Stat("/dev/vsock")
+	return err == nil
+}
+
+// dialVshd connects to vshd using the appropriate transport. In VMs (when
+// /dev/vsock exists) it connects directly via vsock to the host; in containers
+// it connects to the Unix socket at sockPath and performs the CONNECT 5222
+// handshake to be proxied to vshd.
+func dialVshd() (net.Conn, error) {
+	if inVM() {
+		// In a VM: connect directly via vsock to the host.
+		conn, err := vsock.Dial(hostCID, thunderproto.VshPort, nil)
+		if err != nil {
+			return nil, fmt.Errorf("vsock dial: %w", err)
+		}
+		return conn, nil
+	}
+
+	// In a container: connect to the Unix socket with CONNECT 5222 handshake.
+	conn, err := net.Dial("unix", *sockPath)
+	if err != nil {
+		return nil, fmt.Errorf("dial control socket: %w", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	if err := thunderproto.WriteClientHandshakePort(conn, reader, thunderproto.VshPort); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("vshd handshake: %w", err)
+	}
+
+	return &bufferedConn{Conn: conn, reader: reader}, nil
+}
+
+// bufferedConn wraps a net.Conn with a buffered reader for the handshake.
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+// runVsockSession connects to vshd and runs an interactive session.
 // It returns the exit code from the remote session.
 func runVsockSession(frameUUID string) (int, error) {
-	// Connect to vshd via vsock
-	conn, err := vsock.Dial(hostCID, vshPort, nil)
+	// Connect to vshd via vsock (VM) or control socket proxy (container)
+	conn, err := dialVshd()
 	if err != nil {
-		return 1, fmt.Errorf("vsock dial: %w", err)
+		return 1, err
 	}
 	defer conn.Close()
 

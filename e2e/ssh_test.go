@@ -308,15 +308,17 @@ func createFrameViaDaemon(t *testing.T, d *daemonInstance, refName string) strin
 		t.Fatalf("createFrameViaDaemon: ts frame returned exit code %d: %s", exitCode, output)
 	}
 
-	// Parse the UUID from output like "Created frame <uuid> with ref <refname>"
-	// or "Created frame <uuid>"
+	// Parse the UUID from output. ts frame outputs just the UUID on stdout,
+	// but stderr may contain progress messages like "Creating frame...".
+	// Look for the last line that looks like a UUID (contains dashes, 36 chars).
 	output = strings.TrimSpace(output)
-	parts := strings.Fields(output)
-	for i, p := range parts {
-		if p == "frame" && i+1 < len(parts) {
-			uuid := parts[i+1]
-			t.Logf("Created frame %s with ref %s", uuid, refName)
-			return uuid
+	lines := strings.Split(output, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		// UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars with dashes)
+		if len(line) == 36 && strings.Count(line, "-") == 4 {
+			t.Logf("Created frame %s with ref %s", line, refName)
+			return line
 		}
 	}
 	t.Fatalf("createFrameViaDaemon: could not parse UUID from output: %q", output)

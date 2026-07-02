@@ -1528,7 +1528,7 @@ func (c *controlServer) serve() {
 	}
 }
 
-// handleConn handles a single connection with vsock handshake then HTTP.
+// handleConn handles a single connection with vsock handshake then HTTP or vshd proxy.
 func (c *controlServer) handleConn(conn net.Conn) {
 	defer conn.Close()
 
@@ -1536,15 +1536,36 @@ func (c *controlServer) handleConn(conn net.Conn) {
 	// control sockets: a real cloud-hypervisor vsock (for VM/VMX frames) and this
 	// Unix socket (for plain container frames). Cloud-hypervisor's vsock requires
 	// a "CONNECT <port>\n" / "OK <port>\n" text handshake before the real stream,
-	// so we emulate that handshake here over the Unix socket and only then speak
-	// HTTP, letting the client be oblivious to which transport it actually got.
+	// so we emulate that handshake here and dispatch based on port:
+	//   - Port 5223: HTTP control protocol (snap, refs, etc.)
+	//   - Port 5222: vshd proxy (for ts go/undo from inside containers)
 	reader := bufio.NewReader(conn)
-	if err := thunderproto.ReadServerHandshake(conn, reader); err != nil {
+	port, err := thunderproto.ParseConnectLine(reader)
+	if err != nil {
+		thunderproto.WriteError(conn, "invalid handshake")
 		log.Printf("control socket: handshake failed: %v", err)
 		return
 	}
 
-	// Now serve HTTP on this connection
+	switch port {
+	case thunderproto.Port: // 5223 - HTTP control
+		if err := thunderproto.WriteOK(conn, port); err != nil {
+			log.Printf("control socket: failed to write OK: %v", err)
+			return
+		}
+		c.serveHTTP(conn, reader)
+
+	case thunderproto.VshPort: // 5222 - vshd proxy
+		c.proxyVshd(conn, reader)
+
+	default:
+		thunderproto.WriteError(conn, "invalid port")
+		log.Printf("control socket: unknown port %d", port)
+	}
+}
+
+// serveHTTP handles the HTTP control protocol after the CONNECT handshake.
+func (c *controlServer) serveHTTP(conn net.Conn, reader *bufio.Reader) {
 	for {
 		req, err := http.ReadRequest(reader)
 		if err != nil {
@@ -1566,6 +1587,55 @@ func (c *controlServer) handleConn(conn net.Conn) {
 		// HTTP/1.0 style: close after one request
 		return
 	}
+}
+
+// proxyVshd proxies a vshd session from the client to host-vshd.sock.
+// This enables ts go/undo to work from inside containers by routing
+// vshd connections through the control socket.
+func (c *controlServer) proxyVshd(clientConn net.Conn, clientReader *bufio.Reader) {
+	// Get the host vshd socket path
+	vshdSock, err := hostVshd.ensure()
+	if err != nil {
+		thunderproto.WriteError(clientConn, "vshd unavailable")
+		log.Printf("control socket: vshd proxy failed to ensure host vshd: %v", err)
+		return
+	}
+
+	// Connect to the host vshd
+	vshdConn, err := net.Dial("unix", vshdSock)
+	if err != nil {
+		thunderproto.WriteError(clientConn, "vshd connect failed")
+		log.Printf("control socket: vshd proxy failed to connect to %s: %v", vshdSock, err)
+		return
+	}
+	defer vshdConn.Close()
+
+	// Send OK to client now that we have a vshd connection
+	if err := thunderproto.WriteOK(clientConn, thunderproto.VshPort); err != nil {
+		log.Printf("control socket: vshd proxy failed to write OK: %v", err)
+		return
+	}
+
+	// Bidirectional proxy between client and vshd.
+	// Any data already buffered by clientReader must be forwarded first.
+	done := make(chan struct{}, 2)
+
+	// Client -> vshd (use clientReader which may have buffered data)
+	go func() {
+		io.Copy(vshdConn, clientReader)
+		vshdConn.(*net.UnixConn).CloseWrite()
+		done <- struct{}{}
+	}()
+
+	// vshd -> client
+	go func() {
+		io.Copy(clientConn, vshdConn)
+		done <- struct{}{}
+	}()
+
+	// Wait for both directions to complete
+	<-done
+	<-done
 }
 
 // controlResponseWriter implements http.ResponseWriter for control socket connections.
