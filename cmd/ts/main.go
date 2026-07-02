@@ -1565,9 +1565,9 @@ func doLog(sockPath, uuid string) error {
 
 	for _, entry := range result.History {
 		if entry.Message != "" {
-			fmt.Printf("%s  %s  %s\n", entry.Snap, entry.Time, entry.Message)
+			fmt.Printf("%s  %s  %s\n", entry.Time, entry.Snap, entry.Message)
 		} else {
-			fmt.Printf("%s  %s\n", entry.Snap, entry.Time)
+			fmt.Printf("%s  %s\n", entry.Time, entry.Snap)
 		}
 	}
 	return nil
