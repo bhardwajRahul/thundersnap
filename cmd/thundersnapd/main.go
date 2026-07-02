@@ -1504,6 +1504,11 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux.HandleFunc("/reflog", cs.handleReflog)
 	mux.HandleFunc("/log", cs.handleLog)
 	mux.HandleFunc("/autorun", cs.handleAutorun)
+	// Frame resolution and history management for ts frame/go/undo
+	mux.HandleFunc("/frame", cs.handleFrame)
+	mux.HandleFunc("/resolve-frame", cs.handleResolveFrame)
+	mux.HandleFunc("/clone-history", cs.handleCloneHistory)
+	mux.HandleFunc("/prune-history", cs.handlePruneHistory)
 	cs.handler = mux
 
 	go cs.serve()
