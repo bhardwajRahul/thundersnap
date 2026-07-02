@@ -9,19 +9,28 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	neturl "net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	"net"
+
+	"github.com/mdlayher/vsock"
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/thunderclient"
+	"github.com/tailscale/thundersnap/thunderproto"
 	"github.com/tailscale/thundersnap/tsm"
+	"github.com/tailscale/thundersnap/vshdproto"
 	"golang.org/x/term"
 )
 
@@ -35,8 +44,10 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  ping           send a ping to thundersnapd")
 	fmt.Fprintln(os.Stderr, "  snap           create a snapshot of the current container/VM")
 	fmt.Fprintln(os.Stderr, "  snaps          list all snapshots with sizes")
-	fmt.Fprintln(os.Stderr, "  frame          create a new frame from root:home:work snaps")
+	fmt.Fprintln(os.Stderr, "  frame          resolve or create frames")
 	fmt.Fprintln(os.Stderr, "  frames         list all frames with status")
+	fmt.Fprintln(os.Stderr, "  go             enter a frame (create/resolve + start session)")
+	fmt.Fprintln(os.Stderr, "  undo           jump backward in time by one snap")
 	fmt.Fprintln(os.Stderr, "  ref            manage refs (named pointers to frames)")
 	fmt.Fprintln(os.Stderr, "  refs           list all refs")
 	fmt.Fprintln(os.Stderr, "  reflog         show ref history")
@@ -105,6 +116,10 @@ func main() {
 		cmdLog(cmdArgs)
 	case "autorun":
 		cmdAutorun(cmdArgs)
+	case "go":
+		cmdGo(cmdArgs)
+	case "undo":
+		cmdUndo(cmdArgs)
 	case "drop-caps-and-run":
 		// Hidden command - not listed in usage
 		cmdDropCapsAndRun(cmdArgs)
@@ -509,7 +524,7 @@ func doListSnaps(sockPath string) error {
 func cmdFrame(args []string) {
 	opts := getopt.New()
 	opts.SetProgram("ts frame")
-	opts.SetParameters("<snapshot-spec>")
+	opts.SetParameters("[<spec>]")
 	isolation := opts.StringLong("isolation", 0, "", "isolation level: vm, container, none")
 	refName := opts.StringLong("ref", 0, "", "create a ref with this name pointing at the new frame")
 	deleteFlag := opts.BoolLong("delete", 'd', "delete a frame by UUID")
@@ -531,38 +546,93 @@ func cmdFrame(args []string) {
 		return
 	}
 
+	// No argument: print current frame UUID
+	if opts.NArgs() == 0 {
+		uuid, err := doGetCurrentFrame(*sockPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(uuid)
+		return
+	}
+
 	if opts.NArgs() != 1 {
-		fmt.Fprintln(os.Stderr, "error: frame requires exactly one argument: snapshot-spec")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "usage: ts frame [--isolation=<level>] [--ref=<name>] <snapshot-spec>")
-		fmt.Fprintln(os.Stderr, "       ts frame --delete <uuid>")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "snapshot-spec format: <rootfs>:<home>:<work>")
-		fmt.Fprintln(os.Stderr, "  Use 'nil' for empty components, e.g., abc123:nil:nil")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "options:")
-		fmt.Fprintln(os.Stderr, "  --ref <name>         create a ref pointing at the new frame")
-		fmt.Fprintln(os.Stderr, "  --isolation <level>  vm, container, or none")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "examples:")
-		fmt.Fprintln(os.Stderr, "  ts frame abc123:nil:nil             rootfs only")
-		fmt.Fprintln(os.Stderr, "  ts frame abc123:def456:nil          rootfs + home")
-		fmt.Fprintln(os.Stderr, "  ts frame --ref=prod abc123:def456:ghi789   full frame with ref")
+		frameUsage()
 		os.Exit(1)
 	}
 
-	snapshotSpec := opts.Arg(0)
+	spec := opts.Arg(0)
+
+	// Validate snap triplet syntax: exactly two colons required for creation
+	colonCount := strings.Count(spec, ":")
+	if colonCount == 1 {
+		fmt.Fprintln(os.Stderr, "error: invalid spec - one colon is invalid")
+		fmt.Fprintln(os.Stderr, "       use two colons for snap triplet: root:home:work")
+		os.Exit(1)
+	}
+	if colonCount > 2 {
+		fmt.Fprintln(os.Stderr, "error: invalid spec - too many colons")
+		fmt.Fprintln(os.Stderr, "       snap triplet format: root:home:work (exactly two colons)")
+		os.Exit(1)
+	}
+
+	// No colons: this is a UUID or ref resolution (not creation)
+	if colonCount == 0 {
+		uuid, err := doResolveFrame(*sockPath, spec)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(uuid)
+		return
+	}
+
+	// Two colons: snap triplet
+	// Special case: :: snaps the current frame and creates a new frame from it
+	if spec == "::" {
+		// First snap the current state
+		snapTriplet, err := doSnap(*sockPath, "")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error snapping current frame: %v\n", err)
+			os.Exit(1)
+		}
+		// The snapshot triplet is already a valid spec (root:home:work)
+		spec = snapTriplet
+	}
+
+	// Handle empty components by inheriting from current frame, then create
+	snapshotSpec, err := resolveSnapTriplet(*sockPath, spec)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 
 	uuid, err := doCreate(*sockPath, snapshotSpec, *isolation, *refName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	if *refName != "" {
-		fmt.Printf("Created frame %s with ref %s\n", uuid, *refName)
-	} else {
-		fmt.Printf("Created frame %s\n", uuid)
-	}
+	// Output just the UUID for scripting
+	fmt.Println(uuid)
+}
+
+func frameUsage() {
+	fmt.Fprintln(os.Stderr, "usage: ts frame                            print current frame UUID")
+	fmt.Fprintln(os.Stderr, "       ts frame <uuid>                     validate UUID exists, print it")
+	fmt.Fprintln(os.Stderr, "       ts frame <ref>                      resolve ref to UUID")
+	fmt.Fprintln(os.Stderr, "       ts frame <root:home:work>           create frame from snap triplet")
+	fmt.Fprintln(os.Stderr, "       ts frame --delete <uuid>            delete a frame")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "snap triplet syntax (exactly two colons):")
+	fmt.Fprintln(os.Stderr, "  - empty components inherit from current frame")
+	fmt.Fprintln(os.Stderr, "  - ts frame <snap>::        replace root, keep /home and /work")
+	fmt.Fprintln(os.Stderr, "  - ts frame :<snap>:        replace /home only")
+	fmt.Fprintln(os.Stderr, "  - ts frame ::              current frame (identity)")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "options:")
+	fmt.Fprintln(os.Stderr, "  --ref <name>         create a ref pointing at the new frame")
+	fmt.Fprintln(os.Stderr, "  --isolation <level>  vm, container, or none")
 }
 
 func cmdFrames(args []string) {
@@ -715,6 +785,137 @@ func doDeleteFrame(sockPath, uuid string) error {
 	}
 
 	return nil
+}
+
+// GetFrameResponse is the response from GET /frame
+type GetFrameResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+	UUID    string `json:"uuid"`
+	Rootfs  string `json:"rootfs,omitempty"`
+	Home    string `json:"home,omitempty"`
+	Work    string `json:"work,omitempty"`
+}
+
+// doGetCurrentFrame returns the current frame's UUID.
+func doGetCurrentFrame(sockPath string) (string, error) {
+	client := thunderclient.NewHTTPClient(sockPath)
+
+	resp, err := client.Get("http://localhost/frame")
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result GetFrameResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return "", fmt.Errorf("%s", result.Message)
+	}
+
+	return result.UUID, nil
+}
+
+// doGetCurrentFrameInfo returns the current frame's full metadata.
+func doGetCurrentFrameInfo(sockPath string) (*GetFrameResponse, error) {
+	client := thunderclient.NewHTTPClient(sockPath)
+
+	resp, err := client.Get("http://localhost/frame")
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result GetFrameResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return nil, fmt.Errorf("%s", result.Message)
+	}
+
+	return &result, nil
+}
+
+// ResolveFrameRequest is the request body for /resolve-frame
+type ResolveFrameRequest struct {
+	Spec string `json:"spec"`
+}
+
+// ResolveFrameResponse is the response from /resolve-frame
+type ResolveFrameResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+	UUID    string `json:"uuid"`
+	Exists  bool   `json:"exists"`
+	IsRef   bool   `json:"is_ref,omitempty"`
+	RefName string `json:"ref_name,omitempty"`
+	Rootfs  string `json:"rootfs,omitempty"`
+	Home    string `json:"home,omitempty"`
+	Work    string `json:"work,omitempty"`
+}
+
+// doResolveFrame resolves a UUID or ref name to a frame UUID.
+func doResolveFrame(sockPath, spec string) (string, error) {
+	result, err := thunderclient.PostJSON[ResolveFrameRequest, ResolveFrameResponse](
+		sockPath, "/resolve-frame", ResolveFrameRequest{Spec: spec})
+	if err != nil {
+		return "", err
+	}
+	if result.Status != "ok" {
+		return "", fmt.Errorf("%s", result.Message)
+	}
+	if !result.Exists {
+		return "", fmt.Errorf("frame or ref %q not found", spec)
+	}
+	return result.UUID, nil
+}
+
+// resolveSnapTriplet resolves a snap triplet spec by filling in empty components
+// from the current frame. Returns a fully resolved spec like "abc:def:ghi".
+func resolveSnapTriplet(sockPath, spec string) (string, error) {
+	parts := strings.Split(spec, ":")
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid snap triplet: expected exactly 2 colons")
+	}
+
+	root, home, work := parts[0], parts[1], parts[2]
+
+	// If all three are specified, no need to look up current frame
+	if root != "" && home != "" && work != "" {
+		return spec, nil
+	}
+
+	// Get current frame info for inheritance
+	current, err := doGetCurrentFrameInfo(sockPath)
+	if err != nil {
+		return "", fmt.Errorf("get current frame for inheritance: %w", err)
+	}
+
+	// Fill in empty components from current frame
+	if root == "" {
+		root = current.Rootfs
+	}
+	if home == "" {
+		home = current.Home
+	}
+	if work == "" {
+		work = current.Work
+	}
+
+	// Format for the create API (empty strings become "nil" for that API)
+	formatSnap := func(s string) string {
+		if s == "" {
+			return "nil"
+		}
+		return s
+	}
+
+	return fmt.Sprintf("%s:%s:%s", formatSnap(root), formatSnap(home), formatSnap(work)), nil
 }
 
 // ListFramesResponse is the response from /list-frames
@@ -1643,4 +1844,460 @@ func doAutorunSet(sockPath, refName string, argv []string) error {
 
 func doAutorunStop(sockPath, refName string) error {
 	return doAutorun(sockPath, refName, nil)
+}
+
+// =====================================
+// ts go command
+// =====================================
+
+// cmdGo creates/resolves a frame and starts a new session inside it.
+func cmdGo(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts go")
+	opts.SetParameters("[<spec>]")
+	isolation := opts.StringLong("isolation", 0, "", "isolation level for new frames: vm, container, none")
+	// Parse expects first element to be program name (like os.Args)
+	opts.Parse(append([]string{"ts go"}, args...))
+
+	if opts.NArgs() > 1 {
+		fmt.Fprintln(os.Stderr, "usage: ts go                         enter current frame (no-op)")
+		fmt.Fprintln(os.Stderr, "       ts go <uuid>                  enter existing frame by UUID")
+		fmt.Fprintln(os.Stderr, "       ts go <ref>                   enter frame by ref name")
+		fmt.Fprintln(os.Stderr, "       ts go <root:home:work>        create and enter new frame")
+		os.Exit(1)
+	}
+
+	// Get current frame UUID for history cloning
+	currentUUID, err := doGetCurrentFrame(*sockPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	var targetUUID string
+	var createdNewFrame bool
+
+	if opts.NArgs() == 0 {
+		// No args: stay in current frame (identity operation, but still enters session)
+		targetUUID = currentUUID
+	} else {
+		spec := opts.Arg(0)
+		colonCount := strings.Count(spec, ":")
+
+		if colonCount == 1 {
+			fmt.Fprintln(os.Stderr, "error: invalid spec - one colon is invalid")
+			fmt.Fprintln(os.Stderr, "       use two colons for snap triplet: root:home:work")
+			os.Exit(1)
+		}
+		if colonCount > 2 {
+			fmt.Fprintln(os.Stderr, "error: invalid spec - too many colons")
+			os.Exit(1)
+		}
+
+		if colonCount == 0 {
+			// UUID or ref - resolve it
+			targetUUID, err = doResolveFrame(*sockPath, spec)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+		} else if spec == "::" {
+			// :: snaps current frame and creates a new frame from it
+			snapTriplet, err := doSnap(*sockPath, "")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error snapping current frame: %v\n", err)
+				os.Exit(1)
+			}
+			targetUUID, err = doCreate(*sockPath, snapTriplet, *isolation, "")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+			createdNewFrame = true
+		} else {
+			// Snap triplet - create new frame
+			snapshotSpec, err := resolveSnapTriplet(*sockPath, spec)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+			targetUUID, err = doCreate(*sockPath, snapshotSpec, *isolation, "")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+			createdNewFrame = true
+		}
+	}
+
+	// If we created a new frame, clone the parent's history
+	if createdNewFrame && currentUUID != "" {
+		if err := doCloneHistory(*sockPath, currentUUID, targetUUID); err != nil {
+			// Log but don't fail - history cloning is best-effort
+			fmt.Fprintf(os.Stderr, "warning: failed to clone history: %v\n", err)
+		}
+	}
+
+	// Connect to the target frame via vsock and start session
+	exitCode, err := runVsockSession(targetUUID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(exitCode)
+}
+
+// hostCID is the vsock context ID of the host.
+const hostCID = 2
+
+// inVM reports whether we are running inside a VM with vsock support.
+func inVM() bool {
+	_, err := os.Stat("/dev/vsock")
+	return err == nil
+}
+
+// dialVshd connects to vshd using the appropriate transport. In VMs (when
+// /dev/vsock exists) it connects directly via vsock to the host; in containers
+// it connects to the Unix socket at sockPath and performs the CONNECT 5222
+// handshake to be proxied to vshd.
+func dialVshd() (net.Conn, error) {
+	if inVM() {
+		// In a VM: connect directly via vsock to the host.
+		conn, err := vsock.Dial(hostCID, thunderproto.VshPort, nil)
+		if err != nil {
+			return nil, fmt.Errorf("vsock dial: %w", err)
+		}
+		return conn, nil
+	}
+
+	// In a container: connect to the Unix socket with CONNECT 5222 handshake.
+	conn, err := net.Dial("unix", *sockPath)
+	if err != nil {
+		return nil, fmt.Errorf("dial control socket: %w", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	if err := thunderproto.WriteClientHandshakePort(conn, reader, thunderproto.VshPort); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("vshd handshake: %w", err)
+	}
+
+	return &bufferedConn{Conn: conn, reader: reader}, nil
+}
+
+// bufferedConn wraps a net.Conn with a buffered reader for the handshake.
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+// runVsockSession connects to vshd and runs an interactive session.
+// It returns the exit code from the remote session.
+func runVsockSession(frameUUID string) (int, error) {
+	// Connect to vshd via vsock (VM) or control socket proxy (container)
+	conn, err := dialVshd()
+	if err != nil {
+		return 1, err
+	}
+	defer conn.Close()
+
+	// Determine if we have a TTY
+	isPTY := term.IsTerminal(int(os.Stdin.Fd()))
+
+	// Write the VMX protocol header: VMX\0framePath\0user\0pty\0argc\0
+	// For ts go, we always want a login shell (no command)
+	ptyFlag := "0"
+	if isPTY {
+		ptyFlag = "1"
+	}
+	// Empty user means auto-detect, empty command means login shell
+	fmt.Fprintf(conn, "VMX\x00%s\x00\x00%s\x000\x00", frameUUID, ptyFlag)
+
+	// Set up terminal raw mode if PTY
+	var oldState *term.State
+	if isPTY {
+		oldState, err = term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			return 1, fmt.Errorf("make raw: %w", err)
+		}
+		defer term.Restore(int(os.Stdin.Fd()), oldState)
+	}
+
+	// Set up signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGWINCH, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	// Mutex for writing frames (stdin and winsize both write)
+	var writeMu sync.Mutex
+	writeFrame := func(typ uint8, payload []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return vshdproto.WriteFrame(conn, typ, payload)
+	}
+
+	// Send initial window size for PTY sessions
+	if isPTY {
+		width, height, err := term.GetSize(int(os.Stdin.Fd()))
+		if err == nil {
+			writeFrame(vshdproto.FrameWinsize, vshdproto.EncodeWinsize(vshdproto.Winsize{
+				Rows: uint16(height),
+				Cols: uint16(width),
+			}))
+		}
+	}
+
+	// Done channel signals when the remote session ends
+	done := make(chan struct{})
+	exitCode := 0
+
+	// Handle signals (window resize, interrupt)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case sig := <-sigCh:
+				switch sig {
+				case syscall.SIGWINCH:
+					if isPTY {
+						width, height, err := term.GetSize(int(os.Stdin.Fd()))
+						if err == nil {
+							writeFrame(vshdproto.FrameWinsize, vshdproto.EncodeWinsize(vshdproto.Winsize{
+								Rows: uint16(height),
+								Cols: uint16(width),
+							}))
+						}
+					}
+				case syscall.SIGINT:
+					// Send Ctrl-C to remote
+					writeFrame(vshdproto.FrameStdin, []byte{3})
+				}
+			}
+		}
+	}()
+
+	// Host -> guest: send stdin as FrameStdin
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if n > 0 {
+				if werr := writeFrame(vshdproto.FrameStdin, buf[:n]); werr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	// Guest -> host: decode TLV frames
+	go func() {
+		defer close(done)
+		for {
+			typ, payload, err := vshdproto.ReadFrame(conn)
+			if err != nil {
+				break
+			}
+			switch typ {
+			case vshdproto.FrameStdout:
+				os.Stdout.Write(payload)
+			case vshdproto.FrameStderr:
+				os.Stderr.Write(payload)
+			case vshdproto.FrameExit:
+				if code, derr := vshdproto.DecodeExit(payload); derr == nil {
+					exitCode = int(code)
+				}
+			}
+		}
+	}()
+
+	// Wait for session end
+	<-done
+
+	return exitCode, nil
+}
+
+// CloneHistoryRequest is the request body for /clone-history
+type CloneHistoryRequest struct {
+	SourceUUID string `json:"source_uuid"`
+	TargetUUID string `json:"target_uuid"`
+}
+
+// CloneHistoryResponse is the response from /clone-history
+type CloneHistoryResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+func doCloneHistory(sockPath, sourceUUID, targetUUID string) error {
+	result, err := thunderclient.PostJSON[CloneHistoryRequest, CloneHistoryResponse](
+		sockPath, "/clone-history", CloneHistoryRequest{
+			SourceUUID: sourceUUID,
+			TargetUUID: targetUUID,
+		})
+	if err != nil {
+		return err
+	}
+	if result.Status != "ok" {
+		return fmt.Errorf("%s", result.Message)
+	}
+	return nil
+}
+
+// PruneHistoryRequest is the request body for /prune-history
+type PruneHistoryRequest struct {
+	UUID  string   `json:"uuid"`
+	Snaps []string `json:"snaps"`
+}
+
+// PruneHistoryResponse is the response from /prune-history
+type PruneHistoryResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+	Pruned  int    `json:"pruned"`
+}
+
+func doPruneHistory(sockPath, uuid string, snaps []string) error {
+	result, err := thunderclient.PostJSON[PruneHistoryRequest, PruneHistoryResponse](
+		sockPath, "/prune-history", PruneHistoryRequest{
+			UUID:  uuid,
+			Snaps: snaps,
+		})
+	if err != nil {
+		return err
+	}
+	if result.Status != "ok" {
+		return fmt.Errorf("%s", result.Message)
+	}
+	return nil
+}
+
+// doGetLog retrieves the frame's history log.
+func doGetLog(sockPath, uuid string) ([]LogEntry, error) {
+	client := thunderclient.NewHTTPClient(sockPath)
+
+	url := "http://localhost/log"
+	if uuid != "" {
+		url += "?uuid=" + uuid
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result LogResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+
+	if result.Status != "ok" {
+		return nil, fmt.Errorf("server error")
+	}
+
+	return result.History, nil
+}
+
+// =====================================
+// ts undo command
+// =====================================
+
+// cmdUndo jumps backward in time by one snap.
+func cmdUndo(args []string) {
+	opts := getopt.New()
+	opts.SetProgram("ts undo")
+	opts.Parse(append([]string{"ts undo"}, args...))
+
+	if opts.NArgs() > 0 {
+		fmt.Fprintln(os.Stderr, "usage: ts undo")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Jumps backward in time by one snap:")
+		fmt.Fprintln(os.Stderr, "1. Takes a snapshot of the current state")
+		fmt.Fprintln(os.Stderr, "2. Creates a new frame based on the previous snap")
+		fmt.Fprintln(os.Stderr, "3. Enters the new frame with pruned history")
+		os.Exit(1)
+	}
+
+	// 1. Get current frame info and history
+	currentUUID, err := doGetCurrentFrame(*sockPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	history, err := doGetLog(*sockPath, currentUUID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(history) == 0 {
+		fmt.Fprintln(os.Stderr, "error: no snapshots in history to undo")
+		os.Exit(1)
+	}
+
+	// The most recent snap in the log is history[0] (newest first)
+	prevSnap := history[0].Snap
+
+	// 2. Run ts snap to record current state
+	currentSnap, err := doSnap(*sockPath, "")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error taking snapshot: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 3. Get current frame metadata for home/work inheritance
+	currentFrame, err := doGetCurrentFrameInfo(*sockPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 4. Create new frame based on prev snap for rootfs, keep home/work
+	// Format: <prevSnap>:<currentHome>:<currentWork>
+	homeSnap := currentFrame.Home
+	workSnap := currentFrame.Work
+	if homeSnap == "" {
+		homeSnap = "nil"
+	}
+	if workSnap == "" {
+		workSnap = "nil"
+	}
+	snapshotSpec := fmt.Sprintf("%s:%s:%s", prevSnap, homeSnap, workSnap)
+
+	newUUID, err := doCreate(*sockPath, snapshotSpec, "", "")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error creating frame: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 5. Clone history from current frame to new frame
+	if err := doCloneHistory(*sockPath, currentUUID, newUUID); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to clone history: %v\n", err)
+	}
+
+	// 6. Prune both currentSnap and prevSnap from new frame's history
+	if err := doPruneHistory(*sockPath, newUUID, []string{currentSnap, prevSnap}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to prune history: %v\n", err)
+	}
+
+	// 7. Enter the new frame
+	fmt.Fprintf(os.Stderr, "Undoing to snap %s...\n", prevSnap)
+	exitCode, err := runVsockSession(newUUID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(exitCode)
 }

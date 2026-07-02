@@ -18,6 +18,10 @@ import (
 	"strings"
 )
 
+// VshPort is the vsock port used for vshd shell sessions. The ts go command
+// connects here to enter frames via the vsh protocol.
+const VshPort = 5222
+
 // Port is the vsock port used for the thunder control protocol. It is one past
 // VshPort (5222) so the two protocols do not collide on the same vsock CID. Both
 // the daemon's CONNECT-handshake check and the client's CONNECT request use this
@@ -31,6 +35,24 @@ const Port = 5223
 // reading subsequent bytes from r, not the raw connection.
 func WriteClientHandshake(w io.Writer, r *bufio.Reader) error {
 	if _, err := fmt.Fprintf(w, "CONNECT %d\n", Port); err != nil {
+		return fmt.Errorf("send CONNECT: %w", err)
+	}
+	response, err := r.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read handshake response: %w", err)
+	}
+	response = strings.TrimSpace(response)
+	if !strings.HasPrefix(response, "OK") {
+		return fmt.Errorf("handshake failed: %s", response)
+	}
+	return nil
+}
+
+// WriteClientHandshakePort performs the client side of the emulated vsock handshake
+// for a specific port. It sends "CONNECT <port>\n" and reads the server's reply,
+// which must begin with "OK".
+func WriteClientHandshakePort(w io.Writer, r *bufio.Reader, port int) error {
+	if _, err := fmt.Fprintf(w, "CONNECT %d\n", port); err != nil {
 		return fmt.Errorf("send CONNECT: %w", err)
 	}
 	response, err := r.ReadString('\n')
@@ -69,4 +91,37 @@ func ReadServerHandshake(w io.Writer, r *bufio.Reader) error {
 
 	fmt.Fprintf(w, "OK %d\n", port)
 	return nil
+}
+
+// ParseConnectLine reads a "CONNECT <port>\n" line from r, parses the port, and
+// returns it. On success, the caller should send "OK <port>\n" and dispatch based
+// on the port value. On error, the caller should send "ERROR ...\n" and close.
+func ParseConnectLine(r *bufio.Reader) (int, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return 0, fmt.Errorf("read handshake: %w", err)
+	}
+
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "CONNECT ") {
+		return 0, fmt.Errorf("invalid handshake: %s", line)
+	}
+	portStr := strings.TrimPrefix(line, "CONNECT ")
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid port: %s", portStr)
+	}
+	return port, nil
+}
+
+// WriteOK sends the "OK <port>\n" reply after a successful CONNECT handshake.
+func WriteOK(w io.Writer, port int) error {
+	_, err := fmt.Fprintf(w, "OK %d\n", port)
+	return err
+}
+
+// WriteError sends an "ERROR <msg>\n" reply for a failed handshake.
+func WriteError(w io.Writer, msg string) error {
+	_, err := fmt.Fprintf(w, "ERROR %s\n", msg)
+	return err
 }
