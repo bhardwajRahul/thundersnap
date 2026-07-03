@@ -58,7 +58,7 @@ e2e: ts vshd thundersnapd
 		TS_BINARY="$(CURDIR)/$(BIN)/ts" \
 		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
 		THUNDERSNAPD_BINARY="$(CURDIR)/$(BIN)/thundersnapd" \
-		$(BIN)/e2e.test -test.v -test.failfast -test.timeout=$(E2E_TEST_TIMEOUT)
+		$(BIN)/e2e.test -test.v -test.failfast -test.timeout=$(E2E_TEST_TIMEOUT) $(E2E_ARGS)
 
 # Run legacy "e2e" tests (not actually e2e - see not-e2e-enough.md)
 # These tests exercise individual components but don't go through the SSH front door.

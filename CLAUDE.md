@@ -10,6 +10,10 @@
   build tag so it is excluded from "make test" and only run via "make e2e".
 - e2e tests run simplest-to-hardest in tiers (see e2e/main_test.go TestMain); if
   an early tier fails, later tiers are skipped so you debug the root cause first.
+- To run a single e2e test, use E2E_ARGS with -test.run and log to a file:
+  `make e2e E2E_ARGS="-test.run=TestSSHContainerBasic" 2>&1 | tee e2e.log`
+  Always log output to a file (e2e tests are verbose). Tests typically complete
+  in ~30s; use a 1-2 minute timeout when waiting.
 - This project workspace may be using the 'jj' tool instead of git. Always
   check for jj first. If using jj, when making a fix, always `jj describe` it
   when done and then `jj new` so you don't accidentally mix changes
