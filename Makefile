@@ -73,7 +73,7 @@ not_e2e: ts vshd thundersnapd
 		$(BIN)/not_e2e.test -test.v -test.failfast -test.timeout=$(NOT_E2E_TEST_TIMEOUT)
 
 # Build all binaries for local development
-binaries: ts vsh vshd thundersnapd bupdate tsm fidx slab
+binaries: ts vsh vshd thundersnapd tsm
 
 # Binaries that need CGO_ENABLED=0 (run inside containers/VMs)
 ts:
@@ -93,19 +93,7 @@ thundersnapd:
 	@mkdir -p $(BIN)
 	go build -o $(BIN)/$@ ./cmd/$@
 
-bupdate:
-	@mkdir -p $(BIN)
-	go build -o $(BIN)/$@ ./cmd/$@
-
 tsm:
-	@mkdir -p $(BIN)
-	go build -o $(BIN)/$@ ./cmd/$@
-
-fidx:
-	@mkdir -p $(BIN)
-	go build -o $(BIN)/$@ ./cmd/$@
-
-slab:
 	@mkdir -p $(BIN)
 	go build -o $(BIN)/$@ ./cmd/$@
 
