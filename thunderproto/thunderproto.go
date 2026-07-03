@@ -31,6 +31,15 @@ const VshPort = 5222
 // value, so they cannot disagree.
 const Port = 5223
 
+// EnterPort is the vsock port used for the /enter session protocol. ts go uses
+// this to enter frames with full session setup handled by thundersnapd (instead
+// of the raw vshd proxy on VshPort). The protocol is:
+//  1. Client sends "CONNECT 5224\n", server responds "OK 5224\n"
+//  2. Client sends: uuid\0user\0pty\0argc\0arg0\0arg1\0...argN\0
+//  3. Server does frame setup (resolve rootfs, prepare container, start control socket)
+//  4. Connection switches to vshdproto TLV framing
+const EnterPort = 5224
+
 // WriteClientHandshake performs the client side of the emulated vsock handshake
 // over a Unix socket: it sends "CONNECT <Port>\n" and reads the server's reply,
 // which must begin with "OK". The provided reader must wrap the same connection

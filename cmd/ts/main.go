@@ -2011,51 +2011,42 @@ func inVM() bool {
 	return err == nil
 }
 
-// dialVshd connects to vshd using the appropriate transport. In VMs (when
+// dialEnter connects to the /enter endpoint on port 5224. In VMs (when
 // /dev/vsock exists) it connects directly via vsock to the host; in containers
-// it connects to the Unix socket at sockPath and performs the CONNECT 5222
-// handshake to be proxied to vshd.
-func dialVshd() (net.Conn, error) {
+// it connects to the Unix socket at sockPath and performs the CONNECT 5224
+// handshake.
+func dialEnter() (net.Conn, *bufio.Reader, error) {
 	if inVM() {
 		// In a VM: connect directly via vsock to the host.
-		conn, err := vsock.Dial(hostCID, thunderproto.VshPort, nil)
+		conn, err := vsock.Dial(hostCID, thunderproto.EnterPort, nil)
 		if err != nil {
-			return nil, fmt.Errorf("vsock dial: %w", err)
+			return nil, nil, fmt.Errorf("vsock dial: %w", err)
 		}
-		return conn, nil
+		reader := bufio.NewReader(conn)
+		return conn, reader, nil
 	}
 
-	// In a container: connect to the Unix socket with CONNECT 5222 handshake.
+	// In a container: connect to the Unix socket with CONNECT 5224 handshake.
 	conn, err := net.Dial("unix", *sockPath)
 	if err != nil {
-		return nil, fmt.Errorf("dial control socket: %w", err)
+		return nil, nil, fmt.Errorf("dial control socket: %w", err)
 	}
 
 	reader := bufio.NewReader(conn)
-	if err := thunderproto.WriteClientHandshakePort(conn, reader, thunderproto.VshPort); err != nil {
+	if err := thunderproto.WriteClientHandshakePort(conn, reader, thunderproto.EnterPort); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("vshd handshake: %w", err)
+		return nil, nil, fmt.Errorf("enter handshake: %w", err)
 	}
 
-	return &bufferedConn{Conn: conn, reader: reader}, nil
+	return conn, reader, nil
 }
 
-// bufferedConn wraps a net.Conn with a buffered reader for the handshake.
-type bufferedConn struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (c *bufferedConn) Read(p []byte) (int, error) {
-	return c.reader.Read(p)
-}
-
-// runVsockSession connects to vshd and runs a session with optional command.
+// runVsockSession connects to the /enter endpoint and runs a session with optional command.
 // If cmdArgs is empty, runs an interactive login shell.
 // It returns the exit code from the remote session.
 func runVsockSession(frameUUID string, cmdArgs []string) (int, error) {
-	// Connect to vshd via vsock (VM) or control socket proxy (container)
-	conn, err := dialVshd()
+	// Connect to /enter endpoint via vsock (VM) or control socket (container)
+	conn, reader, err := dialEnter()
 	if err != nil {
 		return 1, err
 	}
@@ -2064,16 +2055,19 @@ func runVsockSession(frameUUID string, cmdArgs []string) (int, error) {
 	// Determine if we have a TTY - but if running a command, don't request PTY
 	isPTY := term.IsTerminal(int(os.Stdin.Fd())) && len(cmdArgs) == 0
 
-	// Write the VMX protocol header: VMX\0framePath\0user\0pty\0argc\0args...
+	// Write the /enter protocol header: uuid\0user\0pty\0argc\0arg0\0arg1\0...
 	ptyFlag := "0"
 	if isPTY {
 		ptyFlag = "1"
 	}
 	// Empty user means auto-detect
-	fmt.Fprintf(conn, "VMX\x00%s\x00\x00%s\x00%d\x00", frameUUID, ptyFlag, len(cmdArgs))
+	fmt.Fprintf(conn, "%s\x00\x00%s\x00%d\x00", frameUUID, ptyFlag, len(cmdArgs))
 	for _, arg := range cmdArgs {
 		fmt.Fprintf(conn, "%s\x00", arg)
 	}
+
+	// Use the buffered reader for subsequent reads (important: the handshake
+	// response may have left bytes in the reader's buffer)
 
 	// Set up terminal raw mode if PTY
 	var oldState *term.State
@@ -2163,11 +2157,12 @@ func runVsockSession(frameUUID string, cmdArgs []string) (int, error) {
 		}()
 	}
 
-	// Guest -> host: decode TLV frames
+	// Guest -> host: decode TLV frames (using buffered reader to not lose
+	// any bytes that may have been buffered during the handshake)
 	go func() {
 		defer close(done)
 		for {
-			typ, payload, err := vshdproto.ReadFrame(conn)
+			typ, payload, err := vshdproto.ReadFrame(reader)
 			if err != nil {
 				break
 			}

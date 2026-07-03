@@ -417,39 +417,47 @@ func writeVshdRequest(conn net.Conn, framePath, targetUser string, pty bool, cmd
 	}
 }
 
-// proxyVshdSession proxies an SSH session to/from a vshd connection using the
-// vshdproto TLV framing. Host -> guest: SSH stdin is framed as FrameStdin and,
-// for PTY sessions, the initial window size plus every winCh change is sent as
-// FrameWinsize. Guest -> host: FrameStdout/FrameStderr are written to the SSH
-// stdout/stderr channels and FrameExit carries the real exit status.
+// proxyVshdSessionGeneric proxies a session to/from a vshd connection using
+// vshdproto TLV framing. This is the core proxy logic shared by SSH sessions
+// and control socket /enter sessions.
 //
-// It is shared by all vshd-backed sessions (VMX container, VMX outer shell, and
-// any future host-vshd shim).
-func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, winCh <-chan ssh.Window, done <-chan struct{}, panicked <-chan struct{}) error {
-	// The session's pty (line discipline, OPOST/ONLCR cooking, raw mode) lives
-	// inside the container/VM. gliderlabs/ssh's default "minimal PTY emulation"
-	// would re-cook our output host-side, rewriting \n -> \r\n on every
-	// FrameStdout write and ignoring raw mode. Disable it so this relay is a
-	// transparent byte pipe and the guest pty owns line discipline (classic
-	// ssh behaviour). Must precede any s.Write below.
-	s.DisablePTYEmulation()
-
+// Parameters:
+//   - clientIn: reader for client input (stdin)
+//   - clientOut: writer for session stdout
+//   - clientErr: writer for session stderr
+//   - vshdConn: connection to vshd
+//   - isPty: whether this is a PTY session
+//   - initialWinsize: initial window size for PTY sessions (ignored if !isPty)
+//   - winCh: channel of window size changes (nil for non-PTY or no resize support)
+//   - clientClosed: channel that fires when the client disconnects (may be nil)
+//   - done: channel that fires when VM exits (may be nil, for host containers)
+//   - panicked: channel that fires when VM panics (may be nil, for host containers)
+//
+// Returns the exit code from the remote process.
+func proxyVshdSessionGeneric(
+	clientIn io.Reader,
+	clientOut, clientErr io.Writer,
+	vshdConn net.Conn,
+	isPty bool,
+	initialWinsize vshdproto.Winsize,
+	winCh <-chan vshdproto.Winsize,
+	clientClosed <-chan struct{},
+	done <-chan struct{},
+	panicked <-chan struct{},
+) int {
 	// Stdin and winsize frames are written from independent goroutines; a
 	// mutex keeps each frame's header+payload contiguous on the wire.
 	var writeMu sync.Mutex
 	writeFrame := func(typ uint8, payload []byte) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		return vshdproto.WriteFrame(conn, typ, payload)
+		return vshdproto.WriteFrame(vshdConn, typ, payload)
 	}
 
 	// For PTY sessions, send the initial window size first so the guest pty is
 	// created/resized to the client's terminal rather than the default 80x24.
 	if isPty {
-		writeFrame(vshdproto.FrameWinsize, vshdproto.EncodeWinsize(vshdproto.Winsize{
-			Rows: uint16(ptyReq.Window.Height),
-			Cols: uint16(ptyReq.Window.Width),
-		}))
+		writeFrame(vshdproto.FrameWinsize, vshdproto.EncodeWinsize(initialWinsize))
 	}
 
 	// guestDone fires when the guest->host direction ends (FrameExit received or
@@ -460,22 +468,19 @@ func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, 
 	// race the command's output frames.
 	guestDone := make(chan struct{})
 
-	// Host -> guest: frame SSH stdin as FrameStdin; relay winsize changes. This
-	// goroutine exits when SSH stdin EOFs; it does not signal session end.
+	// Host -> guest: frame client stdin as FrameStdin; relay winsize changes.
+	// This goroutine exits when stdin EOFs; it does not signal session end.
 	go func() {
-		if isPty {
+		if isPty && winCh != nil {
 			go func() {
 				for win := range winCh {
-					writeFrame(vshdproto.FrameWinsize, vshdproto.EncodeWinsize(vshdproto.Winsize{
-						Rows: uint16(win.Height),
-						Cols: uint16(win.Width),
-					}))
+					writeFrame(vshdproto.FrameWinsize, vshdproto.EncodeWinsize(win))
 				}
 			}()
 		}
 		buf := make([]byte, 32*1024)
 		for {
-			n, rerr := s.Read(buf)
+			n, rerr := clientIn.Read(buf)
 			if n > 0 {
 				if werr := writeFrame(vshdproto.FrameStdin, buf[:n]); werr != nil {
 					break
@@ -493,15 +498,15 @@ func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, 
 	go func() {
 		defer close(guestDone)
 		for {
-			typ, payload, err := vshdproto.ReadFrame(conn)
+			typ, payload, err := vshdproto.ReadFrame(vshdConn)
 			if err != nil {
 				break
 			}
 			switch typ {
 			case vshdproto.FrameStdout:
-				s.Write(payload)
+				clientOut.Write(payload)
 			case vshdproto.FrameStderr:
-				s.Stderr().Write(payload)
+				clientErr.Write(payload)
 			case vshdproto.FrameExit:
 				if code, derr := vshdproto.DecodeExit(payload); derr == nil {
 					exitCode = int(code)
@@ -513,16 +518,16 @@ func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, 
 	// Wait for session end
 	select {
 	case <-guestDone:
-		log.Printf("SSH proxy: vshd connection closed")
+		log.Printf("proxy: vshd connection closed")
 	case <-done:
-		log.Printf("SSH proxy: VM exited")
+		log.Printf("proxy: VM exited")
 	case <-panicked:
-		log.Printf("SSH proxy: VM kernel panic")
-	case <-s.Context().Done():
-		log.Printf("SSH proxy: SSH session closed by client")
+		log.Printf("proxy: VM kernel panic")
+	case <-clientClosed:
+		log.Printf("proxy: client disconnected")
 	}
 
-	conn.Close()
+	vshdConn.Close()
 
 	// Closing conn unblocks the guest->host reader if it is still running (e.g.
 	// when we exited the select via done/panicked/client-close rather than
@@ -532,6 +537,64 @@ func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, 
 	case <-guestDone:
 	case <-time.After(100 * time.Millisecond):
 	}
+
+	return exitCode
+}
+
+// proxyVshdSession proxies an SSH session to/from a vshd connection using the
+// vshdproto TLV framing. Host -> guest: SSH stdin is framed as FrameStdin and,
+// for PTY sessions, the initial window size plus every winCh change is sent as
+// FrameWinsize. Guest -> host: FrameStdout/FrameStderr are written to the SSH
+// stdout/stderr channels and FrameExit carries the real exit status.
+//
+// It is shared by all vshd-backed sessions (VMX container, VMX outer shell, and
+// any future host-vshd shim).
+func proxyVshdSession(s ssh.Session, conn net.Conn, isPty bool, ptyReq ssh.Pty, winCh <-chan ssh.Window, done <-chan struct{}, panicked <-chan struct{}) error {
+	// The session's pty (line discipline, OPOST/ONLCR cooking, raw mode) lives
+	// inside the container/VM. gliderlabs/ssh's default "minimal PTY emulation"
+	// would re-cook our output host-side, rewriting \n -> \r\n on every
+	// FrameStdout write and ignoring raw mode. Disable it so this relay is a
+	// transparent byte pipe and the guest pty owns line discipline (classic
+	// ssh behaviour). Must precede any s.Write below.
+	s.DisablePTYEmulation()
+
+	// Convert SSH window size to vshdproto.Winsize
+	initialWinsize := vshdproto.Winsize{
+		Rows: uint16(ptyReq.Window.Height),
+		Cols: uint16(ptyReq.Window.Width),
+	}
+
+	// Adapt ssh.Window channel to vshdproto.Winsize channel
+	var vshdWinCh <-chan vshdproto.Winsize
+	if isPty && winCh != nil {
+		ch := make(chan vshdproto.Winsize)
+		vshdWinCh = ch
+		go func() {
+			defer close(ch)
+			for win := range winCh {
+				ch <- vshdproto.Winsize{
+					Rows: uint16(win.Height),
+					Cols: uint16(win.Width),
+				}
+			}
+		}()
+	}
+
+	// Use session context done channel as client disconnect signal
+	clientClosed := s.Context().Done()
+
+	exitCode := proxyVshdSessionGeneric(
+		s,          // clientIn (ssh.Session implements io.Reader)
+		s,          // clientOut (ssh.Session implements io.Writer)
+		s.Stderr(), // clientErr
+		conn,       // vshdConn
+		isPty,      // isPty
+		initialWinsize,
+		vshdWinCh,
+		clientClosed,
+		done,
+		panicked,
+	)
 
 	s.Exit(exitCode)
 	return nil

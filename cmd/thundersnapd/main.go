@@ -1580,8 +1580,8 @@ func (c *controlServer) handleConn(conn net.Conn) {
 		}
 		c.serveHTTP(conn, reader)
 
-	case thunderproto.VshPort: // 5222 - vshd proxy
-		c.proxyVshd(conn, reader)
+	case thunderproto.EnterPort: // 5224 - /enter session protocol
+		c.handleEnter(conn, reader)
 
 	default:
 		thunderproto.WriteError(conn, "invalid port")
@@ -1614,88 +1614,113 @@ func (c *controlServer) serveHTTP(conn net.Conn, reader *bufio.Reader) {
 	}
 }
 
-// proxyVshd proxies a vshd session from the client to host-vshd.sock.
-// This enables ts go/undo to work from inside containers by routing
-// vshd connections through the control socket.
+// handleEnter handles the /enter session protocol on port 5224. It performs the
+// full frame setup sequence (same as runContainerSession for SSH) before proxying.
 //
-// The VMX protocol from the client contains just the target frame's UUID.
-// We need to resolve this to the full host path before forwarding to vshd,
-// since host vshd uses the path to find the container rootfs.
-func (c *controlServer) proxyVshd(clientConn net.Conn, clientReader *bufio.Reader) {
-	log.Printf("control socket: proxying vshd session")
-
-	// Get the host vshd socket path
-	vshdSock, err := hostVshd.ensure()
-	if err != nil {
-		thunderproto.WriteError(clientConn, "vshd unavailable")
-		log.Printf("control socket: vshd proxy failed to ensure host vshd: %v", err)
+// Protocol:
+//  1. Server sends OK 5224\n
+//  2. Client sends: uuid\0user\0pty\0argc\0arg0\0arg1\0...argN\0
+//  3. Server resolves UUID, prepares rootfs, creates control socket
+//  4. Server connects to host vshd and sends VMX header
+//  5. Connection switches to vshdproto TLV framing
+func (c *controlServer) handleEnter(clientConn net.Conn, clientReader *bufio.Reader) {
+	// Send OK to indicate we're ready for the enter request
+	if err := thunderproto.WriteOK(clientConn, thunderproto.EnterPort); err != nil {
+		log.Printf("control socket: enter failed to write OK: %v", err)
 		return
 	}
 
-	// Connect to the host vshd
-	vshdConn, err := net.Dial("unix", vshdSock)
+	// Parse the enter request header: uuid\0user\0pty\0argc\0args...
+	uuid, err := readNullTerminatedField(clientReader)
 	if err != nil {
-		thunderproto.WriteError(clientConn, "vshd connect failed")
-		log.Printf("control socket: vshd proxy failed to connect to %s: %v", vshdSock, err)
+		log.Printf("control socket: enter failed to read uuid: %v", err)
+		return
+	}
+
+	targetUser, err := readNullTerminatedField(clientReader)
+	if err != nil {
+		log.Printf("control socket: enter failed to read user: %v", err)
+		return
+	}
+
+	ptyStr, err := readNullTerminatedField(clientReader)
+	if err != nil {
+		log.Printf("control socket: enter failed to read pty: %v", err)
+		return
+	}
+	isPty := ptyStr == "1"
+
+	argcStr, err := readNullTerminatedField(clientReader)
+	if err != nil {
+		log.Printf("control socket: enter failed to read argc: %v", err)
+		return
+	}
+	argc, _ := strconv.Atoi(argcStr)
+
+	var cmdArgs []string
+	for i := 0; i < argc; i++ {
+		arg, err := readNullTerminatedField(clientReader)
+		if err != nil {
+			log.Printf("control socket: enter failed to read arg %d: %v", i, err)
+			return
+		}
+		cmdArgs = append(cmdArgs, arg)
+	}
+
+	log.Printf("control socket: enter uuid=%s user=%s pty=%v argc=%d", uuid, targetUser, isPty, argc)
+
+	// --- Full frame setup (same as runContainerSession for SSH) ---
+
+	// 1. Resolve UUID to rootFS path
+	// The target frame should be in the same user directory as c.rootFS
+	// (e.g., /home/.../fs/e2e/<targetUUID>).
+	framePath := uuid
+	if !filepath.IsAbs(uuid) && c.rootFS != "" {
+		userFsDir := filepath.Dir(c.rootFS)
+		framePath = filepath.Join(userFsDir, uuid)
+	}
+
+	// 2. Prepare container rootFS (same as SSH path)
+	if err := prepareContainerRootFS(framePath, ""); err != nil {
+		log.Printf("control socket: enter failed to prepare rootfs: %v", err)
+		return
+	}
+
+	// 3. Get or create control server for the target frame (same as SSH path)
+	_, err = controlServers.getOrCreateControlServer(framePath)
+	if err != nil {
+		log.Printf("control socket: enter failed to create control server: %v", err)
+		return
+	}
+	defer controlServers.releaseControlServer(framePath)
+
+	// 4. Dial host vshd (same as SSH path)
+	sockPath, err := hostVshd.ensure()
+	if err != nil {
+		log.Printf("control socket: enter failed to ensure host vshd: %v", err)
+		return
+	}
+	vshdConn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		log.Printf("control socket: enter failed to dial host vshd: %v", err)
 		return
 	}
 	defer vshdConn.Close()
 
-	// Send OK to client now that we have a vshd connection
-	if err := thunderproto.WriteOK(clientConn, thunderproto.VshPort); err != nil {
-		log.Printf("control socket: vshd proxy failed to write OK: %v", err)
-		return
-	}
-
-	// Parse and rewrite the VMX header. The client sends:
-	//   VMX\0<uuid>\0<user>\0<pty>\0<argc>\0<args...>
-	// We need to rewrite <uuid> to the full frame path on the host.
-
-	// Read the first field to check if it's VMX
-	firstField, err := readNullTerminatedField(clientReader)
+	// 5. Write vshd request (same as SSH path)
+	// The frame rootfs is an absolute host path; vshd reconstructs it from the
+	// VMX header as filepath.Clean("/" + framePath), so strip the leading slash.
+	absRootFS, err := filepath.Abs(framePath)
 	if err != nil {
-		log.Printf("control socket: vshd proxy failed to read first field: %v", err)
+		log.Printf("control socket: enter failed to get abs path: %v", err)
 		return
 	}
+	framePathHdr := strings.TrimPrefix(absRootFS, "/")
+	writeVshdRequest(vshdConn, framePathHdr, targetUser, isPty, cmdArgs)
 
-	if firstField == "VMX" {
-		// Read the frame UUID/path
-		frameSpec, err := readNullTerminatedField(clientReader)
-		if err != nil {
-			log.Printf("control socket: vshd proxy failed to read frame spec: %v", err)
-			return
-		}
-
-		// Resolve UUID to full path. The current frame's rootFS is at c.rootFS
-		// (e.g., /home/.../fs/e2e/UUID). The target frame should be in the same
-		// user directory (e.g., /home/.../fs/e2e/<targetUUID>).
-		framePath := frameSpec
-		if !filepath.IsAbs(frameSpec) && c.rootFS != "" {
-			// Looks like a UUID - resolve it relative to the user's frame dir
-			userFsDir := filepath.Dir(c.rootFS)
-			framePath = filepath.Join(userFsDir, frameSpec)
-		}
-		log.Printf("control socket: vshd proxy rewriting frame %q -> %q", frameSpec, framePath)
-
-		// Ensure the target frame has a control socket. When entering a frame
-		// via ts go (VMX protocol), the SSH front door is bypassed, so we must
-		// create the control socket here so that ts commands inside the frame
-		// can communicate with thundersnapd.
-		if _, err := controlServers.getOrCreateControlServer(framePath); err != nil {
-			log.Printf("control socket: failed to ensure control server for %s: %v", framePath, err)
-			thunderproto.WriteError(clientConn, fmt.Sprintf("failed to prepare frame: %v", err))
-			return
-		}
-		defer controlServers.releaseControlServer(framePath)
-
-		// Forward the rewritten VMX header to vshd
-		fmt.Fprintf(vshdConn, "VMX\x00%s\x00", framePath)
-	} else {
-		// Not VMX - forward the first field as-is
-		fmt.Fprintf(vshdConn, "%s\x00", firstField)
-	}
-
-	// Proxy the rest of the connection bidirectionally
+	// 6. Proxy the session bidirectionally
+	// The client speaks vshdproto TLV directly, so we just relay bytes between
+	// the client and vshd - no re-framing needed.
 	done := make(chan struct{}, 2)
 
 	// Client -> vshd (use clientReader which may have buffered data)
@@ -1705,19 +1730,18 @@ func (c *controlServer) proxyVshd(clientConn net.Conn, clientReader *bufio.Reade
 		done <- struct{}{}
 	}()
 
-	// vshd -> client. When vshd closes (session ends), close clientConn to
-	// signal the client that the session is over. This unblocks the
-	// client->vshd goroutine (which is waiting on clientReader) and allows
-	// the client's ReadFrame to get EOF.
+	// vshd -> client
 	go func() {
 		io.Copy(clientConn, vshdConn)
-		clientConn.Close() // Signal EOF to both client and client->vshd goroutine
+		clientConn.Close()
 		done <- struct{}{}
 	}()
 
 	// Wait for both directions to complete
 	<-done
 	<-done
+
+	log.Printf("control socket: enter session ended")
 }
 
 // readNullTerminatedField reads a null-terminated string from the reader.
