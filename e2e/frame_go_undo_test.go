@@ -358,8 +358,34 @@ func TestTsGoWithCommand(t *testing.T) {
 
 	createFrameViaDaemon(t, d, "gocmdtest")
 
+	// Test: ts go nil:nil:nil -c 'echo hello' - simplest case, empty frame
+	output, exitCode, err := sshExec(t, d, "root@gocmdtest", `ts go nil:nil:nil -c 'echo hello'`)
+	if err != nil {
+		t.Fatalf("ts go nil:nil:nil -c 'echo hello' failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts go nil:nil:nil -c 'echo hello': expected exit 0, got %d (output: %q)", exitCode, output)
+	}
+	if !strings.Contains(output, "hello") {
+		t.Errorf("ts go nil:nil:nil -c 'echo hello': expected 'hello' in output, got: %q", output)
+	}
+
+	// Test: ts go nil:nil:nil -c 'ts frame' - run ts subcommand in empty frame
+	output, exitCode, err = sshExec(t, d, "root@gocmdtest", `ts go nil:nil:nil -c 'ts frame'`)
+	if err != nil {
+		t.Fatalf("ts go nil:nil:nil -c 'ts frame' failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts go nil:nil:nil -c 'ts frame': expected exit 0, got %d (output: %q)", exitCode, output)
+	}
+	// Should output a UUID
+	nilFrameUUID := strings.TrimSpace(output)
+	if nilFrameUUID == "" {
+		t.Errorf("ts go nil:nil:nil -c 'ts frame': expected UUID output, got empty")
+	}
+
 	// Get the original frame UUID
-	output, exitCode, err := sshExec(t, d, "root@gocmdtest", "ts frame")
+	output, exitCode, err = sshExec(t, d, "root@gocmdtest", "ts frame")
 	if err != nil {
 		t.Fatalf("ts frame failed: %v", err)
 	}

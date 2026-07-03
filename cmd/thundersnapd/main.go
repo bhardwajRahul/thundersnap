@@ -1677,6 +1677,17 @@ func (c *controlServer) proxyVshd(clientConn net.Conn, clientReader *bufio.Reade
 		}
 		log.Printf("control socket: vshd proxy rewriting frame %q -> %q", frameSpec, framePath)
 
+		// Ensure the target frame has a control socket. When entering a frame
+		// via ts go (VMX protocol), the SSH front door is bypassed, so we must
+		// create the control socket here so that ts commands inside the frame
+		// can communicate with thundersnapd.
+		if _, err := controlServers.getOrCreateControlServer(framePath); err != nil {
+			log.Printf("control socket: failed to ensure control server for %s: %v", framePath, err)
+			thunderproto.WriteError(clientConn, fmt.Sprintf("failed to prepare frame: %v", err))
+			return
+		}
+		defer controlServers.releaseControlServer(framePath)
+
 		// Forward the rewritten VMX header to vshd
 		fmt.Fprintf(vshdConn, "VMX\x00%s\x00", framePath)
 	} else {
