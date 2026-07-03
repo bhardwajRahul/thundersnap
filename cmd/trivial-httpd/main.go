@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // trivial-httpd serves a static directory over HTTP with full support for range requests.
 // Only serves regular files and symlinks. For symlinks, returns the readlink() result.
 // Opens files with O_NOFOLLOW and O_NONBLOCK for safety.

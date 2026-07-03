@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package frameid provides frame identity (UUID) generation and handling.
 //
 // Frame UUIDs use UUIDv7, which is time-ordered (sortable by creation time)

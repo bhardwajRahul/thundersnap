@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package vshdsession implements the guest-side server for a vshd session: it
 // runs a command and bridges it to a client over the vshdproto TLV stream.
 //

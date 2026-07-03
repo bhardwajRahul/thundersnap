@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // metrics.go wires the importable metrics package into the daemon's :7575
 // tsnet HTTP server, supplying the live session/VM counts from in-memory state.
 package main

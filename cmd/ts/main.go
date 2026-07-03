@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // ts is a client for communicating with thundersnapd via its control socket.
 // The protocol uses a vsock-style handshake: after connecting, the client sends
 // "CONNECT <port>\n" and waits for "OK <port>\n" before proceeding with HTTP.

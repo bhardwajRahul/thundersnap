@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // NFS server implementation for thundersnapd.
 // Provides NFSv3 server with maximal caching for high-speed file access.
 package main

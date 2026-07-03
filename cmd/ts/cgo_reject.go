@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // This file rejects CGO at compile time for the ts binary.
 //
 // RATIONALE: The ts binary runs inside containers and VMs where dynamically

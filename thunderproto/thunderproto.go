@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package thunderproto holds the wire constants and handshake helpers shared by
 // the thundersnap daemon (the control server) and the in-container `ts` client.
 //

@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // policy.go implements the grant-based policy system for thundersnap.
 // Policies can come from Tailscale CapMap grants or a local policy file.
 package main

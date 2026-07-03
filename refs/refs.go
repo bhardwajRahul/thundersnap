@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package refs provides the ref system for thundersnap.
 //
 // A ref is a mutable pointer from a name to a frame UUID, analogous to a git branch.

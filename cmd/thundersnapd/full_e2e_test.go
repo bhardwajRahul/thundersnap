@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // full_e2e_test.go contains a comprehensive end-to-end test for thundersnap.
 //
 // This test exercises the full flow without tsnet:

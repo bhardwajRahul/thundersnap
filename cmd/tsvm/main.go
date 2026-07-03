@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // tsvm is a test tool for spinning up a VM with a thundersnap filesystem.
 package main
 

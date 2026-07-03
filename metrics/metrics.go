@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package metrics exports Prometheus metrics for thundersnapd: the standard
 // OS-level Go runtime and process collectors, plus thundersnap-specific gauges
 // (frames, snaps, refs, running sessions, running VMs). The counting logic is

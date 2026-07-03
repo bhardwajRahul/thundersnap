@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package thunderclient is the client transport for talking to thundersnapd's
 // control protocol. The protocol is plain HTTP/1 carried over either a real
 // cloud-hypervisor vsock (inside a VM) or a Unix socket with an emulated vsock

@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 package tsm
 
 // This file provides helpers to ensure a "user" account exists in /etc/passwd

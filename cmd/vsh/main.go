@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // vsh connects to a VM's vsh daemon over a cloud-hypervisor vsock unix socket
 // and bridges the local terminal to the guest shell. It dials the socket given
 // as argv[1], performs the cloud-hypervisor "CONNECT <port>" handshake, puts the

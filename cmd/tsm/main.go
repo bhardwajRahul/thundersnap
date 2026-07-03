@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // tsm indexes a filesystem and writes .tsm (ThunderSnap Manifest) and
 // .tsc (ThunderSnap Chunks) files.
 //

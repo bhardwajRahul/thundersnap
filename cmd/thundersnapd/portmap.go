@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Portmapper (rpcbind) implementation for thundersnapd.
 // Provides a minimal portmapper that returns fixed ports for NFS and MOUNT services.
 // Supports both TCP (with record marking) and UDP (without record marking).

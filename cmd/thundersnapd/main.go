@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // thundersnapd is a Tailscale tsnet-based SSH server that provides
 // isolated container environments for each user session.
 package main

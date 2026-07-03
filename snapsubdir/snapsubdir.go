@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package snapsubdir implements the btrfs snapshot reduction used by
 // "ts snap <path>": it takes a writable snapshot of an entire subvolume (for
 // atomicity), then reduces it to just a requested subtree by deleting

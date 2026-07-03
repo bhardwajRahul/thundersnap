@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // docker.go handles downloading and flattening Docker images into snaps.
 package main
 
