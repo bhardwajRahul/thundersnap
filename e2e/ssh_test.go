@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -380,6 +381,67 @@ func installBusyboxAppletInFrame(t *testing.T, d *daemonInstance, refName, apple
 	t.Logf("Installed busybox applet %s in frame %s via SFTP", applet, refName)
 }
 
+// snapProgressStats holds parsed stats from a single component's progress output.
+type snapProgressStats struct {
+	name       string
+	unmodified int
+	modified   int
+	sizeGB     string // keep as string for exact comparison
+}
+
+// parseSnapProgress parses the final progress line from ts snap stderr.
+// Format: "root 0+5 0.001G                home 0+3 0.000G           work 0+2 0.000G"
+// Returns stats for root, home, work in that order.
+func parseSnapProgress(stderr string) (root, home, work snapProgressStats, err error) {
+	// Find the last non-empty line (the final progress line)
+	lines := strings.Split(stderr, "\n")
+	var lastLine string
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			lastLine = lines[i]
+			break
+		}
+	}
+	if lastLine == "" {
+		return root, home, work, fmt.Errorf("no progress line found in stderr")
+	}
+
+	// Pattern: "name unmodified+modified sizeG"
+	// E.g. "root 0+5 0.001G"
+	re := regexp.MustCompile(`(\w+)\s+(\d+)\+(\d+)\s+([\d.]+G)`)
+	matches := re.FindAllStringSubmatch(lastLine, -1)
+	if len(matches) < 3 {
+		return root, home, work, fmt.Errorf("expected 3 components in progress line, got %d: %q", len(matches), lastLine)
+	}
+
+	parseOne := func(m []string) snapProgressStats {
+		unmod := 0
+		mod := 0
+		fmt.Sscanf(m[2], "%d", &unmod)
+		fmt.Sscanf(m[3], "%d", &mod)
+		return snapProgressStats{
+			name:       m[1],
+			unmodified: unmod,
+			modified:   mod,
+			sizeGB:     m[4],
+		}
+	}
+
+	// Find root, home, work in any order
+	for _, m := range matches {
+		switch m[1] {
+		case "root":
+			root = parseOne(m)
+		case "home":
+			home = parseOne(m)
+		case "work":
+			work = parseOne(m)
+		}
+	}
+
+	return root, home, work, nil
+}
+
 // verifySnaphashOutput confirms that the value printed by `ts snap` to
 // stdout is a snaphash (or a "rootfs:home:work" frame spec of snaphashes,
 // with "nil" allowed for absent components), not e.g. a raw hex-encoded
@@ -461,6 +523,63 @@ func TestSSHContainerBasic(t *testing.T) {
 	t.Logf("ts snap stdout: %s", snapStdout)
 	t.Logf("ts snap stderr: %s", snapStderr)
 	verifySnaphashOutput(t, snapStdout)
+
+	// Parse first snap's progress stats
+	root1, home1, work1, err := parseSnapProgress(snapStderr)
+	if err != nil {
+		t.Logf("ts snap (1st): could not parse progress: %v", err)
+	} else {
+		t.Logf("ts snap (1st) stats: root=%d+%d %s, home=%d+%d %s, work=%d+%d %s",
+			root1.unmodified, root1.modified, root1.sizeGB,
+			home1.unmodified, home1.modified, home1.sizeGB,
+			work1.unmodified, work1.modified, work1.sizeGB)
+	}
+
+	// Test snap idempotence: run a second snap immediately without any changes.
+	// The second snap should report 0 modified entries and identical sizes.
+	snap2Stdout, snap2Stderr, exitCode, err := sshExecSplit(t, d, "testframe", "ts snap")
+	if err != nil {
+		t.Fatalf("ts snap (2nd) failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts snap (2nd): expected exit code 0, got %d (stdout: %q, stderr: %q)", exitCode, snap2Stdout, snap2Stderr)
+	}
+	t.Logf("ts snap (2nd) stdout: %s", snap2Stdout)
+	t.Logf("ts snap (2nd) stderr: %s", snap2Stderr)
+	verifySnaphashOutput(t, snap2Stdout)
+
+	// Parse second snap's progress stats and compare
+	root2, home2, work2, err := parseSnapProgress(snap2Stderr)
+	if err != nil {
+		t.Logf("ts snap (2nd): could not parse progress: %v", err)
+	} else {
+		t.Logf("ts snap (2nd) stats: root=%d+%d %s, home=%d+%d %s, work=%d+%d %s",
+			root2.unmodified, root2.modified, root2.sizeGB,
+			home2.unmodified, home2.modified, home2.sizeGB,
+			work2.unmodified, work2.modified, work2.sizeGB)
+
+		// Second snap should have 0 modified entries for all three sections
+		if root2.modified != 0 {
+			t.Errorf("ts snap idempotence: root should have 0 modified entries on 2nd snap, got %d", root2.modified)
+		}
+		if home2.modified != 0 {
+			t.Errorf("ts snap idempotence: home should have 0 modified entries on 2nd snap, got %d", home2.modified)
+		}
+		if work2.modified != 0 {
+			t.Errorf("ts snap idempotence: work should have 0 modified entries on 2nd snap, got %d", work2.modified)
+		}
+
+		// Sizes should be identical between the two snaps
+		if root1.sizeGB != root2.sizeGB {
+			t.Errorf("ts snap idempotence: root size mismatch: 1st=%s, 2nd=%s", root1.sizeGB, root2.sizeGB)
+		}
+		if home1.sizeGB != home2.sizeGB {
+			t.Errorf("ts snap idempotence: home size mismatch: 1st=%s, 2nd=%s", home1.sizeGB, home2.sizeGB)
+		}
+		if work1.sizeGB != work2.sizeGB {
+			t.Errorf("ts snap idempotence: work size mismatch: 1st=%s, 2nd=%s", work1.sizeGB, work2.sizeGB)
+		}
+	}
 
 	// Test ts snaps: list snapshots, should include the one we just created
 	output, exitCode, err = sshExec(t, d, "testframe", "ts snaps")
