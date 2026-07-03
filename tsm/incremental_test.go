@@ -1,6 +1,7 @@
 package tsm
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -226,6 +227,225 @@ func TestReuseParentChunksRejectsRacyCollision(t *testing.T) {
 
 	if _, ok := idx.reuseParentChunks(entry); ok {
 		t.Fatal("reuseParentChunks falsely reused chunks across a racy ctime collision")
+	}
+}
+
+// TestIncrementalSocketRecreated verifies that sockets are excluded from indexing.
+func TestIncrementalSocketRecreated(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "file.txt"), []byte("hello"))
+
+	sockPath := filepath.Join(root, "test.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("create socket: %v", err)
+	}
+	defer ln.Close()
+
+	time.Sleep(1200 * time.Millisecond)
+
+	out := t.TempDir()
+	base1 := filepath.Join(out, "snap1")
+	stats1, tsm1 := indexTree(t, root, base1, nil, nil)
+	t.Logf("snap1: modified=%d unmodified=%d", stats1.ModifiedEntries, stats1.UnmodifiedEntries)
+
+	parentTSM, _ := ReadTSM(base1 + ".tsm")
+	parentTSC, _ := ReadTSC(base1 + ".tsc")
+
+	ln.Close()
+	os.Remove(sockPath)
+	ln2, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("recreate socket: %v", err)
+	}
+	defer ln2.Close()
+
+	base2 := filepath.Join(out, "snap2")
+	stats2, tsm2 := indexTree(t, root, base2, parentTSM, parentTSC)
+	t.Logf("snap2: modified=%d unmodified=%d", stats2.ModifiedEntries, stats2.UnmodifiedEntries)
+
+	if tsm1.SHA256 != tsm2.SHA256 {
+		t.Errorf("socket recreation changed snapshot hash")
+	}
+	if stats2.ModifiedEntries != 0 {
+		t.Errorf("expected 0 modified entries on second snap, got %d", stats2.ModifiedEntries)
+	}
+}
+
+// TestIncrementalStatsAccuracy verifies that the indexer stats (modified/unmodified
+// counts) accurately reflect what's in the resulting TSM.
+func TestIncrementalStatsAccuracy(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "a.txt"), []byte("aaa"))
+	mustWrite(t, filepath.Join(root, "b.txt"), []byte("bbb"))
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "sub", "c.txt"), []byte("ccc"))
+
+	time.Sleep(1200 * time.Millisecond)
+
+	out := t.TempDir()
+	base1 := filepath.Join(out, "snap1")
+	stats1, tsm1 := indexTree(t, root, base1, nil, nil)
+
+	// First snap: all entries should be modified (no parent)
+	totalEntries1 := stats1.ModifiedEntries + stats1.UnmodifiedEntries
+	tsmEntryCount1 := len(tsm1.Entries)
+	t.Logf("snap1: stats total=%d (mod=%d unmod=%d), tsm entries=%d",
+		totalEntries1, stats1.ModifiedEntries, stats1.UnmodifiedEntries, tsmEntryCount1)
+
+	if totalEntries1 != tsmEntryCount1 {
+		t.Errorf("snap1: stats total (%d) != tsm entry count (%d)", totalEntries1, tsmEntryCount1)
+	}
+	if stats1.UnmodifiedEntries != 0 {
+		t.Errorf("snap1: expected 0 unmodified (no parent), got %d", stats1.UnmodifiedEntries)
+	}
+
+	parentTSM, _ := ReadTSM(base1 + ".tsm")
+	parentTSC, _ := ReadTSC(base1 + ".tsc")
+
+	// Second snap with parent - nothing changed
+	base2 := filepath.Join(out, "snap2")
+	stats2, tsm2 := indexTree(t, root, base2, parentTSM, parentTSC)
+
+	totalEntries2 := stats2.ModifiedEntries + stats2.UnmodifiedEntries
+	tsmEntryCount2 := len(tsm2.Entries)
+	t.Logf("snap2: stats total=%d (mod=%d unmod=%d), tsm entries=%d",
+		totalEntries2, stats2.ModifiedEntries, stats2.UnmodifiedEntries, tsmEntryCount2)
+
+	if totalEntries2 != tsmEntryCount2 {
+		t.Errorf("snap2: stats total (%d) != tsm entry count (%d)", totalEntries2, tsmEntryCount2)
+	}
+	if stats2.ModifiedEntries != 0 {
+		t.Errorf("snap2: expected 0 modified (nothing changed), got %d", stats2.ModifiedEntries)
+	}
+	if stats2.UnmodifiedEntries != tsmEntryCount2 {
+		t.Errorf("snap2: expected all %d entries unmodified, got %d", tsmEntryCount2, stats2.UnmodifiedEntries)
+	}
+}
+
+// TestIncrementalWithStampFileChanging simulates thundersnapd writing a .stamp
+// file into the snapshot dir with atomic rename (tmp + rename).
+// The .stamp content changes between snaps, and we verify only 1 entry is modified.
+func TestIncrementalWithStampFileChanging(t *testing.T) {
+	// First "snapshot" directory with base content
+	snap1Dir := t.TempDir()
+	mustWrite(t, filepath.Join(snap1Dir, "file.txt"), []byte("hello"))
+	os.MkdirAll(filepath.Join(snap1Dir, "etc"), 0755)
+	os.MkdirAll(filepath.Join(snap1Dir, "bin"), 0755)
+	// Atomic write of .stamp (simulating writeStampFile)
+	stampTmp1 := filepath.Join(snap1Dir, ".stamp.tmp")
+	stamp1 := filepath.Join(snap1Dir, ".stamp")
+	os.WriteFile(stampTmp1, []byte("1\n"), 0644)
+	os.Rename(stampTmp1, stamp1)
+
+	// Wait past racy ctime window AFTER creating files
+	time.Sleep(1200 * time.Millisecond)
+
+	out := t.TempDir()
+	base1 := filepath.Join(out, "snap1")
+	stats1, tsm1 := indexTree(t, snap1Dir, base1, nil, nil)
+	t.Logf("snap1: entries=%d, modified=%d", len(tsm1.Entries), stats1.ModifiedEntries)
+	for _, e := range tsm1.Entries {
+		t.Logf("  snap1 entry: path=%q size=%d ctime=%d", e.Path, e.Size, e.Ctime)
+	}
+
+	parentTSM, _ := ReadTSM(base1 + ".tsm")
+	parentTSC, _ := ReadTSC(base1 + ".tsc")
+
+	// Second "snapshot" - modify .stamp in the same directory.
+	// This simulates btrfs behavior where ctimes are preserved for
+	// unchanged files, and only modified files get new ctimes.
+	stampTmp2 := filepath.Join(snap1Dir, ".stamp.tmp")
+	stamp2 := filepath.Join(snap1Dir, ".stamp")
+	os.WriteFile(stampTmp2, []byte("ABC123-first-snap-id\n"), 0644)
+	os.Rename(stampTmp2, stamp2)
+	snap2Dir := snap1Dir // Reuse same dir - only .stamp changed
+
+	base2 := filepath.Join(out, "snap2")
+	stats2, tsm2 := indexTree(t, snap2Dir, base2, parentTSM, parentTSC)
+	t.Logf("snap2: entries=%d, modified=%d, unmodified=%d", len(tsm2.Entries), stats2.ModifiedEntries, stats2.UnmodifiedEntries)
+	for _, e := range tsm2.Entries {
+		parent, found := parentTSM.LookupPath(e.Path)
+		if found {
+			match := parent.Type == e.Type && parent.Ctime == e.Ctime
+			t.Logf("  snap2 entry: path=%q size=%d ctime=%d | parent: size=%d ctime=%d | match=%v",
+				e.Path, e.Size, e.Ctime, parent.Size, parent.Ctime, match)
+		} else {
+			t.Logf("  snap2 entry: path=%q size=%d ctime=%d | NO PARENT", e.Path, e.Size, e.Ctime)
+		}
+	}
+
+	// Only .stamp should be modified (content and size changed)
+	if stats2.ModifiedEntries != 1 {
+		t.Errorf("snap2: expected 1 modified entry (.stamp changed), got %d", stats2.ModifiedEntries)
+	}
+
+	// Entry count should be the same
+	if len(tsm1.Entries) != len(tsm2.Entries) {
+		t.Errorf("entry count mismatch: snap1=%d, snap2=%d", len(tsm1.Entries), len(tsm2.Entries))
+	}
+}
+
+// TestIncrementalDifferentSourceDirs simulates the e2e scenario where:
+// 1. First snap indexes a btrfs snapshot (tmp copy of rootfs)
+// 2. Second snap indexes a NEW btrfs snapshot (different tmp path)
+// The parent TSM has paths relative to the first snapshot, but we index a different directory.
+// This tests whether incremental indexing works when the source directory changes between snaps.
+func TestIncrementalDifferentSourceDirs(t *testing.T) {
+	// Create two identical directory trees (simulating two btrfs snapshots)
+	root1 := t.TempDir()
+	root2 := t.TempDir()
+
+	// Same content in both
+	for _, root := range []string{root1, root2} {
+		mustWrite(t, filepath.Join(root, "file.txt"), []byte("hello"))
+		if err := os.MkdirAll(filepath.Join(root, "etc"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, filepath.Join(root, "etc", "config"), []byte("cfg"))
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+
+	out := t.TempDir()
+
+	// First snap from root1
+	base1 := filepath.Join(out, "snap1")
+	stats1, tsm1 := indexTree(t, root1, base1, nil, nil)
+	t.Logf("snap1 (from %s): entries=%d, modified=%d, unmodified=%d",
+		root1, len(tsm1.Entries), stats1.ModifiedEntries, stats1.UnmodifiedEntries)
+	for i, e := range tsm1.Entries {
+		t.Logf("  snap1 entry[%d]: path=%q type=%d", i, e.Path, e.Type)
+	}
+
+	parentTSM, _ := ReadTSM(base1 + ".tsm")
+	parentTSC, _ := ReadTSC(base1 + ".tsc")
+
+	// Second snap from root2 (different directory, same content)
+	base2 := filepath.Join(out, "snap2")
+	stats2, tsm2 := indexTree(t, root2, base2, parentTSM, parentTSC)
+	t.Logf("snap2 (from %s): entries=%d, modified=%d, unmodified=%d",
+		root2, len(tsm2.Entries), stats2.ModifiedEntries, stats2.UnmodifiedEntries)
+	for i, e := range tsm2.Entries {
+		t.Logf("  snap2 entry[%d]: path=%q type=%d", i, e.Path, e.Type)
+	}
+
+	// Both should have the same number of entries
+	if len(tsm1.Entries) != len(tsm2.Entries) {
+		t.Errorf("entry count mismatch: snap1=%d, snap2=%d", len(tsm1.Entries), len(tsm2.Entries))
+	}
+
+	// The TSM hashes should be identical (same content)
+	if tsm1.SHA256 != tsm2.SHA256 {
+		t.Errorf("TSM hash mismatch: snap1 and snap2 should be identical")
+	}
+
+	// Second snap should report 0 modified (content is the same)
+	// Note: This will FAIL if ctime comparison is broken across different source dirs
+	if stats2.ModifiedEntries != 0 {
+		t.Errorf("snap2: expected 0 modified entries, got %d", stats2.ModifiedEntries)
 	}
 }
 

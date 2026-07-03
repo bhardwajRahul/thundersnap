@@ -130,9 +130,11 @@ func (m *controlServerManager) getOrCreateControlServer(rootFS string) (*control
 		return ms.server, nil
 	}
 
-	// Create new control server with socket inside the rootFS.
-	// Use short relative name "thunder.sock" to avoid Unix socket path length limits.
-	sockPath := filepath.Join(rootFS, "thunder.sock")
+	// Create new control server with socket inside the /id subvolume.
+	// The /id subvolume is excluded from btrfs snapshots (see rootfs.go), so
+	// the socket doesn't affect snapshot idempotence. Use short relative name
+	// to avoid Unix socket path length limits.
+	sockPath := filepath.Join(rootFS, "id", "thunder.sock")
 	cs, err := startControlServer(sockPath, rootFS)
 	if err != nil {
 		return nil, err
@@ -1475,14 +1477,15 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 
 	// Bind using a relative path to avoid socket path length limits.
 	// Unix socket paths are limited to ~108 characters; deep test paths can exceed this.
-	// By chdir'ing to rootFS first, we use a short relative name for the bind.
-	sockName := filepath.Base(sockPath) // e.g., "ctrl.sock"
+	// By chdir'ing to the socket's parent directory first, we use a short relative name.
+	sockName := filepath.Base(sockPath) // e.g., "thunder.sock"
+	sockDir := filepath.Dir(sockPath)   // e.g., rootFS/id
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, fmt.Errorf("get cwd: %w", err)
 	}
-	if err := os.Chdir(rootFS); err != nil {
-		return nil, fmt.Errorf("chdir to rootFS %s: %w", rootFS, err)
+	if err := os.Chdir(sockDir); err != nil {
+		return nil, fmt.Errorf("chdir to socket dir %s: %w", sockDir, err)
 	}
 	ln, listenErr := net.Listen("unix", sockName)
 	os.Chdir(cwd) // restore cwd regardless of error
@@ -3610,6 +3613,25 @@ func createSnapshotWithTaintsSubdir(source, subdir, parentStampID string, taints
 					log.Printf("Taint intersection for %s: %v", snapshotID, intersected)
 				}
 			}
+		}
+
+		// Emit final progress stats as if the content was just indexed. The
+		// indexer ran but since we're discarding the duplicate, report the
+		// stats from what we indexed to ensure progress is consistent with the
+		// content. All entries are "unmodified" since nothing actually changed
+		// from the content's perspective.
+		if progressCallback != nil {
+			totalEntries := len(tsmReader.Entries)
+			var totalBytes int64
+			for _, e := range tsmReader.Entries {
+				totalBytes += int64(e.Size)
+			}
+			progressCallback(tsm.IndexerStats{
+				UnmodifiedEntries: totalEntries,
+				ModifiedEntries:   0,
+				ChunkCount:        uint64(len(tsmReader.Entries)),
+				TotalBytes:        totalBytes,
+			})
 		}
 
 		cleanupTmp()

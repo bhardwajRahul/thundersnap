@@ -201,8 +201,13 @@ func (idx *Indexer) Index(rootPath, outBase string) error {
 		return fmt.Errorf("writing tsm: %w", err)
 	}
 
-	// Final progress is emitted by the caller (createSnapshotSubdir) which
-	// coordinates the three-snap progress line.
+	// Emit final progress with the actual stats (not rate-limited). The
+	// caller (createSnapshotSubdir) coordinates the three-snap progress line
+	// and calls progress.Final() after all snaps complete, but each individual
+	// snap needs to report its final stats so the combined line is accurate.
+	if idx.opts.ProgressCallback != nil {
+		idx.opts.ProgressCallback(idx.Stats())
+	}
 
 	return nil
 }
@@ -308,7 +313,10 @@ func (idx *Indexer) processEntry(path, relPath string, info os.FileInfo, entryIn
 		entry.Type = EntryTypeFifo
 
 	case mode&os.ModeSocket != 0:
-		entry.Type = EntryTypeSocket
+		// Unix sockets are ephemeral and cannot be meaningfully restored.
+		// Exclude them from snapshots to ensure idempotence (a recreated
+		// socket with a new inode/ctime shouldn't change the snapshot hash).
+		return nil, nil
 
 	default:
 		// Unknown type, skip

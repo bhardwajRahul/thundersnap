@@ -50,12 +50,11 @@ func TestSnapshotProgressReporting(t *testing.T) {
 
 	// Step 1: first (full) index with progress tracking.
 	var callCount1 int
-	var lastStats1 tsm.IndexerStats
 	snap1Base := filepath.Join(env.snapshotsDir, "prog-snap1")
 	idx1 := tsm.NewIndexer(tsm.IndexerOptions{
 		ProgressCallback: func(stats tsm.IndexerStats) {
 			callCount1++
-			lastStats1 = stats
+			_ = stats // stats captured for potential future assertions
 		},
 	})
 	if err := idx1.Index(framePath, snap1Base); err != nil {

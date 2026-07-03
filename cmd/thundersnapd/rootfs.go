@@ -480,6 +480,10 @@ func setupFsDirLibexec() error {
 // It uses btrfs reflink (COW copy) which requires source and destination to be on the
 // same btrfs filesystem. The source is $fs-dir/libexec/<binary>, which was populated
 // by setupFsDirLibexec() at startup.
+//
+// If the destination already exists with the same size and not older than the source,
+// the copy is skipped to preserve the existing file's ctime (important for incremental
+// snapshot change detection).
 func copyBinaryToRootFS(rootFS, binaryName, destPath string) error {
 	// Use the fs-dir libexec directory as source (same filesystem as rootFS)
 	src := filepath.Join(fsDirLibexec, binaryName)
@@ -488,13 +492,22 @@ func copyBinaryToRootFS(rootFS, binaryName, destPath string) error {
 	dst := filepath.Join(rootFS, destPath)
 
 	// Check if source exists
-	if _, err := os.Stat(src); err != nil {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
 		return fmt.Errorf("%s binary not found at %s (run setupFsDirLibexec first): %w", binaryName, src, err)
 	}
 
 	// Ensure destination directory exists
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return fmt.Errorf("create destination directory: %w", err)
+	}
+
+	// Check if destination exists and is up to date (same size, not older than source)
+	if dstInfo, err := os.Stat(dst); err == nil {
+		if dstInfo.Size() == srcInfo.Size() && !dstInfo.ModTime().Before(srcInfo.ModTime()) {
+			// Already up to date, skip copy to preserve ctime
+			return nil
+		}
 	}
 
 	// Remove existing destination if present (reflink won't overwrite)

@@ -16,10 +16,11 @@ import (
 func TestControlServerManagerRefCounting(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Create a fake rootFS directory
+	// Create a fake rootFS directory with /id subvolume
 	rootFS := filepath.Join(tmpDir, "fs", "testuser", "testframe")
-	if err := os.MkdirAll(rootFS, 0755); err != nil {
-		t.Fatalf("mkdir rootFS: %v", err)
+	idDir := filepath.Join(rootFS, "id")
+	if err := os.MkdirAll(idDir, 0755); err != nil {
+		t.Fatalf("mkdir rootFS/id: %v", err)
 	}
 
 	// Create a fresh manager for this test (don't use the global one)
@@ -27,7 +28,7 @@ func TestControlServerManagerRefCounting(t *testing.T) {
 		servers: make(map[string]*managedControlServer),
 	}
 
-	sockPath := filepath.Join(rootFS, "thunder.sock")
+	sockPath := filepath.Join(idDir, "thunder.sock")
 
 	// Session 1 connects
 	cs1, err := manager.getOrCreateControlServer(rootFS)
@@ -115,12 +116,13 @@ func TestControlServerManagerRefCounting(t *testing.T) {
 func TestControlServerManagerMultipleRootFS(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Create two fake rootFS directories
+	// Create two fake rootFS directories with /id subvolumes
 	rootFS1 := filepath.Join(tmpDir, "fs", "user1", "frame1")
 	rootFS2 := filepath.Join(tmpDir, "fs", "user1", "frame2")
 	for _, dir := range []string{rootFS1, rootFS2} {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			t.Fatalf("mkdir %s: %v", dir, err)
+		idDir := filepath.Join(dir, "id")
+		if err := os.MkdirAll(idDir, 0755); err != nil {
+			t.Fatalf("mkdir %s/id: %v", dir, err)
 		}
 	}
 
@@ -146,8 +148,8 @@ func TestControlServerManagerMultipleRootFS(t *testing.T) {
 	}
 
 	// Both sockets should exist
-	sock1 := filepath.Join(rootFS1, "thunder.sock")
-	sock2 := filepath.Join(rootFS2, "thunder.sock")
+	sock1 := filepath.Join(rootFS1, "id", "thunder.sock")
+	sock2 := filepath.Join(rootFS2, "id", "thunder.sock")
 
 	if _, err := os.Stat(sock1); err != nil {
 		t.Errorf("sock1 should exist: %v", err)
@@ -180,7 +182,8 @@ func TestControlServerManagerMultipleRootFS(t *testing.T) {
 func TestControlServerManagerConcurrentAccess(t *testing.T) {
 	tmpDir := t.TempDir()
 	rootFS := filepath.Join(tmpDir, "fs", "concurrent", "frame")
-	if err := os.MkdirAll(rootFS, 0755); err != nil {
+	idDir := filepath.Join(rootFS, "id")
+	if err := os.MkdirAll(idDir, 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 
@@ -219,7 +222,7 @@ func TestControlServerManagerConcurrentAccess(t *testing.T) {
 	manager.mu.Unlock()
 
 	// Socket should exist
-	sockPath := filepath.Join(rootFS, "thunder.sock")
+	sockPath := filepath.Join(idDir, "thunder.sock")
 	if _, err := os.Stat(sockPath); err != nil {
 		t.Fatalf("socket should exist: %v", err)
 	}

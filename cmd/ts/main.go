@@ -34,7 +34,7 @@ import (
 	"golang.org/x/term"
 )
 
-var sockPath = getopt.StringLong("sock", 0, "/thunder.sock", "path to control socket")
+var sockPath = getopt.StringLong("sock", 0, "/id/thunder.sock", "path to control socket")
 var help = getopt.BoolLong("help", 'h', "show help")
 
 func usage() {
