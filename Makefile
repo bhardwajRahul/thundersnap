@@ -47,8 +47,10 @@ test:
 # TMPDIR must be on btrfs (not /tmp which is typically tmpfs).
 # -test.timeout is intentionally aggressive (well under Go's 10m default): these
 # tests are all fast, so a hang almost always means a real bug, not a slow test.
+# E2E_ARGS can be used to pass extra args (e.g., E2E_ARGS="-run TestFoo").
 E2E_TMPDIR ?= $(CURDIR)/.tmp-e2e
 E2E_TEST_TIMEOUT ?= 2m
+E2E_ARGS ?=
 NOT_E2E_TEST_TIMEOUT ?= 2m
 e2e: ts vshd thundersnapd
 	@mkdir -p $(E2E_TMPDIR)

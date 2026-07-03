@@ -350,6 +350,139 @@ func TestTsGoNoArgsCreatesThenEnters(t *testing.T) {
 	t.Logf("original=%s new=%s frames before=%d after=%d", originalUUID, newUUID, framesBefore, framesAfter)
 }
 
+// TestTsGoWithCommand tests "ts go :: -c 'command'" which creates a new frame,
+// runs the command, and exits. This allows non-interactive testing of ts go.
+func TestTsGoWithCommand(t *testing.T) {
+	env := newTestEnv(t)
+	d := startDaemon(t, env)
+
+	createFrameViaDaemon(t, d, "gocmdtest")
+
+	// Get the original frame UUID
+	output, exitCode, err := sshExec(t, d, "root@gocmdtest", "ts frame")
+	if err != nil {
+		t.Fatalf("ts frame failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("ts frame: exit %d", exitCode)
+	}
+	originalUUID := strings.TrimSpace(output)
+
+	// Count frames before
+	output, exitCode, err = sshExec(t, d, "root@gocmdtest", "ts frames")
+	if err != nil {
+		t.Fatalf("ts frames failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("ts frames: exit %d", exitCode)
+	}
+	framesBefore := strings.Count(output, "\n")
+
+	// Run ts go :: -c "echo hello" - this should:
+	// 1. Create a new frame (via ::)
+	// 2. Run "echo hello" in that frame
+	// 3. Exit and return to the original frame
+	output, exitCode, err = sshExec(t, d, "root@gocmdtest", `ts go :: -c "echo GOCMD_MARKER"`)
+	if err != nil {
+		t.Fatalf("ts go :: -c failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts go :: -c: expected exit 0, got %d (output: %q)", exitCode, output)
+	}
+	if !strings.Contains(output, "GOCMD_MARKER") {
+		t.Errorf("ts go :: -c: expected output to contain GOCMD_MARKER, got: %q", output)
+	}
+	t.Logf("ts go :: -c output: %s", output)
+
+	// Count frames after - should have one more
+	output, exitCode, err = sshExec(t, d, "root@gocmdtest", "ts frames")
+	if err != nil {
+		t.Fatalf("ts frames (after) failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("ts frames (after): exit %d", exitCode)
+	}
+	framesAfter := strings.Count(output, "\n")
+
+	if framesAfter <= framesBefore {
+		t.Errorf("expected more frames after ts go ::, got before=%d after=%d", framesBefore, framesAfter)
+	}
+	t.Logf("frames before=%d after=%d", framesBefore, framesAfter)
+
+	// Verify we're still in the original frame (ts go -c should return)
+	output, exitCode, err = sshExec(t, d, "root@gocmdtest", "ts frame")
+	if err != nil {
+		t.Fatalf("ts frame (after) failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("ts frame (after): exit %d", exitCode)
+	}
+	currentUUID := strings.TrimSpace(output)
+	if currentUUID != originalUUID {
+		t.Errorf("expected to be back in original frame %s, but got %s", originalUUID, currentUUID)
+	}
+}
+
+// TestTsGoWithCommandExitCode tests that ts go -c propagates the command's exit code.
+func TestTsGoWithCommandExitCode(t *testing.T) {
+	env := newTestEnv(t)
+	d := startDaemon(t, env)
+
+	createFrameViaDaemon(t, d, "goexittest")
+
+	// Run a command that exits with code 42
+	_, exitCode, err := sshExec(t, d, "root@goexittest", `ts go :: -c "exit 42"`)
+	if err != nil {
+		t.Fatalf("ts go :: -c failed: %v", err)
+	}
+	if exitCode != 42 {
+		t.Errorf("ts go :: -c 'exit 42': expected exit 42, got %d", exitCode)
+	}
+	t.Logf("ts go :: -c 'exit 42' returned exit code %d", exitCode)
+
+	// Run a command that succeeds
+	_, exitCode, err = sshExec(t, d, "root@goexittest", `ts go :: -c "true"`)
+	if err != nil {
+		t.Fatalf("ts go :: -c failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts go :: -c 'true': expected exit 0, got %d", exitCode)
+	}
+}
+
+// TestTsGoWithCommandToExistingFrame tests ts go <ref> -c 'command' which
+// runs a command in an existing frame without creating a new one.
+func TestTsGoWithCommandToExistingFrame(t *testing.T) {
+	env := newTestEnv(t)
+	d := startDaemon(t, env)
+
+	// Create two frames
+	createFrameViaDaemon(t, d, "goref1")
+	createFrameViaDaemon(t, d, "goref2")
+
+	// Write a marker file in goref2
+	_, exitCode, err := sshExec(t, d, "root@goref2", "echo FRAME2_MARKER > /tmp/marker")
+	if err != nil {
+		t.Fatalf("write marker failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("write marker: exit %d", exitCode)
+	}
+
+	// From goref1, run ts go goref2 -c to read the marker
+	output, exitCode, err := sshExec(t, d, "root@goref1", `ts go goref2 -c "read line < /tmp/marker && echo \$line"`)
+	if err != nil {
+		t.Fatalf("ts go goref2 -c failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts go goref2 -c: expected exit 0, got %d (output: %q)", exitCode, output)
+	}
+	if !strings.Contains(output, "FRAME2_MARKER") {
+		t.Errorf("ts go goref2 -c: expected output to contain FRAME2_MARKER, got: %q", output)
+	}
+	t.Logf("ts go goref2 -c output: %s", output)
+}
+
 // TestTsUndo tests ts undo behavior. Since ts undo enters an interactive
 // session, we test the components: it should create a new frame from the
 // previous snap. We verify by manually doing what undo does (create frame

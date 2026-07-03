@@ -80,7 +80,12 @@ func main() {
 
 	getopt.SetParameters("<command> [command-options]")
 	getopt.SetUsage(usage)
-	getopt.Parse()
+	// Use Getopt (not Parse) so we stop at the first non-option argument
+	// (the subcommand). This lets subcommands handle their own flags.
+	if err := getopt.Getopt(nil); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
 	args := getopt.Args()
 
 	if *help || len(args) == 0 {
@@ -1853,22 +1858,64 @@ func doAutorunStop(sockPath, refName string) error {
 // ts go command
 // =====================================
 
-// cmdGo creates/resolves a frame and starts a new session inside it.
-func cmdGo(args []string) {
+// goArgs holds the parsed arguments for the "ts go" command.
+type goArgs struct {
+	spec      string // frame spec (uuid, ref, or snap triplet)
+	isolation string // isolation level
+	command   string // command to run (if -c specified)
+}
+
+// parseGoArgs parses the arguments for "ts go" and returns the parsed values.
+// Returns an error if the arguments are invalid.
+func parseGoArgs(args []string) (*goArgs, error) {
 	opts := getopt.New()
 	opts.SetProgram("ts go")
 	opts.SetParameters("[<spec>]")
 	isolation := opts.StringLong("isolation", 0, "", "isolation level for new frames: vm, container, none")
-	// Parse expects first element to be program name (like os.Args)
-	opts.Parse(append([]string{"ts go"}, args...))
+	cmdFlag := opts.StringLong("command", 'c', "", "run shell command instead of interactive session")
 
-	if opts.NArgs() > 1 {
+	// Parse stops at the first non-option (the spec). Call Parse again on
+	// remaining args to support GNU-style "ts go :: -c cmd" ordering.
+	// The first element of Args() is the spec itself, which becomes the
+	// "program name" for the second parse - that's fine, we just need to
+	// extract the spec before the second parse.
+	if err := opts.Getopt(append([]string{"ts go"}, args...), nil); err != nil {
+		return nil, err
+	}
+	var spec string
+	if opts.NArgs() > 0 {
+		spec = opts.Arg(0)
+		// Parse any flags that appear after the positional argument.
+		// Args()[0] (the spec) becomes the program name for this parse.
+		if err := opts.Getopt(opts.Args(), nil); err != nil {
+			return nil, err
+		}
+	}
+
+	if opts.NArgs() > 0 {
+		return nil, fmt.Errorf("unexpected argument: %s", opts.Arg(0))
+	}
+
+	return &goArgs{
+		spec:      spec,
+		isolation: *isolation,
+		command:   *cmdFlag,
+	}, nil
+}
+
+// cmdGo creates/resolves a frame and starts a new session inside it.
+func cmdGo(args []string) {
+	parsed, err := parseGoArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ts go: %v\n", err)
 		fmt.Fprintln(os.Stderr, "usage: ts go                         enter current frame (no-op)")
 		fmt.Fprintln(os.Stderr, "       ts go <uuid>                  enter existing frame by UUID")
 		fmt.Fprintln(os.Stderr, "       ts go <ref>                   enter frame by ref name")
 		fmt.Fprintln(os.Stderr, "       ts go <root:home:work>        create and enter new frame")
+		fmt.Fprintln(os.Stderr, "       ts go :: -c 'cmd'             create new frame, run cmd, exit")
 		os.Exit(1)
 	}
+	spec := parsed.spec
 
 	// Get current frame UUID for history cloning
 	currentUUID, err := doGetCurrentFrame(*sockPath)
@@ -1880,11 +1927,10 @@ func cmdGo(args []string) {
 	var targetUUID string
 	var createdNewFrame bool
 
-	if opts.NArgs() == 0 {
+	if spec == "" {
 		// No args: stay in current frame (identity operation, but still enters session)
 		targetUUID = currentUUID
 	} else {
-		spec := opts.Arg(0)
 		colonCount := strings.Count(spec, ":")
 
 		if colonCount == 1 {
@@ -1911,7 +1957,7 @@ func cmdGo(args []string) {
 				fmt.Fprintf(os.Stderr, "error snapping current frame: %v\n", err)
 				os.Exit(1)
 			}
-			targetUUID, err = doCreate(*sockPath, snapTriplet, *isolation, "")
+			targetUUID, err = doCreate(*sockPath, snapTriplet, parsed.isolation, "")
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				os.Exit(1)
@@ -1924,7 +1970,7 @@ func cmdGo(args []string) {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				os.Exit(1)
 			}
-			targetUUID, err = doCreate(*sockPath, snapshotSpec, *isolation, "")
+			targetUUID, err = doCreate(*sockPath, snapshotSpec, parsed.isolation, "")
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				os.Exit(1)
@@ -1941,8 +1987,14 @@ func cmdGo(args []string) {
 		}
 	}
 
+	// Build command args if -c was provided
+	var cmdArgs []string
+	if parsed.command != "" {
+		cmdArgs = []string{"sh", "-c", parsed.command}
+	}
+
 	// Connect to the target frame via vsock and start session
-	exitCode, err := runVsockSession(targetUUID)
+	exitCode, err := runVsockSession(targetUUID, cmdArgs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -1998,9 +2050,10 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 	return c.reader.Read(p)
 }
 
-// runVsockSession connects to vshd and runs an interactive session.
+// runVsockSession connects to vshd and runs a session with optional command.
+// If cmdArgs is empty, runs an interactive login shell.
 // It returns the exit code from the remote session.
-func runVsockSession(frameUUID string) (int, error) {
+func runVsockSession(frameUUID string, cmdArgs []string) (int, error) {
 	// Connect to vshd via vsock (VM) or control socket proxy (container)
 	conn, err := dialVshd()
 	if err != nil {
@@ -2008,17 +2061,19 @@ func runVsockSession(frameUUID string) (int, error) {
 	}
 	defer conn.Close()
 
-	// Determine if we have a TTY
-	isPTY := term.IsTerminal(int(os.Stdin.Fd()))
+	// Determine if we have a TTY - but if running a command, don't request PTY
+	isPTY := term.IsTerminal(int(os.Stdin.Fd())) && len(cmdArgs) == 0
 
-	// Write the VMX protocol header: VMX\0framePath\0user\0pty\0argc\0
-	// For ts go, we always want a login shell (no command)
+	// Write the VMX protocol header: VMX\0framePath\0user\0pty\0argc\0args...
 	ptyFlag := "0"
 	if isPTY {
 		ptyFlag = "1"
 	}
-	// Empty user means auto-detect, empty command means login shell
-	fmt.Fprintf(conn, "VMX\x00%s\x00\x00%s\x000\x00", frameUUID, ptyFlag)
+	// Empty user means auto-detect
+	fmt.Fprintf(conn, "VMX\x00%s\x00\x00%s\x00%d\x00", frameUUID, ptyFlag, len(cmdArgs))
+	for _, arg := range cmdArgs {
+		fmt.Fprintf(conn, "%s\x00", arg)
+	}
 
 	// Set up terminal raw mode if PTY
 	var oldState *term.State
@@ -2087,21 +2142,26 @@ func runVsockSession(frameUUID string) (int, error) {
 		}
 	}()
 
-	// Host -> guest: send stdin as FrameStdin
-	go func() {
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if n > 0 {
-				if werr := writeFrame(vshdproto.FrameStdin, buf[:n]); werr != nil {
+	// Host -> guest: send stdin as FrameStdin.
+	// Skip stdin forwarding when running a command (-c) since there's no
+	// interactive input expected and stdin may not close properly in some
+	// environments (e.g., SSH exec sessions).
+	if len(cmdArgs) == 0 {
+		go func() {
+			buf := make([]byte, 32*1024)
+			for {
+				n, err := os.Stdin.Read(buf)
+				if n > 0 {
+					if werr := writeFrame(vshdproto.FrameStdin, buf[:n]); werr != nil {
+						break
+					}
+				}
+				if err != nil {
 					break
 				}
 			}
-			if err != nil {
-				break
-			}
-		}
-	}()
+		}()
+	}
 
 	// Guest -> host: decode TLV frames
 	go func() {
@@ -2297,7 +2357,7 @@ func cmdUndo(args []string) {
 
 	// 7. Enter the new frame
 	fmt.Fprintf(os.Stderr, "Undoing to snap %s...\n", prevSnap)
-	exitCode, err := runVsockSession(newUUID)
+	exitCode, err := runVsockSession(newUUID, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

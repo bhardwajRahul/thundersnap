@@ -1617,7 +1617,13 @@ func (c *controlServer) serveHTTP(conn net.Conn, reader *bufio.Reader) {
 // proxyVshd proxies a vshd session from the client to host-vshd.sock.
 // This enables ts go/undo to work from inside containers by routing
 // vshd connections through the control socket.
+//
+// The VMX protocol from the client contains just the target frame's UUID.
+// We need to resolve this to the full host path before forwarding to vshd,
+// since host vshd uses the path to find the container rootfs.
 func (c *controlServer) proxyVshd(clientConn net.Conn, clientReader *bufio.Reader) {
+	log.Printf("control socket: proxying vshd session")
+
 	// Get the host vshd socket path
 	vshdSock, err := hostVshd.ensure()
 	if err != nil {
@@ -1641,8 +1647,44 @@ func (c *controlServer) proxyVshd(clientConn net.Conn, clientReader *bufio.Reade
 		return
 	}
 
-	// Bidirectional proxy between client and vshd.
-	// Any data already buffered by clientReader must be forwarded first.
+	// Parse and rewrite the VMX header. The client sends:
+	//   VMX\0<uuid>\0<user>\0<pty>\0<argc>\0<args...>
+	// We need to rewrite <uuid> to the full frame path on the host.
+
+	// Read the first field to check if it's VMX
+	firstField, err := readNullTerminatedField(clientReader)
+	if err != nil {
+		log.Printf("control socket: vshd proxy failed to read first field: %v", err)
+		return
+	}
+
+	if firstField == "VMX" {
+		// Read the frame UUID/path
+		frameSpec, err := readNullTerminatedField(clientReader)
+		if err != nil {
+			log.Printf("control socket: vshd proxy failed to read frame spec: %v", err)
+			return
+		}
+
+		// Resolve UUID to full path. The current frame's rootFS is at c.rootFS
+		// (e.g., /home/.../fs/e2e/UUID). The target frame should be in the same
+		// user directory (e.g., /home/.../fs/e2e/<targetUUID>).
+		framePath := frameSpec
+		if !filepath.IsAbs(frameSpec) && c.rootFS != "" {
+			// Looks like a UUID - resolve it relative to the user's frame dir
+			userFsDir := filepath.Dir(c.rootFS)
+			framePath = filepath.Join(userFsDir, frameSpec)
+		}
+		log.Printf("control socket: vshd proxy rewriting frame %q -> %q", frameSpec, framePath)
+
+		// Forward the rewritten VMX header to vshd
+		fmt.Fprintf(vshdConn, "VMX\x00%s\x00", framePath)
+	} else {
+		// Not VMX - forward the first field as-is
+		fmt.Fprintf(vshdConn, "%s\x00", firstField)
+	}
+
+	// Proxy the rest of the connection bidirectionally
 	done := make(chan struct{}, 2)
 
 	// Client -> vshd (use clientReader which may have buffered data)
@@ -1652,15 +1694,34 @@ func (c *controlServer) proxyVshd(clientConn net.Conn, clientReader *bufio.Reade
 		done <- struct{}{}
 	}()
 
-	// vshd -> client
+	// vshd -> client. When vshd closes (session ends), close clientConn to
+	// signal the client that the session is over. This unblocks the
+	// client->vshd goroutine (which is waiting on clientReader) and allows
+	// the client's ReadFrame to get EOF.
 	go func() {
 		io.Copy(clientConn, vshdConn)
+		clientConn.Close() // Signal EOF to both client and client->vshd goroutine
 		done <- struct{}{}
 	}()
 
 	// Wait for both directions to complete
 	<-done
 	<-done
+}
+
+// readNullTerminatedField reads a null-terminated string from the reader.
+func readNullTerminatedField(r *bufio.Reader) (string, error) {
+	var buf []byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if b == 0 {
+			return string(buf), nil
+		}
+		buf = append(buf, b)
+	}
 }
 
 // controlResponseWriter implements http.ResponseWriter for control socket connections.
