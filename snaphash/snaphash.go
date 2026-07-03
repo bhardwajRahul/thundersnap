@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package snaphash provides encoding and decoding of snap hashes.
 //
 // Snap hashes are 256-bit SHA256 values. Rather than hex encoding (64 chars),

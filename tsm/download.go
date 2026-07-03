@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // download.go provides functionality for downloading snapshots using the
 // TSM/TSC format from mesh peers. (See types.go for the package doc.)
 package tsm

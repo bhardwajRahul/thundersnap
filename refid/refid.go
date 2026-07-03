@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package refid manages the per-ref identity subvolumes that live under a
 // frame's /id directory.
 //

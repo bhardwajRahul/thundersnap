@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package cgroup implements the cgroup v2 / OOM resource-control plumbing used
 // to confine thundersnap container processes. It is pure Linux resource-control
 // glue with no dependency on the rest of the daemon: a Manager owns one parent

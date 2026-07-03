@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package frames provides frame metadata management for thundersnap.
 //
 // A frame is identified by a UUID and represents a filesystem with history.

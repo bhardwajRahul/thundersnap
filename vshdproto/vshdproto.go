@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package vshdproto defines the TLV (type-length-value) framing used on a vshd
 // session connection after the null-delimited request header.
 //

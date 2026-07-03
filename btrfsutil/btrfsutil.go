@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package btrfsutil centralizes the handful of "btrfs" subcommand invocations
 // used across the daemon and the leaf packages (snapsubdir, refid). Every call
 // previously open-coded exec.Command("btrfs", ...).CombinedOutput() with its

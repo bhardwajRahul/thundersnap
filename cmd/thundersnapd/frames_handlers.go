@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // frames_handlers.go provides HTTP handlers for the frame history/log API.
 package main
 

@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // vshd is the shell daemon used by thundersnap to run sessions inside a
 // container, both on the host (over a Unix socket, --unix) and inside a VM
 // (over vsock). It serves a simple null-delimited request protocol over each

@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package sftpfs implements an SFTP request handler that serves files from a
 // container's root filesystem. All client paths are interpreted relative to a
 // configured rootFS directory on the host and are confined to it, so an SFTP

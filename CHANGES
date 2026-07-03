@@ -1,0 +1,7 @@
+
+v0.01 (the unbearable lightness of SNAPPING)
+
+* Supports basic commands: snap, frame, ref, autorun, go, undo, download-docker,
+  download-snap
+
+* Lots of bugs still! But you have to start somewhere.

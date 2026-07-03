@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package containerns manages shared PID/mount/UTS namespaces for container
 // sessions. Each rootFS gets a single "init" process ("ts container-init") that
 // creates and anchors the namespaces; all sessions join these existing

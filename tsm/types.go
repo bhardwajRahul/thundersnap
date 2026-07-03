@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package tsm provides types and functions for the TSM (ThunderSnap Manifest)
 // and TSC (ThunderSnap Chunks) file formats.
 //

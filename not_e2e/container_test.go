@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 //go:build e2e
 
 // Package e2e contains end-to-end tests for thundersnap container isolation.

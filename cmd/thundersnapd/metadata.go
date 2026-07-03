@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // metadata.go provides types and helpers for frame and snap metadata files.
 // These are stored as .jsonc files alongside the btrfs subvolumes.
 package main

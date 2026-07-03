@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // refs_handlers.go provides HTTP handlers for the ref API.
 package main
 
