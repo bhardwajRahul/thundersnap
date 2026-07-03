@@ -307,7 +307,7 @@ func TestE2ESnapshotCloneUIDPreservation(t *testing.T) {
 		[]byte("hello from e2e\n"), 0644); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
-	newID, err := createSnapshot(rootFS, nil, false)
+	newID, err := createSnapshot(rootFS, nil)
 	if err != nil {
 		t.Fatalf("createSnapshot: %v", err)
 	}

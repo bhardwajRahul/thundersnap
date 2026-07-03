@@ -64,12 +64,13 @@ func TestSnapshotIncrementalNoReindex(t *testing.T) {
 		t.Fatalf("first index: %v", err)
 	}
 	stats1 := idx1.Stats()
-	t.Logf("first index: files=%d reused=%d", stats1.FileCount, stats1.ReusedFiles)
-	if stats1.ReusedFiles != 0 {
-		t.Errorf("first index should reuse nothing, reused=%d", stats1.ReusedFiles)
+	t.Logf("first index: unmodified=%d modified=%d", stats1.UnmodifiedEntries, stats1.ModifiedEntries)
+	if stats1.UnmodifiedEntries != 0 {
+		t.Errorf("first index should have 0 unmodified, got %d", stats1.UnmodifiedEntries)
 	}
-	if stats1.FileCount == 0 {
-		t.Fatal("first index processed no files")
+	totalEntries1 := stats1.UnmodifiedEntries + stats1.ModifiedEntries
+	if totalEntries1 == 0 {
+		t.Fatal("first index processed no entries")
 	}
 
 	parentTSM, err := tsm.ReadTSM(snap1Base + ".tsm")
@@ -79,16 +80,6 @@ func TestSnapshotIncrementalNoReindex(t *testing.T) {
 	parentTSC, err := tsm.ReadTSC(snap1Base + ".tsc")
 	if err != nil {
 		t.Fatalf("read parent tsc: %v", err)
-	}
-
-	regularFiles := 0
-	for i := range parentTSM.Entries {
-		if parentTSM.Entries[i].Type == tsm.EntryTypeFile {
-			regularFiles++
-		}
-	}
-	if regularFiles == 0 {
-		t.Fatal("parent manifest has no regular files; test cannot verify reuse")
 	}
 
 	// Step 3: Take a read-only btrfs snapshot of the UNCHANGED frame (this is
@@ -107,11 +98,12 @@ func TestSnapshotIncrementalNoReindex(t *testing.T) {
 		t.Fatalf("second (incremental) index: %v", err)
 	}
 	stats2 := idx2.Stats()
-	t.Logf("second index: files=%d reused=%d", stats2.FileCount, stats2.ReusedFiles)
+	t.Logf("second index: unmodified=%d modified=%d", stats2.UnmodifiedEntries, stats2.ModifiedEntries)
 
-	if stats2.ReusedFiles != regularFiles {
-		t.Errorf("second consecutive snap reused %d of %d regular files; expected ALL files reused (no reindexing on a no-op snap)",
-			stats2.ReusedFiles, regularFiles)
+	// All entries should be unmodified on second snap of unchanged tree
+	if stats2.ModifiedEntries != 0 {
+		t.Errorf("second consecutive snap has %d modified entries; expected ALL entries unmodified (no reindexing on a no-op snap)",
+			stats2.ModifiedEntries)
 	}
 
 	// The incremental manifest must be byte-identical (same SHA) to snap1.

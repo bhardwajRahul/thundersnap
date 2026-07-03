@@ -1889,24 +1889,64 @@ func (pe *progressEmitter) emit(v any) error {
 	return nil
 }
 
-type snapProgressWriter struct {
-	progressEmitter
+// threeSnapProgress coordinates progress reporting for root/home/work snaps.
+// It tracks stats for each component and emits a combined progress line.
+type threeSnapProgress struct {
+	emitter progressEmitter
+	root    tsm.IndexerStats
+	home    tsm.IndexerStats
+	work    tsm.IndexerStats
 }
 
-func newSnapProgressWriter(w http.ResponseWriter) *snapProgressWriter {
-	return &snapProgressWriter{newProgressEmitter(w)}
+func newThreeSnapProgress(w http.ResponseWriter) *threeSnapProgress {
+	return &threeSnapProgress{emitter: newProgressEmitter(w)}
 }
 
-func (pw *snapProgressWriter) Write(p []byte) (n int, err error) {
-	// Each write from the progress tracker is a line of progress text
-	msg := strings.TrimSpace(string(p))
-	if msg == "" {
-		return len(p), nil
+// formatComponent formats a single component's stats as "name %d+%d %.3fG"
+func formatComponent(name string, stats tsm.IndexerStats) string {
+	return fmt.Sprintf("%s %d+%d %.3fG",
+		name,
+		stats.UnmodifiedEntries,
+		stats.ModifiedEntries,
+		float64(stats.TotalBytes)/(1024*1024*1024))
+}
+
+// emit sends the current combined progress line
+func (p *threeSnapProgress) emit() {
+	msg := fmt.Sprintf("%-25.25s %-25.25s %-25.25s",
+		formatComponent("root", p.root),
+		formatComponent("home", p.home),
+		formatComponent("work", p.work))
+	p.emitter.emit(SnapStreamEvent{Type: "progress", Message: msg})
+}
+
+// RootCallback returns a callback for the root snap indexer
+func (p *threeSnapProgress) RootCallback() func(tsm.IndexerStats) {
+	return func(stats tsm.IndexerStats) {
+		p.root = stats
+		p.emit()
 	}
-	if err := pw.emit(SnapStreamEvent{Type: "progress", Message: msg}); err != nil {
-		return 0, err
+}
+
+// HomeCallback returns a callback for the home snap indexer
+func (p *threeSnapProgress) HomeCallback() func(tsm.IndexerStats) {
+	return func(stats tsm.IndexerStats) {
+		p.home = stats
+		p.emit()
 	}
-	return len(p), nil
+}
+
+// WorkCallback returns a callback for the work snap indexer
+func (p *threeSnapProgress) WorkCallback() func(tsm.IndexerStats) {
+	return func(stats tsm.IndexerStats) {
+		p.work = stats
+		p.emit()
+	}
+}
+
+// Final emits the final progress line (after all snaps complete)
+func (p *threeSnapProgress) Final() {
+	p.emit()
 }
 
 // makeSnapHandler creates a /snap handler for the given rootFS.
@@ -1919,18 +1959,17 @@ func makeSnapHandler(rootFS string) http.HandlerFunc {
 
 		// Check if client wants streaming progress
 		stream := r.URL.Query().Get("stream") == "1"
-		isTTY := r.URL.Query().Get("tty") == "1"
 		subdir := r.URL.Query().Get("subdir")
 
 		if stream {
-			handleSnapStreaming(w, rootFS, subdir, isTTY)
+			handleSnapStreaming(w, rootFS, subdir)
 			return
 		}
 
 		// Non-streaming fallback: a single JSON response with no progress
 		// events. The in-tree `ts` client always requests stream=1, so this
 		// branch only serves plain HTTP clients that omit it.
-		snapshotID, err := createSnapshotSubdir(rootFS, subdir, nil, false)
+		snapshotID, err := createSnapshotSubdir(rootFS, subdir, nil)
 		if err != nil {
 			log.Printf("snap failed for %s: %v", rootFS, err)
 			writeJSON(w, http.StatusInternalServerError, SnapResponse{
@@ -1971,7 +2010,7 @@ func addSnapHistory(rootFS, snapshotID string) {
 }
 
 // handleSnapStreaming handles the streaming version of /snap
-func handleSnapStreaming(w http.ResponseWriter, rootFS, subdir string, isTTY bool) {
+func handleSnapStreaming(w http.ResponseWriter, rootFS, subdir string) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 
 	// Enable streaming mode immediately by flushing
@@ -1979,10 +2018,10 @@ func handleSnapStreaming(w http.ResponseWriter, rootFS, subdir string, isTTY boo
 		f.Flush()
 	}
 
-	pw := newSnapProgressWriter(w)
+	progress := newThreeSnapProgress(w)
 	encoder := json.NewEncoder(w)
 
-	snapshotID, err := createSnapshotSubdir(rootFS, subdir, pw, isTTY)
+	snapshotID, err := createSnapshotSubdir(rootFS, subdir, progress)
 	if err != nil {
 		log.Printf("snap failed for %s: %v", rootFS, err)
 		encoder.Encode(SnapStreamEvent{
@@ -3288,8 +3327,8 @@ func prepareDownloadDir(targetDir string, fileList []string, progress io.Writer)
 // non-nil, progress updates are written to it. This is the whole-frame
 // convenience form (no subdir); production handlers call createSnapshotSubdir
 // directly, but it remains the entry point used by the e2e tests.
-func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string, error) {
-	return createSnapshotSubdir(rootFS, "", progressWriter, isTTY)
+func createSnapshot(rootFS string, progress *threeSnapProgress) (string, error) {
+	return createSnapshotSubdir(rootFS, "", progress)
 }
 
 // createSnapshotSubdir is createSnapshot with optional subdir support. When
@@ -3297,7 +3336,7 @@ func createSnapshot(rootFS string, progressWriter io.Writer, isTTY bool) (string
 // single snapshot ID is returned; the frame's own stamp/metadata are left
 // untouched, so this can be used to assemble a snap from a portion of a
 // container's filesystem.
-func createSnapshotSubdir(rootFS, subdir string, progressWriter io.Writer, isTTY bool) (string, error) {
+func createSnapshotSubdir(rootFS, subdir string, progress *threeSnapProgress) (string, error) {
 	if subdir != "" {
 		clean, err := snapsubdir.Validate(subdir)
 		if err != nil {
@@ -3310,14 +3349,17 @@ func createSnapshotSubdir(rootFS, subdir string, progressWriter io.Writer, isTTY
 		if frameMeta != nil {
 			frameTaints = frameMeta.Taints
 		}
-		return createSnapshotWithTaintsSubdir(rootFS, clean, "", frameTaints, progressWriter, isTTY)
+		// For subdir snaps, use root callback (subdir is a single snap)
+		var cb func(tsm.IndexerStats)
+		if progress != nil {
+			cb = progress.RootCallback()
+		}
+		return createSnapshotWithTaintsSubdir(rootFS, clean, "", frameTaints, cb)
 	}
 
-	// Check if this is a three-component frame (has nested home/work subvolumes)
+	// Three-component frame: snapshot root, home, and work
 	homePath := filepath.Join(rootFS, "home")
 	workPath := filepath.Join(rootFS, "work")
-	hasHomeSubvol := isSubvolume(homePath)
-	hasWorkSubvol := isSubvolume(workPath)
 
 	// Read the frame metadata for taints
 	frameMeta, _ := readFrameSidecar(rootFS)
@@ -3333,7 +3375,11 @@ func createSnapshotSubdir(rootFS, subdir string, progressWriter io.Writer, isTTY
 	}
 
 	// Snapshot the rootfs (btrfs automatically excludes nested subvolumes)
-	rootfsID, err := createSnapshotWithTaints(rootFS, baseStampID, frameTaints, progressWriter, isTTY)
+	var rootCb func(tsm.IndexerStats)
+	if progress != nil {
+		rootCb = progress.RootCallback()
+	}
+	rootfsID, err := createSnapshotWithTaints(rootFS, baseStampID, frameTaints, rootCb)
 	if err != nil {
 		return "", fmt.Errorf("snapshot rootfs: %w", err)
 	}
@@ -3343,32 +3389,41 @@ func createSnapshotSubdir(rootFS, subdir string, progressWriter io.Writer, isTTY
 		log.Printf("Warning: failed to update stamp file for %s: %v", rootFS, err)
 	}
 
-	// If no nested subvolumes, return single ID (legacy format)
-	if !hasHomeSubvol && !hasWorkSubvol {
-		return rootfsID, nil
+	// Snapshot home (must be a subvolume)
+	if !isSubvolume(homePath) {
+		return "", fmt.Errorf("home is not a subvolume: %s", homePath)
 	}
-
-	// Snapshot home if it's a subvolume and not empty
 	homeID := ""
-	if hasHomeSubvol && !isDirEmpty(homePath) {
+	if !isDirEmpty(homePath) {
 		homeParent := ""
 		if frameMeta != nil && frameMeta.Home != "" {
 			homeParent = frameMeta.Home
 		}
-		homeID, err = createSnapshotWithTaints(homePath, homeParent, frameTaints, progressWriter, isTTY)
+		var homeCb func(tsm.IndexerStats)
+		if progress != nil {
+			homeCb = progress.HomeCallback()
+		}
+		homeID, err = createSnapshotWithTaints(homePath, homeParent, frameTaints, homeCb)
 		if err != nil {
 			return "", fmt.Errorf("snapshot home: %w", err)
 		}
 	}
 
-	// Snapshot work if it's a subvolume and not empty
+	// Snapshot work (must be a subvolume)
+	if !isSubvolume(workPath) {
+		return "", fmt.Errorf("work is not a subvolume: %s", workPath)
+	}
 	workID := ""
-	if hasWorkSubvol && !isDirEmpty(workPath) {
+	if !isDirEmpty(workPath) {
 		workParent := ""
 		if frameMeta != nil && frameMeta.Work != "" {
 			workParent = frameMeta.Work
 		}
-		workID, err = createSnapshotWithTaints(workPath, workParent, frameTaints, progressWriter, isTTY)
+		var workCb func(tsm.IndexerStats)
+		if progress != nil {
+			workCb = progress.WorkCallback()
+		}
+		workID, err = createSnapshotWithTaints(workPath, workParent, frameTaints, workCb)
 		if err != nil {
 			return "", fmt.Errorf("snapshot work: %w", err)
 		}
@@ -3390,6 +3445,11 @@ func createSnapshotSubdir(rootFS, subdir string, progressWriter io.Writer, isTTY
 	}
 	if err := writeFrameSidecar(rootFS, frameMeta); err != nil {
 		log.Printf("Warning: failed to update frame sidecar for %s: %v", rootFS, err)
+	}
+
+	// Emit final progress
+	if progress != nil {
+		progress.Final()
 	}
 
 	// Return frame spec format: rootfs:home:work
@@ -3429,8 +3489,8 @@ func loadParentManifest(parentStampID string) (*tsm.TSMReader, *tsm.TSCReader) {
 // createSnapshotWithTaints creates a read-only snapshot of source with the
 // given explicit taints. If taints is nil, taints are inherited from the parent
 // snap.
-func createSnapshotWithTaints(source, parentStampID string, taints []string, progressWriter io.Writer, isTTY bool) (string, error) {
-	return createSnapshotWithTaintsSubdir(source, "", parentStampID, taints, progressWriter, isTTY)
+func createSnapshotWithTaints(source, parentStampID string, taints []string, progressCallback func(tsm.IndexerStats)) (string, error) {
+	return createSnapshotWithTaintsSubdir(source, "", parentStampID, taints, progressCallback)
 }
 
 // createSnapshotWithTaintsSubdir creates a read-only snapshot in snaps-dir and
@@ -3452,7 +3512,7 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 // contents are promoted to the snapshot root before the subvolume is made
 // read-only and indexed. The resulting snapshot ID is then the content hash of
 // just that subtree, so it can be dropped into a frame on its own.
-func createSnapshotWithTaintsSubdir(source, subdir, parentStampID string, taints []string, progressWriter io.Writer, isTTY bool) (string, error) {
+func createSnapshotWithTaintsSubdir(source, subdir, parentStampID string, taints []string, progressCallback func(tsm.IndexerStats)) (string, error) {
 	// Generate a random temporary ID for the work-in-progress snapshot
 	tmpID, err := generateRandomID()
 	if err != nil {
@@ -3498,8 +3558,7 @@ func createSnapshotWithTaintsSubdir(source, subdir, parentStampID string, taints
 	// re-reading and re-hashing every file. This makes a second consecutive
 	// snap of an unchanged tree do essentially no file I/O.
 	tsmOpts := tsm.IndexerOptions{
-		ProgressWriter: progressWriter,
-		IsTTY:          isTTY,
+		ProgressCallback: progressCallback,
 	}
 	// Incremental reuse only applies to a full-root snap, where the parent
 	// manifest's paths line up with this tree. A subdir snap re-roots the

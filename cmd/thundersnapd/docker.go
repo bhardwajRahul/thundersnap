@@ -239,8 +239,8 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 		fmt.Fprintf(progress, "Creating snapshot...\n")
 	}
 
-	// Create the final snapshot
-	snapshotID, err := createSnapshotWithTaints(extractPath, "", nil, progress, false)
+	// Create the final snapshot (no progress callback for docker downloads)
+	snapshotID, err := createSnapshotWithTaints(extractPath, "", nil, nil)
 	if err != nil {
 		cleanup()
 		return "", false, fmt.Errorf("create snapshot: %w", err)

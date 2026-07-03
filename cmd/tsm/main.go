@@ -77,16 +77,32 @@ func main() {
 
 	fmt.Printf("Indexing %s -> %s.tsm + %s.tsc\n", inputDir, outBase, outBase)
 
-	// Only emit \r-style progress when stderr is a real terminal; a non-TTY
-	// (pipe/file) invocation gets plain line-oriented progress instead.
+	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
+	var lastStats tsm.IndexerStats
 	opts := tsm.IndexerOptions{
-		ProgressWriter: os.Stderr,
-		IsTTY:          term.IsTerminal(int(os.Stderr.Fd())),
+		ProgressCallback: func(stats tsm.IndexerStats) {
+			lastStats = stats
+			msg := fmt.Sprintf("%d+%d %.3fG",
+				stats.UnmodifiedEntries, stats.ModifiedEntries,
+				float64(stats.TotalBytes)/(1024*1024*1024))
+			if isTTY {
+				fmt.Fprintf(os.Stderr, "\r%-40s", msg)
+			} else {
+				fmt.Fprintln(os.Stderr, msg)
+			}
+		},
 	}
 
 	if err := tsm.Create(inputDir, outBase, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "\nerror: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Print final stats
+	if isTTY {
+		fmt.Fprintf(os.Stderr, "\r%-40s\n", fmt.Sprintf("%d+%d %.3fG",
+			lastStats.UnmodifiedEntries, lastStats.ModifiedEntries,
+			float64(lastStats.TotalBytes)/(1024*1024*1024)))
 	}
 
 	// Print file sizes

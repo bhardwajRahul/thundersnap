@@ -2,7 +2,6 @@ package tsm
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,12 +13,9 @@ import (
 
 // IndexerOptions configures the TSM indexer
 type IndexerOptions struct {
-	// ProgressWriter receives progress updates. Progress reporting is enabled
-	// exactly when this is non-nil.
-	ProgressWriter io.Writer
-
-	// IsTTY indicates whether progress writer is a terminal
-	IsTTY bool
+	// ProgressCallback, if non-nil, is called periodically with current stats.
+	// The caller can use this to render progress information.
+	ProgressCallback func(stats IndexerStats)
 
 	// CrossDevice allows indexing across filesystem boundaries
 	CrossDevice bool
@@ -73,7 +69,6 @@ type Indexer struct {
 	tsm        *TSMWriter
 	rootPath   string
 	rootDev    uint64
-	fileCount  int
 	totalBytes int64
 	lastUpdate time.Time
 
@@ -84,9 +79,13 @@ type Indexer struct {
 	// technique this is modeled on.
 	indexStart time.Time
 
-	// reusedFiles counts files whose chunks were reused from the parent
-	// snapshot (i.e. not re-hashed) during incremental indexing.
-	reusedFiles int
+	// unmodifiedEntries counts entries (of any type) that match the parent
+	// snapshot's path and ctime, meaning they haven't changed.
+	unmodifiedEntries int
+
+	// modifiedEntries counts entries that are new or have changed since the
+	// parent snapshot.
+	modifiedEntries int
 
 	// Track hardlinks: device+inode -> entry index
 	hardlinks map[uint64]uint32
@@ -125,9 +124,8 @@ func (idx *Indexer) Index(rootPath, outBase string) error {
 	var allPaths []string
 	err = filepath.Walk(idx.rootPath, func(walkPath string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
-			// Log permission errors but continue
+			// Skip permission errors silently
 			if os.IsPermission(walkErr) {
-				idx.logProgress("permission denied: %s\n", walkPath)
 				return nil
 			}
 			return walkErr
@@ -203,8 +201,8 @@ func (idx *Indexer) Index(rootPath, outBase string) error {
 		return fmt.Errorf("writing tsm: %w", err)
 	}
 
-	idx.logProgress("Indexed %d files (%d already indexed), %d unique chunks, %d MB\n",
-		idx.tsm.EntryCount(), idx.reusedFiles, idx.tsc.ChunkCount(), idx.totalBytes/(1024*1024))
+	// Final progress is emitted by the caller (createSnapshotSubdir) which
+	// coordinates the three-snap progress line.
 
 	return nil
 }
@@ -251,6 +249,13 @@ func (idx *Indexer) processEntry(path, relPath string, info os.FileInfo, entryIn
 				// This is a hardlink to an already-seen file
 				entry.Type = EntryTypeHardlink
 				entry.LinkIndex = firstIdx
+				// Hardlinks are counted based on whether they match parent
+				if idx.isUnmodified(entry) {
+					idx.unmodifiedEntries++
+				} else {
+					idx.modifiedEntries++
+				}
+				idx.updateProgress(relPath)
 				return entry, nil
 			}
 			// First time seeing this inode, record it
@@ -263,7 +268,7 @@ func (idx *Indexer) processEntry(path, relPath string, info os.FileInfo, entryIn
 		if chunkRefs, ok := idx.reuseParentChunks(entry); ok {
 			entry.ChunkRefs = chunkRefs
 			entry.ChunkCount = uint32(len(chunkRefs))
-			idx.reusedFiles++
+			idx.unmodifiedEntries++
 		} else {
 			// Process file chunks
 			chunkRefs, err := idx.processFileChunks(path, info.Size())
@@ -272,6 +277,7 @@ func (idx *Indexer) processEntry(path, relPath string, info os.FileInfo, entryIn
 			}
 			entry.ChunkRefs = chunkRefs
 			entry.ChunkCount = uint32(len(chunkRefs))
+			idx.modifiedEntries++
 		}
 
 		// Apply the racy-ctime adjustment to the value that gets *stored*
@@ -309,7 +315,15 @@ func (idx *Indexer) processEntry(path, relPath string, info os.FileInfo, entryIn
 		return nil, nil
 	}
 
-	idx.fileCount++
+	// Track modified/unmodified for non-file entries (files are tracked above)
+	if entry.Type != EntryTypeFile {
+		if idx.isUnmodified(entry) {
+			idx.unmodifiedEntries++
+		} else {
+			idx.modifiedEntries++
+		}
+	}
+
 	idx.updateProgress(relPath)
 
 	return entry, nil
@@ -344,6 +358,21 @@ func (idx *Indexer) processFileChunks(path string, size int64) ([]uint32, error)
 	}
 
 	return chunkRefs, nil
+}
+
+// isUnmodified checks whether the given entry matches the parent snapshot's
+// entry at the same path (same type and ctime). This is used for all entry
+// types to determine if they should be counted as "unmodified" vs "modified"
+// in progress reporting.
+func (idx *Indexer) isUnmodified(entry *TSMEntry) bool {
+	if idx.opts.ParentTSM == nil {
+		return false
+	}
+	parent, ok := idx.opts.ParentTSM.LookupPath(entry.Path)
+	if !ok {
+		return false
+	}
+	return parent.Type == entry.Type && parent.Ctime == entry.Ctime
 }
 
 // reuseParentChunks checks whether the given regular-file entry is unchanged
@@ -412,21 +441,10 @@ func (idx *Indexer) reuseParentChunks(entry *TSMEntry) ([]uint32, bool) {
 	return chunkRefs, true
 }
 
-// logProgress writes a progress message if a ProgressWriter is configured.
-func (idx *Indexer) logProgress(format string, args ...interface{}) {
-	if idx.opts.ProgressWriter != nil {
-		fmt.Fprintf(idx.opts.ProgressWriter, format, args...)
-	}
-}
-
-// updateProgress updates the progress display roughly every 250ms, reporting
-// the total files indexed, how many of those were reused (already indexed,
-// based on the parent .tsm), and total bytes indexed so far. The message is
-// emitted for both TTY and non-TTY consumers: on a TTY it is prefixed with a
-// carriage return and includes the current path so it overwrites in place; on
-// a non-TTY (e.g. an NDJSON progress stream) it is a plain line.
+// updateProgress calls the progress callback with current stats, rate-limited
+// to about 4 updates per second (~250ms).
 func (idx *Indexer) updateProgress(path string) {
-	if idx.opts.ProgressWriter == nil {
+	if idx.opts.ProgressCallback == nil {
 		return
 	}
 
@@ -437,19 +455,7 @@ func (idx *Indexer) updateProgress(path string) {
 	}
 	idx.lastUpdate = now
 
-	msg := fmt.Sprintf("Indexing: %d files (%d already indexed), %d MB",
-		idx.fileCount, idx.reusedFiles, idx.totalBytes/(1024*1024))
-
-	if idx.opts.IsTTY {
-		// Append the current path and overwrite the line in place.
-		displayPath := path
-		if len(displayPath) > 60 {
-			displayPath = "..." + displayPath[len(displayPath)-57:]
-		}
-		fmt.Fprintf(idx.opts.ProgressWriter, "\r%s %s", msg, displayPath)
-	} else {
-		fmt.Fprintln(idx.opts.ProgressWriter, msg)
-	}
+	idx.opts.ProgressCallback(idx.Stats())
 }
 
 // Create is a convenience function to create TSM/TSC files from a path
@@ -460,18 +466,18 @@ func Create(rootPath, outBase string, opts IndexerOptions) error {
 
 // IndexerStats returns statistics about the indexing
 type IndexerStats struct {
-	FileCount   int
-	ReusedFiles int
-	ChunkCount  uint64
-	TotalBytes  int64
+	UnmodifiedEntries int
+	ModifiedEntries   int
+	ChunkCount        uint64
+	TotalBytes        int64
 }
 
 // Stats returns current indexing statistics
 func (idx *Indexer) Stats() IndexerStats {
 	return IndexerStats{
-		FileCount:   idx.fileCount,
-		ReusedFiles: idx.reusedFiles,
-		ChunkCount:  idx.tsc.ChunkCount(),
-		TotalBytes:  idx.totalBytes,
+		UnmodifiedEntries: idx.unmodifiedEntries,
+		ModifiedEntries:   idx.modifiedEntries,
+		ChunkCount:        idx.tsc.ChunkCount(),
+		TotalBytes:        idx.totalBytes,
 	}
 }

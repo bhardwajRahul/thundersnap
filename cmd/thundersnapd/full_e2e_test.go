@@ -706,14 +706,14 @@ func TestE2ESnapDeterministic(t *testing.T) {
 
 	// Snap both frames
 	setFlagsForTest(env1.fsDir, env1.snapshotsDir, env1.libexecDir)
-	newSnap1, err := createSnapshot(frame1, nil, false)
+	newSnap1, err := createSnapshot(frame1, nil)
 	if err != nil {
 		t.Fatalf("createSnapshot inst1: %v", err)
 	}
 	resetFlagsForTest()
 
 	setFlagsForTest(env2.fsDir, env2.snapshotsDir, env2.libexecDir)
-	newSnap2, err := createSnapshot(frame2, nil, false)
+	newSnap2, err := createSnapshot(frame2, nil)
 	if err != nil {
 		t.Fatalf("createSnapshot inst2: %v", err)
 	}
@@ -780,7 +780,7 @@ func TestE2EDownloadSnap(t *testing.T) {
 
 	// Step 3: Snap the frame
 	t.Log("Snapping frame on instance 1...")
-	snapSpec1, err := createSnapshot(frame1, nil, false)
+	snapSpec1, err := createSnapshot(frame1, nil)
 	if err != nil {
 		t.Fatalf("createSnapshot inst1: %v", err)
 	}
@@ -863,7 +863,7 @@ func TestE2EDownloadSnap(t *testing.T) {
 
 	// Snap the frame on instance 2
 	t.Log("Snapping frame on instance 2...")
-	snapSpec2, err := createSnapshot(frame2, nil, false)
+	snapSpec2, err := createSnapshot(frame2, nil)
 	if err != nil {
 		t.Fatalf("createSnapshot inst2: %v", err)
 	}

@@ -60,11 +60,12 @@ func TestIncrementalReuseUnchangedTree(t *testing.T) {
 
 	// First (full) index — no parent.
 	stats1, tsm1 := indexTree(t, root, base1, nil, nil)
-	if stats1.ReusedFiles != 0 {
-		t.Errorf("first index should reuse nothing, reused=%d", stats1.ReusedFiles)
+	if stats1.UnmodifiedEntries != 0 {
+		t.Errorf("first index should reuse nothing, unmodified=%d", stats1.UnmodifiedEntries)
 	}
-	if stats1.FileCount == 0 {
-		t.Fatal("first index processed no files")
+	totalEntries := stats1.UnmodifiedEntries + stats1.ModifiedEntries
+	if totalEntries == 0 {
+		t.Fatal("first index processed no entries")
 	}
 
 	parentTSM, err := ReadTSM(base1 + ".tsm")
@@ -81,16 +82,11 @@ func TestIncrementalReuseUnchangedTree(t *testing.T) {
 	base2 := filepath.Join(out, "snap2")
 	stats2, tsm2 := indexTree(t, root, base2, parentTSM, parentTSC)
 
-	// Count regular files (only those carry chunks / can be reused).
-	regularFiles := 0
-	for i := range parentTSM.Entries {
-		if parentTSM.Entries[i].Type == EntryTypeFile {
-			regularFiles++
-		}
-	}
-	if stats2.ReusedFiles != regularFiles {
-		t.Errorf("second index reused %d files, want all %d regular files re-used",
-			stats2.ReusedFiles, regularFiles)
+	// All entries should be unmodified on the second pass.
+	totalEntries2 := stats2.UnmodifiedEntries + stats2.ModifiedEntries
+	if stats2.UnmodifiedEntries != totalEntries2 {
+		t.Errorf("second index: unmodified=%d, modified=%d, want all unmodified",
+			stats2.UnmodifiedEntries, stats2.ModifiedEntries)
 	}
 
 	// The snapshot ID (TSM SHA) must be identical: incremental reuse must not
@@ -134,10 +130,10 @@ func TestIncrementalRehashChangedFile(t *testing.T) {
 	base2 := filepath.Join(out, "snap2")
 	stats2, _ := indexTree(t, root, base2, parentTSM, parentTSC)
 
-	// Exactly one regular file (keep.txt) should be reused; change.txt must
-	// be re-hashed.
-	if stats2.ReusedFiles != 1 {
-		t.Errorf("expected exactly 1 reused file (keep.txt), got %d", stats2.ReusedFiles)
+	// There are 3 entries total: root dir, keep.txt, change.txt.
+	// The root dir and keep.txt should be unmodified; change.txt should be modified.
+	if stats2.ModifiedEntries != 1 {
+		t.Errorf("expected exactly 1 modified entry (change.txt), got %d", stats2.ModifiedEntries)
 	}
 }
 

@@ -105,9 +105,10 @@ func TestSnapshotHomeWorkIncrementalPreserveParent(t *testing.T) {
 		t.Fatalf("first index of home: %v", err)
 	}
 	stats1 := idx1.Stats()
-	t.Logf("first home snap: files=%d, reused=%d", stats1.FileCount, stats1.ReusedFiles)
-	if stats1.FileCount == 0 {
-		t.Fatal("first snap found no files")
+	t.Logf("first home snap: unmodified=%d, modified=%d", stats1.UnmodifiedEntries, stats1.ModifiedEntries)
+	totalEntries1 := stats1.UnmodifiedEntries + stats1.ModifiedEntries
+	if totalEntries1 == 0 {
+		t.Fatal("first snap found no entries")
 	}
 
 	// Read snap1's TSM/TSC for later comparison
@@ -145,7 +146,7 @@ func TestSnapshotHomeWorkIncrementalPreserveParent(t *testing.T) {
 		t.Fatalf("third index of home: %v", err)
 	}
 	stats3 := idx3.Stats()
-	t.Logf("third home snap (with parent): files=%d, reused=%d", stats3.FileCount, stats3.ReusedFiles)
+	t.Logf("third home snap (with parent): unmodified=%d, modified=%d", stats3.UnmodifiedEntries, stats3.ModifiedEntries)
 
 	snap3TSM, err := tsm.ReadTSM(snap3Path + ".tsm")
 	if err != nil {
@@ -156,9 +157,7 @@ func TestSnapshotHomeWorkIncrementalPreserveParent(t *testing.T) {
 		t.Fatalf("read snap3 tsc: %v", err)
 	}
 
-	// stats3.FileCount also counts the root directory entry itself (not
-	// just regular files), so check the regular-file count from the TSM
-	// entries directly rather than asserting on FileCount.
+	// Check regular-file count from the TSM entries.
 	regularFiles := 0
 	for i := range snap3TSM.Entries {
 		if snap3TSM.Entries[i].Type == tsm.EntryTypeFile {
@@ -170,11 +169,15 @@ func TestSnapshotHomeWorkIncrementalPreserveParent(t *testing.T) {
 	}
 
 	// The key assertion for the original bug: persistent.txt was never
-	// touched, so with the parent snap ID correctly preserved, its chunks
-	// must be reused rather than re-hashed. If the parent had been lost
-	// (frameMeta.Home = ""), this would show 0 reused files instead.
-	if stats3.ReusedFiles != 1 {
-		t.Errorf("expected exactly 1 reused file (persistent.txt), got %d reused; parent snap ID was likely lost", stats3.ReusedFiles)
+	// touched, so with the parent snap ID correctly preserved, it must be
+	// marked as unmodified. If the parent had been lost (frameMeta.Home = ""),
+	// all entries would be modified instead.
+	// Expected: root dir unmodified, persistent.txt unmodified, transient.txt modified (was deleted/recreated)
+	if stats3.UnmodifiedEntries != 2 {
+		t.Errorf("expected 2 unmodified entries (root dir + persistent.txt), got %d; parent snap ID was likely lost", stats3.UnmodifiedEntries)
+	}
+	if stats3.ModifiedEntries != 1 {
+		t.Errorf("expected 1 modified entry (transient.txt), got %d", stats3.ModifiedEntries)
 	}
 
 	persistentEntry, ok := snap3TSM.LookupPath("persistent.txt")
