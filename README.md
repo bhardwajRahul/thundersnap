@@ -1,7 +1,7 @@
 # THUNDERSNAP
 
 Thundersnap is a collection of new and old ideas in distributed filesystem
-design. It’s named after the primary two ways this early veresion is likely
+design. It’s named after the primary two ways this early version is likely
 to fail: the thundering herd (its mesh replication protocol) and the Thanos
 Snap (which is likely to lose roughly have your data).
 
