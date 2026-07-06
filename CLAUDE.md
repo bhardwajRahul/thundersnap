@@ -1,3 +1,9 @@
+Oh yes, this project is very AI-coded, with all the pros and cons that come
+with it. The bad news is the quality is currently variable; the good news is
+that this project would not have been possible at all without it, because
+it's too many moving parts at once to be justifiable as a human-driven
+experiment. Over time we need to improve the quality of all the components.
+
 # Claude Code Project Notes
 
 - Always run "make test" after making changes. "make test" also enforces gofmt;

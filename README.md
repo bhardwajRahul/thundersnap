@@ -5,7 +5,19 @@ design. It’s named after the primary two ways this early version is likely
 to fail: the thundering herd (its mesh replication protocol) and the Thanos
 Snap (which is likely to lose roughly half your data).
 
-Anyway, don’t use it for anything in production right now! It’s a toy.
+What does it do?
+
+* Quickly converts docker containers to on-disk btrfs subvolumes that can be
+  content-addressed.
+* Lets you create, fork, and run "frames" (execution environments) by
+  combining snapshots.
+* Lets you replicate those snapshots around between thundersnap instances.
+* Lets you run programs in "persistent container" environments with mutable
+  filesystems (unlike normal containers), kind of like using a regular
+  computer, except you can snapshot that whole filesystem whenever you want
+  instantly... which means you can undo changes across the entire system.
+
+But don’t use it for anything in production right now! It’s a toy.
 
 But, being a toy gives us a chance to be creative. Imagine if we removed all
 the requirements of a production-ready distributed system. It doesn’t have
@@ -35,7 +47,7 @@ Then you need to activate by logging it into Tailscale. Thundersnap
 fundamentally needs Tailscale to work, so that its auth and mesh replication
 features are secure. You can use Headscale (open source control server) if
 you want, or [Tailscale’s generous free
-plan](https://tailscale.com/blog/free-plan). Anyway, ones thundersnapd is
+plan](https://tailscale.com/blog/free-plan). Anyway, once thundersnapd is
 running in the background, use `thundersnapd --activate` and follow the URL
 to log in.
 
@@ -52,7 +64,7 @@ The primary attribute of a Thundersnap system is Durability — the D in
 database “ACID” terminology. Thundersnap works pretty hard to make your data
 durable. It doesn’t particularly try at Atomicity, Consistency, or
 Isolation. In this version it’s probably not super Durable either, but
-that’s not an achitectural limit.
+that’s not an architectural limit.
 
 The underlying thesis of Thundersnap is that modern distributed storage
 needs to rely on *snapshots* rather than real-time synchronization. Nothing
@@ -84,7 +96,7 @@ To make a snapshot, use `ts snap`.
 
 ## Lightweight execution frames
 
-Thundersnap defaults to using Linux namespacing (”containers”) instead of
+Thundersnap defaults to using Linux namespacing (“containers”) instead of
 full VMs. The idea is that modern cloud architecture suggests making
 everything you do into its own tiny isolated microVM. Although that’s very
 safe, it’s also very slow, and somehow we’ve gotten used to it.
@@ -107,9 +119,10 @@ but you can play with it today.
 An execution frame is actually made of three independent snaps:
 
 - root (`/`): the operating system (which you can extract from a docker
-container to start with, if you like) - `/home`: the /home directory that
-contains your personal preferences and tools - `/work`: the /work directory
-where you put the project you’re working on.
+  container to start with, if you like)
+- `/home`: the /home directory that contains your personal preferences and
+  tools
+- `/work`: the /work directory where you put the project you’re working on.
 
 You might be surprised that `/home` and `/work` are separate. We did it that
 way because you might want to swap out each of the three parts
@@ -162,12 +175,15 @@ leftover key material floating around in RAM).
 
 This lets you do blue-green deployments for example:
 
-- `ts frame --ref blue <whatever>` - `ts go blue` - `app
---state-dir=/id/blue/ --login` # do the Tailscale login flow - …get app
-working… - `ts frame --ref=green ::` # duplicate my frame - `ts go green` #
-duplicate my frame - `app --state-dir=/id/green --login` # do the Tailscale
-login flow - …make changes to app and test it in green mode… - `ts ref move
-blue $(ts frame)`
+- `ts frame --ref blue <whatever>`
+- `ts go blue`
+- `app --state-dir=/id/blue/ --login` # do the Tailscale login flow
+- …get app working…
+- `ts frame --ref=green ::` # duplicate my frame
+- `ts go green` # duplicate my frame
+- `app --state-dir=/id/green --login` # do the Tailscale login flow
+- …make changes to app and test it in green mode…
+- `ts ref move blue $(ts frame)`
 
 Anyway this part is only lightly tested, but you get the idea.
 
@@ -198,7 +214,7 @@ in the latest security fixes, but also means you pull in arbitrary other
 changes that might be better or worse, but at the very least will be
 surprising.
 
-Thundersnap works differently, If you use for example `ts download-docker
+Thundersnap works differently. If you use for example `ts download-docker
 debian:latest` it will download the latest docker container named
 `debian:latest`, but then it prints out the content hash of the snap it
 created; every time you use that content hash, you get exactly what you
@@ -222,12 +238,12 @@ When mesh mode is enabled, thundersnapd periodically pings all the machines
 on your tailnet that have the same identity as it does (by default, your
 username). This is a little hacky and we should fix it, but it’s a good way
 to get started. So if you have multiple computers and you install
-`thundersnapd —mesh` on each, they’ll see each other. You can then see their
+`thundersnapd --mesh` on each, they’ll see each other. You can then see their
 mesh status and peer list by visiting
 [http://thundersnap:7575/](http://thundersnap:7575/) if you want. (Replace
 “thundersnap” with whatever hostname you assign.)
 
-One you have peers, you can replicate snaps. The only command for that right
+Once you have peers, you can replicate snaps. The only command for that right
 now is `ts download-snap <snapid>` — as long as you know the snapid
 generated from `ts snap` on one machine, you can download-snap it to
 another, and then construct frames from it.
