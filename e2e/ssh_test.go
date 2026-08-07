@@ -559,7 +559,8 @@ func verifySnaphashOutput(t *testing.T, output string) {
 }
 
 // testFrameForkCreatesRef verifies the special `ts frame ::` fork path honors
-// --ref, and that explicit ref creation stays silent on success.
+// --ref, and that explicit ref creation accepts a ref target and stays silent
+// on success.
 func testFrameForkCreatesRef(t *testing.T, d *daemonInstance) {
 	output, exitCode, err := sshExec(t, d, "root@", "ts frame --ref frameforkref ::")
 	if err != nil || exitCode != 0 {
@@ -578,12 +579,20 @@ func testFrameForkCreatesRef(t *testing.T, d *daemonInstance) {
 		t.Fatalf("frameforkref resolves to %q, want newly created frame %q", got, frameUUID)
 	}
 
-	output, exitCode, err = sshExec(t, d, "root@", "ts ref create frameforkalias "+frameUUID)
+	output, exitCode, err = sshExec(t, d, "root@", "ts ref create frameforkalias frameforkref")
 	if err != nil || exitCode != 0 {
-		t.Fatalf("ts ref create: err=%v exit=%d output=%q", err, exitCode, output)
+		t.Fatalf("ts ref create from ref: err=%v exit=%d output=%q", err, exitCode, output)
 	}
 	if output != "" {
 		t.Fatalf("ts ref create produced output %q, want none", output)
+	}
+
+	output, exitCode, err = sshExec(t, d, "root@", "ts frame frameforkalias")
+	if err != nil || exitCode != 0 {
+		t.Fatalf("resolve frameforkalias: err=%v exit=%d output=%q", err, exitCode, output)
+	}
+	if got := strings.TrimSpace(output); got != frameUUID {
+		t.Fatalf("frameforkalias resolves to %q, want target ref's UUID %q", got, frameUUID)
 	}
 }
 

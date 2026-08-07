@@ -242,9 +242,14 @@ nothing on stdout. Exits 1 if any download failed.`,
 	{
 		name:     "ref create",
 		category: "ref",
-		short:    "create a new ref pointing at a frame UUID",
-		long:     `Creates a new ref named <name> that points at the frame UUID <uuid>. The ref name must start with a letter and contain only letters, digits, dashes, and underscores.`,
-		outputs:  `Nothing on success.`,
+		short:    "create a new ref pointing at a frame",
+		long: `Creates a new ref named <name> that points at the frame identified by
+<uuid-or-ref>. If the target is a ref, its current frame UUID is used. The new
+ref name must start with a letter and contain only letters, digits, dashes, and
+underscores.`,
+		examples: `  ts ref create alias <uuid>       point "alias" at a frame UUID
+  ts ref create alias existing     point "alias" at "existing"'s current UUID`,
+		outputs: `Nothing on success.`,
 	},
 	{
 		name:     "ref move",

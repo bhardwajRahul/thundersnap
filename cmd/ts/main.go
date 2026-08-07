@@ -1707,7 +1707,7 @@ func cmdRef(args []string) {
 }
 
 func cmdRefCreate(args []string) {
-	opts, helpFlag := newCmdOpts("ref create", "<name> <uuid>")
+	opts, helpFlag := newCmdOpts("ref create", "<name> <uuid-or-ref>")
 	parseCmd(opts, "ref create", args)
 
 	if *helpFlag {
@@ -1716,15 +1716,15 @@ func cmdRefCreate(args []string) {
 	}
 
 	if opts.NArgs() != 2 {
-		fmt.Fprintln(os.Stderr, "error: ref create requires name and uuid")
-		fmt.Fprintln(os.Stderr, "usage: ts ref create <name> <uuid>")
+		fmt.Fprintln(os.Stderr, "error: ref create requires name and target")
+		fmt.Fprintln(os.Stderr, "usage: ts ref create <name> <uuid-or-ref>")
 		os.Exit(1)
 	}
 
 	name := opts.Arg(0)
-	uuid := opts.Arg(1)
+	target := opts.Arg(1)
 
-	if err := doRefCreate(*sockPath, name, uuid); err != nil {
+	if err := doRefCreate(*sockPath, name, target); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -1808,7 +1808,11 @@ func doRefRequest(sockPath, path string, req RefRequest) error {
 	return nil
 }
 
-func doRefCreate(sockPath, name, uuid string) error {
+func doRefCreate(sockPath, name, target string) error {
+	uuid, err := doResolveFrame(sockPath, target)
+	if err != nil {
+		return fmt.Errorf("resolve target %q: %w", target, err)
+	}
 	return doRefRequest(sockPath, "/ref/create", RefRequest{Name: name, UUID: uuid})
 }
 
