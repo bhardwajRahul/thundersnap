@@ -359,11 +359,11 @@ func handleConnection(conn io.ReadWriteCloser) {
 	// <parent>/<rootfs-base>/<conn-id> so sessions sharing a container land
 	// under the same intermediate dir while each gets its own leaf. VM sessions
 	// (cgroupMgr nil) and outer/non-container sessions skip this entirely.
-	var postStart func(pid int)
+	var postStart func(pid int) error
 	if cgroupMgr != nil && rootPrefix != "" {
 		leaf := fmt.Sprintf("%s/%s/%d", cgroupMgr.ParentName(), filepath.Base(rootPrefix), id)
-		postStart = func(pid int) {
-			cgroupMgr.ConfigureContainer(pid, leaf)
+		postStart = func(pid int) error {
+			return cgroupMgr.ConfigureContainer(pid, leaf)
 		}
 	}
 
@@ -399,7 +399,7 @@ func handleConnection(conn io.ReadWriteCloser) {
 // inside the container, frames stdout/stderr, and sends FrameExit), so vshd
 // performs no framing here. postStart, when non-nil, applies cgroup limits to
 // the child once started.
-func spliceContainerSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int)) {
+func spliceContainerSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int) error) {
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		log.Printf("[conn %d] stdin pipe: %v", id, err)
@@ -426,7 +426,14 @@ func spliceContainerSession(id uint64, conn io.Writer, reader io.Reader, cmd *ex
 		return
 	}
 	if postStart != nil {
-		postStart(cmd.Process.Pid)
+		if err := postStart(cmd.Process.Pid); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			log.Printf("[conn %d] failed to confine container session: %v", id, err)
+			vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte("vshd: failed to confine session: "+err.Error()+"\n"))
+			vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
+			return
+		}
 	}
 	log.Printf("[conn %d] container session started with PID %d", id, cmd.Process.Pid)
 

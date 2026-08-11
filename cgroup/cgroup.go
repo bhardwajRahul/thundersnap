@@ -79,10 +79,13 @@ func (m *Manager) ParentName() string {
 // ConfigureContainer applies resource limits to a freshly-started container
 // process: it biases the OOM score and creates+joins a leaf cgroup with memory,
 // pids, and CPU limits. cgroupName is the leaf path relative to the cgroup root
-// (typically "<ParentName()>/<user>/<session>"). Best-effort; errors are logged.
-func (m *Manager) ConfigureContainer(pid int, cgroupName string) {
+// (typically "<ParentName()>/<user>/<session>"). Failure to create or join the
+// cgroup is returned to the caller, which must terminate the unconfined process.
+// Individual controller tuning remains best-effort for kernels that lack one
+// of the optional controls.
+func (m *Manager) ConfigureContainer(pid int, cgroupName string) error {
 	setProcessOOMScore(pid, containerOOMScore)
-	m.setupContainerCgroup(pid, cgroupName)
+	return m.setupContainerCgroup(pid, cgroupName)
 }
 
 // getSystemMemoryBytes returns the total system memory in bytes.
@@ -106,19 +109,17 @@ func getSystemMemoryBytes() (uint64, error) {
 	return 0, fmt.Errorf("MemTotal not found in /proc/meminfo")
 }
 
-// initParent creates the parent cgroup with system-wide limits, once. Errors
-// are logged but not fatal.
-func (m *Manager) initParent() {
+// initParent creates the parent cgroup with system-wide limits, once.
+func (m *Manager) initParent() error {
 	if m.initialized {
-		return
+		return nil
 	}
 
 	cgroupPath := filepath.Join(cgroupRoot, m.parentName)
 
 	// Create parent cgroup directory
 	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
-		log.Printf("warning: failed to create parent cgroup %s: %v", cgroupPath, err)
-		return
+		return fmt.Errorf("create parent cgroup %s: %w", cgroupPath, err)
 	}
 
 	// Enable controllers for child cgroups. We need to enable controllers in
@@ -151,6 +152,7 @@ func (m *Manager) initParent() {
 	}
 
 	m.initialized = true
+	return nil
 }
 
 // setProcessOOMScore sets the OOM score adjustment for a process. Higher scores
@@ -169,18 +171,20 @@ func setProcessOOMScore(pid int, score int) {
 //   - pids.max: limit process count (fork bomb protection)
 //   - cpu.weight: fair sharing among containers
 //
-// Best-effort; errors are logged.
-func (m *Manager) setupContainerCgroup(pid int, cgroupName string) {
-	// Ensure parent cgroup exists with system-wide limits
-	m.initParent()
+// Failure to create the leaf or move the process into it is fatal to the
+// session; unsupported individual limits remain warnings.
+func (m *Manager) setupContainerCgroup(pid int, cgroupName string) error {
+	// Ensure parent cgroup exists with system-wide limits.
+	if err := m.initParent(); err != nil {
+		return err
+	}
 
 	// Use cgroup v2 unified hierarchy
 	cgroupPath := filepath.Join(cgroupRoot, cgroupName)
 
 	// Create cgroup directory
 	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
-		log.Printf("warning: failed to create cgroup %s: %v", cgroupPath, err)
-		return
+		return fmt.Errorf("create cgroup %s: %w", cgroupPath, err)
 	}
 
 	// Enable subtree_control on all intermediate directories between parent and
@@ -228,7 +232,7 @@ func (m *Manager) setupContainerCgroup(pid int, cgroupName string) {
 	// Move the process into the cgroup
 	procsPath := filepath.Join(cgroupPath, "cgroup.procs")
 	if err := os.WriteFile(procsPath, []byte(strconv.Itoa(pid)), 0644); err != nil {
-		log.Printf("warning: failed to add pid %d to cgroup %s: %v", pid, cgroupName, err)
-		return
+		return fmt.Errorf("add pid %d to cgroup %s: %w", pid, cgroupName, err)
 	}
+	return nil
 }

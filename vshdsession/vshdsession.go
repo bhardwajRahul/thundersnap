@@ -49,7 +49,7 @@ func (l Logf) logf(format string, args ...any) {
 // postStart, when non-nil, is invoked with the started child's PID immediately
 // after the command starts (used to apply cgroup limits in host mode). logf,
 // when non-nil, receives diagnostic logs.
-func Serve(conn io.Writer, reader io.Reader, cmd *exec.Cmd, wantPTY bool, ptyOwnerUID int, postStart func(pid int), logf Logf) {
+func Serve(conn io.Writer, reader io.Reader, cmd *exec.Cmd, wantPTY bool, ptyOwnerUID int, postStart func(pid int) error, logf Logf) {
 	if wantPTY {
 		servePTY(conn, reader, cmd, ptyOwnerUID, postStart, logf)
 	} else {
@@ -59,7 +59,7 @@ func Serve(conn io.Writer, reader io.Reader, cmd *exec.Cmd, wantPTY bool, ptyOwn
 
 // servePTY starts cmd on a pty and bridges it to the TLV stream:
 // FrameStdin -> pty, FrameWinsize -> pty.Setsize, pty output -> FrameStdout.
-func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, ptyOwnerUID int, postStart func(pid int), logf Logf) {
+func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, ptyOwnerUID int, postStart func(pid int) error, logf Logf) {
 	// The client (the daemon's proxyVshdSessionGeneric) sends the initial
 	// FrameWinsize as the FIRST frame of a PTY session, before any stdin. Read
 	// it here and create the pty at that size with pty.StartWithSize, so the
@@ -124,7 +124,14 @@ func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, ptyOwnerUID int, 
 	}
 	defer ptmx.Close()
 	if postStart != nil {
-		postStart(cmd.Process.Pid)
+		if err := postStart(cmd.Process.Pid); err != nil {
+			_ = killProcessGroup(cmd, syscall.SIGKILL)
+			_ = cmd.Wait()
+			logf.logf("post-start confinement failed: %v", err)
+			vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte("vshd: failed to confine session: "+err.Error()+"\n"))
+			vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
+			return
+		}
 	}
 	logf.logf("pty session started with PID %d (size %dx%d)", cmd.Process.Pid, initSize.Rows, initSize.Cols)
 
@@ -202,7 +209,7 @@ func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, ptyOwnerUID int, 
 // servePipe runs cmd without a pty, feeding FrameStdin frames to the child's
 // stdin and framing its stdout/stderr separately (FrameStdout/FrameStderr), then
 // sending FrameExit.
-func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int), logf Logf) {
+func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int) error, logf Logf) {
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		logf.logf("stdin pipe: %v", err)
@@ -228,7 +235,14 @@ func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(p
 		return
 	}
 	if postStart != nil {
-		postStart(cmd.Process.Pid)
+		if err := postStart(cmd.Process.Pid); err != nil {
+			_ = killProcessGroup(cmd, syscall.SIGKILL)
+			_ = cmd.Wait()
+			logf.logf("post-start confinement failed: %v", err)
+			vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte("vshd: failed to confine session: "+err.Error()+"\n"))
+			vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
+			return
+		}
 	}
 	logf.logf("command started with PID %d", cmd.Process.Pid)
 
