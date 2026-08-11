@@ -47,21 +47,25 @@ func boot() error {
 			return err
 		}
 	}
-	if err := mount("bootconfig", "/bootconfig", "virtiofs", syscall.MS_RDONLY, ""); err != nil {
+	rootDevice, err := setupStorage()
+	if err != nil {
 		return err
 	}
-	if err := mount("/dev/vda", newRoot, "btrfs", 0, "compress=zstd"); err != nil {
+	if err := mount(rootDevice, newRoot, "btrfs", 0, "compress=zstd"); err != nil {
 		return err
 	}
 
+	params, err := kernelParams()
+	if err != nil {
+		return err
+	}
+	if params["thundersnap.testonly"] == "storage" {
+		log.Printf("THUNDERBOOT STORAGE OK: %s", rootDevice)
+		return syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)
+	}
 	logMemory("before installing appliance")
 	if err := installAppliance(); err != nil {
 		return err
-	}
-
-	authKey, err := os.ReadFile("/bootconfig/authkey")
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("read authkey: %w", err)
 	}
 	if err := switchRoot(); err != nil {
 		return err
@@ -76,9 +80,6 @@ func boot() error {
 	}
 
 	env := append(os.Environ(), "PATH=/bin")
-	if key := strings.TrimSpace(string(authKey)); key != "" {
-		env = append(env, "TS_AUTHKEY="+key)
-	}
 	args := []string{
 		"/bin/thundersnapd",
 		"--policy=/bin/thundersnap-policy.jsonc",
@@ -97,7 +98,6 @@ func installAppliance() error {
 		newRoot + "/lib",
 		newRoot + "/lib64",
 		newRoot + "/usr/lib",
-		newRoot + "/bootconfig",
 		newRoot + "/dev/pts",
 		newRoot + "/etc/ssl/certs",
 		newRoot + "/proc",
@@ -117,6 +117,10 @@ func installAppliance() error {
 		"/bin/busybox":                       newRoot + "/bin/busybox",
 		"/bin/btrfs":                         newRoot + "/bin/btrfs",
 		"/bin/mkfs.btrfs":                    newRoot + "/bin/mkfs.btrfs",
+		"/bin/blkid":                         newRoot + "/bin/blkid",
+		"/bin/mdadm":                         newRoot + "/bin/mdadm",
+		"/bin/make-bcache":                   newRoot + "/bin/make-bcache",
+		"/bin/nbd-client":                    newRoot + "/bin/nbd-client",
 		"/bin/cloud-hypervisor":              newRoot + "/bin/cloud-hypervisor",
 		"/bin/vmlinux":                       newRoot + "/bin/vmlinux",
 		"/bin/thundersnap-policy.jsonc":      newRoot + "/bin/thundersnap-policy.jsonc",
@@ -199,7 +203,7 @@ func copyTree(src, dst string) error {
 // disk root, unlink the unpacked initramfs, move the disk mount over /, and
 // chroot into it. The following Exec releases the old /init mappings too.
 func switchRoot() error {
-	for _, path := range []string{"/dev", "/proc", "/sys", "/run", "/tmp", "/bootconfig"} {
+	for _, path := range []string{"/dev", "/proc", "/sys", "/run", "/tmp"} {
 		target := newRoot + path
 		if err := syscall.Mount(path, target, "", syscall.MS_MOVE, ""); err != nil {
 			return fmt.Errorf("move mount %s to %s: %w", path, target, err)

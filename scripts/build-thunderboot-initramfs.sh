@@ -45,6 +45,10 @@ copy_dynamic_binary() {
 }
 copy_dynamic_binary /usr/bin/btrfs btrfs
 copy_dynamic_binary /usr/sbin/mkfs.btrfs mkfs.btrfs
+copy_dynamic_binary /usr/sbin/blkid blkid
+copy_dynamic_binary /usr/sbin/mdadm mdadm
+copy_dynamic_binary /usr/sbin/make-bcache make-bcache
+copy_dynamic_binary /usr/sbin/nbd-client nbd-client
 
 cp cmd/thundersnapd/policy.jsonc "$root/bin/thundersnap-policy.jsonc"
 if [ ! -r /etc/ssl/certs/ca-certificates.crt ]; then
