@@ -52,9 +52,10 @@ func main() {
 	noBcache := getopt.BoolLong("no-bcache", 'n', "Skip bcache setup, just boot with virtiofs")
 	appliance := getopt.BoolLong("appliance", 0, "Boot the thundersnap appliance initramfs")
 	initramfs := getopt.StringLong("initramfs", 0, "thunderboot-out/initramfs.cpio", "Appliance initramfs path")
-	dataDisk := getopt.StringLong("data-disk", 0, "thunderboot-out/data.btrfs", "Persistent appliance data disk")
-	dataDiskSize := getopt.StringLong("data-disk-size", 0, "2T", "New appliance disk size (M, G, or T)")
-	configDir := getopt.StringLong("config-dir", 0, "thunderboot-out/config", "Appliance first-boot configuration directory")
+	applianceCache := getopt.StringLong("cache", 0, "", "Appliance cache spec (device list or raid0/raid1;devices)")
+	applianceDisk := getopt.StringLong("disk", 0, "thunderboot-out/data.img", "Appliance disk spec (devices, RAID, or nbd:// URL)")
+	diskSize := getopt.StringLong("disk-size", 0, "2T", "Size for newly created host disk images")
+	testOnly := getopt.BoolLong("testonly", 0, "Set up and mount storage, then power off")
 	cpus := getopt.IntLong("cpus", 0, 1, "Appliance virtual CPU count")
 	help := getopt.BoolLong("help", 'h', "Show help")
 
@@ -132,9 +133,10 @@ func main() {
 	}
 	if *appliance {
 		cfg.Initramfs = *initramfs
-		cfg.DataDisk = *dataDisk
-		cfg.DataDiskSize = *dataDiskSize
-		cfg.ConfigDir = *configDir
+		cfg.ApplianceCache = *applianceCache
+		cfg.ApplianceDisk = *applianceDisk
+		cfg.ApplianceDiskSize = *diskSize
+		cfg.TestOnly = *testOnly
 		cfg.CPUs = *cpus
 	}
 
@@ -148,8 +150,8 @@ func main() {
 	log.Printf("Starting thunderboot VM...")
 	if *appliance {
 		log.Printf("  Initramfs: %s", cfg.Initramfs)
-		log.Printf("  Data disk: %s (%s if new)", cfg.DataDisk, cfg.DataDiskSize)
-		log.Printf("  Config dir: %s", cfg.ConfigDir)
+		log.Printf("  Cache: %s", cfg.ApplianceCache)
+		log.Printf("  Disk: %s (%s for new host images)", cfg.ApplianceDisk, cfg.ApplianceDiskSize)
 		log.Printf("  CPUs: %d", cfg.CPUs)
 	} else {
 		log.Printf("  RootFS: %s", cfg.RootFS)
@@ -185,6 +187,12 @@ func main() {
 		log.Printf("Appliance VM started; serial console follows")
 		if err := session.Wait(); err != nil {
 			log.Fatal(err)
+		}
+		// Reap passt and remove its socket. This is particularly important when
+		// stdout/stderr are pipes: a surviving helper keeps the pipe open and
+		// makes callers wait forever after Cloud Hypervisor exits.
+		if err := session.Close(); err != nil {
+			log.Printf("cleanup: %v", err)
 		}
 		return
 	}

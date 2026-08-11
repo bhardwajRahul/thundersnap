@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/creack/pty"
@@ -20,97 +21,99 @@ func startApplianceVM(cfg VMConfig) (*VMSession, error) {
 	if cfg.CPUs == 0 {
 		cfg.CPUs = 1
 	}
-	if cfg.DataDiskSize == "" {
-		cfg.DataDiskSize = "2T"
+	if cfg.ApplianceDiskSize == "" {
+		cfg.ApplianceDiskSize = "2T"
 	}
 	for _, path := range []string{cfg.Initramfs, filepath.Join(cfg.VMDir, "cloud-hypervisor"), filepath.Join(cfg.VMDir, "vmlinux")} {
 		if _, err := os.Stat(path); err != nil {
 			return nil, fmt.Errorf("required appliance artifact %s: %w", path, err)
 		}
 	}
-	if cfg.DataDisk == "" {
-		return nil, fmt.Errorf("appliance DataDisk is required")
+	cache, err := ParseDiskSpec(cfg.ApplianceCache, false)
+	if err != nil {
+		return nil, fmt.Errorf("cache: %w", err)
 	}
-	if cfg.ConfigDir == "" {
-		return nil, fmt.Errorf("appliance ConfigDir is required")
+	disk, err := ParseDiskSpec(cfg.ApplianceDisk, true)
+	if err != nil {
+		return nil, fmt.Errorf("disk: %w", err)
 	}
-	if err := ensureBtrfsDisk(cfg.DataDisk, cfg.DataDiskSize); err != nil {
+	if len(disk.Devices) == 0 && disk.NBD == nil {
+		return nil, fmt.Errorf("appliance disk is required")
+	}
+
+	// Translate each host image path into the corresponding virtio-blk device.
+	var hostDisks []string
+	translate := func(spec *DiskSpec) error {
+		for i, path := range spec.Devices {
+			if err := ensureSparseDisk(path, cfg.ApplianceDiskSize); err != nil {
+				return err
+			}
+			hostDisks = append(hostDisks, path)
+			if len(hostDisks) > 26 {
+				return fmt.Errorf("too many appliance disks")
+			}
+			spec.Devices[i] = fmt.Sprintf("/dev/vd%c", 'a'+len(hostDisks)-1)
+		}
+		return nil
+	}
+	if err := translate(&cache); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(cfg.ConfigDir, 0700); err != nil {
-		return nil, fmt.Errorf("create config directory: %w", err)
+	if err := translate(&disk); err != nil {
+		return nil, err
 	}
 
 	sessionID := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
-	virtiofsSock := filepath.Join("/tmp", "tb-config-"+sessionID+".sock")
 	passtSock := filepath.Join("/tmp", "tb-passt-"+sessionID+".sock")
-
-	virtiofsdCmd := exec.Command("/usr/libexec/virtiofsd",
-		"--socket-path="+virtiofsSock,
-		"--shared-dir="+cfg.ConfigDir,
-		"--cache=never",
-		"--modcaps=-setfcap",
-	)
-	virtiofsdCmd.Stderr = os.Stderr
-	if err := virtiofsdCmd.Start(); err != nil {
-		return nil, fmt.Errorf("start virtiofsd: %w", err)
-	}
-	cleanup := func() {
-		_ = virtiofsdCmd.Process.Kill()
-		_ = virtiofsdCmd.Wait()
-		_ = os.Remove(virtiofsSock)
-	}
-	if err := waitForSocket(virtiofsSock, 5*time.Second); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("virtiofsd socket: %w", err)
-	}
-
 	passtCmd := exec.Command("passt", "--socket", passtSock, "--vhost-user", "--foreground", "--quiet",
-		"-a", "10.0.2.15",
-		"-g", "10.0.2.2",
-		"--dns-forward", "10.0.2.3",
-	)
+		"-a", "10.0.2.15", "-g", "10.0.2.2", "--dns-forward", "10.0.2.3")
 	passtCmd.Stderr = os.Stderr
 	if err := passtCmd.Start(); err != nil {
-		cleanup()
 		return nil, fmt.Errorf("start passt: %w", err)
 	}
-	cleanupAll := func() {
+	cleanup := func() {
 		_ = passtCmd.Process.Kill()
 		_ = passtCmd.Wait()
 		_ = os.Remove(passtSock)
-		cleanup()
 	}
 	if err := waitForSocket(passtSock, 5*time.Second); err != nil {
-		cleanupAll()
+		cleanup()
 		return nil, fmt.Errorf("passt socket: %w", err)
 	}
 
-	cmdline := "console=ttyS0 panic=-1 reboot=t ip=10.0.2.15::10.0.2.2:255.255.255.0:thunderboot:eth0:off"
-	chvCmd := exec.Command(filepath.Join(cfg.VMDir, "cloud-hypervisor"),
+	cmdline := []string{
+		"console=ttyS0", "panic=-1", "reboot=t",
+		"ip=10.0.2.15::10.0.2.2:255.255.255.0:thunderboot:eth0:off",
+		"thunderboot.disk=" + disk.String(),
+	}
+	if cache.String() != "" {
+		cmdline = append(cmdline, "thunderboot.cache="+cache.String())
+	}
+	if cfg.TestOnly {
+		cmdline = append(cmdline, "thundersnap.testonly=storage")
+	}
+	args := []string{
 		"--kernel", filepath.Join(cfg.VMDir, "vmlinux"),
 		"--initramfs", cfg.Initramfs,
-		"--cpus", "boot="+strconv.Itoa(cfg.CPUs),
+		"--cpus", "boot=" + strconv.Itoa(cfg.CPUs),
 		"--memory", fmt.Sprintf("size=%dM,shared=on", cfg.MemoryMB),
-		"--disk", "path="+cfg.DataDisk,
-		"--fs", "tag=bootconfig,socket="+virtiofsSock,
-		"--net", "vhost_user=true,socket="+passtSock+",num_queues=2",
-		"--cmdline", cmdline,
-		"--serial", "tty",
-		"--console", "off",
-		"--pvpanic",
-	)
-	session := &VMSession{
-		virtiofsdCmd:  virtiofsdCmd,
-		passtCmd:      passtCmd,
-		chvCmd:        chvCmd,
-		virtiofsSock:  virtiofsSock,
-		preserveDisks: true,
-		done:          make(chan struct{}),
 	}
+	if len(hostDisks) > 0 {
+		args = append(args, "--disk")
+		for _, path := range hostDisks {
+			args = append(args, "path="+path)
+		}
+	}
+	args = append(args,
+		"--net", "vhost_user=true,socket="+passtSock+",num_queues=2",
+		"--cmdline", strings.Join(cmdline, " "),
+		"--serial", "tty", "--console", "off", "--pvpanic",
+	)
+	chvCmd := exec.Command(filepath.Join(cfg.VMDir, "cloud-hypervisor"), args...)
+	session := &VMSession{passtCmd: passtCmd, chvCmd: chvCmd, preserveDisks: true, done: make(chan struct{})}
 	ptmx, err := pty.Start(chvCmd)
 	if err != nil {
-		cleanupAll()
+		cleanup()
 		return nil, fmt.Errorf("start cloud-hypervisor: %w", err)
 	}
 	session.consolePtmx = ptmx
@@ -131,38 +134,29 @@ func startApplianceVM(cfg VMConfig) (*VMSession, error) {
 	return session, nil
 }
 
-func ensureBtrfsDisk(path, size string) error {
+func ensureSparseDisk(path, size string) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("stat data disk: %w", err)
+		return fmt.Errorf("stat disk: %w", err)
 	}
 	bytes, err := parseDiskSize(size)
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return fmt.Errorf("create data disk directory: %w", err)
+		return err
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
-		return fmt.Errorf("create data disk: %w", err)
+		return err
 	}
 	if err := f.Truncate(bytes); err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
-		return fmt.Errorf("size data disk: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
 		return err
 	}
-	cmd := exec.Command("mkfs.btrfs", "-f", "-L", "thundersnap-data", path)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(path)
-		return fmt.Errorf("mkfs.btrfs: %w\n%s", err, out)
-	}
-	return nil
+	return f.Close()
 }
 
 func parseDiskSize(size string) (int64, error) {

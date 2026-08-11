@@ -31,11 +31,15 @@ type VMConfig struct {
 	// Initramfs selects appliance mode when non-empty. In appliance mode the
 	// initramfs supplies PID 1, DataDisk is /dev/vda, and ConfigDir is shared
 	// read-only with the guest as the "bootconfig" virtiofs tag.
-	Initramfs    string
-	DataDisk     string
-	DataDiskSize string
-	ConfigDir    string
-	CPUs         int
+	Initramfs string
+	// ApplianceCache and ApplianceDisk are kernel-style storage specs. Host
+	// paths are attached in declaration order and rewritten to /dev/vd[a-z].
+	ApplianceCache string
+	ApplianceDisk  string
+	// ApplianceDiskSize is the size used when creating missing host image paths.
+	ApplianceDiskSize string
+	TestOnly          bool
+	CPUs              int
 	// RootFS is the path to the root filesystem to share via virtiofs.
 	RootFS string
 	// VMDir is the path to the directory containing cloud-hypervisor and vmlinux.

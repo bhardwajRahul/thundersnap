@@ -22,7 +22,7 @@ OUT ?= dist
 # Output directory for local binaries
 BIN ?= ./bin
 
-.PHONY: all test e2e not_e2e binaries ts vshd thundersnapd thunderboot \
+.PHONY: all test e2e e2e-tb not_e2e binaries ts vshd thundersnapd thunderboot \
         list build build-deb build-rpm build-tgz clean
 
 all: build
@@ -87,6 +87,12 @@ e2e: ts vshd thundersnapd
 		THUNDERSNAPD_BINARY="$(CURDIR)/$(BIN)/thundersnapd" \
 		$(BIN)/e2e.test -test.v -test.failfast -test.timeout=$(E2E_TEST_TIMEOUT) $(E2E_ARGS)
 	@./test-cleanup.sh $(E2E_TMPDIR)
+
+# Run thunderboot storage-layout tests.
+e2e-tb: thunderboot
+	./scripts/build-thunderboot-initramfs.sh
+	CGO_ENABLED=0 go test -tags e2e -c -o $(BIN)/e2e-tb.test ./e2e-tb
+	sudo -E timeout 300s $(BIN)/e2e-tb.test -test.v -test.failfast -test.timeout=5m $(E2E_ARGS)
 
 # Run legacy "e2e" tests (not actually e2e - see not-e2e-enough.md).
 # These tests exercise individual components but don't go through the SSH front
