@@ -2,16 +2,19 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
-	"os/exec"
-	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 )
+
+const newRoot = "/newroot"
 
 func main() {
 	log.SetPrefix("thunderboot-init: ")
@@ -42,54 +45,146 @@ func boot() error {
 			return err
 		}
 	}
-	if err := os.MkdirAll("/etc", 0755); err != nil {
-		return err
-	}
-	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 10.0.2.3\n"), 0644); err != nil {
-		return fmt.Errorf("write resolv.conf: %w", err)
-	}
 	if err := mount("bootconfig", "/bootconfig", "virtiofs", syscall.MS_RDONLY, ""); err != nil {
 		return err
 	}
-	if err := mount("/dev/vda", "/var/lib/thundersnap", "btrfs", 0, "compress=zstd"); err != nil {
+	if err := mount("/dev/vda", newRoot, "btrfs", 0, "compress=zstd"); err != nil {
 		return err
 	}
 
-	env := append(os.Environ(), "PATH=/sbin:/bin")
-	if key, err := os.ReadFile("/bootconfig/authkey"); err == nil {
-		if key := strings.TrimSpace(string(key)); key != "" {
-			env = append(env, "TS_AUTHKEY="+key)
-		}
-	} else if !os.IsNotExist(err) {
+	logMemory("before installing appliance")
+	if err := installAppliance(); err != nil {
+		return err
+	}
+
+	authKey, err := os.ReadFile("/bootconfig/authkey")
+	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("read authkey: %w", err)
 	}
+	if err := switchRoot(); err != nil {
+		return err
+	}
+	logMemory("after switch_root")
 
+	env := append(os.Environ(), "PATH=/boot")
+	if key := strings.TrimSpace(string(authKey)); key != "" {
+		env = append(env, "TS_AUTHKEY="+key)
+	}
 	args := []string{
-		"--policy=/etc/thundersnap-policy.jsonc",
+		"/boot/thundersnapd",
+		"--policy=/boot/thundersnap-policy.jsonc",
 		"--data-dir=/var/lib/thundersnap",
 		"--state-dir=/var/lib/thundersnap",
-		"--libexec-dir=/sbin",
-		"--vm-dir=/vm",
+		"--libexec-dir=/boot",
+		"--vm-dir=/boot",
 	}
-	cmd := exec.Command("/sbin/thundersnapd", args...)
-	cmd.Env = env
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start thundersnapd: %w", err)
-	}
-	log.Printf("started thundersnapd pid %d", cmd.Process.Pid)
+	log.Printf("executing thundersnapd as PID 1")
+	return syscall.Exec(args[0], args, env)
+}
 
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case sig := <-sigc:
-		_ = cmd.Process.Signal(sig)
-		return fmt.Errorf("thundersnapd stopped after %s: %w", sig, <-done)
-	case err := <-done:
-		return fmt.Errorf("thundersnapd exited: %w", err)
+func installAppliance() error {
+	for _, dir := range []string{
+		newRoot + "/boot",
+		newRoot + "/bootconfig",
+		newRoot + "/dev/pts",
+		newRoot + "/etc",
+		newRoot + "/proc",
+		newRoot + "/run",
+		newRoot + "/sys",
+		newRoot + "/tmp",
+		newRoot + "/var/lib/thundersnap",
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
 	}
+	files := map[string]string{
+		"/sbin/thundersnapd":            newRoot + "/boot/thundersnapd",
+		"/sbin/ts":                      newRoot + "/boot/ts",
+		"/sbin/vshd":                    newRoot + "/boot/vshd",
+		"/sbin/busybox":                 newRoot + "/boot/busybox",
+		"/vm/cloud-hypervisor":          newRoot + "/boot/cloud-hypervisor",
+		"/vm/vmlinux":                   newRoot + "/boot/vmlinux",
+		"/etc/thundersnap-policy.jsonc": newRoot + "/boot/thundersnap-policy.jsonc",
+	}
+	for src, dst := range files {
+		if err := copyFile(src, dst); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(newRoot + "/boot/cp"); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Symlink("busybox", newRoot+"/boot/cp"); err != nil {
+		return fmt.Errorf("create cp symlink: %w", err)
+	}
+	if err := os.WriteFile(newRoot+"/etc/resolv.conf", []byte("nameserver 10.0.2.3\n"), 0644); err != nil {
+		return fmt.Errorf("write resolv.conf: %w", err)
+	}
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", src, err)
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
+	if err != nil {
+		return fmt.Errorf("create %s: %w", dst, err)
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return fmt.Errorf("copy %s: %w", src, copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close %s: %w", dst, closeErr)
+	}
+	return nil
+}
+
+// switchRoot implements the initramfs switch_root operation. The kernel's
+// special rootfs cannot be pivot_root(2)'d, so move the live mounts into the
+// disk root, unlink the unpacked initramfs, move the disk mount over /, and
+// chroot into it. The following Exec releases the old /init mappings too.
+func switchRoot() error {
+	for _, path := range []string{"/dev", "/proc", "/sys", "/run", "/tmp", "/bootconfig"} {
+		target := newRoot + path
+		if err := syscall.Mount(path, target, "", syscall.MS_MOVE, ""); err != nil {
+			return fmt.Errorf("move mount %s to %s: %w", path, target, err)
+		}
+	}
+	entries, err := os.ReadDir("/")
+	if err != nil {
+		return fmt.Errorf("read old root: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == strings.TrimPrefix(newRoot, "/") {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join("/", entry.Name())); err != nil {
+			return fmt.Errorf("remove old root entry %s: %w", entry.Name(), err)
+		}
+	}
+	if err := os.Chdir(newRoot); err != nil {
+		return fmt.Errorf("chdir new root: %w", err)
+	}
+	if err := syscall.Mount(".", "/", "", syscall.MS_MOVE, ""); err != nil {
+		return fmt.Errorf("move new root onto /: %w", err)
+	}
+	if err := syscall.Chroot("."); err != nil {
+		return fmt.Errorf("chroot: %w", err)
+	}
+	if err := os.Chdir("/"); err != nil {
+		return fmt.Errorf("chdir /: %w", err)
+	}
+	return nil
 }
 
 func mount(source, target, fstype string, flags uintptr, data string) error {
@@ -100,4 +195,19 @@ func mount(source, target, fstype string, flags uintptr, data string) error {
 		return fmt.Errorf("mount %s on %s: %w", source, target, err)
 	}
 	return nil
+}
+
+func logMemory(stage string) {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "MemAvailable:") {
+			log.Printf("%s: %s", stage, scanner.Text())
+			return
+		}
+	}
 }
