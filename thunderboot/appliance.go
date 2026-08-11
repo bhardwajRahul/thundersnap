@@ -65,7 +65,11 @@ func startApplianceVM(cfg VMConfig) (*VMSession, error) {
 		return nil, fmt.Errorf("virtiofsd socket: %w", err)
 	}
 
-	passtCmd := exec.Command("passt", "--socket", passtSock, "--vhost-user", "--foreground", "--quiet", "-a", "10.0.2.15", "-g", "10.0.2.2", "-D", "10.0.2.3")
+	passtCmd := exec.Command("passt", "--socket", passtSock, "--vhost-user", "--foreground", "--quiet",
+		"-a", "10.0.2.15",
+		"-g", "10.0.2.2",
+		"--dns-forward", "10.0.2.3",
+	)
 	passtCmd.Stderr = os.Stderr
 	if err := passtCmd.Start(); err != nil {
 		cleanup()
