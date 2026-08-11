@@ -44,7 +44,7 @@ import (
 //     the joined mount namespace).
 func cmdNsenter(args []string) {
 	var targetPid int = -1
-	var wantPID, wantMnt, wantUTS bool
+	var wantPID, wantMnt, wantUTS, wantCgroup bool
 	var cmdArgs []string
 
 	for i := 0; i < len(args); i++ {
@@ -62,6 +62,8 @@ func cmdNsenter(args []string) {
 			wantMnt = true
 		case args[i] == "-u":
 			wantUTS = true
+		case args[i] == "-C":
+			wantCgroup = true
 		case args[i] == "--":
 			cmdArgs = args[i+1:]
 			i = len(args)
@@ -82,6 +84,15 @@ func cmdNsenter(args []string) {
 	if wantUTS {
 		if err := setnsPath(fmt.Sprintf("/proc/%d/ns/uts", targetPid), unix.CLONE_NEWUTS); err != nil {
 			fatalNsenter("setns uts: %v", err)
+		}
+	}
+
+	// Join the cgroup namespace before forking the stage-2 child. This makes
+	// /proc/self/cgroup and a cgroup2 mount resolve relative to the container's
+	// delegated cgroup root.
+	if wantCgroup {
+		if err := setnsPath(fmt.Sprintf("/proc/%d/ns/cgroup", targetPid), unix.CLONE_NEWCGROUP); err != nil {
+			fatalNsenter("setns cgroup: %v", err)
 		}
 	}
 

@@ -11,7 +11,7 @@ import (
 // TestReleaseUnknown verifies releasing a rootFS that was never registered is a
 // no-op (does not panic, does not underflow).
 func TestReleaseUnknown(t *testing.T) {
-	m := New()
+	m := New(nil)
 	m.Release("/never/registered") // must not panic
 	if len(m.entries) != 0 {
 		t.Errorf("entries = %d, want 0", len(m.entries))
@@ -24,7 +24,7 @@ func TestReleaseUnknown(t *testing.T) {
 // its stdin is closed, so the shutdown path (close stdin, Wait) is exercised
 // for real and completes promptly.
 func TestReleaseRefcount(t *testing.T) {
-	m := New()
+	m := New(nil)
 
 	cmd := exec.Command("cat") // reads stdin; exits on EOF when stdin closes
 	stdin, err := cmd.StdinPipe()

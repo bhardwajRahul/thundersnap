@@ -48,14 +48,6 @@ func TestConstantsInRange(t *testing.T) {
 
 // TestParentNameFormat documents the expected "thundersnap-<pid>" shape used by
 // the daemon, matching what callers split on to build leaf cgroup paths.
-func TestShouldManageSessions(t *testing.T) {
-	// The project's test host is expected to expose cgroup2. This also guards
-	// against silently disabling fail-closed confinement on a bare host.
-	if !ShouldManageSessions() {
-		t.Fatal("ShouldManageSessions() = false on the test host")
-	}
-}
-
 func TestParentNameFormat(t *testing.T) {
 	m := New("thundersnap-42")
 	if !strings.HasPrefix(m.ParentName(), "thundersnap-") {

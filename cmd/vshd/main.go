@@ -39,15 +39,12 @@ import (
 	"github.com/tailscale/thundersnap/vshdsession"
 )
 
-// containerNs anchors the shared PID/mount/UTS namespaces for container
-// sessions, keyed by container rootfs path. Sessions join via `ts nsenter`.
-var containerNs = containerns.New()
-
-// cgroupMgr applies per-session resource limits (memory/pids/cpu + OOM bias) to
-// each container session's child process. It is nil unless --cgroup-parent is
-// passed (host mode); in a VM, resource limits come from the VM itself so vshd
-// leaves cgroups alone.
+// cgroupMgr applies fail-closed container and per-session cgroup v2 limits.
+// It is initialized from --cgroup-parent before containerNs is used.
 var cgroupMgr *cgroup.Manager
+
+// containerNs anchors shared PID/mount/UTS/cgroup namespaces per rootfs.
+var containerNs *containerns.Manager
 
 // selectUser determines which Unix user to run as, auto-detecting when the
 // caller did not request one. rootPrefix is "" for the host VM filesystem or a
@@ -354,16 +351,20 @@ func handleConnection(conn io.ReadWriteCloser) {
 		defer release()
 	}
 
-	// For container sessions (rootPrefix != "") in host mode (cgroupMgr set),
-	// apply per-session cgroup limits to the started child. The leaf name is
-	// <parent>/<rootfs-base>/<conn-id> so sessions sharing a container land
-	// under the same intermediate dir while each gets its own leaf. VM sessions
-	// (cgroupMgr nil) and outer/non-container sessions skip this entirely.
+	// Container sessions get a leaf inside the container's delegated cgroup.
+	// Because vshd is outside the container cgroup namespace it addresses the
+	// complete path; inside the container the same cgroup appears as /.
 	var postStart func(pid int) error
-	if cgroupMgr != nil && rootPrefix != "" {
-		leaf := fmt.Sprintf("%s/%s/%d", cgroupMgr.ParentName(), filepath.Base(rootPrefix), id)
+	var postExit func()
+	if cgroupMgr != nil && rootPrefix != "" && cgroup.CanCloneInto() {
+		leaf := filepath.Join(containerNs.CgroupName(rootPrefix), "sessions", fmt.Sprintf("%d", id))
 		postStart = func(pid int) error {
 			return cgroupMgr.ConfigureContainer(pid, leaf)
+		}
+		postExit = func() {
+			if err := cgroupMgr.RemoveSession(leaf); err != nil {
+				log.Printf("[conn %d] failed to remove session cgroup: %v", id, err)
+			}
 		}
 	}
 
@@ -378,6 +379,9 @@ func handleConnection(conn io.ReadWriteCloser) {
 		// directions; it does not interpret the protocol. This is what lets the
 		// pty be opened from inside the container so /dev/pts/N is visible there.
 		spliceContainerSession(id, conn, reader, cmd, postStart)
+		if postExit != nil {
+			postExit()
+		}
 		return
 	}
 
@@ -513,6 +517,9 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 	// Container session (VMX or host): join the shared namespaces anchored by
 	// container-init, then chroot + drop caps. GetOrCreate refcounts the init
 	// per rootfs; release drops our reference when the session ends.
+	if containerNs == nil {
+		return nil, nil, fmt.Errorf("container cgroup manager is not initialized")
+	}
 	initPid, err := containerNs.GetOrCreate(rootPrefix, "", "")
 	if err != nil {
 		return nil, nil, fmt.Errorf("create container namespace: %w", err)
@@ -556,7 +563,7 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 	}, serveArgs...)
 	nsenterArgs := append([]string{
 		"nsenter",
-		"-t", strconv.Itoa(initPid), "-p", "-m", "-u", "--",
+		"-t", strconv.Itoa(initPid), "-p", "-m", "-u", "-C", "--",
 		innerTs,
 	}, dropCapsArgs...)
 
@@ -687,9 +694,15 @@ func main() {
 	// In host mode the daemon passes its cgroup parent name so vshd can apply
 	// per-session memory/pids/cpu limits to each container child. In a VM the
 	// flag is unset and resource limits come from the VM itself.
+	if *cgroupParent == "" && *unixPath == "" {
+		// VM-mode vshd has its own cgroup2 hierarchy and no daemon-supplied
+		// parent name. PID is stable enough to distinguish concurrent daemons.
+		*cgroupParent = fmt.Sprintf("thundersnap-vm-%d", os.Getpid())
+	}
 	if *cgroupParent != "" {
 		cgroupMgr = cgroup.New(*cgroupParent)
-		log.Printf("per-session cgroups enabled under parent %q", *cgroupParent)
+		containerNs = containerns.New(cgroupMgr)
+		log.Printf("container and per-session cgroups enabled under parent %q", *cgroupParent)
 	}
 
 	// Determine ts binary path. An explicit --ts wins (host mode, where vshd is

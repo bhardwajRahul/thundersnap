@@ -194,20 +194,20 @@ func cmdDropCapsAndRun(args []string) {
 		unix.Close(chrootFd)
 	}
 
-	// Ensure mount points exist (blank containers may not have them)
+	// Ensure mount points exist (blank containers may not have them).
 	os.MkdirAll("/proc", 0555)
 	os.MkdirAll("/sys", 0555)
-
-	// Mount /proc filesystem
-	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		// Ignore errors - /proc might already be mounted
-		_ = err
+	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil && err != unix.EBUSY {
+		fmt.Fprintf(os.Stderr, "error: failed to mount proc: %v\n", err)
+		os.Exit(1)
 	}
-
-	// Mount /sys filesystem
-	if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
-		// Ignore errors - /sys might already be mounted
-		_ = err
+	if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil && err != unix.EBUSY {
+		fmt.Fprintf(os.Stderr, "error: failed to mount sysfs: %v\n", err)
+		os.Exit(1)
+	}
+	if err := ensureCgroup2Mount(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Set up /dev like Docker/containerd do:
@@ -730,6 +730,29 @@ func bindMountSubvolumeAncestors(target string) {
 	}
 }
 
+func ensureCgroup2Mount() error {
+	if err := os.MkdirAll("/sys/fs/cgroup", 0755); err != nil {
+		return fmt.Errorf("create cgroup2 mountpoint: %w", err)
+	}
+	if err := unix.Mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, "nsdelegate"); err != nil && err != unix.EBUSY {
+		return fmt.Errorf("mount cgroup2: %w", err)
+	}
+	controllers, err := os.ReadFile("/sys/fs/cgroup/cgroup.controllers")
+	if err != nil {
+		return fmt.Errorf("read cgroup2 controllers: %w", err)
+	}
+	have := make(map[string]bool)
+	for _, controller := range strings.Fields(string(controllers)) {
+		have[controller] = true
+	}
+	for _, required := range []string{"memory", "pids", "cpu"} {
+		if !have[required] {
+			return fmt.Errorf("required cgroup2 controller %q unavailable", required)
+		}
+	}
+	return nil
+}
+
 func cmdContainerInit(args []string) {
 	var hostname, domainname, chrootPath string
 
@@ -875,18 +898,23 @@ func cmdContainerInit(args []string) {
 		fmt.Fprintf(os.Stderr, "warning: failed to remove old root dir: %v\n", err)
 	}
 
-	// Ensure mount points exist (blank containers may not have them)
+	// Ensure mount points exist (blank containers may not have them).
 	os.MkdirAll("/proc", 0555)
-	os.MkdirAll("/sys", 0555)
+	os.MkdirAll("/sys/fs/cgroup", 0755)
 
-	// Mount /proc filesystem
 	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		_ = err // Ignore - /proc might already be mounted
+		fmt.Fprintf(os.Stderr, "error: failed to mount proc: %v\n", err)
+		os.Exit(1)
 	}
-
-	// Mount /sys filesystem
 	if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
-		_ = err // Ignore - /sys might already be mounted
+		fmt.Fprintf(os.Stderr, "error: failed to mount sysfs: %v\n", err)
+		os.Exit(1)
+	}
+	// Every container gets a private cgroup namespace and fresh cgroup2 mount.
+	// Its namespace root is the delegated container cgroup prepared by vshd.
+	if err := ensureCgroup2Mount(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Set up /dev (tmpfs with device nodes, devpts, etc.). Containers never need

@@ -23,26 +23,30 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/tailscale/thundersnap/cgroup"
+	"golang.org/x/sys/unix"
 )
 
 // Manager manages shared PID/mount/UTS namespaces keyed by rootFS path.
 type Manager struct {
-	mu      sync.Mutex
-	entries map[string]*entry // key: rootFS path
+	mu        sync.Mutex
+	entries   map[string]*entry // key: rootFS path
+	cgroupMgr *cgroup.Manager
 }
 
 type entry struct {
-	initPid   int            // host PID of the container-init process
-	initStdin io.WriteCloser // write end of pipe - close to signal shutdown
-	initCmd   *exec.Cmd      // the container-init command (for Wait)
-	refCount  int
+	initPid    int            // host PID of the container-init process
+	initStdin  io.WriteCloser // write end of pipe - close to signal shutdown
+	initCmd    *exec.Cmd      // the container-init command (for Wait)
+	cgroupName string
+	refCount   int
 }
 
-// New creates a new namespace manager.
-func New() *Manager {
-	return &Manager{
-		entries: make(map[string]*entry),
-	}
+// New creates a namespace manager. cgroupMgr is required: every container is
+// placed in a delegated cgroup and a fresh cgroup namespace before it starts.
+func New(cgroupMgr *cgroup.Manager) *Manager {
+	return &Manager{entries: make(map[string]*entry), cgroupMgr: cgroupMgr}
 }
 
 // GetOrCreate returns an existing namespace entry or creates a new one by
@@ -91,6 +95,16 @@ func (m *Manager) GetOrCreate(rootFS, hostname, domainname string) (initPid int,
 		args = append(args, "--domainname="+domainname)
 	}
 
+	if m.cgroupMgr == nil {
+		return 0, fmt.Errorf("container cgroup manager is required")
+	}
+	cgroupName := m.cgroupMgr.ContainerName(absRootFS)
+	cgroupDir, err := m.cgroupMgr.PrepareContainer(cgroupName)
+	if err != nil {
+		return 0, fmt.Errorf("prepare container cgroup: %w", err)
+	}
+	defer cgroupDir.Close()
+
 	cmd := exec.Command(tsBinary, args...)
 	cmd.Dir = "/"
 
@@ -108,14 +122,35 @@ func (m *Manager) GetOrCreate(rootFS, hostname, domainname string) (initPid int,
 	}
 	cmd.Stderr = os.Stderr
 
-	// Start in new PID, mount, and UTS namespaces.
+	// Prefer clone3's atomic CLONE_INTO_CGROUP path. A process whose cgroup
+	// namespace exposes a relative ".." path cannot use that kernel API: the
+	// cgroup fd is unreachable from its namespace and exec returns ENOENT. Such
+	// a process is already confined by an outer cgroup, so start it normally.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
+	}
+	cloneInto := cgroup.CanCloneInto()
+	if cloneInto {
+		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWCGROUP
+		cmd.SysProcAttr.UseCgroupFD = true
+		cmd.SysProcAttr.CgroupFD = int(cgroupDir.Fd())
 	}
 
 	if err := cmd.Start(); err != nil {
 		stdinPipe.Close()
-		return 0, fmt.Errorf("start container-init: %w", err)
+		return 0, fmt.Errorf("start container-init in cgroup %s: %w", cgroupName, err)
+	}
+	if !cloneInto {
+		// This environment already supplies outer cgroup confinement but cannot
+		// address host-relative nested cgroup paths from this namespace.
+		// Continue without nested delegation rather than treating the kernel's
+		// namespace-relative ENOENT as a missing executable.
+		log.Printf("cgroup path is namespace-relative; using inherited outer confinement for %s", rootFS)
+	} else if err := m.cgroupMgr.DelegateContainer(cmd.Process.Pid, cgroupName); err != nil {
+		stdinPipe.Close()
+		cmd.Process.Kill()
+		cmd.Wait()
+		return 0, fmt.Errorf("delegate container cgroup: %w", err)
 	}
 
 	// Wait for READY signal.
@@ -150,15 +185,21 @@ func (m *Manager) GetOrCreate(rootFS, hostname, domainname string) (initPid int,
 	}
 
 	e := &entry{
-		initPid:   cmd.Process.Pid,
-		initStdin: stdinPipe,
-		initCmd:   cmd,
-		refCount:  1,
+		initPid:    cmd.Process.Pid,
+		initStdin:  stdinPipe,
+		initCmd:    cmd,
+		cgroupName: cgroupName,
+		refCount:   1,
 	}
 	m.entries[rootFS] = e
 	log.Printf("Created container namespace for %s (initPid=%d)", rootFS, e.initPid)
 
 	return e.initPid, nil
+}
+
+// CgroupName returns the delegated cgroup for rootFS.
+func (m *Manager) CgroupName(rootFS string) string {
+	return m.cgroupMgr.ContainerName(rootFS)
 }
 
 // Release decrements the reference count for rootFS and shuts down its init
@@ -182,6 +223,9 @@ func (m *Manager) Release(rootFS string) {
 			rootFS, e.initPid)
 		e.initStdin.Close()
 		e.initCmd.Wait()
+		if err := m.cgroupMgr.RemoveContainer(e.cgroupName); err != nil {
+			log.Printf("warning: failed to remove cgroup for %s: %v", rootFS, err)
+		}
 		delete(m.entries, rootFS)
 	}
 }

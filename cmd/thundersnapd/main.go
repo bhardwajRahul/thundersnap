@@ -435,11 +435,11 @@ func (m *hostVshdManager) ensure() (sockPath string, err error) {
 	// already confined by its outer container; in that case its children inherit
 	// the outer cgroup and it cannot create nested leaves itself.
 	// The lifecycle fd is passed as fd 3 (ExtraFiles[0]).
-	args := []string{"--unix=" + sockPath, "--ts=" + tsBin, "--lifecycle-fd=3"}
-	if cgroup.ShouldManageSessions() {
-		args = append(args, "--cgroup-parent="+cgroupManager.ParentName())
-	} else {
-		log.Printf("cgroup hierarchy hidden inside an outer cgroup; per-session cgroups disabled")
+	args := []string{
+		"--unix=" + sockPath,
+		"--ts=" + tsBin,
+		"--lifecycle-fd=3",
+		"--cgroup-parent=" + cgroupManager.ParentName(),
 	}
 	cmd := exec.Command(vshdBin, args...)
 	cmd.ExtraFiles = []*os.File{lifecycleR}

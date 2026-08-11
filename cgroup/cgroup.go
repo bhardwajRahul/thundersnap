@@ -1,118 +1,247 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package cgroup implements the cgroup v2 / OOM resource-control plumbing used
-// to confine thundersnap container processes. It is pure Linux resource-control
-// glue with no dependency on the rest of the daemon: a Manager owns one parent
-// cgroup (named per daemon instance) under which each container gets a leaf
-// cgroup with memory, pids (fork-bomb), and CPU-fairness limits, plus an OOM
-// score bias so containers are killed before the host or the daemon itself.
-//
-// All operations are best-effort: failures are logged and never fatal, because
-// the daemon must keep serving sessions even on a kernel without full cgroup v2
-// controller support.
+// Package cgroup implements fail-closed cgroup v2 resource control for
+// thundersnap containers and sessions.
 package cgroup
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
 
-// Resource-limit tuning constants. These provide defense against runaway
-// processes while allowing efficient memory sharing between containers.
 const (
-	// containerOOMScore is the OOM score adjustment applied to container
-	// processes. Range is -1000..+1000 (default 0); +500 makes containers far
-	// more likely to be OOM-killed than the host OS or the daemon itself.
-	containerOOMScore = 500
-
-	// parentMemoryMaxPercent is the percentage of system RAM that all
-	// thundersnap containers combined may use — a hard limit protecting the host.
-	parentMemoryMaxPercent = 80
-
-	// parentCPUWeight is the CPU weight for all thundersnap containers relative
-	// to other system work (default 100); 50 lets non-thundersnap work win when
-	// CPU is contested, while idle CPU is still fully available to containers.
-	parentCPUWeight = 50
-
-	// containerMemoryHighPercent is the per-container soft memory limit as a
-	// percentage of system RAM. Above it the kernel reclaims aggressively
-	// (swap, drop caches) but does not OOM-kill, letting a container burst above
-	// its fair share when memory is available.
+	containerOOMScore          = 500
+	parentMemoryMaxPercent     = 80
+	parentCPUWeight            = 50
 	containerMemoryHighPercent = 10
-
-	// containerPidsMax limits the process count per container — the primary
-	// fork-bomb defense.
-	containerPidsMax = 2000
-
-	// containerCPUWeight is the CPU weight for each container relative to other
-	// containers (100 = default, i.e. equal weight).
-	containerCPUWeight = 100
+	containerPidsMax           = 2000
+	containerCPUWeight         = 100
+	cgroupRoot                 = "/sys/fs/cgroup"
+	requiredControllers        = "memory pids cpu"
 )
 
-const cgroupRoot = "/sys/fs/cgroup"
-
-// Manager owns one parent cgroup (one per daemon instance) and the leaf cgroups
-// of the containers beneath it.
+// Manager owns one parent cgroup and the container/session hierarchy below it.
 type Manager struct {
 	parentName  string
 	initialized bool
 }
 
-// New returns a Manager rooted at the given parent cgroup name. The name should
-// be unique per daemon instance (e.g. "thundersnap-<pid>") so multiple or
-// nested daemons do not collide.
-func New(parentName string) *Manager {
-	return &Manager{parentName: parentName}
+func New(parentName string) *Manager  { return &Manager{parentName: parentName} }
+func (m *Manager) ParentName() string { return m.parentName }
+
+// CanCloneInto reports whether cgroup paths visible through /proc are rooted in
+// the same hierarchy as the cgroup2 mount. Some service containers expose a
+// relative cgroup namespace path containing ".."; clone3 then rejects an
+// otherwise valid CLONE_INTO_CGROUP fd with ENOENT. Such processes are already
+// confined by an outer cgroup and must use the post-start move fallback.
+func CanCloneInto() bool {
+	self, err := os.ReadFile("/proc/self/cgroup")
+	return err == nil && !strings.Contains(string(self), "..")
 }
 
-// ShouldManageSessions reports whether this process should create per-session
-// cgroups. A visible cgroup v2 hierarchy means it can and should try. If the
-// hierarchy is intentionally hidden inside a container but /proc says the
-// process already belongs to a non-root cgroup, children inherit that outer
-// confinement and nested cgroup management is disabled. At the cgroup root,
-// a missing hierarchy is not accepted: callers still enable management so the
-// first session fails closed with a useful error.
-func ShouldManageSessions() bool {
-	if _, err := os.Stat(filepath.Join(cgroupRoot, "cgroup.controllers")); err == nil {
-		return true
+// ContainerName returns the cgroup path, relative to the current cgroup2 mount,
+// reserved for a container. The caller-provided key is reduced to one safe path
+// component while retaining enough entropy to avoid collisions.
+func (m *Manager) ContainerName(key string) string {
+	base := filepath.Base(filepath.Clean(key))
+	base = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
+			return r
+		}
+		return '_'
+	}, base)
+	return filepath.Join(m.parentName, "containers", base)
+}
+
+// PrepareContainer creates a delegated container subtree and opens it for use
+// with clone3(CLONE_INTO_CGROUP). The caller must close the returned file.
+func (m *Manager) PrepareContainer(name string) (*os.File, error) {
+	if err := m.initParent(); err != nil {
+		return nil, err
 	}
-	data, err := os.ReadFile("/proc/self/cgroup")
+	path := filepath.Join(cgroupRoot, name)
+	parent := filepath.Dir(path)
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		return nil, fmt.Errorf("create container cgroup parent %s: %w", parent, err)
+	}
+	if err := enableControllers(parent); err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(path, 0755); err != nil && !os.IsExist(err) {
+		return nil, fmt.Errorf("create container cgroup %s: %w", path, err)
+	}
+	f, err := os.Open(path)
 	if err != nil {
-		return true
+		return nil, fmt.Errorf("open container cgroup %s: %w", path, err)
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "0::") {
-			path := strings.TrimSpace(strings.TrimPrefix(line, "0::"))
-			return path == "" || path == "/"
+	return f, nil
+}
+
+// Move moves pid into the named cgroup.
+func (m *Manager) Move(pid int, name string) error {
+	path := filepath.Join(cgroupRoot, name, "cgroup.procs")
+	if err := os.WriteFile(path, []byte(strconv.Itoa(pid)), 0644); err != nil {
+		return fmt.Errorf("move pid %d to cgroup %s: %w", pid, name, err)
+	}
+	return nil
+}
+
+// RemoveSession removes a session leaf after its process has exited.
+func (m *Manager) RemoveSession(name string) error {
+	path := filepath.Join(cgroupRoot, name)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove session cgroup %s: %w", path, err)
+	}
+	return nil
+}
+
+// DelegateContainer moves the namespace anchor out of the container root and
+// enables all required controllers there. The cgroup namespace remains rooted
+// at the container cgroup even after its creating process moves to .init.
+func (m *Manager) DelegateContainer(pid int, name string) error {
+	initName := filepath.Join(name, ".init")
+	if err := os.MkdirAll(filepath.Join(cgroupRoot, initName), 0755); err != nil {
+		return fmt.Errorf("create container init cgroup: %w", err)
+	}
+	if err := m.Move(pid, initName); err != nil {
+		return err
+	}
+	return enableControllers(filepath.Join(cgroupRoot, name))
+}
+
+// RemoveContainer removes an empty delegated container hierarchy after its
+// namespace anchor and all sessions have exited.
+func (m *Manager) RemoveContainer(name string) error {
+	root := filepath.Join(cgroupRoot, name)
+	var dirs []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("walk container cgroup %s: %w", root, err)
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := os.Remove(dirs[i]); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove container cgroup %s: %w", dirs[i], err)
 		}
 	}
-	return true
+	return nil
 }
 
-// ParentName returns the parent cgroup name, used by callers to build the
-// per-container leaf name (e.g. "<parent>/<user>/<session>").
-func (m *Manager) ParentName() string {
-	return m.parentName
-}
-
-// ConfigureContainer applies resource limits to a freshly-started container
-// process: it biases the OOM score and creates+joins a leaf cgroup with memory,
-// pids, and CPU limits. cgroupName is the leaf path relative to the cgroup root
-// (typically "<ParentName()>/<user>/<session>"). Failure to create or join the
-// cgroup is returned to the caller, which must terminate the unconfined process.
-// Individual controller tuning remains best-effort for kernels that lack one
-// of the optional controls.
+// ConfigureContainer creates a session leaf, applies every configured limit,
+// and moves pid into it. Any failure is fatal: running without one requested
+// controller or limit would make confinement depend silently on host details.
 func (m *Manager) ConfigureContainer(pid int, cgroupName string) error {
-	setProcessOOMScore(pid, containerOOMScore)
-	return m.setupContainerCgroup(pid, cgroupName)
+	if err := setProcessOOMScore(pid, containerOOMScore); err != nil {
+		return err
+	}
+	if err := m.initParent(); err != nil {
+		return err
+	}
+	path := filepath.Join(cgroupRoot, cgroupName)
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return fmt.Errorf("create session cgroup %s: %w", path, err)
+	}
+
+	parts := strings.Split(filepath.Clean(cgroupName), string(filepath.Separator))
+	for i := 1; i < len(parts); i++ {
+		dir := filepath.Join(cgroupRoot, filepath.Join(parts[:i]...))
+		if err := enableControllers(dir); err != nil {
+			return err
+		}
+	}
+	totalMem, err := getSystemMemoryBytes()
+	if err != nil {
+		return err
+	}
+	settings := map[string]string{
+		"memory.high":      strconv.FormatUint(totalMem*containerMemoryHighPercent/100, 10),
+		"memory.oom.group": "1",
+		"pids.max":         strconv.Itoa(containerPidsMax),
+		"cpu.weight":       strconv.Itoa(containerCPUWeight),
+	}
+	for file, value := range settings {
+		if err := os.WriteFile(filepath.Join(path, file), []byte(value), 0644); err != nil {
+			return fmt.Errorf("set %s for cgroup %s: %w", file, cgroupName, err)
+		}
+	}
+	return m.Move(pid, cgroupName)
 }
 
-// getSystemMemoryBytes returns the total system memory in bytes.
+func (m *Manager) initParent() error {
+	if m.initialized {
+		return nil
+	}
+	if err := requireCgroup2(cgroupRoot); err != nil {
+		return err
+	}
+	path := filepath.Join(cgroupRoot, m.parentName)
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return fmt.Errorf("create parent cgroup %s: %w", path, err)
+	}
+	if err := enableControllers(cgroupRoot); err != nil {
+		return err
+	}
+	if err := enableControllers(path); err != nil {
+		return err
+	}
+	totalMem, err := getSystemMemoryBytes()
+	if err != nil {
+		return err
+	}
+	settings := map[string]string{
+		"cpu.weight": strconv.Itoa(parentCPUWeight),
+		"memory.max": strconv.FormatUint(totalMem*parentMemoryMaxPercent/100, 10),
+	}
+	for file, value := range settings {
+		if err := os.WriteFile(filepath.Join(path, file), []byte(value), 0644); err != nil {
+			return fmt.Errorf("set parent %s: %w", file, err)
+		}
+	}
+	m.initialized = true
+	return nil
+}
+
+func requireCgroup2(path string) error {
+	data, err := os.ReadFile(filepath.Join(path, "cgroup.controllers"))
+	if err != nil {
+		return fmt.Errorf("cgroup2 is not mounted at %s: %w", path, err)
+	}
+	have := map[string]bool{}
+	for _, controller := range strings.Fields(string(data)) {
+		have[controller] = true
+	}
+	for _, controller := range strings.Fields(requiredControllers) {
+		if !have[controller] {
+			return fmt.Errorf("required cgroup2 controller %q is unavailable at %s", controller, path)
+		}
+	}
+	return nil
+}
+
+func enableControllers(path string) error {
+	if err := requireCgroup2(path); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(path, "cgroup.subtree_control"), []byte("+memory +pids +cpu"), 0644); err != nil {
+		return fmt.Errorf("enable cgroup2 controllers under %s: %w", path, err)
+	}
+	return nil
+}
+
 func getSystemMemoryBytes() (uint64, error) {
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
@@ -126,137 +255,17 @@ func getSystemMemoryBytes() (uint64, error) {
 				if err != nil {
 					return 0, err
 				}
-				return kb * 1024, nil // Convert KB to bytes
+				return kb * 1024, nil
 			}
 		}
 	}
 	return 0, fmt.Errorf("MemTotal not found in /proc/meminfo")
 }
 
-// initParent creates the parent cgroup with system-wide limits, once.
-func (m *Manager) initParent() error {
-	if m.initialized {
-		return nil
-	}
-
-	cgroupPath := filepath.Join(cgroupRoot, m.parentName)
-
-	// Create parent cgroup directory
-	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
-		return fmt.Errorf("create parent cgroup %s: %w", cgroupPath, err)
-	}
-
-	// Enable controllers for child cgroups. We need to enable controllers in
-	// the parent so children can use them.
-	subtreeControl := filepath.Join(cgroupPath, "cgroup.subtree_control")
-	if err := os.WriteFile(subtreeControl, []byte("+memory +pids +cpu"), 0644); err != nil {
-		log.Printf("warning: failed to enable cgroup controllers: %v", err)
-		// Continue anyway - some controllers might already be enabled
-	}
-
-	// Set CPU weight (lower priority than default)
-	cpuWeight := filepath.Join(cgroupPath, "cpu.weight")
-	if err := os.WriteFile(cpuWeight, []byte(strconv.Itoa(parentCPUWeight)), 0644); err != nil {
-		log.Printf("warning: failed to set parent cpu.weight: %v", err)
-	}
-
-	// Set memory.max as hard backstop (percentage of system RAM)
-	totalMem, err := getSystemMemoryBytes()
-	if err != nil {
-		log.Printf("warning: failed to get system memory: %v", err)
-	} else {
-		memMax := totalMem * parentMemoryMaxPercent / 100
-		memMaxPath := filepath.Join(cgroupPath, "memory.max")
-		if err := os.WriteFile(memMaxPath, []byte(strconv.FormatUint(memMax, 10)), 0644); err != nil {
-			log.Printf("warning: failed to set parent memory.max: %v", err)
-		} else {
-			log.Printf("Configured parent cgroup %s: memory.max=%dMB, cpu.weight=%d",
-				m.parentName, memMax/(1024*1024), parentCPUWeight)
-		}
-	}
-
-	m.initialized = true
-	return nil
-}
-
-// setProcessOOMScore sets the OOM score adjustment for a process. Higher scores
-// make the process more likely to be killed during memory pressure. Best-effort.
-func setProcessOOMScore(pid int, score int) {
+func setProcessOOMScore(pid, score int) error {
 	path := fmt.Sprintf("/proc/%d/oom_score_adj", pid)
 	if err := os.WriteFile(path, []byte(strconv.Itoa(score)), 0644); err != nil {
-		log.Printf("warning: failed to set OOM score for pid %d: %v", pid, err)
-	}
-}
-
-// setupContainerCgroup creates a leaf cgroup for the container process with
-// resource limits and moves the process into it. Limits applied:
-//   - memory.high: soft memory limit (kernel reclaims aggressively above this)
-//   - memory.oom.group: kill entire container on OOM, not just one process
-//   - pids.max: limit process count (fork bomb protection)
-//   - cpu.weight: fair sharing among containers
-//
-// Failure to create the leaf or move the process into it is fatal to the
-// session; unsupported individual limits remain warnings.
-func (m *Manager) setupContainerCgroup(pid int, cgroupName string) error {
-	// Ensure parent cgroup exists with system-wide limits.
-	if err := m.initParent(); err != nil {
-		return err
-	}
-
-	// Use cgroup v2 unified hierarchy
-	cgroupPath := filepath.Join(cgroupRoot, cgroupName)
-
-	// Create cgroup directory
-	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
-		return fmt.Errorf("create cgroup %s: %w", cgroupPath, err)
-	}
-
-	// Enable subtree_control on all intermediate directories between parent and
-	// leaf. In cgroup v2, each intermediate directory must have controllers
-	// enabled for children to use them. The cgroupName is like
-	// "thundersnap-123/user/container", so we need to enable controllers on
-	// "thundersnap-123/user" as well.
-	parts := strings.Split(cgroupName, "/")
-	for i := 1; i < len(parts); i++ {
-		intermediateDir := filepath.Join(cgroupRoot, filepath.Join(parts[:i]...))
-		subtreeControl := filepath.Join(intermediateDir, "cgroup.subtree_control")
-		// Ignore errors - the parent's initParent already set the top level,
-		// and some systems may not support all controllers
-		os.WriteFile(subtreeControl, []byte("+memory +pids +cpu"), 0644)
-	}
-
-	// Set memory.high (soft limit) - kernel reclaims aggressively above this
-	totalMem, err := getSystemMemoryBytes()
-	if err == nil {
-		memHigh := totalMem * containerMemoryHighPercent / 100
-		memHighPath := filepath.Join(cgroupPath, "memory.high")
-		if err := os.WriteFile(memHighPath, []byte(strconv.FormatUint(memHigh, 10)), 0644); err != nil {
-			log.Printf("warning: failed to set memory.high for %s: %v", cgroupName, err)
-		}
-	}
-
-	// Enable memory.oom.group=1 so OOM kills the entire cgroup
-	oomGroupPath := filepath.Join(cgroupPath, "memory.oom.group")
-	if err := os.WriteFile(oomGroupPath, []byte("1"), 0644); err != nil {
-		log.Printf("warning: failed to set memory.oom.group for %s: %v", cgroupName, err)
-	}
-
-	// Set pids.max (fork bomb protection)
-	pidsMaxPath := filepath.Join(cgroupPath, "pids.max")
-	if err := os.WriteFile(pidsMaxPath, []byte(strconv.Itoa(containerPidsMax)), 0644); err != nil {
-		log.Printf("warning: failed to set pids.max for %s: %v", cgroupName, err)
-	}
-
-	// Set cpu.weight for fair sharing among containers
-	cpuWeightPath := filepath.Join(cgroupPath, "cpu.weight")
-	if err := os.WriteFile(cpuWeightPath, []byte(strconv.Itoa(containerCPUWeight)), 0644); err != nil {
-		log.Printf("warning: failed to set cpu.weight for %s: %v", cgroupName, err)
-	}
-
-	// Move the process into the cgroup
-	procsPath := filepath.Join(cgroupPath, "cgroup.procs")
-	if err := os.WriteFile(procsPath, []byte(strconv.Itoa(pid)), 0644); err != nil {
-		return fmt.Errorf("add pid %d to cgroup %s: %w", pid, cgroupName, err)
+		return fmt.Errorf("set OOM score for pid %d: %w", pid, err)
 	}
 	return nil
 }
