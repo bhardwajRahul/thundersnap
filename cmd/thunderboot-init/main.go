@@ -99,7 +99,7 @@ func installAppliance() error {
 		newRoot + "/usr/lib",
 		newRoot + "/bootconfig",
 		newRoot + "/dev/pts",
-		newRoot + "/etc",
+		newRoot + "/etc/ssl/certs",
 		newRoot + "/proc",
 		newRoot + "/run",
 		newRoot + "/sys",
@@ -111,15 +111,16 @@ func installAppliance() error {
 		}
 	}
 	files := map[string]string{
-		"/bin/thundersnapd":             newRoot + "/bin/thundersnapd",
-		"/bin/ts":                       newRoot + "/bin/ts",
-		"/bin/vshd":                     newRoot + "/bin/vshd",
-		"/bin/busybox":                  newRoot + "/bin/busybox",
-		"/bin/btrfs":                    newRoot + "/bin/btrfs",
-		"/bin/mkfs.btrfs":               newRoot + "/bin/mkfs.btrfs",
-		"/bin/cloud-hypervisor":         newRoot + "/bin/cloud-hypervisor",
-		"/bin/vmlinux":                  newRoot + "/bin/vmlinux",
-		"/bin/thundersnap-policy.jsonc": newRoot + "/bin/thundersnap-policy.jsonc",
+		"/bin/thundersnapd":                  newRoot + "/bin/thundersnapd",
+		"/bin/ts":                            newRoot + "/bin/ts",
+		"/bin/vshd":                          newRoot + "/bin/vshd",
+		"/bin/busybox":                       newRoot + "/bin/busybox",
+		"/bin/btrfs":                         newRoot + "/bin/btrfs",
+		"/bin/mkfs.btrfs":                    newRoot + "/bin/mkfs.btrfs",
+		"/bin/cloud-hypervisor":              newRoot + "/bin/cloud-hypervisor",
+		"/bin/vmlinux":                       newRoot + "/bin/vmlinux",
+		"/bin/thundersnap-policy.jsonc":      newRoot + "/bin/thundersnap-policy.jsonc",
+		"/etc/ssl/certs/ca-certificates.crt": newRoot + "/etc/ssl/certs/ca-certificates.crt",
 	}
 	for src, dst := range files {
 		if err := copyFile(src, dst); err != nil {

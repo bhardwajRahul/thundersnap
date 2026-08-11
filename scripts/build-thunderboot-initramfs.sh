@@ -5,7 +5,7 @@ out=$(realpath -m "${1:-thunderboot-out/initramfs.cpio}")
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT INT TERM
 mkdir -p "$(dirname "$out")" "$root"/bin "$root"/dev/pts "$root"/proc \
-  "$root"/sys "$root"/run "$root"/tmp "$root"/etc \
+  "$root"/sys "$root"/run "$root"/tmp "$root"/etc/ssl/certs \
   "$root"/var/lib/thundersnap "$root"/bootconfig
 
 build() {
@@ -47,6 +47,11 @@ copy_dynamic_binary /usr/bin/btrfs btrfs
 copy_dynamic_binary /usr/sbin/mkfs.btrfs mkfs.btrfs
 
 cp cmd/thundersnapd/policy.jsonc "$root/bin/thundersnap-policy.jsonc"
+if [ ! -r /etc/ssl/certs/ca-certificates.crt ]; then
+	echo "required CA bundle /etc/ssl/certs/ca-certificates.crt is missing (install ca-certificates)" >&2
+	exit 1
+fi
+cp /etc/ssl/certs/ca-certificates.crt "$root/etc/ssl/certs/ca-certificates.crt"
 cp vm/cloud-hypervisor "$root/bin/cloud-hypervisor"
 cp vm/vmlinux "$root/bin/vmlinux"
 
