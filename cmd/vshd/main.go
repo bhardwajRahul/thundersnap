@@ -473,8 +473,10 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 	var argv []string
 	switch {
 	case len(cmdArgs) == 0 && runAsUser == "root":
-		// Interactive root shell: run /bin/sh -l directly (avoids needing su).
-		argv = []string{"/bin/sh", "-l"}
+		// Force interactive mode rather than relying on each minimal image's sh
+		// to infer it from the pty. In particular, BusyBox ash otherwise exits
+		// when the terminal line discipline delivers Ctrl-C at the prompt.
+		argv = []string{"/bin/sh", "-il"}
 	case len(cmdArgs) == 0:
 		// Use our in-frame su directly rather than the image's su. In particular,
 		// do not use `su - user -c "...; exec sh -l"`: util-linux su puts its
