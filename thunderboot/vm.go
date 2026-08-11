@@ -153,6 +153,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		"--socket-path="+virtiofsSock,
 		"--shared-dir="+cfg.RootFS,
 		"--cache=always",
+		"--modcaps=-setfcap",
 	)
 	virtiofsdCmd.Stderr = os.Stderr
 	if err := virtiofsdCmd.Start(); err != nil {

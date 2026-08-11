@@ -127,23 +127,9 @@ func main() {
 
 	// Use simple init script if no bcache
 	if *noBcache {
-		cfg.InitScript = `
-echo 'init: mounting essential filesystems'
-mkdir -p /dev/pts /proc /sys
-mount -t devpts devpts /dev/pts
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-
-echo 'init: configuring network'
-ip link set eth0 up 2>/dev/null || true
-ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || true
-ip route add default via 10.0.2.2 2>/dev/null || true
-
-echo 'init: starting vshd'
-/bin/sh -l -c 'exec /sbin/vshd'
-echo 'init: vshd exited, powering off'
-/bin/busybox poweroff -f
-`
+		// Keep this on one line: the kernel command-line parser does not
+		// preserve the newlines escaped by strconv.Quote/%q for the shell.
+		cfg.InitScript = `echo 'init: mounting essential filesystems'; mkdir -p /dev/pts /proc /sys; mount -t devpts devpts /dev/pts; mount -t proc proc /proc; mount -t sysfs sysfs /sys; echo 'init: configuring network'; ip link set eth0 up 2>/dev/null || true; ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || true; ip route add default via 10.0.2.2 2>/dev/null || true; echo 'init: starting vshd'; exec /sbin/vshd`
 	}
 
 	log.Printf("Starting thunderboot VM...")
