@@ -50,6 +50,12 @@ func main() {
 	backingNBD := getopt.StringLong("backing-nbd", 0, "", "NBD server host:port for backing device (mutually exclusive with --backing-mb)")
 	memoryMB := getopt.IntLong("memory-mb", 'm', 512, "VM memory size in MB")
 	noBcache := getopt.BoolLong("no-bcache", 'n', "Skip bcache setup, just boot with virtiofs")
+	appliance := getopt.BoolLong("appliance", 0, "Boot the thundersnap appliance initramfs")
+	initramfs := getopt.StringLong("initramfs", 0, "thunderboot-out/initramfs.cpio", "Appliance initramfs path")
+	dataDisk := getopt.StringLong("data-disk", 0, "thunderboot-out/data.btrfs", "Persistent appliance data disk")
+	dataDiskSize := getopt.StringLong("data-disk-size", 0, "2T", "New appliance disk size (M, G, or T)")
+	configDir := getopt.StringLong("config-dir", 0, "thunderboot-out/config", "Appliance first-boot configuration directory")
+	cpus := getopt.IntLong("cpus", 0, 1, "Appliance virtual CPU count")
 	help := getopt.BoolLong("help", 'h', "Show help")
 
 	getopt.Parse()
@@ -86,8 +92,8 @@ func main() {
 		log.Fatalf("vmlinux not found in %s", *vmDir)
 	}
 
-	// Handle rootfs
-	if *rootFS == "" && !*autoRootFS {
+	// Appliance mode supplies its root through an initramfs.
+	if !*appliance && *rootFS == "" && !*autoRootFS {
 		log.Fatal("Must specify -rootfs or -auto-rootfs. virtiofsd cannot share / directly.")
 	}
 	if *rootFS == "/" {
@@ -104,7 +110,7 @@ func main() {
 
 	// Create auto rootfs if requested
 	var tempRootFS string
-	if *autoRootFS {
+	if *autoRootFS && !*appliance {
 		var err error
 		tempRootFS, err = createAutoRootFS(*vmDir)
 		if err != nil {
@@ -124,16 +130,30 @@ func main() {
 		BackingNBD:    *backingNBD,
 		MemoryMB:      *memoryMB,
 	}
+	if *appliance {
+		cfg.Initramfs = *initramfs
+		cfg.DataDisk = *dataDisk
+		cfg.DataDiskSize = *dataDiskSize
+		cfg.ConfigDir = *configDir
+		cfg.CPUs = *cpus
+	}
 
 	// Use simple init script if no bcache
-	if *noBcache {
+	if *noBcache && !*appliance {
 		// Keep this on one line: the kernel command-line parser does not
 		// preserve the newlines escaped by strconv.Quote/%q for the shell.
 		cfg.InitScript = `echo 'init: mounting essential filesystems'; mkdir -p /dev/pts /proc /sys; mount -t devpts devpts /dev/pts; mount -t proc proc /proc; mount -t sysfs sysfs /sys; echo 'init: configuring network'; ip link set eth0 up 2>/dev/null || true; ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || true; ip route add default via 10.0.2.2 2>/dev/null || true; echo 'init: starting vshd'; exec /sbin/vshd`
 	}
 
 	log.Printf("Starting thunderboot VM...")
-	log.Printf("  RootFS: %s", cfg.RootFS)
+	if *appliance {
+		log.Printf("  Initramfs: %s", cfg.Initramfs)
+		log.Printf("  Data disk: %s (%s if new)", cfg.DataDisk, cfg.DataDiskSize)
+		log.Printf("  Config dir: %s", cfg.ConfigDir)
+		log.Printf("  CPUs: %d", cfg.CPUs)
+	} else {
+		log.Printf("  RootFS: %s", cfg.RootFS)
+	}
 	log.Printf("  VMDir: %s", cfg.VMDir)
 	log.Printf("  Cache: %d MB", cfg.CacheSizeMB)
 	if cfg.BackingNBD != "" {
@@ -160,6 +180,14 @@ func main() {
 		session.Close()
 		os.Exit(0)
 	}()
+
+	if *appliance {
+		log.Printf("Appliance VM started; serial console follows")
+		if err := session.Wait(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	log.Printf("VM started, waiting for vshd...")
 

@@ -15,6 +15,12 @@ build init thunderboot-init
 build sbin/thundersnapd thundersnapd
 build sbin/ts ts
 build sbin/vshd vshd
+if [ ! -x /bin/busybox ]; then
+	echo "static /bin/busybox is required (install busybox-static)" >&2
+	exit 1
+fi
+cp /bin/busybox "$root/sbin/busybox"
+ln -s busybox "$root/sbin/cp"
 cp cmd/thundersnapd/policy.jsonc "$root/etc/thundersnap-policy.jsonc"
 cp vm/cloud-hypervisor "$root/vm/cloud-hypervisor"
 cp vm/vmlinux "$root/vm/vmlinux"

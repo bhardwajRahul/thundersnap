@@ -28,6 +28,14 @@ import (
 
 // VMConfig holds configuration for starting a thunderboot VM.
 type VMConfig struct {
+	// Initramfs selects appliance mode when non-empty. In appliance mode the
+	// initramfs supplies PID 1, DataDisk is /dev/vda, and ConfigDir is shared
+	// read-only with the guest as the "bootconfig" virtiofs tag.
+	Initramfs    string
+	DataDisk     string
+	DataDiskSize string
+	ConfigDir    string
+	CPUs         int
 	// RootFS is the path to the root filesystem to share via virtiofs.
 	RootFS string
 	// VMDir is the path to the directory containing cloud-hypervisor and vmlinux.
@@ -59,16 +67,17 @@ const VshPort = 5222
 
 // VMSession represents a running thunderboot VM session.
 type VMSession struct {
-	virtiofsdCmd *exec.Cmd
-	passtCmd     *exec.Cmd
-	chvCmd       *exec.Cmd
-	virtiofsSock string
-	vsockSock    string
-	cacheFile    string
-	backingFile  string
-	done         chan struct{}
-	consoleOut   *bufio.Scanner // for reading console output
-	consolePtmx  *os.File
+	virtiofsdCmd  *exec.Cmd
+	passtCmd      *exec.Cmd
+	chvCmd        *exec.Cmd
+	virtiofsSock  string
+	vsockSock     string
+	cacheFile     string
+	backingFile   string
+	preserveDisks bool
+	done          chan struct{}
+	consoleOut    *bufio.Scanner // for reading console output
+	consolePtmx   *os.File
 }
 
 // DefaultInitScript returns the default init script that sets up bcache.
@@ -86,6 +95,9 @@ func NBDInitScript(nbdHost, nbdPort string) string {
 
 // StartVM starts a new thunderboot VM session with bcache-backed storage.
 func StartVM(cfg VMConfig) (*VMSession, error) {
+	if cfg.Initramfs != "" {
+		return startApplianceVM(cfg)
+	}
 	if cfg.MemoryMB == 0 {
 		cfg.MemoryMB = 512
 	}
@@ -339,8 +351,10 @@ func (s *VMSession) cleanup() {
 	os.Remove(s.virtiofsSock)
 	os.Remove(s.vsockSock)
 	os.Remove(fmt.Sprintf("%s_%d", s.vsockSock, VshPort))
-	os.Remove(s.cacheFile)
-	os.Remove(s.backingFile)
+	if !s.preserveDisks {
+		os.Remove(s.cacheFile)
+		os.Remove(s.backingFile)
+	}
 	log.Printf("Cleaned up thunderboot resources")
 }
 
