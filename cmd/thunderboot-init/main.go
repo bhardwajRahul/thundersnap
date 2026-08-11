@@ -40,6 +40,7 @@ func boot() error {
 		{"devpts", "/dev/pts", "devpts", "mode=0620", 0},
 		{"tmpfs", "/run", "tmpfs", "mode=0755", 0},
 		{"tmpfs", "/tmp", "tmpfs", "mode=1777", 0},
+		{"cgroup2", "/sys/fs/cgroup", "cgroup2", "", 0},
 	}
 	for _, m := range mounts {
 		if err := mount(m.source, m.target, m.fstype, m.flags, m.data); err != nil {
