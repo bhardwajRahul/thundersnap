@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -65,18 +66,25 @@ func boot() error {
 		return err
 	}
 	logMemory("after switch_root")
+	for _, tool := range []string{"/bin/btrfs", "/bin/mkfs.btrfs"} {
+		out, err := exec.Command(tool, "--version").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("verify %s: %w: %s", tool, err, out)
+		}
+		log.Printf("installed %s", strings.TrimSpace(string(out)))
+	}
 
-	env := append(os.Environ(), "PATH=/boot")
+	env := append(os.Environ(), "PATH=/bin")
 	if key := strings.TrimSpace(string(authKey)); key != "" {
 		env = append(env, "TS_AUTHKEY="+key)
 	}
 	args := []string{
-		"/boot/thundersnapd",
-		"--policy=/boot/thundersnap-policy.jsonc",
+		"/bin/thundersnapd",
+		"--policy=/bin/thundersnap-policy.jsonc",
 		"--data-dir=/var/lib/thundersnap",
 		"--state-dir=/var/lib/thundersnap",
-		"--libexec-dir=/boot",
-		"--vm-dir=/boot",
+		"--libexec-dir=/bin",
+		"--vm-dir=/bin",
 	}
 	log.Printf("executing thundersnapd as PID 1")
 	return syscall.Exec(args[0], args, env)
@@ -84,7 +92,10 @@ func boot() error {
 
 func installAppliance() error {
 	for _, dir := range []string{
-		newRoot + "/boot",
+		newRoot + "/bin",
+		newRoot + "/lib",
+		newRoot + "/lib64",
+		newRoot + "/usr/lib",
 		newRoot + "/bootconfig",
 		newRoot + "/dev/pts",
 		newRoot + "/etc",
@@ -99,23 +110,30 @@ func installAppliance() error {
 		}
 	}
 	files := map[string]string{
-		"/sbin/thundersnapd":            newRoot + "/boot/thundersnapd",
-		"/sbin/ts":                      newRoot + "/boot/ts",
-		"/sbin/vshd":                    newRoot + "/boot/vshd",
-		"/sbin/busybox":                 newRoot + "/boot/busybox",
-		"/vm/cloud-hypervisor":          newRoot + "/boot/cloud-hypervisor",
-		"/vm/vmlinux":                   newRoot + "/boot/vmlinux",
-		"/etc/thundersnap-policy.jsonc": newRoot + "/boot/thundersnap-policy.jsonc",
+		"/bin/thundersnapd":             newRoot + "/bin/thundersnapd",
+		"/bin/ts":                       newRoot + "/bin/ts",
+		"/bin/vshd":                     newRoot + "/bin/vshd",
+		"/bin/busybox":                  newRoot + "/bin/busybox",
+		"/bin/btrfs":                    newRoot + "/bin/btrfs",
+		"/bin/mkfs.btrfs":               newRoot + "/bin/mkfs.btrfs",
+		"/bin/cloud-hypervisor":         newRoot + "/bin/cloud-hypervisor",
+		"/bin/vmlinux":                  newRoot + "/bin/vmlinux",
+		"/bin/thundersnap-policy.jsonc": newRoot + "/bin/thundersnap-policy.jsonc",
 	}
 	for src, dst := range files {
 		if err := copyFile(src, dst); err != nil {
 			return err
 		}
 	}
-	if err := os.Remove(newRoot + "/boot/cp"); err != nil && !os.IsNotExist(err) {
+	for _, dir := range []string{"/lib", "/lib64", "/usr/lib"} {
+		if err := copyTree(dir, newRoot+dir); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(newRoot + "/bin/cp"); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err := os.Symlink("busybox", newRoot+"/boot/cp"); err != nil {
+	if err := os.Symlink("busybox", newRoot+"/bin/cp"); err != nil {
 		return fmt.Errorf("create cp symlink: %w", err)
 	}
 	if err := os.WriteFile(newRoot+"/etc/resolv.conf", []byte("nameserver 10.0.2.3\n"), 0644); err != nil {
@@ -147,6 +165,31 @@ func copyFile(src, dst string) error {
 		return fmt.Errorf("close %s: %w", dst, closeErr)
 	}
 	return nil
+}
+
+func copyTree(src, dst string) error {
+	if _, err := os.Stat(src); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		return copyFile(path, target)
+	})
 }
 
 // switchRoot implements the initramfs switch_root operation. The kernel's
