@@ -70,6 +70,30 @@ func New(parentName string) *Manager {
 	return &Manager{parentName: parentName}
 }
 
+// ShouldManageSessions reports whether this process should create per-session
+// cgroups. A visible cgroup v2 hierarchy means it can and should try. If the
+// hierarchy is intentionally hidden inside a container but /proc says the
+// process already belongs to a non-root cgroup, children inherit that outer
+// confinement and nested cgroup management is disabled. At the cgroup root,
+// a missing hierarchy is not accepted: callers still enable management so the
+// first session fails closed with a useful error.
+func ShouldManageSessions() bool {
+	if _, err := os.Stat(filepath.Join(cgroupRoot, "cgroup.controllers")); err == nil {
+		return true
+	}
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return true
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "0::") {
+			path := strings.TrimSpace(strings.TrimPrefix(line, "0::"))
+			return path == "" || path == "/"
+		}
+	}
+	return true
+}
+
 // ParentName returns the parent cgroup name, used by callers to build the
 // per-container leaf name (e.g. "<parent>/<user>/<session>").
 func (m *Manager) ParentName() string {

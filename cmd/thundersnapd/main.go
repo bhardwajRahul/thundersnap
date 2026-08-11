@@ -431,13 +431,17 @@ func (m *hostVshdManager) ensure() (sockPath string, err error) {
 	// Pass the daemon's cgroup parent so host vshd applies the same per-session
 	// memory/pids/cpu limits the daemon used to apply itself, preserving
 	// fork-bomb/OOM protection now that the session child is spawned by vshd.
+	// A nested daemon may have the cgroup hierarchy deliberately hidden while
+	// already confined by its outer container; in that case its children inherit
+	// the outer cgroup and it cannot create nested leaves itself.
 	// The lifecycle fd is passed as fd 3 (ExtraFiles[0]).
-	cmd := exec.Command(vshdBin,
-		"--unix="+sockPath,
-		"--ts="+tsBin,
-		"--cgroup-parent="+cgroupManager.ParentName(),
-		"--lifecycle-fd=3",
-	)
+	args := []string{"--unix=" + sockPath, "--ts=" + tsBin, "--lifecycle-fd=3"}
+	if cgroup.ShouldManageSessions() {
+		args = append(args, "--cgroup-parent="+cgroupManager.ParentName())
+	} else {
+		log.Printf("cgroup hierarchy hidden inside an outer cgroup; per-session cgroups disabled")
+	}
+	cmd := exec.Command(vshdBin, args...)
 	cmd.ExtraFiles = []*os.File{lifecycleR}
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
