@@ -128,6 +128,13 @@ func connectNBD(u *url.URL) (string, error) {
 	if err := waitDevice("/dev/nbd0", 10*time.Second); err != nil {
 		return "", err
 	}
+	deadline := time.Now().Add(10 * time.Second)
+	for size("/dev/nbd0") == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if size("/dev/nbd0") == 0 {
+		return "", fmt.Errorf("timeout waiting for /dev/nbd0 capacity")
+	}
 	return "/dev/nbd0", nil
 }
 

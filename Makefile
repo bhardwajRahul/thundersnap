@@ -22,7 +22,7 @@ OUT ?= dist
 # Output directory for local binaries
 BIN ?= ./bin
 
-.PHONY: all test e2e e2e-tb not_e2e binaries ts vshd thundersnapd thunderboot \
+.PHONY: all test e2e e2e-tb not_e2e binaries ts vshd thundersnapd thunderboot infiniblockd \
         list build build-deb build-rpm build-tgz clean
 
 all: build
@@ -89,7 +89,7 @@ e2e: ts vshd thundersnapd
 	@./test-cleanup.sh $(E2E_TMPDIR)
 
 # Run thunderboot storage-layout tests.
-e2e-tb: thunderboot
+e2e-tb: thunderboot infiniblockd
 	./scripts/build-thunderboot-initramfs.sh
 	CGO_ENABLED=0 go test -tags e2e -c -o $(BIN)/e2e-tb.test ./e2e-tb
 	sudo -E timeout 300s $(BIN)/e2e-tb.test -test.v -test.failfast -test.timeout=5m $(E2E_ARGS)
@@ -133,6 +133,10 @@ thundersnapd:
 	CGO_ENABLED=0 go build -o $(BIN)/$@ ./cmd/$@
 
 thunderboot:
+	@mkdir -p $(BIN)
+	go build -o $(BIN)/$@ ./cmd/$@
+
+infiniblockd:
 	@mkdir -p $(BIN)
 	go build -o $(BIN)/$@ ./cmd/$@
 
