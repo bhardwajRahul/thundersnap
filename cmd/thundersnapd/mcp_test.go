@@ -6,8 +6,10 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -258,32 +260,70 @@ func TestReadTail(t *testing.T) {
 
 func TestMCPJobScopeFromRequest(t *testing.T) {
 	ctx := context.WithValue(context.Background(), mcpUserKey{}, "alice")
-	req := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Meta: mcp.Meta{
-		apertureConversationIDMetaKey: "conv-1",
-	}}}
-	got, err := mcpJobScopeFromRequest(ctx, req)
-	if err != nil {
-		t.Fatalf("mcpJobScopeFromRequest: %v", err)
+	for name, req := range map[string]*mcp.CallToolRequest{
+		"metadata": {
+			Params: &mcp.CallToolParamsRaw{Meta: mcp.Meta{apertureConversationIDMetaKey: "conv-meta"}},
+		},
+		"header": {
+			Params: &mcp.CallToolParamsRaw{},
+			Extra:  &mcp.RequestExtra{Header: http.Header{apertureConversationIDHeaderName: {"conv-header"}}},
+		},
+		"header takes precedence": {
+			Params: &mcp.CallToolParamsRaw{Meta: mcp.Meta{apertureConversationIDMetaKey: "conv-meta"}},
+			Extra:  &mcp.RequestExtra{Header: http.Header{apertureConversationIDHeaderName: {"conv-header"}}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := mcpJobScopeFromRequest(ctx, req)
+			if err != nil {
+				t.Fatalf("mcpJobScopeFromRequest: %v", err)
+			}
+			wantConversation := "conv-header"
+			if name == "metadata" {
+				wantConversation = "conv-meta"
+			}
+			if got.user != "alice" || got.conversation != wantConversation {
+				t.Errorf("scope = %+v, want alice/%s", got, wantConversation)
+			}
+		})
 	}
-	if got.user != "alice" || got.conversation != "conv-1" {
-		t.Errorf("scope = %+v, want alice/conv-1", got)
-	}
+
 	for name, req := range map[string]*mcp.CallToolRequest{
 		"nil request": nil,
 		"no params":   {},
 		"no metadata": {Params: &mcp.CallToolParamsRaw{}},
-		"empty": {Params: &mcp.CallToolParamsRaw{Meta: mcp.Meta{
-			apertureConversationIDMetaKey: "",
-		}}},
-		"non-string": {Params: &mcp.CallToolParamsRaw{Meta: mcp.Meta{
+		"empty metadata and header": {
+			Params: &mcp.CallToolParamsRaw{Meta: mcp.Meta{apertureConversationIDMetaKey: ""}},
+			Extra:  &mcp.RequestExtra{Header: http.Header{apertureConversationIDHeaderName: {" "}}},
+		},
+		"non-string metadata": {Params: &mcp.CallToolParamsRaw{Meta: mcp.Meta{
 			apertureConversationIDMetaKey: 123,
 		}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := mcpJobScopeFromRequest(ctx, req); err == nil {
-				t.Fatal("expected missing conversation metadata error")
+				t.Fatal("expected missing conversation identity error")
 			}
 		})
+	}
+}
+
+func TestNestedCallToolRequestPreservesConversationHeader(t *testing.T) {
+	ctx := context.WithValue(context.Background(), mcpUserKey{}, "alice")
+	original := &mcp.CallToolRequest{
+		Params: &mcp.CallToolParamsRaw{Meta: mcp.Meta{}},
+		Extra: &mcp.RequestExtra{Header: http.Header{
+			apertureConversationIDHeaderName: {"conv-header"},
+		}},
+	}
+
+	nested := nestedCallToolRequest(original, json.RawMessage(`{"command":"true"}`))
+	got, err := mcpJobScopeFromRequest(ctx, nested)
+	if err != nil {
+		t.Fatalf("mcpJobScopeFromRequest(nested): %v", err)
+	}
+	if got.user != "alice" || got.conversation != "conv-header" {
+		t.Fatalf("nested scope = %+v, want alice/conv-header", got)
 	}
 }
 

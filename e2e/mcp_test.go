@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -140,12 +141,16 @@ func startDaemonWithHTTP(t *testing.T, env *testEnv) (*daemonInstance, string) {
 // and returns it (with a cleanup that closes the session). The session is
 // already initialized (Connect runs the MCP handshake).
 func mcpClient(t *testing.T, baseURL string) *mcp.ClientSession {
+	return mcpClientWithHTTPClient(t, baseURL, nil)
+}
+
+func mcpClientWithHTTPClient(t *testing.T, baseURL string, httpClient *http.Client) *mcp.ClientSession {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	transport := &mcp.StreamableClientTransport{Endpoint: baseURL + "/v1/mcp"}
+	transport := &mcp.StreamableClientTransport{Endpoint: baseURL + "/v1/mcp", HTTPClient: httpClient}
 	client := mcp.NewClient(&mcp.Implementation{
 		Name:    "thundersnap-e2e-test",
 		Version: "test",
@@ -270,7 +275,21 @@ func callToolForConversation(t *testing.T, session *mcp.ClientSession, conversat
 	return string(b), res.IsError
 }
 
-const apertureConversationIDMetaKeyE2E = "io.tailscale.aperture/conversation-id"
+const (
+	apertureConversationIDMetaKeyE2E = "io.tailscale.aperture/conversation-id"
+	apertureConversationIDHeaderE2E  = "X-Aperture-Conversation-Id"
+)
+
+type apertureConversationTransport struct {
+	conversation string
+	base         http.RoundTripper
+}
+
+func (t apertureConversationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r := req.Clone(req.Context())
+	r.Header.Set(apertureConversationIDHeaderE2E, t.conversation)
+	return t.base.RoundTrip(r)
+}
 
 // waitForMCPJob waits for one job to exit and returns its status.
 func waitForMCPJob(t *testing.T, session *mcp.ClientSession, jobID string, revision uint64) map[string]any {
@@ -358,6 +377,37 @@ var mcpFrameApplets = []string{
 	"stat",    // view (image): stat -c %s (also useful for general tests)
 	"sleep",   // timeout/reap tests: foreground long-running command
 	"ps",      // reap tests: inspect leftover processes
+}
+
+func TestMCPJobWithApertureConversationHeader(t *testing.T) {
+	env := newTestEnv(t)
+	d, httpBase := startDaemonWithHTTP(t, env)
+	createFrameForMCP(t, d, "mcpheader")
+
+	const conversation = "b8f9e7f1313506d1"
+	httpClient := &http.Client{Transport: apertureConversationTransport{
+		conversation: conversation,
+		base:         http.DefaultTransport,
+	}}
+	session := mcpClientWithHTTPClient(t, httpBase, httpClient)
+
+	// Deliberately omit MCP _meta: this models Aperture Chat, which supplies the
+	// conversation only as an HTTP header. A combined launch+wait exercises both
+	// internal requests created by the public jobs wrapper.
+	out, isErr := callToolForConversation(t, session, "", "jobs", map[string]any{
+		"launch": []any{map[string]any{
+			"command": "echo aperture-header-ok",
+			"frame":   "mcpheader",
+			"user":    "root",
+		}},
+		"wait": map[string]any{"until": "all_exit", "timeout": 60},
+	})
+	if isErr {
+		t.Fatalf("header-scoped job failed: %s", out)
+	}
+	if !strings.Contains(out, "aperture-header-ok") {
+		t.Fatalf("header-scoped job output = %q, want marker", out)
+	}
 }
 
 // TestMCPToolsRoundTrip is the core MCP e2e test (Phase 4, T5). It exercises

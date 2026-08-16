@@ -24,11 +24,12 @@ import (
 )
 
 const (
-	apertureConversationIDMetaKey = "io.tailscale.aperture/conversation-id"
-	mcpJobDefaultHardTimeout      = 2 * time.Hour
-	mcpJobMaxHardTimeout          = 2 * time.Hour
-	mcpJobWaitDefaultTimeout      = 30 * time.Second
-	mcpJobWaitMaxTimeout          = 60 * time.Second
+	apertureConversationIDMetaKey    = "io.tailscale.aperture/conversation-id"
+	apertureConversationIDHeaderName = "X-Aperture-Conversation-Id"
+	mcpJobDefaultHardTimeout         = 2 * time.Hour
+	mcpJobMaxHardTimeout             = 2 * time.Hour
+	mcpJobWaitDefaultTimeout         = 30 * time.Second
+	mcpJobWaitMaxTimeout             = 60 * time.Second
 )
 
 type mcpJobScopeKey struct {
@@ -112,15 +113,20 @@ func mcpJobScopeFromRequest(ctx context.Context, req *mcp.CallToolRequest) (mcpJ
 	if user == "" {
 		return mcpJobScopeKey{}, fmt.Errorf("no MCP user resolved for request")
 	}
-	if req == nil || req.Params == nil {
-		return mcpJobScopeKey{}, fmt.Errorf("missing Aperture conversation ID in MCP _meta")
+	if req == nil {
+		return mcpJobScopeKey{}, fmt.Errorf("missing Aperture conversation ID in %s header or MCP _meta", apertureConversationIDHeaderName)
 	}
-	v, ok := req.Params.Meta[apertureConversationIDMetaKey]
-	conversation, okString := v.(string)
-	if !ok || !okString || strings.TrimSpace(conversation) == "" {
-		return mcpJobScopeKey{}, fmt.Errorf("missing Aperture conversation ID in MCP _meta (%s)", apertureConversationIDMetaKey)
+	if req.Extra != nil {
+		if conversation := req.Extra.Header.Get(apertureConversationIDHeaderName); strings.TrimSpace(conversation) != "" {
+			return mcpJobScopeKey{user: user, conversation: conversation}, nil
+		}
 	}
-	return mcpJobScopeKey{user: user, conversation: conversation}, nil
+	if req.Params != nil {
+		if conversation, ok := req.Params.Meta[apertureConversationIDMetaKey].(string); ok && strings.TrimSpace(conversation) != "" {
+			return mcpJobScopeKey{user: user, conversation: conversation}, nil
+		}
+	}
+	return mcpJobScopeKey{}, fmt.Errorf("missing Aperture conversation ID in %s header or MCP _meta (%s)", apertureConversationIDHeaderName, apertureConversationIDMetaKey)
 }
 
 func mcpJobScopeDir(key mcpJobScopeKey) string {
@@ -274,6 +280,18 @@ func callToolResultText(result *mcp.CallToolResult) string {
 	return ""
 }
 
+// nestedCallToolRequest builds an internal tool request while retaining the
+// transport metadata from the original HTTP request. In particular, Extra
+// carries X-Aperture-Conversation-Id; dropping it makes a jobs call pass its
+// initial scope check and then fail when the nested launch or wait handler
+// resolves the scope again.
+func nestedCallToolRequest(req *mcp.CallToolRequest, arguments json.RawMessage) *mcp.CallToolRequest {
+	return &mcp.CallToolRequest{
+		Params: &mcp.CallToolParamsRaw{Meta: req.Params.Meta, Arguments: arguments},
+		Extra:  req.Extra,
+	}
+}
+
 // mcpJobsToolHandler is the public command-execution API. It composes the
 // internal launch and wait handlers so all launches are submitted in array
 // order before waiting. This avoids relying on an MCP client's sibling-tool
@@ -307,10 +325,7 @@ func mcpJobsToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 
 	launchedIDs := make([]string, 0, len(params.Launch))
 	for i, launch := range params.Launch {
-		launchReq := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{
-			Meta: req.Params.Meta, Arguments: launch,
-		}}
-		result, err := mcpBashToolHandler(ctx, launchReq)
+		result, err := mcpBashToolHandler(ctx, nestedCallToolRequest(req, launch))
 		if err != nil {
 			return nil, err
 		}
@@ -338,9 +353,7 @@ func mcpJobsToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 		if err != nil {
 			return textResult(fmt.Sprintf("marshal wait request: %v", err), true)
 		}
-		return mcpJobsWaitToolHandler(ctx, &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{
-			Meta: req.Params.Meta, Arguments: arguments,
-		}})
+		return mcpJobsWaitToolHandler(ctx, nestedCallToolRequest(req, arguments))
 	}
 
 	l := mcpJobs.list(key)

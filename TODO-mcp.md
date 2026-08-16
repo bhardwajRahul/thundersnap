@@ -243,10 +243,11 @@ Design: `mcp-background-bash.md`. Replace the blocking bash result with
 conversation-scoped supervised jobs so Aperture's sequential tool dispatcher
 can launch concurrent work and observe it through short wait calls.
 
-- [x] Forward Aperture's stable conversation ID in MCP `tools/call` `_meta`
-  under the namespaced key `io.tailscale.aperture/conversation-id`.
-  Thundersnap job tools reject missing/empty metadata; there is no MCP
-  session-ID fallback because silently combining chats is worse than failing.
+- [x] Accept Aperture's stable conversation ID from the
+  `X-Aperture-Conversation-Id` HTTP header, with the older MCP `tools/call`
+  `_meta` key `io.tailscale.aperture/conversation-id` retained for compatibility.
+  Thundersnap job tools reject missing/empty identity; there is no MCP session-ID
+  fallback because silently combining chats is worse than failing.
 - [x] Implement conversation-scoped job manager keyed by `(resolved user,
   Aperture conversation ID)`, with short per-scope job IDs and jobs that may
   target any frame.

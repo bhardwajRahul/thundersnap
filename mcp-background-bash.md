@@ -49,9 +49,9 @@ lifetime is not chat lifetime:
 - Open WebUI creates an MCP session per generation and closes it afterward, so
   successive turns in one chat use different MCP sessions.
 
-Aperture already places its stable conversation ID in every chat tool's Go
-context. Its MCP adapter will forward that ID in the standard extensible
-`tools/call` `_meta` object:
+Aperture forwards its stable conversation ID on each conversation-scoped MCP
+request in the `X-Aperture-Conversation-Id` HTTP header. Thundersnap also
+accepts the older `tools/call` `_meta` representation for compatibility:
 
 ```json
 {
@@ -60,6 +60,8 @@ context. Its MCP adapter will forward that ID in the standard extensible
   }
 }
 ```
+
+When both are present, the HTTP header takes precedence.
 
 Thundersnap derives the task-list key as:
 
@@ -231,9 +233,9 @@ code review. E2e tests must never skip.
 
 ### Conversation/task-list identity
 
-- [x] Missing conversation `_meta` rejects every job start/list/wait/kill call.
-- [ ] Empty/non-string conversation metadata rejects cleanly. *(empty covered;
-      non-string only unit-tested)*
+- [x] Missing conversation header and `_meta` reject every job start/list/wait/kill call.
+- [ ] Empty/non-string conversation identity rejects cleanly. *(empty covered;
+      non-string metadata only unit-tested)*
 - [x] Same user + same conversation across separate MCP connections sees the
       same jobs.
 - [x] Same user + different conversations cannot list, wait for, or kill each
