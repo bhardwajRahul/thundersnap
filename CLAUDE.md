@@ -25,8 +25,9 @@ experiment. Over time we need to improve the quality of all the components.
     nil:nil:nil frames which have no /lib64; `apt-get install busybox-static`)
   - `virtiofsd` and `passt` for VM tests (`apt-get install virtiofsd passt`)
   - `/dev/kvm` for VM tests (check for this! you almost certainly have it!)
-  - VM binaries (`cloud-hypervisor`, `vmlinux`) in `vm/` or set
-    `THUNDERSNAP_VM_DIR`
+  - Generated VM binaries (`cloud-hypervisor`, `vmlinux`) in `vm/` or set
+    `THUNDERSNAP_VM_DIR`; on a fresh x86-64 Linux checkout run
+    `make thunderboot-vm-artifacts` (see `README.thunderboot-builder.md`)
 - This project workspace may be using the 'jj' tool instead of git. Always
   check for jj first.
 - Commit messages: first line in the form "dir(s): what changed". Then 

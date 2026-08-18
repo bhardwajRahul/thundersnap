@@ -1,0 +1,118 @@
+# Reproducible native ARM64 Linux builder for thunderboot artifacts.
+#
+# The image is immutable by URL and SHA-512. The repository is mounted at
+# /work/thundersnap so build output lands directly in thunderboot-out/ on the
+# macOS host. Lima itself is intentionally host tooling, not a build input.
+minimumLimaVersion: 2.0.0
+
+vmType: vz
+arch: aarch64
+cpus: 6
+memory: 8GiB
+disk: 80GiB
+
+images:
+- location: https://cloud.debian.org/images/cloud/trixie/20260810-2566/debian-13-genericcloud-arm64-20260810-2566.qcow2
+  arch: aarch64
+  digest: sha512:7a0eeb424f4a0e9fe35a4c04dee92cdded59aa4b056655488caf606cad4711b08c88af69a3d7de8af6837b082609872017e009a845837bde371c17b8fc27cd76
+
+mountType: virtiofs
+mounts:
+- location: "{{.Param.repo}}"
+  mountPoint: /work/thundersnap
+  writable: true
+
+containerd:
+  system: false
+  user: false
+
+vmOpts:
+  vz:
+    rosetta:
+      enabled: false
+      binfmt: false
+
+param:
+  repo: /tmp/thundersnap-repository-must-be-specified
+
+provision:
+- mode: system
+  script: |
+    #!/bin/sh
+    set -eux
+    cat >/etc/apt/sources.list.d/thunderboot-snapshot.sources <<'EOF'
+    Types: deb
+    URIs: https://snapshot.debian.org/archive/debian/20260811T000000Z/
+    Suites: trixie trixie-updates trixie-backports
+    Components: main
+    Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+    Check-Valid-Until: no
+
+    Types: deb
+    URIs: https://snapshot.debian.org/archive/debian-security/20260811T000000Z/
+    Suites: trixie-security
+    Components: main
+    Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+    Check-Valid-Until: no
+    EOF
+    rm -f /etc/apt/sources.list.d/debian.sources
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+      bc \
+      bcache-tools \
+      bison \
+      btrfs-progs \
+      build-essential \
+      busybox-static \
+      ca-certificates \
+      cpio \
+      curl \
+      dwarves \
+      file \
+      flex \
+      git \
+      kmod \
+      libelf-dev \
+      libssl-dev \
+      mdadm \
+      nbd-client \
+      openssl \
+      pkg-config \
+      python3 \
+      rsync \
+      xz-utils \
+      zstd
+
+- mode: system
+  script: |
+    #!/bin/sh
+    set -eux
+    version=1.26.3
+    archive=go${version}.linux-arm64.tar.gz
+    sha256=9d89a3ea57d141c2b22d70083f2c8459ba3890f2d9e818e7e933b75614936565
+    if [ -x /usr/local/go/bin/go ] && [ "$(/usr/local/go/bin/go version | awk '{print $3}')" = "go${version}" ]; then
+      exit 0
+    fi
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' EXIT
+    curl --fail --location --retry 3 --output "$tmp" "https://go.dev/dl/$archive"
+    echo "$sha256  $tmp" | sha256sum --check -
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf "$tmp"
+    ln -sf /usr/local/go/bin/go /usr/local/bin/go
+    ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+
+probes:
+- description: ARM64 Linux build tools are installed
+  script: |
+    #!/bin/sh
+    set -eu
+    test "$(uname -m)" = aarch64
+    test "$(go env GOOS)/$(go env GOARCH)" = linux/arm64
+    command -v gcc >/dev/null
+    command -v make >/dev/null
+    command -v cpio >/dev/null
+    command -v zstd >/dev/null
+    test -x /bin/busybox
+  hint: provisioning the thunderboot builder failed; inspect the Lima cloud-init logs

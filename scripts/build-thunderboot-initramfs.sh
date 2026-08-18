@@ -2,6 +2,11 @@
 set -eu
 
 out=$(realpath -m "${1:-thunderboot-out/initramfs.cpio}")
+include_nested_vm=${THUNDERBOOT_INCLUDE_NESTED_VM:-1}
+case "$include_nested_vm" in
+0|1) ;;
+*) echo "THUNDERBOOT_INCLUDE_NESTED_VM must be 0 or 1" >&2; exit 1 ;;
+esac
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT INT TERM
 mkdir -p "$(dirname "$out")" "$root"/bin "$root"/dev/pts "$root"/proc \
@@ -56,8 +61,17 @@ if [ ! -r /etc/ssl/certs/ca-certificates.crt ]; then
 	exit 1
 fi
 cp /etc/ssl/certs/ca-certificates.crt "$root/etc/ssl/certs/ca-certificates.crt"
-cp vm/cloud-hypervisor "$root/bin/cloud-hypervisor"
-cp vm/vmlinux "$root/bin/vmlinux"
+if [ "$include_nested_vm" = 1 ]; then
+	for artifact in vm/cloud-hypervisor vm/vmlinux; do
+		if [ ! -x "$artifact" ]; then
+			echo "required nested-VM artifact $artifact is missing" >&2
+			echo "run ./scripts/fetch-thunderboot-vm-artifacts.sh first, or set THUNDERBOOT_INCLUDE_NESTED_VM=0" >&2
+			exit 1
+		fi
+	done
+	cp vm/cloud-hypervisor "$root/bin/cloud-hypervisor"
+	cp vm/vmlinux "$root/bin/vmlinux"
+fi
 
 (cd "$root" && find . -print0 | sort -z | cpio --quiet --null -o --format=newc --owner=0:0) >"$out"
 echo "built $out"

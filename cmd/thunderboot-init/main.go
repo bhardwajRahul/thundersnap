@@ -121,13 +121,24 @@ func installAppliance() error {
 		"/bin/mdadm":                         newRoot + "/bin/mdadm",
 		"/bin/make-bcache":                   newRoot + "/bin/make-bcache",
 		"/bin/nbd-client":                    newRoot + "/bin/nbd-client",
-		"/bin/cloud-hypervisor":              newRoot + "/bin/cloud-hypervisor",
-		"/bin/vmlinux":                       newRoot + "/bin/vmlinux",
 		"/bin/thundersnap-policy.jsonc":      newRoot + "/bin/thundersnap-policy.jsonc",
 		"/etc/ssl/certs/ca-certificates.crt": newRoot + "/etc/ssl/certs/ca-certificates.crt",
 	}
 	for src, dst := range files {
 		if err := copyFile(src, dst); err != nil {
+			return err
+		}
+	}
+	// Nested Cloud Hypervisor support is optional in the appliance. Aperture's
+	// first ARM64 appliance intentionally omits these large payloads, while the
+	// Linux/KVM appliance keeps installing them when its builder includes them.
+	for _, path := range []string{"/bin/cloud-hypervisor", "/bin/vmlinux"} {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if err := copyFile(path, newRoot+path); err != nil {
 			return err
 		}
 	}
