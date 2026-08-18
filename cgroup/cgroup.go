@@ -6,11 +6,14 @@
 package cgroup
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 )
 
 const (
@@ -90,13 +93,29 @@ func (m *Manager) Move(pid int, name string) error {
 	return nil
 }
 
+// KillSession terminates every process remaining in a session cgroup.
+func (m *Manager) KillSession(name string) error {
+	path := filepath.Join(cgroupRoot, name, "cgroup.kill")
+	if err := os.WriteFile(path, []byte("1"), 0644); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("kill session cgroup %s: %w", path, err)
+	}
+	return nil
+}
+
 // RemoveSession removes a session leaf after its process has exited.
 func (m *Manager) RemoveSession(name string) error {
 	path := filepath.Join(cgroupRoot, name)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove session cgroup %s: %w", path, err)
+	deadline := time.Now().Add(time.Second)
+	for {
+		err := os.Remove(path)
+		if err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		if !errors.Is(err, syscall.EBUSY) || time.Now().After(deadline) {
+			return fmt.Errorf("remove session cgroup %s: %w", path, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return nil
 }
 
 // DelegateContainer moves the namespace anchor out of the container root and

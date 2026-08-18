@@ -311,9 +311,10 @@ func testAutorunProcessStops(t *testing.T, d *daemonInstance) {
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "procstop")
 
-	// Start autorun with a command that keeps running and maintains a PID file.
-	// We use "while true; do :; done" instead of sleep - pure shell, no external commands.
-	autorunCmd := "ts autorun --ref procstop /bin/sh -c 'echo $$ > /tmp/autorun.pid; while true; do :; done'"
+	// Keep the autorun wrapper's stdout open in a background child. The shell can
+	// exit on SIGHUP while that child remains, which exercises complete session
+	// teardown rather than only reaping the session leader.
+	autorunCmd := "ts autorun --ref procstop /bin/sh -c 'echo $$ > /tmp/autorun.pid; (while true; do echo alive > /tmp/autorun-alive; done) & wait'"
 	output, exitCode, err := sshExec(t, d, "root@procstop", autorunCmd)
 	if err != nil {
 		t.Fatalf("ts autorun failed: %v", err)
@@ -338,15 +339,28 @@ func testAutorunProcessStops(t *testing.T, d *daemonInstance) {
 	}
 	t.Logf("Stopped autorun: %s", output)
 
-	// The process should be killed. We verify by checking the marker file is gone
-	// or by checking if the autorun process created new content.
-	// Give the daemon a moment to kill the process.
-	time.Sleep(1 * time.Second)
-
-	// Remove the PID file and wait - if the process were still running it would
-	// not recreate it (since it only writes PID at startup), so this is sufficient
-	// to show the process stopped.
-	t.Logf("Autorun process stopped (verified by stop command success)")
+	// The stop request waits for teardown. Replacing the liveness value and
+	// observing that it remains replaced verifies the command itself is gone,
+	// not merely its config. Retry because a write already in progress when the
+	// process is killed can leave the file truncated once.
+	deadline := time.Now().Add(time.Second)
+	for {
+		output, exitCode, err = sshExec(t, d, "root@procstop", "echo stopped > /tmp/autorun-alive")
+		if err != nil || exitCode != 0 {
+			t.Fatalf("replace autorun liveness value: err=%v exit=%d output=%q", err, exitCode, output)
+		}
+		time.Sleep(20 * time.Millisecond)
+		output, exitCode, err = sshExec(t, d, "root@procstop", "read -r value < /tmp/autorun-alive; echo $value")
+		if err != nil || exitCode != 0 {
+			t.Fatalf("read autorun liveness value: err=%v exit=%d output=%q", err, exitCode, output)
+		}
+		if strings.TrimSpace(output) == "stopped" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("autorun command remained alive after --stop: liveness value %q", output)
+		}
+	}
 }
 
 // TestAutorunProcessRestartsOnRefMove tests that moving a ref stops the process

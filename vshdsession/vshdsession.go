@@ -282,10 +282,10 @@ func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(p
 	}()
 
 	code := waitExitCode(cmd)
-	// A remote shell/session ending hangs up ordinary background jobs that stayed
-	// in its process group. Processes that deliberately detached into another
-	// session (setsid/nohup) retain normal Unix daemon semantics.
-	_ = killProcessGroup(cmd, syscall.SIGHUP)
+	// The session leader can exit on SIGHUP while an ordinary background job in
+	// its process group ignores it. Reap the remainder before reporting the
+	// session closed; deliberately detached jobs have their own process group.
+	_ = killProcessGroup(cmd, syscall.SIGKILL)
 	vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(code))
 	logf.logf("command exited (code %d)", code)
 }
@@ -346,12 +346,10 @@ func killChildOnDisconnect(cmd *exec.Cmd, logf Logf) {
 		timer := time.NewTimer(2 * time.Second)
 		defer timer.Stop()
 		<-timer.C
-		// Still running? Force-kill the whole group. ProcessState is set once
-		// Wait reaps the direct child; checking it races favorably enough here
-		// (worst case we SIGKILL a just-exited group, which is a harmless no-op).
-		if cmd.ProcessState == nil {
-			_ = killProcessGroup(cmd, syscall.SIGKILL)
-			logf.logf("process group %d did not exit on SIGHUP; sent SIGKILL", cmd.Process.Pid)
+		// The group can outlive its leader when a descendant ignores SIGHUP, so
+		// always escalate. Signalling an empty process group is harmless.
+		if err := killProcessGroup(cmd, syscall.SIGKILL); err == nil {
+			logf.logf("sent SIGKILL to process group %d after disconnect grace period", cmd.Process.Pid)
 		}
 	}()
 }

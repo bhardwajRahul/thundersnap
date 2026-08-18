@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/mdlayher/vsock"
 	"github.com/tailscale/thundersnap/cgroup"
@@ -355,13 +356,24 @@ func handleConnection(conn io.ReadWriteCloser) {
 	// Because vshd is outside the container cgroup namespace it addresses the
 	// complete path; inside the container the same cgroup appears as /.
 	var postStart func(pid int) error
+	var postDisconnect func()
 	var postExit func()
 	if cgroupMgr != nil && rootPrefix != "" && cgroup.CanCloneInto() {
 		leaf := filepath.Join(containerNs.CgroupName(rootPrefix), "sessions", fmt.Sprintf("%d", id))
 		postStart = func(pid int) error {
 			return cgroupMgr.ConfigureContainer(pid, leaf)
 		}
+		postDisconnect = func() {
+			if err := cgroupMgr.KillSession(leaf); err != nil {
+				log.Printf("[conn %d] failed to kill remaining session processes: %v", id, err)
+			}
+		}
 		postExit = func() {
+			// Repeat the kill synchronously before removal. The disconnect callback
+			// runs in the input-copy goroutine and may race the output side exiting.
+			if err := cgroupMgr.KillSession(leaf); err != nil {
+				log.Printf("[conn %d] failed to kill remaining session processes at exit: %v", id, err)
+			}
 			if err := cgroupMgr.RemoveSession(leaf); err != nil {
 				log.Printf("[conn %d] failed to remove session cgroup: %v", id, err)
 			}
@@ -378,7 +390,7 @@ func handleConnection(conn io.ReadWriteCloser) {
 		// TLV endpoint. vshd just splices the raw TLV bytes through in both
 		// directions; it does not interpret the protocol. This is what lets the
 		// pty be opened from inside the container so /dev/pts/N is visible there.
-		spliceContainerSession(id, conn, reader, cmd, postStart)
+		spliceContainerSession(id, conn, reader, cmd, postStart, postDisconnect)
 		if postExit != nil {
 			postExit()
 		}
@@ -403,7 +415,7 @@ func handleConnection(conn io.ReadWriteCloser) {
 // inside the container, frames stdout/stderr, and sends FrameExit), so vshd
 // performs no framing here. postStart, when non-nil, applies cgroup limits to
 // the child once started.
-func spliceContainerSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int) error) {
+func spliceContainerSession(id uint64, conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int) error, postDisconnect func()) {
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		log.Printf("[conn %d] stdin pipe: %v", id, err)
@@ -423,6 +435,7 @@ func spliceContainerSession(id uint64, conn io.Writer, reader io.Reader, cmd *ex
 	// Surface any raw inner-ts stderr to vshd's log to aid debugging.
 	cmd.Stderr = &logWriter{id: id}
 
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		log.Printf("[conn %d] start command: %v", id, err)
 		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: %v\n", err)))
@@ -441,10 +454,22 @@ func spliceContainerSession(id uint64, conn io.Writer, reader io.Reader, cmd *ex
 	}
 	log.Printf("[conn %d] container session started with PID %d", id, cmd.Process.Pid)
 
+	killSession := func() {
+		if postDisconnect != nil {
+			postDisconnect()
+			return
+		}
+		// Nested or namespace-relative cgroup setups cannot create a session leaf.
+		// The wrapper retains a shared process group across nsenter, so killing the
+		// group also closes the inner protocol endpoint and triggers its own reap.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+
 	// Client -> inner ts: copy the raw TLV byte stream to the child's stdin.
 	go func() {
 		io.Copy(stdin, reader)
 		stdin.Close()
+		killSession()
 	}()
 
 	// Inner ts -> client: copy the raw TLV byte stream (stdout, stderr frames,
