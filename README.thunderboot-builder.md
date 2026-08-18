@@ -29,8 +29,11 @@ on `PATH`, in Homebrew's usual locations, or beneath
 # Enter it at /work/thundersnap:
 ./scripts/thunderboot-builder.sh shell
 
-# Build the ARM64 appliance initramfs:
+# Build and package the ARM64 kernel and appliance initramfs:
 ./scripts/thunderboot-builder.sh build
+
+# Re-verify an existing archive without rebuilding it:
+./scripts/thunderboot-builder.sh verify
 
 # Stop it without losing the builder disk:
 ./scripts/thunderboot-builder.sh stop
@@ -43,11 +46,30 @@ Override the default instance name with `THUNDERBOOT_LIMA_INSTANCE`. The Lima
 VM is disposable build infrastructure: everything required to recreate it is
 tracked here, while generated outputs remain ignored.
 
-The initial `build` command produces `thunderboot-out/initramfs.cpio` without
-nested Cloud Hypervisor payloads. The next appliance work will add the ARM64
-kernel recipe and emit a versioned manifest/archive for Aperture+. Keeping this
-first builder change separate makes the native ARM64 host available before
-changing the guest kernel and format.
+The `build` command produces:
+
+```text
+thunderboot-out/
+  Image
+  initramfs.cpio
+  kernel.config
+  manifest.json
+  thunderboot-appliance-linux-arm64.tar.zst
+```
+
+`Image` is the uncompressed ARM64 boot image consumed by Apple's
+`VZLinuxBootLoader`. The initramfs deliberately omits nested Cloud Hypervisor
+payloads. `manifest.json` records the source revision, kernel version, sizes,
+and SHA-256 hashes; the archive is the complete import unit for Aperture+.
+Build timestamps and archive metadata derive from the source commit so two
+clean builds of the same revision have stable outputs. Packaging and the
+standalone `verify` command reject incorrect hashes, unexpected archive
+members, mixed-architecture ELF files, missing tools, and nested-VM payloads.
+
+The tracked ARM64 kernel configuration is a small fragment layered onto Linux's
+maintained `arm64_defconfig`. The build checks every requested setting after
+Kconfig resolves dependencies. Kernel source is Linux 6.12.8, downloaded and
+verified by SHA-256 into the Lima VM's disposable build cache.
 
 ## Linux/KVM test artifacts
 

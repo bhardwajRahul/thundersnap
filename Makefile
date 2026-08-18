@@ -23,7 +23,7 @@ OUT ?= dist
 BIN ?= ./bin
 
 .PHONY: all test e2e e2e-tb not_e2e binaries ts vshd thundersnapd thunderboot infiniblockd \
-        thunderboot-vm-artifacts thunderboot-appliance-arm64 \
+        thunderboot-vm-artifacts thunderboot-appliance-arm64 verify-thunderboot-appliance-arm64 \
         list build build-deb build-rpm build-tgz clean
 
 all: build
@@ -146,9 +146,12 @@ infiniblockd:
 thunderboot-vm-artifacts:
 	./scripts/fetch-thunderboot-vm-artifacts.sh
 
-# Build the ARM64 Aperture appliance in the pinned Lima environment on macOS.
+# Build and package the ARM64 Aperture kernel/initramfs in pinned Lima.
 thunderboot-appliance-arm64:
 	./scripts/thunderboot-builder.sh build
+
+verify-thunderboot-appliance-arm64:
+	./scripts/thunderboot-builder.sh verify
 
 # List all available build targets
 list:

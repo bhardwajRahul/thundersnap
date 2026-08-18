@@ -11,5 +11,16 @@ if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != aarch64 ]; then
 fi
 
 cd "$repo"
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+	SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+	export SOURCE_DATE_EPOCH
+fi
+out=$(realpath -m "${1:-thunderboot-out}")
+rm -rf "$out"
+mkdir -p "$out"
+
+./scripts/build-thunderboot-kernel-arm64.sh "$out/Image"
 export THUNDERBOOT_INCLUDE_NESTED_VM=0
-exec ./scripts/build-thunderboot-initramfs.sh "${1:-thunderboot-out/initramfs.cpio}"
+./scripts/build-thunderboot-initramfs.sh "$out/initramfs.cpio"
+./scripts/package-thunderboot-appliance.sh "$out"
+./scripts/verify-thunderboot-appliance.sh "$out/thunderboot-appliance-linux-arm64.tar.zst"

@@ -29,7 +29,7 @@ limactl=$(find_limactl)
 
 usage() {
 	cat <<EOF
-usage: $0 start|shell|build|stop|delete|status
+usage: $0 start|shell|build|verify|stop|delete|status
 
 Environment:
   LIMACTL                       path to limactl (auto-detected when omitted)
@@ -66,6 +66,10 @@ shell)
 build)
 	start
 	exec "$limactl" shell --workdir /work/thundersnap "$instance" -- ./scripts/build-thunderboot-appliance.sh
+	;;
+verify)
+	start
+	exec "$limactl" shell --workdir /work/thundersnap "$instance" -- ./scripts/verify-thunderboot-appliance.sh
 	;;
 stop)
 	exec "$limactl" stop "$instance"

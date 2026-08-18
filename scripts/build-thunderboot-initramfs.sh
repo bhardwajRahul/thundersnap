@@ -2,6 +2,10 @@
 set -eu
 
 out=$(realpath -m "${1:-thunderboot-out/initramfs.cpio}")
+source_date_epoch=${SOURCE_DATE_EPOCH:-0}
+case "$source_date_epoch" in
+''|*[!0-9]*) echo "SOURCE_DATE_EPOCH must be a non-negative integer" >&2; exit 1 ;;
+esac
 include_nested_vm=${THUNDERBOOT_INCLUDE_NESTED_VM:-1}
 case "$include_nested_vm" in
 0|1) ;;
@@ -73,5 +77,7 @@ if [ "$include_nested_vm" = 1 ]; then
 	cp vm/vmlinux "$root/bin/vmlinux"
 fi
 
-(cd "$root" && find . -print0 | sort -z | cpio --quiet --null -o --format=newc --owner=0:0) >"$out"
+# cpio records mtimes, so normalize every entry before the sorted archive walk.
+find "$root" -print0 | xargs -0 touch -h -d "@$source_date_epoch"
+(cd "$root" && find . -print0 | sort -z | cpio --reproducible --quiet --null -o --format=newc --owner=0:0) >"$out"
 echo "built $out"
