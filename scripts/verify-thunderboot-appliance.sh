@@ -57,7 +57,7 @@ find "$inspect" -type f | while IFS= read -r file; do
 	*ELF*) echo "non-ARM64 ELF in initramfs: ${file#$inspect/}: $description" >&2; exit 1 ;;
 	esac
 done
-for required in init bin/thundersnapd bin/ts bin/vshd bin/busybox bin/btrfs bin/mkfs.btrfs bin/blkid bin/mdadm bin/make-bcache bin/nbd-client; do
+for required in init bin/thundersnapd bin/thunderboot-logrelay bin/ts bin/vshd bin/busybox bin/btrfs bin/mkfs.btrfs bin/blkid bin/mdadm bin/make-bcache bin/nbd-client; do
 	grep -Fqx "$required" "$elf_list" || { echo "required ARM64 executable missing from initramfs: $required" >&2; exit 1; }
 done
 for omitted in bin/cloud-hypervisor bin/vmlinux; do

@@ -24,6 +24,7 @@ build init thunderboot-init
 build bin/thundersnapd thundersnapd
 build bin/ts ts
 build bin/vshd vshd
+build bin/thunderboot-logrelay thunderboot-logrelay
 
 if [ ! -x /bin/busybox ]; then
 	echo "static /bin/busybox is required (install busybox-static)" >&2

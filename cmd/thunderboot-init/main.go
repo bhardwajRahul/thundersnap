@@ -81,6 +81,10 @@ func boot() error {
 
 	env := append(os.Environ(), "PATH=/bin")
 	args := []string{
+		// Keep thundersnapd's ordinary log output unchanged. The tiny relay
+		// mirrors it to the host's virtio-vsock listener while preserving the
+		// serial console as the primary diagnostic path.
+		"/bin/thunderboot-logrelay",
 		"/bin/thundersnapd",
 		"--policy=/bin/thundersnap-policy.jsonc",
 		"--data-dir=/var/lib/thundersnap",
@@ -114,6 +118,7 @@ func installAppliance() error {
 		"/bin/thundersnapd":                  newRoot + "/bin/thundersnapd",
 		"/bin/ts":                            newRoot + "/bin/ts",
 		"/bin/vshd":                          newRoot + "/bin/vshd",
+		"/bin/thunderboot-logrelay":          newRoot + "/bin/thunderboot-logrelay",
 		"/bin/busybox":                       newRoot + "/bin/busybox",
 		"/bin/btrfs":                         newRoot + "/bin/btrfs",
 		"/bin/mkfs.btrfs":                    newRoot + "/bin/mkfs.btrfs",
