@@ -80,6 +80,11 @@ func boot() error {
 	}
 
 	env := append(os.Environ(), "PATH=/bin")
+	if authKey := params["thunderboot.authkey"]; authKey != "" {
+		// The host supplies a test/automation auth key through the VM kernel
+		// command line. Do not persist it in appliance metadata or logs.
+		env = append(env, "TS_AUTHKEY="+authKey)
+	}
 	args := []string{
 		// Keep thundersnapd's ordinary log output unchanged. The tiny relay
 		// mirrors it to the host's virtio-vsock listener while preserving the
