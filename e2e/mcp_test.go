@@ -804,6 +804,58 @@ func TestMCPFrameResolution(t *testing.T) {
 	}
 }
 
+// TestMCPImplicitFrameIsStableAcrossSessions verifies the frame omitted by an
+// MCP caller is stable once the user's only frame has been auto-created. This
+// is important for callers that have a bootstrapping MCP session followed by a
+// secondary session: resolving "" to a new UUID on each request silently
+// changes both the filesystem and the installed command set, which looks like
+// intermittent PATH and wrong-frame failures.
+func TestMCPImplicitFrameIsStableAcrossSessions(t *testing.T) {
+	env := newTestEnv(t)
+	_, httpBase := startDaemonWithHTTP(t, env)
+	sessionA := mcpClient(t, httpBase)
+	sessionB := mcpClient(t, httpBase)
+
+	// The first call creates the user's only unattached frame. Use only shell
+	// builtins plus the always-present ts binary, so this also checks the
+	// deterministic session PATH in a nil:nil:nil frame.
+	first := startAndWaitMCPBash(t, sessionA, map[string]any{
+		"command": "printf '%s\\n' \\\"$PATH\\\" > /work/path.txt; printf '%s\\n' \\\"$PWD\\\" > /work/pwd.txt; command -v ts > /work/tspath.txt",
+		"frame":   "",
+	})
+	if first["state"] != "exited" || first["exit_code"] != float64(0) {
+		t.Fatalf("implicit-frame bootstrap job: %+v", first)
+	}
+
+	// A second session, with the same user but a distinct MCP connection, must
+	// land in the same frame when no frame is supplied.
+	second := startAndWaitMCPBash(t, sessionB, map[string]any{
+		"command": "test -f /work/path.txt && test -f /work/pwd.txt && test -x /bin/ts && test -s /work/tspath.txt",
+		"frame":   "",
+	})
+	if second["state"] != "exited" || second["exit_code"] != float64(0) {
+		t.Fatalf("implicit-frame secondary job landed in a different frame or lost PATH: %+v", second)
+	}
+
+	// list_frames must still contain exactly one frame, not one fresh frame per
+	// omitted-frame request.
+	out, isErr := callTool(t, sessionB, "list_frames", nil)
+	if isErr {
+		t.Fatalf("list_frames after implicit-frame calls: %s", out)
+	}
+	var listed struct {
+		Frames []struct {
+			UUID string `json:"uuid"`
+		} `json:"frames"`
+	}
+	if err := json.Unmarshal([]byte(out), &listed); err != nil {
+		t.Fatalf("list_frames after implicit-frame calls: %v (%s)", err, out)
+	}
+	if len(listed.Frames) != 1 {
+		t.Fatalf("implicit-frame calls created %d frames, want 1: %s", len(listed.Frames), out)
+	}
+}
+
 // TestMCPJobsBatch launches two jobs and waits for exactly that batch in one
 // tool call. It pins the primary public API, concurrent execution, inline
 // output, and job-ID log lookup without copying a frame or path.

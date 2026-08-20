@@ -70,8 +70,10 @@ const defaultRefName = "default"
 //     where tsnet inserts the username as the SSH user), resolves the reserved
 //     "default" ref.
 //   - Any other name is looked up verbatim as a ref.
-//   - If the "default" ref does not exist, the caller is told to use a fresh
-//     unattached frame (attached==false, a freshly minted uuid, no ref bound).
+//   - If the "default" ref does not exist, an existing sole frame is reused;
+//     otherwise the caller gets a fresh unattached frame (attached==false, a
+//     freshly minted uuid, no ref bound). Reusing the sole frame makes the
+//     empty frame selector stable across MCP calls and secondary sessions.
 //   - Any OTHER unknown name is an error ("no such frame ...") — no implicit
 //     create.
 //
@@ -107,8 +109,22 @@ func resolveFrameForUser(tailscaleUser, name string) (uuid frameid.ID, framePath
 	}
 
 	if isDefault {
-		// No bound default yet: hand back a fresh, unattached frame. The user
-		// can later run `ts frame --ref=default ...` to bind it.
+		// MCP calls commonly omit the frame selector. If the first such call
+		// created the user's only unattached frame, returning a new UUID here on
+		// every later call makes the apparent "current frame" change between
+		// calls (and is especially confusing when a second MCP session is
+		// sharing the same user). Reuse the sole persisted frame; when there is
+		// no frame, or more than one frame and no default ref, preserve the
+		// existing fresh-frame behavior.
+		frameStore := userFrameStore(tailscaleUser)
+		uuidNames, lerr := frameStore.List()
+		if lerr != nil {
+			return frameid.Nil, "", false, lerr
+		}
+		if len(uuidNames) == 1 {
+			return uuidNames[0], framePathForUserUUID(tailscaleUser, uuidNames[0]), false, nil
+		}
+
 		fresh := frameid.MustNew()
 		return fresh, framePathForUserUUID(tailscaleUser, fresh), false, nil
 	}

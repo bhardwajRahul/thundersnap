@@ -342,13 +342,15 @@ func TestRefHandlersValidation(t *testing.T) {
 }
 
 // TestResolveFrameForUser drives the real production resolver
-// (resolveFrameForUser) against a real per-user ref store. It pins the five
+// (resolveFrameForUser) against a real per-user ref store. It pins the
 // resolution branches the canonical fs/<user>/<uuid> layout depends on:
 //   - a named ref resolves to its bound UUID and the fs/<user>/<uuid> path,
 //   - a raw UUID for an existing frame resolves directly (no ref needed),
 //   - an empty name (or the bare-login username) resolves the reserved
 //     "default" ref when bound,
-//   - the default with no ref bound returns a fresh, UNATTACHED frame,
+//   - the default with no ref bound reuses the sole existing frame if there
+//     is exactly one (stable across MCP calls/sessions), otherwise returns a
+//     fresh, UNATTACHED frame,
 //   - any other unknown name is an error (no implicit create),
 //   - and refs are isolated per user.
 func TestResolveFrameForUser(t *testing.T) {
@@ -447,8 +449,42 @@ func TestResolveFrameForUser(t *testing.T) {
 		}
 	})
 
+	// When the default ref is unbound but exactly one frame exists, that sole
+	// frame is reused (stable across MCP calls / secondary sessions) instead of
+	// minting a fresh UUID each time.
+	t.Run("default_unbound_sole_frame_reuse", func(t *testing.T) {
+		const u = "carol"
+		frameStore := userFrameStore(u)
+		rawUUID := frameid.MustNew()
+		if err := frameStore.Create(rawUUID, &frames.Frame{}); err != nil {
+			t.Fatalf("create carol sole frame: %v", err)
+		}
+		// First resolution lands on the existing frame.
+		uuid1, path1, attached1, err := resolveFrameForUser(u, "")
+		if err != nil {
+			t.Fatalf("first resolve: %v", err)
+		}
+		if uuid1 != rawUUID {
+			t.Errorf("first uuid = %s, want sole frame %s", uuid1, rawUUID)
+		}
+		if attached1 {
+			t.Error("attached = true, want false for unbound default")
+		}
+		// A second resolution is stable: same frame, not a fresh UUID.
+		uuid2, _, _, err := resolveFrameForUser(u, "")
+		if err != nil {
+			t.Fatalf("second resolve: %v", err)
+		}
+		if uuid2 != uuid1 {
+			t.Errorf("second uuid = %s, want stable %s", uuid2, uuid1)
+		}
+		if want := filepath.Join(fsDir, u, rawUUID.String()); path1 != want {
+			t.Errorf("path = %q, want %q", path1, want)
+		}
+	})
+
 	// Refs are per-user: bob has no "deb", so it must error, and bob's
-	// unbound default yields a fresh, unattached frame.
+	// unbound default (with no frames at all) yields a fresh, unattached frame.
 	t.Run("per_user_isolation", func(t *testing.T) {
 		if _, _, _, err := resolveFrameForUser("bob", "deb"); err == nil {
 			t.Error("bob resolving alice's ref should error")
