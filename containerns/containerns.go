@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -36,7 +37,11 @@ type Manager struct {
 }
 
 type entry struct {
-	initPid    int            // host PID of the container-init process
+	initPid   int    // host PID of the container-init process
+	initStart uint64 // /proc/<initPid>/stat starttime (clock ticks),
+	// pins the init identity against PID reuse: a recycled PID has a
+	// different starttime, so a stale entry whose init died is not
+	// mistaken for a live one.
 	initStdin  io.WriteCloser // write end of pipe - close to signal shutdown
 	initCmd    *exec.Cmd      // the container-init command (for Wait)
 	cgroupName string
@@ -58,22 +63,29 @@ func (m *Manager) GetOrCreate(rootFS, hostname, domainname string) (initPid int,
 
 	// Check for existing entry.
 	if e, ok := m.entries[rootFS]; ok {
-		// Verify init is still alive. Signal 0 performs only the existence/
-		// permission check without delivering a signal.
-		//
-		// CAVEAT (PID reuse): if the original init exited and the kernel
-		// recycled its PID for an unrelated process, this probe succeeds and
-		// we would wrongly reuse a foreign PID. We do not verify start-time or
-		// cmdline here; this is acceptable in practice because init lives for
-		// the lifetime of the refcounted namespace and is shut down explicitly
-		// in Release, but it is a known hazard.
+		// Verify init is still alive AND is the same process we started
+		// (defend against PID reuse). Signal 0 performs only the existence/
+		// permission check without delivering a signal; combined with the
+		// recorded /proc/<pid>/stat starttime, a recycled PID (different
+		// starttime) is detected and treated as a dead init rather than
+		// reused, so we never nsenter into a foreign process's namespaces.
+		alive := false
 		if err := syscall.Kill(e.initPid, 0); err == nil {
+			if e.initStart == 0 {
+				// No starttime recorded (older entry / read failed at
+				// creation): fall back to the kill(0) probe alone.
+				alive = true
+			} else if st, err := processStartTime(e.initPid); err == nil && st == e.initStart {
+				alive = true
+			}
+		}
+		if alive {
 			e.refCount++
 			log.Printf("Reusing container namespace for %s (initPid=%d, refCount=%d)",
 				rootFS, e.initPid, e.refCount)
 			return e.initPid, nil
 		}
-		// Init died - clean up stale entry.
+		// Init died (or its PID was recycled) - clean up stale entry.
 		log.Printf("Container init for %s died (pid %d), cleaning up", rootFS, e.initPid)
 		e.initStdin.Close()
 		e.initCmd.Wait()
@@ -186,6 +198,7 @@ func (m *Manager) GetOrCreate(rootFS, hostname, domainname string) (initPid int,
 
 	e := &entry{
 		initPid:    cmd.Process.Pid,
+		initStart:  startTimeOrZero(cmd.Process.Pid),
 		initStdin:  stdinPipe,
 		initCmd:    cmd,
 		cgroupName: cgroupName,
@@ -195,6 +208,41 @@ func (m *Manager) GetOrCreate(rootFS, hostname, domainname string) (initPid int,
 	log.Printf("Created container namespace for %s (initPid=%d)", rootFS, e.initPid)
 
 	return e.initPid, nil
+}
+
+// processStartTime returns the starttime field (field 22, in clock ticks) of
+// /proc/<pid>/stat. The comm field may contain spaces and parentheses, so the
+// parse anchors on the last ')' before splitting the remaining fields. It is
+// used to detect PID reuse: a recycled PID reports a different starttime than
+// the process we recorded.
+func processStartTime(pid int) (uint64, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	idx := strings.LastIndexByte(string(data), ')')
+	if idx < 0 {
+		return 0, fmt.Errorf("malformed /proc/%d/stat", pid)
+	}
+	fields := strings.Fields(string(data[idx+1:]))
+	// After ')', the list begins at field 3 (state). starttime is field 22, i.e.
+	// fields[22-3] = fields[19].
+	const starttimeIdx = 19
+	if len(fields) <= starttimeIdx {
+		return 0, fmt.Errorf("short /proc/%d/stat", pid)
+	}
+	return strconv.ParseUint(fields[starttimeIdx], 10, 64)
+}
+
+// startTimeOrZero returns the process starttime, or 0 if it cannot be read
+// (the caller falls back to a kill(pid,0)-only liveness probe in that case).
+func startTimeOrZero(pid int) uint64 {
+	st, err := processStartTime(pid)
+	if err != nil {
+		log.Printf("warning: could not read starttime for container-init pid %d: %v", pid, err)
+		return 0
+	}
+	return st
 }
 
 // CgroupName returns the delegated cgroup for rootFS.

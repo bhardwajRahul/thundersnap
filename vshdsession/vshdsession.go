@@ -200,8 +200,21 @@ func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, ptyOwnerUID int, 
 	logf.logf("signaling pty session to exit")
 	// pty.Start set Setsid, so the child leads its own process group; signal
 	// the whole group so backgrounded children die with the shell, not orphaned.
+	// A descendant that traps/ignores SIGHUP can outlive the leader, so after a
+	// grace period escalate to SIGKILL the whole group (mirroring servePipe's
+	// killChildOnDisconnect) before reporting the exit code. Signalling an
+	// already-empty group is harmless (ESRCH).
 	_ = killProcessGroup(cmd, syscall.SIGHUP)
-	code := waitExitCode(cmd)
+	codeCh := make(chan int32, 1)
+	go func() { codeCh <- waitExitCode(cmd) }()
+	var code int32
+	select {
+	case code = <-codeCh:
+	case <-time.After(2 * time.Second):
+		logf.logf("pty session did not exit after SIGHUP; sending SIGKILL to process group %d", cmd.Process.Pid)
+		_ = killProcessGroup(cmd, syscall.SIGKILL)
+		code = <-codeCh
+	}
 	vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(code))
 	logf.logf("pty session exited (code %d)", code)
 }
