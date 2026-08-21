@@ -46,7 +46,14 @@ type entry struct {
 	initCmd    *exec.Cmd      // the container-init command (for Wait)
 	cgroupName string
 	refCount   int
+	stopping   bool
+	stopped    chan struct{}
 }
+
+// initShutdownTimeout bounds how long a container-init may take to exit after
+// its lifecycle pipe is closed. A wedged init must not wedge vshd forever.
+// It is a variable so tests can exercise the escalation path quickly.
+var initShutdownTimeout = 10 * time.Second
 
 // New creates a namespace manager. cgroupMgr is required: every container is
 // placed in a delegated cgroup and a fresh cgroup namespace before it starts.
@@ -59,10 +66,18 @@ func New(cgroupMgr *cgroup.Manager) *Manager {
 // should use to join namespaces via /proc/<pid>/ns/*.
 func (m *Manager) GetOrCreate(rootFS, hostname, domainname string) (initPid int, err error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// Check for existing entry.
 	if e, ok := m.entries[rootFS]; ok {
+		// A final Release is shutting this entry down without holding m.mu.
+		// Wait for that specific rootfs, then retry. Other rootfs entries remain
+		// usable while a slow or wedged init is being reaped.
+		if e.stopping {
+			stopped := e.stopped
+			m.mu.Unlock()
+			<-stopped
+			return m.GetOrCreate(rootFS, hostname, domainname)
+		}
 		// Verify init is still alive AND is the same process we started
 		// (defend against PID reuse). Signal 0 performs only the existence/
 		// permission check without delivering a signal; combined with the
@@ -83,14 +98,23 @@ func (m *Manager) GetOrCreate(rootFS, hostname, domainname string) (initPid int,
 			e.refCount++
 			log.Printf("Reusing container namespace for %s (initPid=%d, refCount=%d)",
 				rootFS, e.initPid, e.refCount)
+			m.mu.Unlock()
 			return e.initPid, nil
 		}
-		// Init died (or its PID was recycled) - clean up stale entry.
+		// Init died (or its PID was recycled). Reaping can block in Wait, so do
+		// it without the manager mutex; otherwise one bad frame freezes every
+		// subsequent vshd session, even for unrelated frames.
 		log.Printf("Container init for %s died (pid %d), cleaning up", rootFS, e.initPid)
-		e.initStdin.Close()
-		e.initCmd.Wait()
-		delete(m.entries, rootFS)
+		e.stopping = true
+		e.stopped = make(chan struct{})
+		m.mu.Unlock()
+		m.stopEntry(rootFS, e)
+		return m.GetOrCreate(rootFS, hostname, domainname)
 	}
+
+	// Keep creation serialized. It includes waiting for READY, but a second
+	// creator must not start another init for the same rootfs.
+	defer m.mu.Unlock()
 
 	// Create new container-init process.
 	absRootFS, err := filepath.Abs(rootFS)
@@ -254,10 +278,10 @@ func (m *Manager) CgroupName(rootFS string) string {
 // process when the count reaches zero. Releasing an unknown rootFS is a no-op.
 func (m *Manager) Release(rootFS string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	e, ok := m.entries[rootFS]
-	if !ok {
+	if !ok || e.stopping {
+		m.mu.Unlock()
 		return
 	}
 
@@ -265,15 +289,46 @@ func (m *Manager) Release(rootFS string) {
 	log.Printf("Released container namespace for %s (initPid=%d, refCount=%d)",
 		rootFS, e.initPid, e.refCount)
 
-	if e.refCount <= 0 {
-		// Close stdin to signal init to exit, then wait for it.
-		log.Printf("Shutting down container namespace for %s (initPid=%d)",
-			rootFS, e.initPid)
-		e.initStdin.Close()
-		e.initCmd.Wait()
+	if e.refCount > 0 {
+		m.mu.Unlock()
+		return
+	}
+
+	// Process shutdown and Wait can block. Mark this rootfs as stopping, then
+	// reap it without m.mu so an unhealthy init cannot freeze all containers.
+	e.stopping = true
+	e.stopped = make(chan struct{})
+	m.mu.Unlock()
+	m.stopEntry(rootFS, e)
+}
+
+// stopEntry terminates and reaps e, then removes it if it is still the current
+// entry for rootFS. The caller must have set e.stopping while holding m.mu.
+func (m *Manager) stopEntry(rootFS string, e *entry) {
+	log.Printf("Shutting down container namespace for %s (initPid=%d)", rootFS, e.initPid)
+	_ = e.initStdin.Close()
+
+	waited := make(chan error, 1)
+	go func() { waited <- e.initCmd.Wait() }()
+	select {
+	case <-waited:
+	case <-time.After(initShutdownTimeout):
+		log.Printf("Container init for %s (pid %d) did not exit after %s; killing it",
+			rootFS, e.initPid, initShutdownTimeout)
+		_ = e.initCmd.Process.Kill()
+		<-waited
+	}
+
+	if m.cgroupMgr != nil {
 		if err := m.cgroupMgr.RemoveContainer(e.cgroupName); err != nil {
 			log.Printf("warning: failed to remove cgroup for %s: %v", rootFS, err)
 		}
+	}
+
+	m.mu.Lock()
+	if m.entries[rootFS] == e {
 		delete(m.entries, rootFS)
 	}
+	close(e.stopped)
+	m.mu.Unlock()
 }

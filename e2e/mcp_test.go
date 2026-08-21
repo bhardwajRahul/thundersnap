@@ -865,6 +865,22 @@ func TestMCPFrameResolution(t *testing.T) {
 		t.Fatalf("auto-created frame name %q is not a UUID: %v", autoUUID, perr)
 	}
 	t.Logf("auto-created frame UUID: %s", autoUUID)
+
+	// Reproduce the production path where an MCP job invokes `ts frame` from
+	// inside its frame. The MCP session's container namespace is torn down when
+	// the job exits; a subsequent SSH session must not hang behind that teardown.
+	created := startAndWaitMCPBash(t, session, map[string]any{
+		"command": "ts frame --ref=mcpcreated nil:nil:nil",
+		"frame":   autoUUID,
+		"user":    "root",
+	})
+	if created["state"] != "exited" || created["exit_code"] != float64(0) {
+		t.Fatalf("MCP ts frame job: %+v", created)
+	}
+	if out, code, err := sshExec(t, d, "root@mcpcreated", "echo ssh-after-mcp-create"); err != nil || code != 0 || !strings.Contains(out, "ssh-after-mcp-create") {
+		t.Fatalf("SSH after MCP frame creation: output=%q code=%d err=%v", out, code, err)
+	}
+
 	installBusyboxAppletsInFrame(t, d, autoUUID, "awk")
 
 	// --- frame=<uuid> resolves the auto-created frame and reads the marker ---

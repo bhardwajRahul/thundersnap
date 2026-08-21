@@ -6,6 +6,7 @@ package containerns
 import (
 	"os/exec"
 	"testing"
+	"time"
 )
 
 // TestReleaseUnknown verifies releasing a rootFS that was never registered is a
@@ -23,6 +24,64 @@ func TestReleaseUnknown(t *testing.T) {
 // process (cat) stands in for container-init: like the real init it exits when
 // its stdin is closed, so the shutdown path (close stdin, Wait) is exercised
 // for real and completes promptly.
+func TestReleaseDoesNotHoldManagerLockWhileWaiting(t *testing.T) {
+	m := New(nil)
+
+	// This child deliberately ignores stdin and therefore does not exit when
+	// Release closes its lifecycle pipe. It models a wedged container-init.
+	cmd := exec.Command("sleep", "10")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	const key = "/wedged/rootfs"
+	m.entries[key] = &entry{
+		initPid:   cmd.Process.Pid,
+		initStdin: stdin,
+		initCmd:   cmd,
+		refCount:  1,
+	}
+
+	oldTimeout := initShutdownTimeout
+	initShutdownTimeout = 100 * time.Millisecond
+	defer func() { initShutdownTimeout = oldTimeout }()
+
+	released := make(chan struct{})
+	go func() {
+		m.Release(key)
+		close(released)
+	}()
+
+	// Release should still be waiting for its escalation timer, but unrelated
+	// manager operations must not queue behind that process wait.
+	time.Sleep(20 * time.Millisecond)
+	lockAcquired := make(chan struct{})
+	go func() {
+		m.mu.Lock()
+		m.mu.Unlock()
+		close(lockAcquired)
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("manager mutex held while waiting for container-init to exit")
+	}
+
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("Release did not kill and reap wedged container-init")
+	}
+}
+
 func TestReleaseRefcount(t *testing.T) {
 	m := New(nil)
 
