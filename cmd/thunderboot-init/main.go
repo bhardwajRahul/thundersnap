@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -163,10 +164,46 @@ func installAppliance() error {
 	if err := os.Symlink("busybox", newRoot+"/bin/cp"); err != nil {
 		return fmt.Errorf("create cp symlink: %w", err)
 	}
-	if err := os.WriteFile(newRoot+"/etc/resolv.conf", []byte("nameserver 10.0.2.3\n"), 0644); err != nil {
+	resolvConf, err := resolverConfigFromDHCP("/proc/net/pnp")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(newRoot+"/etc/resolv.conf", resolvConf, 0644); err != nil {
 		return fmt.Errorf("write resolv.conf: %w", err)
 	}
 	return nil
+}
+
+// resolverConfigFromDHCP uses the DNS servers recorded by Linux's kernel DHCP
+// client. This works with both Virtualization.framework NAT (currently
+// 192.168.64.1) and any future DHCP network without baking its subnet into the
+// appliance. The fallback preserves the static passt configuration used by the
+// Linux/KVM thunderboot path, whose kernel command line does not carry DNS.
+func resolverConfigFromDHCP(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []byte("nameserver 10.0.2.3\n"), nil
+		}
+		return nil, fmt.Errorf("open DHCP resolver data: %w", err)
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) == 2 && fields[0] == "nameserver" && net.ParseIP(fields[1]) != nil {
+			lines = append(lines, "nameserver "+fields[1])
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read DHCP resolver data: %w", err)
+	}
+	if len(lines) == 0 {
+		lines = append(lines, "nameserver 10.0.2.3")
+	}
+	return []byte(strings.Join(lines, "\n") + "\n"), nil
 }
 
 func copyFile(src, dst string) error {
