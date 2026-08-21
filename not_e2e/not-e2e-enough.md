@@ -177,6 +177,18 @@ protect, and they have **zero** coverage today.
    servers, the dead `httpClient`/`post` helpers) once their scenarios run against the real
    daemon — they are a liability that gives false green.
 
+6. **Add a race-detector e2e mode.** Build the host-side `thundersnapd` and `vshd`
+   binaries with `CGO_ENABLED=1 go build -race`, then pass those binaries to the
+   existing e2e harness through `THUNDERSNAPD_BINARY` and `VSHD_BINARY`. This runs
+   the actual long-lived daemon and shared namespace/session managers under the Go
+   race detector, which `go test -race` on unit packages cannot cover. Keep this as
+   a separate target or CI job rather than changing the normal static build: race
+   binaries are dynamically linked, and `ts` intentionally rejects CGO because it
+   must run inside minimal frames and VMs. Nested e2e cases that copy the daemon or
+   vshd into a libc-less rootfs may therefore need to be excluded from this mode or
+   supplied with a compatible runtime; the ordinary e2e suite must continue to run
+   all tests without skips.
+
 ## Loose ends spotted along the way (not the main ask)
 
 - **Dead requirement:** `THUNDERSNAPD_BINARY` is required at setup but never run; the
