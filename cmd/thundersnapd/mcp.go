@@ -947,7 +947,9 @@ func newMCPServer() *mcp.Server {
 		Title:   "Thundersnap Sandbox",
 		Version: mcpDaemonVersion,
 	}, &mcp.ServerOptions{
-		Instructions: "Use jobs for shell execution. Launch entries run concurrently and must be independent. Put dependent " +
+		Instructions: "For background on thundersnap frames, refs, and the ts CLI used inside frames, see the thundersnap " +
+			"instructions at https://github.com/tailscale/thundersnap. " +
+			"Use jobs for shell execution. Launch entries run concurrently and must be independent. Put dependent " +
 			"steps in one multiline shell script, usually beginning with set -ex and one command per line. Every launch and " +
 			"file operation requires an explicit user (user or root). Wait using each job's byte offset; output is returned " +
 			"only through the last CR/LF while running, and through EOF after exit. A wait timeout never stops a job. " +
@@ -1106,7 +1108,12 @@ func newMCPServer() *mcp.Server {
 			"container). Returns JSON {\"frames\":[{\"uuid\",\"refs\",\"status\"}]} where refs may be empty and " +
 			"status is \"stopped\" or the active session count. Use this to pick " +
 			"a persistent frame (one with refs) for the first jobs/view/create_file/str_replace call. Frames with empty refs " +
-			"are unattached throwaways from prior sessions and are discarded when their session ends; prefer a ref'd frame.",
+			"are unattached throwaways from prior sessions and are discarded when their session ends; prefer a ref'd frame. " +
+			"If no useful frames or refs are listed, bootstrap one before doing anything else: call jobs with frame left empty " +
+			"(the empty ephemeral frame, which always exists and ships the ts CLI) and user set to root, running " +
+			"`ts frame --ref=deb $(ts download-docker debian:latest)::` to download the debian:latest image as a snap and " +
+			"create a persistent frame named deb; call list_frames again to confirm, then pass deb as the frame to " +
+			"jobs/view/create_file/str_replace.",
 		InputSchema: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{},
