@@ -140,6 +140,12 @@ func TestContainer(t *testing.T) {
 		// so the extra daemon only lives for the scenario that needs it.
 		{"CrossInstanceSnapDeterminism", testCrossInstanceSnapDeterminism},
 
+		// Mesh who-has + download-snap between two independent HTTP-enabled
+		// daemons. Like CrossInstanceSnapDeterminism it starts its own pair of
+		// daemons (both with --test-http-listen); the suite's shared daemon is
+		// unused. Runs near the end since it pays for two extra daemons.
+		{"MeshWhoHasAndDownload", testMeshWhoHasAndDownload},
+
 		// Destructive by design: this must remain last because it SIGKILLs the
 		// shared daemon while sessions and autorun processes are still alive.
 		{"CrashLifecycle", testContainerCrashLifecycle},

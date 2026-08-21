@@ -94,6 +94,13 @@ Each section below has a "BASIC:" bullet describing the minimal first test to wr
 - [x] Taint types: pii:<dataset>, unsafe-permissions, untrusted-code
 
 ## Mesh/Content-Addressed Operations
+# (2026-08-21) The checks below were stale until now: they previously pointed
+# at the deleted not_e2e/mesh_test.go fakes. The real two-daemon coverage now
+# lives in e2e/mesh_test.go::testMeshWhoHasAndDownload (TestContainer/
+# MeshWhoHasAndDownload), which drives the production handleWhoHas /
+# handleDownloadSnap / CheckPeersForSnapshot / bupdateFileServer over SSH.
+# "Peer discovery via mesh" is still unchecked: the e2e test seeds peers via
+# /ts/ping rather than exercising the real tsnet ping loop.
 - [x] BASIC: Two in-process instances; create snap on A, who-has from B finds it, download-snap succeeds
 - [x] who-has query for existing snapshot
 - [x] who-has query for non-existent snapshot

@@ -119,18 +119,21 @@ item is the isolation concern that prompted the investigation).
 
 ## Test coverage gaps (real-e2e)
 
-- [ ] **Mesh `download-snap` between two daemons has no real-e2e test.** The
-      deleted `TestE2EDownloadSnap` was the only two-daemon download test; the
-      current suite covers it only at the unit level (`tsm/download_test.go`
-      with httptest peers). The `not_e2e/mesh_test.go` and `streaming_test.go`
-      fakes were deleted (they reimplemented the protocol and tested the test's
-      own copy, not the real handlers — false green). `tsm/download.go` + the
-      ChunkIndex dedup changed substantially. Add the W6 workflow from
-      `not_e2e/not-e2e-enough.md`: start daemons A+B, snap on A via SSH,
-      download-snap on B through the production handler/CLI, fork a frame from
-      the downloaded snap, verify content over SSH. This needs a mesh
-      peer-config seam in `--test-listen` mode (the test-mode daemon has no
-      tsnet peers) — a small product change. (Both reviews, HIGH/MEDIUM.)
+- [x] **Mesh `download-snap` between two daemons now has a real-e2e test.**
+      Covered by `e2e/mesh_test.go::testMeshWhoHasAndDownload` (registered as
+      `TestContainer/MeshWhoHasAndDownload`): it starts two independent
+      `--test-http-listen` daemons, wires them as mesh peers via the real
+      `/ts/ping`/`recordPeer` path, snaps on A over SSH, runs `ts who-has` and
+      `ts download-snap <triplet>` on B through the production
+      `handleWhoHas`/`handleDownloadSnap`/`doDownloadSnap`/
+      `tsm.CheckPeersForSnapshot`/`bupdateFileServer`, then builds a frame from
+      the downloaded triplet and verifies root+home markers survive. No
+      product change was needed: `buildTestHTTPMux` already mounts `/ts/ping`
+      and sets `globalMeshState`, so peers can be seeded in test mode. The
+      deleted `TestE2EDownloadSnap` was the only prior two-daemon download
+      test; the `not_e2e/mesh_test.go`/`streaming_test.go` fakes that
+      replaced it were themselves deleted (they reimplemented the protocol
+      and tested the test's own copy — false green).
 - [ ] **`/home` and `/work` ownership not asserted by any real-e2e test.**
       `e2e/fidelity_test.go` now asserts a chown'd file's uid/gid survive a
       snap+fork, but does not assert the daemon-created `/home` and `/work`
@@ -159,14 +162,13 @@ item is the isolation concern that prompted the investigation).
       SSH-driven nested tests against a real daemon, or as package tests on the
       cgroup manager. Needs a writable cgroup v2 hierarchy (read-only in this
       dev container). (Both reviews, MEDIUM.)
-- [ ] **`handleWhoHas` has zero test coverage.** The deleted `not_e2e` fakes
-      reimplemented the protocol and never exercised the real handler; nothing
-      has replaced them. The mesh `download-snap` item above covers the
-      two-daemon happy path; this item is the *error* path — `ts who-has
-      <bogus-snap>` and `handleWhoHas` with an empty/nonexistent snap should
-      return a clean error/empty result, not crash. Add a handler-level test
-      (httptest + a controlled `globalMeshState`) until the mesh peer-config
-      seam enables a two-daemon e2e test. (Both reviews, MEDIUM.)
+- [x] **`handleWhoHas` has test coverage.** Covered by
+      `e2e/mesh_test.go::testMeshWhoHasAndDownload`, which drives the real
+      handler over SSH for both the happy path (who-has finds the peer that
+      has the snap) and the empty/error path (who-has for a valid but
+      nonexistent snap returns "No peers" and non-zero exit). The deleted
+      `not_e2e` fakes reimplemented the protocol and never exercised the real
+      handler; this test replaces them against the production handler.
 - [ ] **`list-snaps` robustness against a partially-corrupt `snaps/` dir is
       untested.** The deleted `TestCorruptedSnapshotMetadata` planted a
       non-subvol entry among the snapshots and verified `ts snaps` skipped it
