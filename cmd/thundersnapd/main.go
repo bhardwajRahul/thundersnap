@@ -4234,6 +4234,14 @@ type meshState struct {
 	myFQDN string
 	peers  map[string]*meshPeer // keyed by hostname
 
+	// lastStatus is the most recent Tailscale node-map snapshot, refreshed by
+	// the ping loop on each cycle. handleTsPing consults it to map an incoming
+	// peer's IP to its authoritative DNSName instead of trusting the hostname
+	// the remote advertises in its MeshPing (which can be stale). nil in test
+	// mode (no tsnet), where there is no node map and the advertised loopback
+	// URL is the real endpoint.
+	lastStatus *ipnstate.Status
+
 	// httpClient dials through tsnet (srv.Dial) so that peer URLs in the
 	// *.ts.net domain are reachable. It is nil in test mode (no tsnet), where
 	// peer URLs are loopback and http.DefaultClient works. Callers that talk
@@ -4266,6 +4274,108 @@ func (m *meshState) meshHTTPClient() *http.Client {
 		return m.httpClient
 	}
 	return http.DefaultClient
+}
+
+// refreshSelf updates our own advertised mesh identity from the latest
+// Tailscale status. tsnet is the source of truth for our own hostname: the
+// control server pushes renames to it, and status.Self.DNSName reports the
+// current value, so reading it on each ping cycle (rather than caching it
+// once at startup) means a server-side rename is picked up automatically and
+// we never advertise an obsolete name. The result is mirrored into the global
+// hostname cache that VM-session creation consults, so freshly-started VMs
+// get the current name too.
+func (m *meshState) refreshSelf(status *ipnstate.Status) {
+	if status == nil || status.Self == nil || status.Self.DNSName == "" {
+		return
+	}
+	fqdn := strings.TrimSuffix(status.Self.DNSName, ".")
+	if fqdn == "" {
+		return
+	}
+
+	changed := false
+	m.mu.Lock()
+	if m.myFQDN != fqdn || m.myURL == "" {
+		m.myFQDN = fqdn
+		m.myURL = fmt.Sprintf("http://%s:%d", fqdn, meshPort)
+		changed = true
+	}
+	m.mu.Unlock()
+	if !changed {
+		return
+	}
+
+	globalTsnetHostnameMu.Lock()
+	globalTsnetHostname = fqdn
+	globalTsnetHostnameMu.Unlock()
+	log.Printf("Mesh: refreshed local FQDN to %s", fqdn)
+}
+
+// setNodeMap caches the latest Tailscale status so inbound /ts/ping handlers
+// can resolve a connecting peer's real DNSName from its IP (see
+// peerDNSNameForIP) rather than trusting the hostname it advertises.
+func (m *meshState) setNodeMap(status *ipnstate.Status) {
+	m.mu.Lock()
+	m.lastStatus = status
+	m.mu.Unlock()
+}
+
+// selfURL returns our current advertised mesh URL and FQDN under the mesh
+// lock. myFQDN/myURL are set at startup by newMeshState and then refreshed from
+// tsnet status by refreshSelf on each ping cycle; this accessor lets callers
+// (handleTsPing, pingAllPeers, handleIndex) read them without racing with
+// refreshSelf.
+func (m *meshState) selfURL() (myURL, myFQDN string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.myURL, m.myFQDN
+}
+
+// peerDNSNameForIP returns the authoritative FQDN (without trailing dot) of
+// the Tailscale peer that owns the given "ip" or "ip:port" address, looked up
+// in the most recent node map cached by setNodeMap. It returns "" if no node
+// map is available (e.g. test mode, which has no tsnet) or no peer matches.
+// handleTsPing uses this to avoid trusting a remote's self-advertised
+// hostname, which can be stale after a server-side rename.
+func (m *meshState) peerDNSNameForIP(addr string) string {
+	host := addr
+	if i := strings.LastIndex(addr, ":"); i != -1 {
+		host = addr[:i]
+	}
+	host = strings.TrimPrefix(host, "[")
+	host = strings.TrimSuffix(host, "]")
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return ""
+	}
+
+	m.mu.Lock()
+	st := m.lastStatus
+	m.mu.Unlock()
+	if st == nil {
+		return ""
+	}
+
+	lookup := func(ps *ipnstate.PeerStatus) string {
+		if ps == nil {
+			return ""
+		}
+		for _, p := range ps.TailscaleIPs {
+			if p == ip {
+				return strings.TrimSuffix(ps.DNSName, ".")
+			}
+		}
+		return ""
+	}
+	if v := lookup(st.Self); v != "" {
+		return v
+	}
+	for _, p := range st.Peer {
+		if v := lookup(p); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // recordPeer records or updates a peer that has been seen
@@ -4332,14 +4442,30 @@ func (m *meshState) handleTsPing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record this peer
-	m.recordPeer(ping)
-	log.Printf("Mesh ping received from %s (%s)", ping.Hostname, ping.URL)
+	// Don't trust the hostname/URL the remote advertises about itself. It is a
+	// cache the remote captured at some point (possibly before a server-side
+	// rename) and can be stale, pointing at a DNS name that no longer
+	// resolves — which silently breaks who-has and download-snap. The
+	// authoritative identity is the DNSName our own Tailscale node map holds
+	// for the IP that actually connected to us. We only fall back to the
+	// advertised values when there is no node map to consult (test mode: no
+	// tsnet, where the injected loopback URL is the real endpoint).
+	identity := ping
+	if fqdn := m.peerDNSNameForIP(r.RemoteAddr); fqdn != "" {
+		identity.Hostname = fqdn
+		identity.URL = fmt.Sprintf("http://%s:%d", fqdn, meshPort)
+	}
 
-	// Respond with our own info
+	// Record this peer
+	m.recordPeer(identity)
+	log.Printf("Mesh ping received from %s (advertised %q)", identity.Hostname, ping.Hostname)
+
+	// Respond with our own authoritative identity, kept fresh from tsnet by
+	// refreshSelf rather than a once-at-startup cache.
+	myURL, myFQDN := m.selfURL()
 	resp := MeshPing{
-		URL:      m.myURL,
-		Hostname: m.myFQDN,
+		URL:      myURL,
+		Hostname: myFQDN,
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -4363,6 +4489,7 @@ func (m *meshState) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	peers := m.getPeers()
+	myURL, _ := m.selfURL()
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<!DOCTYPE html>
@@ -4381,7 +4508,7 @@ th { background: #f0f0f0; }
 <h1>Thundersnap Mesh</h1>
 <p>My URL: <code>%s</code></p>
 <h2>Known Peers (%d)</h2>
-`, m.myURL, len(peers))
+`, myURL, len(peers))
 
 	if len(peers) == 0 {
 		fmt.Fprintf(w, "<p>No peers discovered yet.</p>")
@@ -4438,6 +4565,13 @@ func (m *meshState) pingAllPeers(ctx context.Context, lc *tailscale.LocalClient,
 		return
 	}
 
+	// Refresh our own advertised identity from tsnet (so a server-side rename
+	// is picked up instead of trusting a once-at-startup cache) and cache the
+	// node map so inbound /ts/ping handlers resolve peers authoritatively.
+	// See refreshSelf and peerDNSNameForIP.
+	m.refreshSelf(status)
+	m.setNodeMap(status)
+
 	// Get our own tags and user ID
 	var myTags []string
 	var myUserID tailcfg.UserID
@@ -4448,10 +4582,11 @@ func (m *meshState) pingAllPeers(ctx context.Context, lc *tailscale.LocalClient,
 		myUserID = status.Self.UserID
 	}
 
-	// Build our ping message
+	// Build our ping message from the now-refreshed identity.
+	myURL, myFQDN := m.selfURL()
 	ping := MeshPing{
-		URL:      m.myURL,
-		Hostname: m.myFQDN,
+		URL:      myURL,
+		Hostname: myFQDN,
 	}
 	pingBody, _ := json.Marshal(ping)
 
@@ -4462,7 +4597,7 @@ func (m *meshState) pingAllPeers(ctx context.Context, lc *tailscale.LocalClient,
 		}
 		// Skip ourselves
 		fqdn := strings.TrimSuffix(peer.DNSName, ".")
-		if fqdn == m.myFQDN {
+		if fqdn == myFQDN {
 			continue
 		}
 
@@ -4530,10 +4665,23 @@ func (m *meshState) pingPeer(ctx context.Context, fqdn string, pingBody []byte, 
 		return
 	}
 
-	if peerPing.URL != "" && peerPing.Hostname != "" {
-		m.recordPeer(peerPing)
-		log.Printf("Mesh ping successful: %s", peerPing.Hostname)
+	// The peer must respond with a well-formed MeshPing so we only record
+	// nodes actually running thundersnapd's mesh service — but we discard the
+	// remote's self-reported hostname/URL. That value is a cache the remote
+	// may have captured before a server-side rename, and can point at a DNS
+	// name that no longer resolves; if who-has/download-snap used it they'd
+	// silently fail (connection refused looks like "peer lacks the snap").
+	// The authoritative identity is the DNSName we pulled from our own
+	// Tailscale node map and used to dial above.
+	if peerPing.URL == "" || peerPing.Hostname == "" {
+		return
 	}
+
+	m.recordPeer(MeshPing{
+		URL:      fmt.Sprintf("http://%s:%d", fqdn, meshPort),
+		Hostname: fqdn,
+	})
+	log.Printf("Mesh ping successful: %s", fqdn)
 }
 
 // bupdateFileServer serves files from -snaps-dir with range request support
