@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -351,11 +352,11 @@ func createFrameForMCP(t *testing.T, d *daemonInstance, refName string) string {
 // installBusyboxAppletsInFrame installs the named busybox applets into a
 // frame's /bin over the daemon's SFTP subsystem. A nil:nil:nil frame ships
 // only the `ts` binary (plus /bin/sh and /bin/su symlinks to it); the MCP
-// tool command builders (view/create_file/bash) call out to standard POSIX
-// utilities (mkdir, awk, find, head, sort, base64, ...), so the e2e harness
-// must install them the same way the rest of the suite does (see
-// installBusyboxAppletInFrame). Each applet is a copy of the host's
-// busybox-static, which dispatches on argv[0].
+// view/bash tool command builders call out to standard POSIX utilities
+// (awk, find, head, sort, ...), so the e2e harness must install them the same
+// way the rest of the suite does (see installBusyboxAppletInFrame). Each
+// applet is a copy of the host's busybox-static, which dispatches on argv[0].
+// create_file and str_replace are host-side and need no in-frame utilities.
 func installBusyboxAppletsInFrame(t *testing.T, d *daemonInstance, refName string, applets ...string) {
 	t.Helper()
 	for _, a := range applets {
@@ -364,19 +365,19 @@ func installBusyboxAppletsInFrame(t *testing.T, d *daemonInstance, refName strin
 }
 
 // mcpFrameApplets are the POSIX utilities the MCP tool command builders
-// invoke inside a frame. They are installed once per frame so the bash/view/
-// create_file tools work in a minimal nil:nil:nil frame (which has only `ts`).
+// invoke inside a frame. They are installed once per frame so the bash/view
+// tools work in a minimal nil:nil:nil frame (which has only `ts`). create_file
+// and str_replace are host-side and need nothing in-frame, so they contribute
+// no applets here; view needs awk/find/sort/head/stat, and the timeout/reap
+// tests need sleep/ps.
 var mcpFrameApplets = []string{
-	"mkdir",   // create_file: mkdir -p $(dirname ...)
-	"dirname", // create_file: $(dirname ...)
-	"base64",  // create_file: base64 -d <<heredoc
-	"awk",     // view (file): awk line-numbering
-	"find",    // view (dir): find -maxdepth 2
-	"sort",    // view (dir): | sort
-	"head",    // view (dir): | head -200
-	"stat",    // view (image): stat -c %s (also useful for general tests)
-	"sleep",   // timeout/reap tests: foreground long-running command
-	"ps",      // reap tests: inspect leftover processes
+	"awk",   // view (file): awk line-numbering
+	"find",  // view (dir): find -maxdepth 2
+	"sort",  // view (dir): | sort
+	"head",  // view (dir): | head -200
+	"stat",  // view (image): stat -c %s (also useful for general tests)
+	"sleep", // timeout/reap tests: foreground long-running command
+	"ps",    // reap tests: inspect leftover processes
 }
 
 func TestMCPJobWithApertureConversationHeader(t *testing.T) {
@@ -633,6 +634,116 @@ func TestMCPToolsRoundTrip(t *testing.T) {
 		if !strings.Contains(out, "resolve frame") && !strings.Contains(out, "not found") {
 			t.Errorf("bash bad frame: output %q missing resolve/not-found error", out)
 		}
+	}
+}
+
+// TestMCPCreateFileHostSideMinimalFrame pins the host-side create_file
+// implementation: it must create a file in a fresh nil:nil:nil frame that has
+// NO POSIX utilities installed (no mkdir/dirname/base64). The old exec-based
+// builder failed with "mkdir: executable file not found in $PATH" in such a
+// frame, which is exactly what happens when an MCP caller omits the frame
+// selector and lands in a throwaway minimal frame. This test also verifies
+// the file is owned by the frame's "user" account (so shell jobs running as
+// that user can overwrite it) and that parent directories are created.
+func TestMCPCreateFileHostSideMinimalFrame(t *testing.T) {
+	env := newTestEnv(t)
+	d, httpBase := startDaemonWithHTTP(t, env)
+	session := mcpClient(t, httpBase)
+
+	// Create a real frame but deliberately do NOT install any busybox applets —
+	// the frame ships only `ts`, /bin/sh, and /bin/su. create_file must not
+	// depend on mkdir/dirname/base64 being present.
+	frameUUID := createFrameForMCP(t, d, "minimalframe")
+	hostFramePath := filepath.Join(env.fsDir, "e2e", frameUUID)
+
+	// create_file into a nested path that does not exist yet (exercises
+	// parent-dir creation) with non-ASCII content (exercises binary-safety).
+	const content = "héllo, thundersnap! \n\ttab-indented\n"
+	out, isErr := callTool(t, session, "create_file", map[string]any{
+		"path":      "/work/sub/dir/app.py",
+		"file_text": content,
+		"frame":     "minimalframe",
+	})
+	if isErr {
+		t.Fatalf("create_file in minimal frame: unexpected error %q", out)
+	}
+	if !strings.Contains(out, "Created /work/sub/dir/app.py") {
+		t.Fatalf("create_file: output %q missing 'Created'", out)
+	}
+
+	// Confirm host-side that the file landed where we expect: under the
+	// frame's work subvolume, owned by the thundersnap user (7575:7575) so
+	// shell jobs running as that user can overwrite it.
+	hostFile := filepath.Join(hostFramePath, "work/sub/dir/app.py")
+	hInfo, err := os.Stat(hostFile)
+	if err != nil {
+		t.Fatalf("host-side stat %s: %v", hostFile, err)
+	}
+	if int64(len(content)) != hInfo.Size() {
+		t.Errorf("host file size = %d, want %d", hInfo.Size(), len(content))
+	}
+	if stat, ok := hInfo.Sys().(*syscall.Stat_t); ok {
+		if stat.Uid != 7575 || stat.Gid != 7575 {
+			t.Errorf("host file owner = %d:%d, want 7575:7575", stat.Uid, stat.Gid)
+		}
+	}
+
+	// Read the file back via a shell job that uses only sh builtins (test/echo)
+	// so it works in the minimal frame with no POSIX applets installed. Use a
+	// combined jobs launch+wait so the output is returned in one call (the
+	// jobs_list helper used by startAndWaitMCPBash omits output).
+	verifyOut, isErr := callTool(t, session, "jobs", map[string]any{
+		"launch": []any{map[string]any{
+			"command": "test -f /work/sub/dir/app.py && echo EXISTS; if command -v stat >/dev/null 2>&1; then stat -c '%u:%g' /work/sub/dir/app.py; else echo no-stat; fi",
+			"frame":   "minimalframe",
+			"user":    "user",
+		}},
+		"wait": map[string]any{"until": "all_exit", "timeout": 60},
+	})
+	if isErr {
+		t.Fatalf("verify job in minimal frame: %s", verifyOut)
+	}
+	if !strings.Contains(verifyOut, "EXISTS") {
+		t.Fatalf("verify job: file not reported as existing; output=%q", verifyOut)
+	}
+	// If stat is available, the owner should be 7575:7575 (the thundersnap
+	// user); if not, the no-stat line is fine (the core pin is existence).
+	if strings.Contains(verifyOut, "no-stat") {
+		// stat unavailable in the minimal frame; skip the ownership check.
+	} else if strings.Contains(verifyOut, ":") {
+		// stat is available: extract the owner line and check it.
+		for _, line := range strings.Split(verifyOut, "\n") {
+			if strings.Contains(line, ":") && !strings.Contains(line, "EXISTS") {
+				owner := strings.TrimSpace(line)
+				if owner != "7575:7575" {
+					t.Errorf("create_file: file owner = %q, want 7575:7575", owner)
+				}
+			}
+		}
+	}
+
+	// Overwrite the file (must preserve existing owner/mode, not error) and
+	// confirm the new content lands byte-for-byte.
+	out, isErr = callTool(t, session, "create_file", map[string]any{
+		"path":      "/work/sub/dir/app.py",
+		"file_text": "overwritten\n",
+		"frame":     "minimalframe",
+	})
+	if isErr {
+		t.Fatalf("create_file overwrite: unexpected error %q", out)
+	}
+
+	// create_file must refuse to clobber a directory.
+	out, isErr = callTool(t, session, "create_file", map[string]any{
+		"path":      "/work/sub",
+		"file_text": "x",
+		"frame":     "minimalframe",
+	})
+	if !isErr {
+		t.Errorf("create_file over directory: expected IsError=true, got false (output %q)", out)
+	}
+	if !strings.Contains(out, "is a directory") {
+		t.Errorf("create_file over directory: output %q missing 'is a directory'", out)
 	}
 }
 

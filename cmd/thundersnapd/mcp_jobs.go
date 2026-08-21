@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -292,6 +293,29 @@ func nestedCallToolRequest(req *mcp.CallToolRequest, arguments json.RawMessage) 
 	}
 }
 
+// mcpWaitParams is the wait sub-object of the jobs tool. It accepts the
+// canonical object form {"jobs":[...],"until":...,"timeout":...,"signal":...}
+// and a common shorthand where the whole value is just the jobs array,
+// [{"id":..,"offset":..}, ...]. The array form is a frequent LLM mistake
+// (the schema says wait is an object whose first property is jobs); tolerating
+// it turns a hard unmarshal error into a successful wait.
+type mcpWaitParams struct {
+	Jobs    []mcpWaitJob `json:"jobs"`
+	Until   string       `json:"until"`
+	Timeout int          `json:"timeout"`
+	Signal  string       `json:"signal"`
+}
+
+func (w *mcpWaitParams) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		// Shorthand: wait is the jobs array directly.
+		return json.Unmarshal(trimmed, &w.Jobs)
+	}
+	type alias mcpWaitParams
+	return json.Unmarshal(data, (*alias)(w))
+}
+
 // mcpJobsToolHandler is the public command-execution API. It composes the
 // internal launch and wait handlers so all launches are submitted in array
 // order before waiting. This avoids relying on an MCP client's sibling-tool
@@ -304,12 +328,7 @@ func mcpJobsToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	}
 	var params struct {
 		Launch []json.RawMessage `json:"launch"`
-		Wait   *struct {
-			Jobs    []mcpWaitJob `json:"jobs"`
-			Until   string       `json:"until"`
-			Timeout int          `json:"timeout"`
-			Signal  string       `json:"signal"`
-		} `json:"wait"`
+		Wait   *mcpWaitParams    `json:"wait"`
 	}
 	if len(req.Params.Arguments) > 0 {
 		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {

@@ -33,12 +33,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/mcpexec"
+	"github.com/tailscale/thundersnap/tsm"
 )
 
 // --- Globals set by main() from flags (production-only; empty in test mode) --
@@ -438,10 +440,11 @@ func truncateUTF8(s string, limit int, marker string) string {
 	return s[:cut] + marker
 }
 
-// buildCreateFileCommand returns the shell program that creates path containing
-// fileText. Ported from aperture chat/sandbox/tool_create_file.go. The
-// base64+heredoc dodge keeps the call bounded by the pipe buffer rather than
-// ARG_MAX (~128 KiB on Linux).
+// buildCreateFileCommand is retained for reference and tests, but is no
+// longer used by the production create_file handler: that tool is now
+// implemented host-side (see mcpCreateFileToolHandler), mirroring
+// str_replace, so it works in every frame — including nil:nil:nil frames
+// that ship no mkdir/dirname/base64.
 func buildCreateFileCommand(path, fileText string) string {
 	b64 := base64.StdEncoding.EncodeToString([]byte(fileText))
 	qpath := shellQuote(path)
@@ -453,9 +456,11 @@ func buildCreateFileCommand(path, fileText string) string {
 
 // str_replace has no command builder: it is implemented host-side (see
 // mcpStrReplaceToolHandler) because thundersnap's default nil:nil:nil frames
-// ship no python3 and the daemon has direct rootfs access. The other tools'
-// builders (shellQuote, buildViewCommand, buildCreateFileCommand) remain
-// exec-based below.
+// ship no python3 and the daemon has direct rootfs access. create_file is
+// host-side too (see mcpCreateFileToolHandler) for the same reason: the
+// exec-based builder relied on mkdir/dirname/base64, which nil:nil:nil frames
+// do not provide. The view tool's builders (shellQuote, buildViewCommand)
+// remain exec-based below.
 
 // --- Tool timeout constants (match aperture + design doc) ------------------
 
@@ -546,6 +551,20 @@ awk -v n=%d '{ lines[NR %% n] = $0 } END { start=NR-n+1; if (start < 1) start=1;
 }
 
 // mcpCreateFileToolHandler is the ToolHandler for create_file.
+//
+// Like str_replace, create_file does NOT run a command in the frame. The
+// exec-based builder (buildCreateFileCommand) relied on mkdir/dirname/base64,
+// which thundersnap's default nil:nil:nil frames do not ship — so an omitted
+// frame selector (which lands in a fresh minimal frame) produced
+// "mkdir: executable file not found in $PATH" instead of a file. The daemon
+// has direct host access to the frame's rootfs, so the mkdir/write is done
+// in-process. This is binary-safe and works in every frame, minimal or full.
+//
+// The host-side write chowns the new file (and any freshly created parent
+// directories) to the frame's "user" account (UID/GID 7575) when user=="user",
+// so the file is owned by the same identity that shell jobs run as; root-owned
+// files stay root. An existing file's mode and owner are preserved (matching
+// the old `> file` redirect and str_replace behaviour).
 func mcpCreateFileToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var params struct {
 		Path     string `json:"path"`
@@ -564,22 +583,127 @@ func mcpCreateFileToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 	if params.User != "user" && params.User != "root" {
 		return textResult("user is required and must be either \"user\" or \"root\"", true)
 	}
-	cmd := buildCreateFileCommand(params.Path, params.FileText)
+
+	user := mcpUserFromContext(ctx)
+	if user == "" {
+		return textResult("no MCP user resolved for request", true)
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, mcpCreateFileTimeout)
 	defer cancel()
 
-	res, err := runInFrame(ctx, mcpUserFromContext(ctx), params.Frame, "", cmd, params.User)
+	rootFS, _, err := resolveFrameRootFS(user, params.Frame)
 	if err != nil {
-		if errors.Is(err, errMCPCommandTimeout) && res != nil {
-			return textResult(res.Output, true)
-		}
-		return textResult(fmt.Sprintf("create_file failed: %v", err), true)
+		return textResult(fmt.Sprintf("resolve frame: %v", err), true)
 	}
-	if res.ExitCode != 0 {
-		return textResult(res.Output, true)
+	if err := prepareContainerRootFS(rootFS, ""); err != nil {
+		return textResult(fmt.Sprintf("prepare frame rootfs: %v", err), true)
+	}
+
+	// Resolve the in-frame path to a host path under rootFS, refusing to
+	// escape the frame (a path like /../../etc/shadow must not reach the host).
+	rel := strings.TrimPrefix(filepath.Clean("/"+params.Path), "/")
+	hostPath := filepath.Join(rootFS, rel)
+	if !isWithinRootFS(hostPath, rootFS) {
+		return textResult(fmt.Sprintf("path %q escapes the frame", params.Path), true)
+	}
+
+	// Refuse to clobber a symlink (the exec builder did the same). A symlink
+	// at the target would let a tool write outside the frame via a link.
+	if info, err := os.Lstat(hostPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return textResult(fmt.Sprintf("Error: refusing to overwrite symlink %s", params.Path), true)
+		}
+		if info.IsDir() {
+			return textResult(fmt.Sprintf("Error: %s is a directory", params.Path), true)
+		}
+	}
+
+	// Create parent directories as needed. Chown only the directories we
+	// actually create (not pre-existing ancestors) so user-owned files land in
+	// a tree owned by the frame user, matching what `mkdir -p` run as that user
+	// would produce. Walk downward from the first missing ancestor.
+	uid, gid := 0, 0
+	if params.User == "user" {
+		uid, gid = tsm.ThundersnapUID, tsm.ThundersnapGID
+	}
+	parent := filepath.Dir(hostPath)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return textResult(fmt.Sprintf("create parent dirs for %s: %v", params.Path, err), true)
+	}
+	if params.User == "user" {
+		if err := chownCreatedDirs(parent, rootFS, uid, gid); err != nil {
+			return textResult(fmt.Sprintf("chown parent dirs for %s: %v", params.Path, err), true)
+		}
+	}
+
+	// Preserve an existing file's mode; default 0644 for a new file. Write is
+	// atomic enough for our purposes (the exec path overwrote in place too);
+	// owner is restored below for a new file, and left untouched for an
+	// existing one (os.WriteFile does not chown).
+	mode := os.FileMode(0o644)
+	if info, err := os.Lstat(hostPath); err == nil {
+		mode = info.Mode()
+	}
+	if err := os.WriteFile(hostPath, []byte(params.FileText), mode); err != nil {
+		return textResult(fmt.Sprintf("write %s: %v", params.Path, err), true)
+	}
+	// For a newly created file written as root, chown it to the frame user so
+	// shell jobs running as that user can overwrite it. An existing file keeps
+	// its owner (os.WriteFile preserves it). Lchown so a (defensive) symlink
+	// target is not followed.
+	if params.User == "user" {
+		if err := os.Lchown(hostPath, uid, gid); err != nil {
+			return textResult(fmt.Sprintf("chown %s: %v", params.Path, err), true)
+		}
+	}
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return textResult(fmt.Sprintf("create_file timed out writing %s", params.Path), true)
 	}
 	return textResult(fmt.Sprintf("Created %s (%d bytes)", params.Path, len(params.FileText)), false)
+}
+
+// chownCreatedDirs walks the path from rootFS down to dir, chowning each
+// component that is not already owned by (uid,gid). It stops at the first
+// ancestor that already has the right owner (a pre-existing user-owned dir
+// needs no change), so it touches only the freshly created parents.
+func chownCreatedDirs(dir, rootFS string, uid, gid int) error {
+	absRoot, err := filepath.Abs(rootFS)
+	if err != nil {
+		return err
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(absRoot, absDir)
+	if err != nil || rel == "." {
+		return nil
+	}
+	components := strings.Split(rel, string(filepath.Separator))
+	cur := absRoot
+	for _, comp := range components {
+		if comp == "" {
+			continue
+		}
+		cur = filepath.Join(cur, comp)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			return err
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil
+		}
+		if stat.Uid == uint32(uid) && stat.Gid == uint32(gid) {
+			continue
+		}
+		if err := os.Lchown(cur, uid, gid); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // mcpStrReplaceToolHandler is the ToolHandler for str_replace.
@@ -739,6 +863,19 @@ func mcpListFramesToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 // newMCPServer builds the MCP server with all tools registered. It is
 // called once per handler mount (production main() and test runTestMode each
 // build their own). The server name/version are the thundersnap daemon's.
+
+// frameFieldDesc is the shared description for the "frame" parameter on every
+// tool that targets a frame. Frame is required: always pass an explicit ref
+// name or UUID (from list_frames) so the call lands in the frame you mean. The
+// empty string is only valid for thundersnap_jobs, and only when you
+// deliberately want a throwaway ephemeral frame for that single call — an
+// empty frame is discarded as soon as the MCP call returns, so anything
+// written there (e.g. via create_file) is lost. Use a named/ref'd frame for
+// any work you want to persist.
+const frameFieldDesc = "Frame name or UUID (required). Pass a ref name or UUID from list_frames so the call lands in the frame you mean. " +
+	"An empty string selects a throwaway ephemeral frame that is discarded when the MCP call ends; only useful for one-shot jobs, " +
+	"and never appropriate for create_file/view/str_replace, which need a persistent frame."
+
 func newMCPServer() *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{
 		Name:    "thundersnap",
@@ -756,13 +893,13 @@ func newMCPServer() *mcp.Server {
 		"type": "object",
 		"properties": map[string]any{
 			"command":      map[string]any{"type": "string", "description": "The shell command to run."},
-			"frame":        map[string]any{"type": "string", "description": "Frame name or UUID. Defaults to the user's current/only frame."},
+			"frame":        map[string]any{"type": "string", "description": frameFieldDesc},
 			"workdir":      map[string]any{"type": "string", "description": "Initial working directory inside the frame (default /work); applies only to this job."},
 			"label":        map[string]any{"type": "string", "description": "Optional. Use mainly to distinguish several or long-running jobs; omit for quick commands."},
 			"user":         map[string]any{"type": "string", "enum": []string{"user", "root"}, "description": "Required Unix account inside the frame; use root only for administrative operations."},
 			"hard_timeout": map[string]any{"type": "integer", "description": "Total job lifetime in seconds (default/max 7200)."},
 		},
-		"required":             []string{"command", "user"},
+		"required":             []string{"command", "user", "frame"},
 		"additionalProperties": false,
 	}
 	waitSchema := map[string]any{
@@ -835,16 +972,19 @@ func newMCPServer() *mcp.Server {
 					"type":        "integer",
 					"description": "Optional number of final lines to read; mutually exclusive with view_range.",
 				},
-				"frame": map[string]any{"type": "string"},
+				"frame": map[string]any{"type": "string", "description": frameFieldDesc},
 				"user":  map[string]any{"type": "string", "enum": []string{"user", "root"}},
-			}, "required": []string{"path", "user"}, "additionalProperties": false,
+			}, "required": []string{"path", "user", "frame"}, "additionalProperties": false,
 		},
 	}, mcpViewToolHandler)
 
 	// create_file
 	s.AddTool(&mcp.Tool{
-		Name:        "create_file",
-		Description: "Synchronously create or overwrite a file as the explicitly selected Unix user; creates parent directories.",
+		Name: "create_file",
+		Description: "Synchronously create or overwrite a file as the explicitly selected Unix user; creates parent directories. " +
+			"Implemented host-side, so it works in every frame including minimal ones with no POSIX utilities. The frame is required " +
+			"and must be a persistent (ref'd) frame — a throwaway empty frame is discarded when this call returns, so a file written " +
+			"there would be lost immediately.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -856,10 +996,10 @@ func newMCPServer() *mcp.Server {
 					"type":        "string",
 					"description": "The full text content of the file.",
 				},
-				"frame": map[string]any{"type": "string"},
+				"frame": map[string]any{"type": "string", "description": frameFieldDesc},
 				"user":  map[string]any{"type": "string", "enum": []string{"user", "root"}},
 			},
-			"required":             []string{"path", "file_text", "user"},
+			"required":             []string{"path", "file_text", "user", "frame"},
 			"additionalProperties": false,
 		},
 	}, mcpCreateFileToolHandler)
@@ -887,10 +1027,10 @@ func newMCPServer() *mcp.Server {
 				},
 				"frame": map[string]any{
 					"type":        "string",
-					"description": "Frame name or UUID. Defaults to the user's current/only frame.",
+					"description": frameFieldDesc,
 				},
 			},
-			"required": []string{"path", "old_str", "new_str"},
+			"required": []string{"path", "old_str", "new_str", "frame"},
 		},
 	}, mcpStrReplaceToolHandler)
 
@@ -900,7 +1040,8 @@ func newMCPServer() *mcp.Server {
 		Description: "List the caller's thundersnap frames and all refs pointing to each frame (does NOT launch a " +
 			"container). Returns JSON {\"frames\":[{\"uuid\",\"refs\",\"status\"}]} where refs may be empty and " +
 			"status is \"stopped\" or the active session count. Use this to pick " +
-			"a frame for the first jobs/view/create_file/str_replace call.",
+			"a persistent frame (one with refs) for the first jobs/view/create_file/str_replace call. Frames with empty refs " +
+			"are unattached throwaways from prior sessions and are discarded when their session ends; prefer a ref'd frame.",
 		InputSchema: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{},

@@ -433,3 +433,43 @@ func TestErrMCPCommandTimeoutSentinel(t *testing.T) {
 		t.Errorf("errors.Is(wrapped, errMCPCommandTimeout) = false, want true")
 	}
 }
+
+// TestMCPWaitParamsArrayShorthand pins the tolerance of mcpWaitParams for the
+// common LLM mistake of passing `wait` as the jobs array directly
+// ([{"id":..,"offset":..}, ...]) instead of the canonical object
+// ({"jobs":[...],"until":...}). Both forms must produce the same Jobs list.
+func TestMCPWaitParamsArrayShorthand(t *testing.T) {
+	t.Run("object_form", func(t *testing.T) {
+		var w mcpWaitParams
+		if err := json.Unmarshal([]byte(`{"jobs":[{"id":"j1","offset":0},{"id":"j2","offset":12}],"until":"all_exit","timeout":30}`), &w); err != nil {
+			t.Fatalf("object form unmarshal: %v", err)
+		}
+		if len(w.Jobs) != 2 || w.Jobs[0].ID != "j1" || w.Jobs[1].ID != "j2" || w.Jobs[1].Offset != 12 {
+			t.Errorf("object form jobs = %+v", w.Jobs)
+		}
+		if w.Until != "all_exit" || w.Timeout != 30 {
+			t.Errorf("object form until/timeout = %q/%d", w.Until, w.Timeout)
+		}
+	})
+	t.Run("array_shorthand", func(t *testing.T) {
+		var w mcpWaitParams
+		if err := json.Unmarshal([]byte(`[{"id":"j1","offset":0},{"id":"j2","offset":12}]`), &w); err != nil {
+			t.Fatalf("array shorthand unmarshal: %v", err)
+		}
+		if len(w.Jobs) != 2 || w.Jobs[0].ID != "j1" || w.Jobs[1].ID != "j2" || w.Jobs[1].Offset != 12 {
+			t.Errorf("array shorthand jobs = %+v", w.Jobs)
+		}
+		if w.Until != "" || w.Timeout != 0 {
+			t.Errorf("array shorthand until/timeout = %q/%d (want zero values)", w.Until, w.Timeout)
+		}
+	})
+	t.Run("empty_object", func(t *testing.T) {
+		var w mcpWaitParams
+		if err := json.Unmarshal([]byte(`{}`), &w); err != nil {
+			t.Fatalf("empty object unmarshal: %v", err)
+		}
+		if len(w.Jobs) != 0 {
+			t.Errorf("empty object jobs = %+v", w.Jobs)
+		}
+	})
+}
