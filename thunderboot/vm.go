@@ -328,14 +328,21 @@ func (s *VMSession) Done() <-chan struct{} {
 	return s.done
 }
 
-// Close terminates the VM session and cleans up resources.
+// Close terminates the VM session and cleans up resources. It escalates
+// SIGKILL -> SIGTERM-on-deadline so a wedged cloud-hypervisor (e.g. stuck in
+// vhost teardown) cannot hang shutdown indefinitely, and always tears down
+// passt/virtiofsd even if CHV is already gone.
 func (s *VMSession) Close() error {
 	log.Printf("Closing thunderboot VM session")
 
 	if s.chvCmd != nil && s.chvCmd.Process != nil {
 		log.Printf("Killing cloud-hypervisor PID %d", s.chvCmd.Process.Pid)
-		s.chvCmd.Process.Kill()
-		<-s.done
+		_ = s.chvCmd.Process.Kill()
+		select {
+		case <-s.done:
+		case <-time.After(10 * time.Second):
+			log.Printf("cloud-hypervisor did not exit within 10s; forcing cleanup")
+		}
 	}
 
 	s.cleanup()

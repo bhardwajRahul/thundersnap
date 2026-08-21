@@ -86,18 +86,24 @@ func realizeSpec(spec thunderboot.DiskSpec, name, mdPath string) (string, error)
 	if err := os.MkdirAll(filepath.Dir(mdPath), 0755); err != nil {
 		return "", err
 	}
-	if allBlank(spec.Devices) {
+	// Assemble an existing array first; only create a fresh one when assembly
+	// fails AND every member is verified blank. Branching purely on "all members
+	// blank" (as before) is dangerous: a mid-init crash can leave md superblocks
+	// on only some members, so blkid reads the others as blank and a re-run
+	// would `mdadm --create` over devices that may already hold data, wiping
+	// it. Assemble-first never destroys data; if assembly fails and members
+	// are not all blank we error out rather than risk an overwrite.
+	assemble := append([]string{"--assemble", "--run", mdPath}, spec.Devices...)
+	if err := run("mdadm", assemble...); err != nil {
+		if !allBlank(spec.Devices) {
+			return "", fmt.Errorf("md %s assemble failed and members are not all blank (refusing to create/overwrite): %w", name, err)
+		}
 		level := strings.TrimPrefix(spec.RAID, "raid")
 		args := []string{"--create", mdPath, "--run", "--metadata=1.2", "--level=" + level,
 			"--raid-devices=" + strconv.Itoa(len(spec.Devices))}
 		args = append(args, spec.Devices...)
 		if err := run("mdadm", args...); err != nil {
 			return "", err
-		}
-	} else {
-		args := append([]string{"--assemble", "--run", mdPath}, spec.Devices...)
-		if err := run("mdadm", args...); err != nil {
-			return "", fmt.Errorf("assemble existing %s: %w", name, err)
 		}
 	}
 	if err := waitDevice(mdPath, 10*time.Second); err != nil {
@@ -115,7 +121,10 @@ func connectNBD(u *url.URL) (string, error) {
 		host, port = u.Host, "10809"
 	}
 	export := strings.TrimPrefix(u.Path, "/")
-	args := []string{"-nonetlink", "-nofork"}
+	// -persist keeps /dev/nbd0 alive across server disconnects and retries; the
+	// non-appliance NBDInitScript uses it too. -nofork keeps nbd-client in the
+	// foreground so we can reap it.
+	args := []string{"-nonetlink", "-nofork", "-persist"}
 	if export != "" {
 		args = append(args, "-N", export)
 	}
@@ -125,6 +134,9 @@ func connectNBD(u *url.URL) (string, error) {
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
+	// Reap nbd-client when it eventually exits so it does not become a zombie
+	// child of PID 1 / the post-switch_root appliance process.
+	go func() { _ = cmd.Wait() }()
 	if err := waitDevice("/dev/nbd0", 10*time.Second); err != nil {
 		return "", err
 	}
@@ -141,18 +153,30 @@ func connectNBD(u *url.URL) (string, error) {
 func ensureBcache(cache, backing string) error {
 	cacheType := signature(cache)
 	backingType := signature(backing)
-	if cacheType == "" && backingType == "" {
-		if size(cache) > size(backing) {
-			return fmt.Errorf("bcache backing %s is smaller than cache %s", backing, cache)
-		}
+	// Refuse to overwrite a conflicting (non-bcache) signature on either side.
+	// A blank side is formatted; a bcache side is left alone. This makes each
+	// step idempotent so a crash between `make-bcache -C` and `-B` no longer
+	// leaves the appliance in an unrecoverable "partial/unknown" state: on
+	// reboot the already-formatted side is kept and only the missing side is
+	// formatted.
+	if cacheType != "" && cacheType != "bcache" {
+		return fmt.Errorf("cache %s has conflicting signature %q", cache, cacheType)
+	}
+	if backingType != "" && backingType != "bcache" {
+		return fmt.Errorf("backing %s has conflicting signature %q", backing, backingType)
+	}
+	if cacheType == "" {
 		if err := run("make-bcache", "-C", cache); err != nil {
 			return err
+		}
+	}
+	if backingType == "" {
+		if cs, bs := size(cache), size(backing); cs > 0 && bs > 0 && cs > bs {
+			return fmt.Errorf("bcache backing %s is smaller than cache %s", backing, cache)
 		}
 		if err := run("make-bcache", "-B", backing); err != nil {
 			return err
 		}
-	} else if cacheType != "bcache" || backingType != "bcache" {
-		return fmt.Errorf("partial/unknown bcache state: cache=%q backing=%q", cacheType, backingType)
 	}
 	// Registration is idempotent enough for boot: EINVAL commonly means the
 	// kernel auto-registered the device before init reached this point.
@@ -189,6 +213,13 @@ func allBlank(devices []string) bool {
 }
 
 func size(device string) int64 {
+	// /dev/md/<name> and other alias symlinks are not directly under
+	// /sys/class/block; resolve the symlink (e.g. /dev/md/thunderboot-disk ->
+	// /dev/md127) before taking the basename, otherwise size() silently
+	// returns 0 and the bcache size sanity check becomes meaningless.
+	if resolved, err := filepath.EvalSymlinks(device); err == nil && resolved != "" {
+		device = resolved
+	}
 	name := filepath.Base(device)
 	data, _ := os.ReadFile(filepath.Join("/sys/class/block", name, "size"))
 	sectors, _ := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
