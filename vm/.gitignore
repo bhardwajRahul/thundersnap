@@ -1,1 +1,4 @@
 linux
+cloud-hypervisor
+vmlinux
+.vmlinux-*

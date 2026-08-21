@@ -23,6 +23,7 @@ OUT ?= dist
 BIN ?= ./bin
 
 .PHONY: all test e2e e2e-tb not_e2e binaries ts vshd thundersnapd thunderboot infiniblockd \
+        thunderboot-vm-artifacts thunderboot-appliance-arm64 verify-thunderboot-appliance-arm64 \
         list build build-deb build-rpm build-tgz clean
 
 all: build
@@ -89,7 +90,7 @@ e2e: ts vshd thundersnapd
 	@./test-cleanup.sh $(E2E_TMPDIR)
 
 # Run thunderboot storage-layout tests.
-e2e-tb: thunderboot infiniblockd
+e2e-tb: thunderboot infiniblockd thunderboot-vm-artifacts
 	./scripts/build-thunderboot-initramfs.sh
 	CGO_ENABLED=0 go test -tags e2e -c -o $(BIN)/e2e-tb.test ./e2e-tb
 	sudo -E timeout 300s $(BIN)/e2e-tb.test -test.v -test.failfast -test.timeout=5m $(E2E_ARGS)
@@ -139,6 +140,18 @@ thunderboot:
 infiniblockd:
 	@mkdir -p $(BIN)
 	go build -o $(BIN)/$@ ./cmd/$@
+
+# Generate the untracked x86-64 Cloud Hypervisor and kernel artifacts used by
+# Linux/KVM tests. See README.thunderboot-builder.md.
+thunderboot-vm-artifacts:
+	./scripts/fetch-thunderboot-vm-artifacts.sh
+
+# Build and package the ARM64 Aperture kernel/initramfs in pinned Lima.
+thunderboot-appliance-arm64:
+	./scripts/thunderboot-builder.sh build
+
+verify-thunderboot-appliance-arm64:
+	./scripts/thunderboot-builder.sh verify
 
 # List all available build targets
 list:
