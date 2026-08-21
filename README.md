@@ -218,10 +218,10 @@ changes that might be better or worse, but at the very least will be
 surprising.
 
 Thundersnap works differently. If you use for example `ts download-docker
-debian:latest` it will download the latest docker container named
-`debian:latest`, but then it prints out the content hash of the snap it
-created; every time you use that content hash, you get exactly what you
-expected.
+debian:latest` it will download the latest Linux container matching the
+thundersnapd machine's native architecture, but then it prints out the content
+hash of the snap it created; every time you use that content hash, you get
+exactly what you expected.
 
 So for example,
 

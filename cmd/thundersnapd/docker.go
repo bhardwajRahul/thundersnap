@@ -14,12 +14,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/tailscale/thundersnap/btrfsutil"
@@ -153,35 +155,49 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 		return "", false, fmt.Errorf("parse image reference: %w", err)
 	}
 
-	// Get image descriptor to get the digest.
-	desc, err := remote.Get(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
+	// go-containerregistry defaults multi-platform indexes to linux/amd64,
+	// regardless of the caller's architecture. Select the image matching the
+	// thundersnapd host so frames contain binaries this machine can execute.
+	platform := nativeDockerPlatform()
+	desc, err := remote.Get(ref,
+		remote.WithAuthFromKeychain(authn.DefaultKeychain),
+		remote.WithPlatform(platform),
+	)
 	if err != nil {
-		return "", false, fmt.Errorf("get image descriptor: %w", err)
+		return "", false, fmt.Errorf("get image descriptor for %s: %w", platform, err)
 	}
 
-	// Create canonical ref with digest
-	digestRef := ref.Context().Digest(desc.Digest.String())
-	canonicalRef := digestRef.String()
+	// Resolve an index to the selected child before constructing the cache key.
+	// The top-level index digest is shared by every architecture and would let
+	// an amd64 pull incorrectly satisfy a later arm64 pull from the same daemon.
+	// Image() and Digest() fetch manifests but leave layer reads lazy until the
+	// tarball export below.
+	img, err := desc.Image()
+	if err != nil {
+		return "", false, fmt.Errorf("get image for %s: %w", platform, err)
+	}
+	imageDigest, err := img.Digest()
+	if err != nil {
+		return "", false, fmt.Errorf("get image digest for %s: %w", platform, err)
+	}
+	canonicalRef := ref.Context().Digest(imageDigest.String()).String()
 
-	// Check if we already have a snap with this source before emitting download
-	// progress. Cached pulls get one concise client-side cache message instead.
+	// Check if we already have a snap with this platform-specific image source
+	// before emitting download progress. Cached pulls get one concise
+	// client-side cache message instead.
 	existingID := findSnapByDockerSource(canonicalRef)
 	if existingID != "" {
 		return existingID, true, nil
 	}
 
 	if progress != nil {
-		fmt.Fprintf(progress, "Resolved %s to %s\n", ref.Name(), canonicalRef)
+		fmt.Fprintf(progress, "Resolved %s for %s to %s\n", ref.Name(), platform, canonicalRef)
 		fmt.Fprintf(progress, "Pulling image...\n")
 	}
 
-	// Get the full image. The image is lazy: tarball.Write below performs the
-	// actual layer reads, so time that operation and report the resulting
-	// docker-save archive size as a useful approximation of bytes downloaded.
-	img, err := desc.Image()
-	if err != nil {
-		return "", false, fmt.Errorf("get image: %w", err)
-	}
+	// The image is lazy: tarball.Write below performs the actual layer reads,
+	// so time that operation and report the resulting docker-save archive size
+	// as a useful approximation of bytes downloaded.
 
 	// Create a temporary directory for extraction
 	tmpDir, err := os.MkdirTemp(*flagSnapsDir, "docker-extract-")
@@ -271,6 +287,10 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 		fmt.Fprintln(progress, formatDockerDownloadSummary(downloadedBytes, pullElapsed))
 	}
 	return snapshotID, false, nil
+}
+
+func nativeDockerPlatform() v1.Platform {
+	return v1.Platform{OS: "linux", Architecture: runtime.GOARCH}
 }
 
 func formatDockerDownloadSummary(bytes int64, elapsed time.Duration) string {

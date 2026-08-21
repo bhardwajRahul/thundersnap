@@ -205,9 +205,11 @@ Nothing is printed when no autoruns are configured.`,
 		category: "other",
 		short:    "download a Docker image as a snap",
 		long: `Downloads a Docker image from a registry and stores it as a
-content-addressed snapshot that can be used as a frame's rootfs. Download and
-extraction progress is streamed to stderr, followed by the downloaded size and
-Mbps. If the image is cached, a cache notice goes to stderr instead.`,
+content-addressed snapshot that can be used as a frame's rootfs. For a
+multi-platform image, it automatically selects Linux on the thundersnapd
+machine's native architecture. Download and extraction progress is streamed to
+stderr, followed by the downloaded size and Mbps. If the image is cached, a
+cache notice goes to stderr instead.`,
 		outputs: `stdout: the snapshot ID, one line, whether downloaded or cached.
 stderr: progress and final size/rate for a download, or a cache notice.`,
 		examples: `  ts download-docker ubuntu:24.04

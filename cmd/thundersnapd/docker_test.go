@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -22,6 +23,19 @@ import (
 // TestFlattenDockerTarball tests the docker tarball flattening logic without
 // requiring root access or btrfs. It creates a synthetic docker-save-format
 // tarball and verifies the extraction produces the correct filesystem.
+func TestNativeDockerPlatform(t *testing.T) {
+	got := nativeDockerPlatform()
+	if got.OS != "linux" {
+		t.Fatalf("nativeDockerPlatform OS = %q, want linux", got.OS)
+	}
+	if got.Architecture != runtime.GOARCH {
+		t.Fatalf("nativeDockerPlatform architecture = %q, want %q", got.Architecture, runtime.GOARCH)
+	}
+	if runtime.GOARCH == "arm64" && got.String() != "linux/arm64" {
+		t.Fatalf("nativeDockerPlatform = %q on arm64, want linux/arm64", got)
+	}
+}
+
 func TestFormatDockerDownloadSummary(t *testing.T) {
 	got := formatDockerDownloadSummary(3*1024*1024, 1500*time.Millisecond)
 	want := "Downloaded 3.000 MiB at 16.777 Mbps"
