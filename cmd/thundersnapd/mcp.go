@@ -89,17 +89,21 @@ const mcpDaemonVersion = "dev"
 // visible to every ToolHandler.
 type mcpUserKey struct{}
 
-// resolveMCPUser returns the effective Tailscale user for an MCP HTTP request.
+// resolveMCPUser returns the workspace namespace for an MCP HTTP request.
+// The production principal lookup remains intentionally unfinished below; its
+// current "unknown" result maps to the default shared namespace.
 func resolveMCPUser(r *http.Request) string {
-	if testModeUser != "" {
-		return testModeUser
+	principal := testModeUser
+	if principal == "" {
+		// Production path: honour X-Aperture-Login only from the trusted Aperture
+		// node, else fall back to the peer's own WhoIs login.
+		if h := r.Header.Get("X-Aperture-Login"); h != "" && mcpTrustedAperture != "" && peerIsTrustedAperture(r) {
+			principal = h
+		} else {
+			principal = peerWhoIsLogin(r)
+		}
 	}
-	// Production path: honour X-Aperture-Login only from the trusted Aperture
-	// node, else fall back to the peer's own WhoIs login.
-	if h := r.Header.Get("X-Aperture-Login"); h != "" && mcpTrustedAperture != "" && peerIsTrustedAperture(r) {
-		return h
-	}
-	return peerWhoIsLogin(r)
+	return globalPolicy.NamespaceForPrincipal(principal)
 }
 
 // peerIsTrustedAperture reports whether the TCP peer's Tailscale identity
@@ -877,8 +881,8 @@ func mcpListFramesToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 	if user == "" {
 		return textResult("no MCP user resolved for request", true)
 	}
-	frameStore := userFrameStore(user)
-	refStore := userRefStore(user)
+	frameStore := namespaceFrameStore(user)
+	refStore := namespaceRefStore(user)
 
 	uuids, err := frameStore.List()
 	if err != nil {
@@ -906,7 +910,7 @@ func mcpListFramesToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 			refs = []string{}
 		}
 		sort.Strings(refs)
-		sessionCount := getActiveFrameCount(framePathForUserUUID(user, uuid))
+		sessionCount := getActiveFrameCount(framePathForNamespaceUUID(user, uuid))
 		status := "stopped"
 		if sessionCount > 0 {
 			status = fmt.Sprintf("%d", sessionCount)

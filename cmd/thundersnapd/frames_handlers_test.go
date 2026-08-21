@@ -29,7 +29,7 @@ func TestHandleLogDefaultsToCurrentFrame(t *testing.T) {
 
 	// Create a frame with some history
 	uuid := frameid.MustNew()
-	frameStore := userFrameStore(user)
+	frameStore := namespaceFrameStore(user)
 	frame := &frames.Frame{}
 	if err := frameStore.Create(uuid, frame); err != nil {
 		t.Fatalf("create frame: %v", err)
@@ -84,7 +84,7 @@ func TestHandleLogExplicitUUID(t *testing.T) {
 	// Create two frames
 	currentUUID := frameid.MustNew()
 	otherUUID := frameid.MustNew()
-	frameStore := userFrameStore(user)
+	frameStore := namespaceFrameStore(user)
 
 	if err := frameStore.Create(currentUUID, &frames.Frame{}); err != nil {
 		t.Fatalf("create current frame: %v", err)

@@ -113,7 +113,7 @@ func (m *autorunManager) scanAndStartAll() {
 
 // scanUserRefs scans a user's refs and starts autorun processes for any with autorun configured.
 func (m *autorunManager) scanUserRefs(user string) {
-	store := refs.NewUserStore(m.dataDir, user)
+	store := refs.NewNamespaceStore(m.dataDir, user)
 	names, err := store.List()
 	if err != nil {
 		log.Printf("autorun: failed to list refs for user %s: %v", user, err)

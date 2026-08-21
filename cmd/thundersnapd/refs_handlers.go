@@ -17,57 +17,51 @@ import (
 	"github.com/tailscale/thundersnap/refs"
 )
 
-// framePathForUserUUID returns the on-disk frame path for a user's frame UUID.
-// Frames live at <fs-dir>/<user>/<uuid>/. It returns "" when the fs dir is not
-// configured (e.g. in unit tests that exercise the ref store without a running
-// daemon).
-func framePathForUserUUID(user string, uuid frameid.ID) string {
+// framePathForNamespaceUUID returns the on-disk path for a namespace's frame.
+// Frames live at <fs-dir>/<namespace>/<uuid>/. It returns "" when the fs dir
+// is not configured (e.g. in unit tests without a running daemon).
+func framePathForNamespaceUUID(namespace string, uuid frameid.ID) string {
 	if flagFsDir == nil || *flagFsDir == "" {
 		return ""
 	}
-	return filepath.Join(*flagFsDir, user, uuid.String())
+	return filepath.Join(*flagFsDir, namespace, uuid.String())
 }
 
-// refsStateDir is the data directory used to construct per-user ref stores.
-// It is set in initRefStore from --data-dir, NOT the fs dir: a per-user
-// refs.Store appends "refs/<user>", so its root must be the data dir.
+// refsStateDir is the data directory used to construct namespace ref stores.
+// It is set in initRefStore from --data-dir, NOT the fs dir: a namespace store
+// appends "refs/<namespace>", so its root must be the data dir.
 var refsStateDir string
 
-// initRefStore records the data directory used for per-user ref stores.
+// initRefStore records the data directory used for namespace ref stores.
 func initRefStore(dataDir string) {
 	refsStateDir = dataDir
 }
 
-// userRefStore returns a ref store scoped to the given tailscale user.
-func userRefStore(user string) *refs.Store {
-	return refs.NewUserStore(refsStateDir, user)
+// namespaceRefStore returns a ref store scoped to namespace.
+func namespaceRefStore(namespace string) *refs.Store {
+	return refs.NewNamespaceStore(refsStateDir, namespace)
 }
 
-// userRefStore returns a ref store scoped to the tailscale user that owns this
-// control server's frame. The user is derived from the frame's rootFS path
-// (<fs-dir>/<user>/<uuid>).
-func (c *controlServer) userRefStore() (*refs.Store, string, error) {
-	user, err := tailscaleUserFromRootFS(c.rootFS)
+// namespaceRefStore returns the ref store that owns this control server's
+// frame. The namespace is derived from <fs-dir>/<namespace>/<uuid>.
+func (c *controlServer) namespaceRefStore() (*refs.Store, string, error) {
+	namespace, err := namespaceFromRootFS(c.rootFS)
 	if err != nil {
 		return nil, "", err
 	}
-	return userRefStore(user), user, nil
+	return namespaceRefStore(namespace), namespace, nil
 }
 
-// defaultRefName is the reserved ref name used for a user's "default" frame:
-// the one reached by a bare login (`ssh host`, which tsnet turns into
-// `<tailscale-user>@host`) or an explicitly empty frame name (`root@@host`).
+// defaultRefName is the reserved ref name used for a namespace's default frame.
 const defaultRefName = "default"
 
-// resolveFrameForUser maps an SSH frame name to a concrete frame for the given
-// tailscale user, using that user's ref store. The returned uuid identifies the
-// frame; framePath is its on-disk location (<fs-dir>/<user>/<uuid>).
+// resolveFrameForNamespace maps a frame name to a concrete frame in namespace.
+// The returned path is <fs-dir>/<namespace>/<uuid>.
 //
 // Resolution rules:
 //   - If the name is a valid UUID and a frame with that UUID exists for the
 //     user, return it directly (unattached, since there's no ref binding).
-//   - An empty name, or a name equal to the tailscale username (a bare login,
-//     where tsnet inserts the username as the SSH user), resolves the reserved
+//   - An empty name, or a name equal to the namespace, resolves the reserved
 //     "default" ref.
 //   - Any other name is looked up verbatim as a ref.
 //   - If the "default" ref does not exist, an existing sole frame is reused;
@@ -80,21 +74,21 @@ const defaultRefName = "default"
 // attached reports whether the returned uuid is bound to an existing ref. When
 // false (only possible for the default case or UUID lookups), the caller should
 // create/connect to an empty frame without binding a ref.
-func resolveFrameForUser(tailscaleUser, name string) (uuid frameid.ID, framePath string, attached bool, err error) {
+func resolveFrameForNamespace(namespace, name string) (uuid frameid.ID, framePath string, attached bool, err error) {
 	// First, check if the name is a valid UUID that exists as a frame. This
 	// allows SSH directly into a frame by UUID even if it has no refs.
 	if parsed, perr := frameid.Parse(name); perr == nil {
-		frameStore := userFrameStore(tailscaleUser)
+		frameStore := namespaceFrameStore(namespace)
 		if frameStore.Exists(parsed) {
-			return parsed, framePathForUserUUID(tailscaleUser, parsed), false, nil
+			return parsed, framePathForNamespaceUUID(namespace, parsed), false, nil
 		}
 		// UUID parses but frame doesn't exist - fall through to ref lookup
 		// in case a ref happens to be named like a UUID (unlikely but allowed).
 	}
 
-	store := userRefStore(tailscaleUser)
+	store := namespaceRefStore(namespace)
 
-	isDefault := name == "" || name == tailscaleUser
+	isDefault := name == "" || name == namespace
 	lookup := name
 	if isDefault {
 		lookup = defaultRefName
@@ -102,7 +96,7 @@ func resolveFrameForUser(tailscaleUser, name string) (uuid frameid.ID, framePath
 
 	ref, gerr := store.Get(lookup)
 	if gerr == nil {
-		return ref.UUID, framePathForUserUUID(tailscaleUser, ref.UUID), true, nil
+		return ref.UUID, framePathForNamespaceUUID(namespace, ref.UUID), true, nil
 	}
 	if gerr != refs.ErrRefNotFound {
 		return frameid.Nil, "", false, gerr
@@ -110,23 +104,23 @@ func resolveFrameForUser(tailscaleUser, name string) (uuid frameid.ID, framePath
 
 	if isDefault {
 		// MCP calls commonly omit the frame selector. If the first such call
-		// created the user's only unattached frame, returning a new UUID here on
+		// created the namespace's only unattached frame, returning a new UUID here on
 		// every later call makes the apparent "current frame" change between
 		// calls (and is especially confusing when a second MCP session is
-		// sharing the same user). Reuse the sole persisted frame; when there is
+		// sharing the same namespace). Reuse the sole persisted frame; when there is
 		// no frame, or more than one frame and no default ref, preserve the
 		// existing fresh-frame behavior.
-		frameStore := userFrameStore(tailscaleUser)
+		frameStore := namespaceFrameStore(namespace)
 		uuidNames, lerr := frameStore.List()
 		if lerr != nil {
 			return frameid.Nil, "", false, lerr
 		}
 		if len(uuidNames) == 1 {
-			return uuidNames[0], framePathForUserUUID(tailscaleUser, uuidNames[0]), false, nil
+			return uuidNames[0], framePathForNamespaceUUID(namespace, uuidNames[0]), false, nil
 		}
 
 		fresh := frameid.MustNew()
-		return fresh, framePathForUserUUID(tailscaleUser, fresh), false, nil
+		return fresh, framePathForNamespaceUUID(namespace, fresh), false, nil
 	}
 
 	return frameid.Nil, "", false, fmt.Errorf("no such frame %q", name)
@@ -138,8 +132,8 @@ func resolveFrameForUser(tailscaleUser, name string) (uuid frameid.ID, framePath
 // frame, like git's detached HEAD). This mirrors the "find refs pointing to
 // this frame" logic in handleReflog so a PS1 can show the ref(s) the user
 // logged into, falling back to the frame UUID for an unattached frame.
-func frameDescriptor(tailscaleUser string, uuid frameid.ID) string {
-	store := userRefStore(tailscaleUser)
+func frameDescriptor(namespace string, uuid frameid.ID) string {
+	store := namespaceRefStore(namespace)
 	names, err := store.List()
 	if err != nil {
 		return uuid.String()
@@ -179,7 +173,7 @@ func (c *controlServer) handleRefCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	refStore, user, err := c.userRefStore()
+	refStore, user, err := c.namespaceRefStore()
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -221,7 +215,7 @@ func (c *controlServer) handleRefCreate(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Initialize the ref's identity subvolume inside the target frame's /id.
-	if framePath := framePathForUserUUID(user, uuid); framePath != "" {
+	if framePath := framePathForNamespaceUUID(user, uuid); framePath != "" {
 		if err := refid.Ensure(framePath, req.Name); err != nil {
 			log.Printf("Warning: ensure id subvolume for ref %s in frame %s: %v", req.Name, uuid, err)
 		}
@@ -237,7 +231,7 @@ func (c *controlServer) handleRefMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	refStore, user, err := c.userRefStore()
+	refStore, user, err := c.namespaceRefStore()
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -289,7 +283,7 @@ func (c *controlServer) handleRefMove(w http.ResponseWriter, r *http.Request) {
 
 	// Move the ref's identity subvolume from the old frame's /id to the new
 	// frame's /id so its private state follows the ref.
-	srcFrame, dstFrame := framePathForUserUUID(user, oldUUID), framePathForUserUUID(user, uuid)
+	srcFrame, dstFrame := framePathForNamespaceUUID(user, oldUUID), framePathForNamespaceUUID(user, uuid)
 	if oldUUID != uuid && srcFrame != "" && dstFrame != "" {
 		if err := refid.Move(srcFrame, dstFrame, req.Name); err != nil {
 			log.Printf("Warning: move id subvolume for ref %s (%s -> %s): %v", req.Name, oldUUID, uuid, err)
@@ -312,7 +306,7 @@ func (c *controlServer) handleRefDelete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	refStore, user, err := c.userRefStore()
+	refStore, user, err := c.namespaceRefStore()
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -371,7 +365,7 @@ func (c *controlServer) handleRefDelete(w http.ResponseWriter, r *http.Request) 
 	if req.Force {
 		refStore.RemoveIDDir(req.Name)
 		if getErr == nil {
-			if framePath := framePathForUserUUID(user, ref.UUID); framePath != "" {
+			if framePath := framePathForNamespaceUUID(user, ref.UUID); framePath != "" {
 				if err := refid.Remove(framePath, req.Name); err != nil {
 					log.Printf("Warning: remove id subvolume for ref %s in frame %s: %v", req.Name, ref.UUID, err)
 				}
@@ -402,7 +396,7 @@ func (c *controlServer) handleListRefs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	refStore, _, err := c.userRefStore()
+	refStore, _, err := c.namespaceRefStore()
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -453,7 +447,7 @@ func (c *controlServer) handleReflog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	refStore, _, err := c.userRefStore()
+	refStore, _, err := c.namespaceRefStore()
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -545,7 +539,7 @@ func (c *controlServer) handleAutorun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	refStore, user, err := c.userRefStore()
+	refStore, user, err := c.namespaceRefStore()
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return

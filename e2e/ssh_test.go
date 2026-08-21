@@ -37,7 +37,10 @@ type daemonInstance struct {
 // testUser is the identity used for all test SSH connections.
 // Keep this short to avoid exceeding Unix socket path length limits
 // (the control socket lives inside the frame's rootFS).
-const testUser = "e2e"
+const (
+	testUser             = "e2e"
+	defaultTestNamespace = "shared"
+)
 
 // startDaemon starts thundersnapd in test mode with --test-listen and --test-user.
 // It returns a daemonInstance that can be used to connect via SSH.

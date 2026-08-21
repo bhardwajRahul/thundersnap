@@ -33,19 +33,19 @@ func TestTailscaleUserFromRootFS(t *testing.T) {
 		{"/var/lib/thundersnap/fs/alice", "", true}, // only one component
 	}
 	for _, tt := range tests {
-		got, err := tailscaleUserFromRootFS(tt.rootFS)
+		got, err := namespaceFromRootFS(tt.rootFS)
 		if tt.wantErr {
 			if err == nil {
-				t.Errorf("tailscaleUserFromRootFS(%q) = (%q,nil), want error", tt.rootFS, got)
+				t.Errorf("namespaceFromRootFS(%q) = (%q,nil), want error", tt.rootFS, got)
 			}
 			continue
 		}
 		if err != nil {
-			t.Errorf("tailscaleUserFromRootFS(%q): %v", tt.rootFS, err)
+			t.Errorf("namespaceFromRootFS(%q): %v", tt.rootFS, err)
 			continue
 		}
 		if got != tt.want {
-			t.Errorf("tailscaleUserFromRootFS(%q) = %q, want %q", tt.rootFS, got, tt.want)
+			t.Errorf("namespaceFromRootFS(%q) = %q, want %q", tt.rootFS, got, tt.want)
 		}
 	}
 }

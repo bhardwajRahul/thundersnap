@@ -9,9 +9,8 @@
 //
 // Frame filesystems are stored at fs/<uuid>/ with metadata at fs/<uuid>.jsonc
 // for a flat (legacy) Store created with NewStore. A per-user Store created with
-// NewUserStore(stateDir, user) namespaces frames under the owning user at
-// fs/<user>/<uuid>/ with metadata at fs/<user>/<uuid>.jsonc, so a user only ever
-// sees their own frames.
+// NewNamespaceStore(stateDir, namespace) stores frames at
+// fs/<namespace>/<uuid>/ with metadata at fs/<namespace>/<uuid>.jsonc.
 package frames
 
 import (
@@ -82,12 +81,12 @@ type Frame struct {
 	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
-// Store manages frames in a state directory. When user is non-empty, frames are
-// namespaced under that user (fs/<user>/<uuid>) so a user only ever sees their
-// own frames; when user is empty the flat legacy layout (fs/<uuid>) is used.
+// Store manages frames in a state directory. When namespace is non-empty,
+// frames live under fs/<namespace>/<uuid>; an empty namespace selects the flat
+// legacy layout at fs/<uuid>.
 type Store struct {
-	stateDir string
-	user     string
+	stateDir  string
+	namespace string
 }
 
 // NewStore creates a new frame store rooted at stateDir using the flat layout.
@@ -95,16 +94,15 @@ func NewStore(stateDir string) *Store {
 	return &Store{stateDir: stateDir}
 }
 
-// NewUserStore creates a frame store namespaced under user (fs/<user>/<uuid>).
-// A user only ever sees their own frames.
-func NewUserStore(stateDir, user string) *Store {
-	return &Store{stateDir: stateDir, user: user}
+// NewNamespaceStore creates a frame store under fs/<namespace>/<uuid>.
+func NewNamespaceStore(stateDir, namespace string) *Store {
+	return &Store{stateDir: stateDir, namespace: namespace}
 }
 
 // fsDir returns the path to the fs directory.
 func (s *Store) fsDir() string {
-	if s.user != "" {
-		return filepath.Join(s.stateDir, "fs", s.user)
+	if s.namespace != "" {
+		return filepath.Join(s.stateDir, "fs", s.namespace)
 	}
 	return filepath.Join(s.stateDir, "fs")
 }

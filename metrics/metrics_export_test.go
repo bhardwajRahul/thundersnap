@@ -77,7 +77,7 @@ func TestMetricsExport(t *testing.T) {
 
 	// Two refs in a real per-user ref store, counted via the Refs closure.
 	dataDir := t.TempDir()
-	store := refs.NewUserStore(dataDir, "testuser")
+	store := refs.NewNamespaceStore(dataDir, "testuser")
 	wantRefs := 2
 	for i := 0; i < wantRefs; i++ {
 		if err := store.Create(fmt.Sprintf("ref%d", i), frameid.MustNew()); err != nil {

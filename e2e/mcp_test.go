@@ -654,7 +654,7 @@ func TestMCPCreateFileHostSideMinimalFrame(t *testing.T) {
 	// the frame ships only `ts`, /bin/sh, and /bin/su. create_file must not
 	// depend on mkdir/dirname/base64 being present.
 	frameUUID := createFrameForMCP(t, d, "minimalframe")
-	hostFramePath := filepath.Join(env.fsDir, "e2e", frameUUID)
+	hostFramePath := filepath.Join(env.fsDir, defaultTestNamespace, frameUUID)
 
 	// create_file into a nested path that does not exist yet (exercises
 	// parent-dir creation) with non-ASCII content (exercises binary-safety).

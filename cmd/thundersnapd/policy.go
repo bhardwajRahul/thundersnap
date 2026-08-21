@@ -19,6 +19,11 @@ import (
 // ThundersnapCapName is the capability name used in Tailscale grants.
 const ThundersnapCapName = "tailscale.com/cap/thundersnap"
 
+// defaultNamespace is used for every principal not explicitly mapped by the
+// local policy. Frames and refs are keyed by namespace, not by the connecting
+// Tailscale identity.
+const defaultNamespace = "shared"
+
 // ThundersnapCap represents the grant capability structure.
 type ThundersnapCap struct {
 	// Role determines the session type.
@@ -51,6 +56,11 @@ var DefaultCap = ThundersnapCap{
 // It uses the same grant format as Tailscale policy files.
 type PolicyFile struct {
 	Grants []PolicyGrant `json:"grants"`
+
+	// Namespaces maps authenticated principal names to workspace namespaces.
+	// Principals absent from this map use the "shared" namespace. A namespace
+	// is a single directory name below fs/, refs/, and id/.
+	Namespaces map[string]string `json:"namespaces,omitempty"`
 }
 
 // PolicyGrant represents a single grant in the policy file.
@@ -77,8 +87,43 @@ func LoadPolicyFile(path string) (*PolicyFile, error) {
 	if err := json.Unmarshal(standardized, &policy); err != nil {
 		return nil, fmt.Errorf("unmarshal policy: %w", err)
 	}
+	for principal, namespace := range policy.Namespaces {
+		if principal == "" {
+			return nil, fmt.Errorf("namespace mapping has an empty principal")
+		}
+		if err := validateNamespace(namespace); err != nil {
+			return nil, fmt.Errorf("namespace for %q: %w", principal, err)
+		}
+	}
 
 	return &policy, nil
+}
+
+// NamespaceForPrincipal returns the workspace namespace assigned to principal.
+// Namespace mappings are local policy, rather than Tailscale capabilities:
+// they choose where persistent state lives and do not grant access by
+// themselves. Unmapped principals, including the temporary MCP principal
+// "unknown", share the default namespace.
+func (p *PolicyFile) NamespaceForPrincipal(principal string) string {
+	if p != nil {
+		if namespace := p.Namespaces[principal]; namespace != "" {
+			return namespace
+		}
+	}
+	return defaultNamespace
+}
+
+// validateNamespace ensures a namespace is exactly one safe path component.
+// Email addresses remain valid, which permits explicitly selecting an old
+// per-user directory during an early-install migration.
+func validateNamespace(namespace string) error {
+	if namespace == "" {
+		return fmt.Errorf("must not be empty")
+	}
+	if namespace == "." || namespace == ".." || strings.ContainsAny(namespace, "/\\\x00") {
+		return fmt.Errorf("%q is not a valid directory name", namespace)
+	}
+	return nil
 }
 
 // MatchGrant finds the first matching grant for the given identity.

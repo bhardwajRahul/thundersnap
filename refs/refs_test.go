@@ -73,10 +73,10 @@ func TestValidateFrameName(t *testing.T) {
 	}
 }
 
-func TestUserStoreIsolation(t *testing.T) {
+func TestNamespaceStoreIsolation(t *testing.T) {
 	dir := t.TempDir()
-	alice := NewUserStore(dir, "alice")
-	bob := NewUserStore(dir, "bob")
+	alice := NewNamespaceStore(dir, "alice")
+	bob := NewNamespaceStore(dir, "bob")
 
 	aliceUUID := frameid.MustNew()
 	bobUUID := frameid.MustNew()
@@ -105,12 +105,12 @@ func TestUserStoreIsolation(t *testing.T) {
 		t.Errorf("bob deb = %s, want %s", got.UUID, bobUUID)
 	}
 
-	// Refs land under the per-user directory, not the flat one.
+	// Refs land under the namespace directory, not the flat one.
 	if _, err := os.Stat(filepath.Join(dir, "refs", "alice", "deb.jsonc")); err != nil {
 		t.Errorf("alice ref not at refs/alice/deb.jsonc: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "refs", "deb.jsonc")); !os.IsNotExist(err) {
-		t.Errorf("per-user store wrote a flat ref at refs/deb.jsonc (err=%v)", err)
+		t.Errorf("namespace store wrote a flat ref at refs/deb.jsonc (err=%v)", err)
 	}
 
 	// A user only lists their own refs.

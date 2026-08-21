@@ -14,19 +14,19 @@ import (
 	"github.com/tailscale/thundersnap/refs"
 )
 
-// framesStateDir is the data directory used to construct per-user frame stores.
-// It is set in initFrameStore from --data-dir, NOT the fs dir: a per-user
-// frames.Store appends "fs/<user>", so its root must be the data dir.
+// framesStateDir is the data directory used to construct namespace frame stores.
+// It is set in initFrameStore from --data-dir, NOT the fs dir: a namespace
+// store appends "fs/<namespace>", so its root must be the data dir.
 var framesStateDir string
 
-// initFrameStore records the data directory used for per-user frame stores.
+// initFrameStore records the data directory used for namespace frame stores.
 func initFrameStore(dataDir string) {
 	framesStateDir = dataDir
 }
 
-// userFrameStore returns a frame store scoped to the given tailscale user.
-func userFrameStore(user string) *frames.Store {
-	return frames.NewUserStore(framesStateDir, user)
+// namespaceFrameStore returns a frame store scoped to namespace.
+func namespaceFrameStore(namespace string) *frames.Store {
+	return frames.NewNamespaceStore(framesStateDir, namespace)
 }
 
 // LogEntry is a single entry in the frame history response.
@@ -51,12 +51,12 @@ func (c *controlServer) handleLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := tailscaleUserFromRootFS(c.rootFS)
+	user, err := namespaceFromRootFS(c.rootFS)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	frameStore := userFrameStore(user)
+	frameStore := namespaceFrameStore(user)
 
 	uuidStr := r.URL.Query().Get("uuid")
 	var uuid frameid.ID
@@ -120,7 +120,7 @@ func (c *controlServer) handleFrame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := tailscaleUserFromRootFS(c.rootFS)
+	user, err := namespaceFromRootFS(c.rootFS)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -132,7 +132,7 @@ func (c *controlServer) handleFrame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	frameStore := userFrameStore(user)
+	frameStore := namespaceFrameStore(user)
 	frame, err := frameStore.Get(uuid)
 	if err != nil {
 		if err == frames.ErrFrameNotFound {
@@ -193,14 +193,14 @@ func (c *controlServer) handleResolveFrame(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	user, err := tailscaleUserFromRootFS(c.rootFS)
+	user, err := namespaceFromRootFS(c.rootFS)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	frameStore := userFrameStore(user)
-	refStore := userRefStore(user)
+	frameStore := namespaceFrameStore(user)
+	refStore := namespaceRefStore(user)
 
 	// Try parsing as UUID first
 	if uuid, err := frameid.Parse(req.Spec); err == nil {
@@ -302,13 +302,13 @@ func (c *controlServer) handleCloneHistory(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	user, err := tailscaleUserFromRootFS(c.rootFS)
+	user, err := namespaceFromRootFS(c.rootFS)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	frameStore := userFrameStore(user)
+	frameStore := namespaceFrameStore(user)
 
 	sourceFrame, err := frameStore.Get(sourceUUID)
 	if err != nil {
@@ -380,13 +380,13 @@ func (c *controlServer) handlePruneHistory(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	user, err := tailscaleUserFromRootFS(c.rootFS)
+	user, err := namespaceFromRootFS(c.rootFS)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	frameStore := userFrameStore(user)
+	frameStore := namespaceFrameStore(user)
 
 	frame, err := frameStore.Get(uuid)
 	if err != nil {

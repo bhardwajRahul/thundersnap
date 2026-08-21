@@ -26,14 +26,14 @@ import (
 	"github.com/tailscale/thundersnap/vshdproto"
 )
 
-// resolveFrameRootFS maps an SSH frame name to a concrete frame for the given
-// tailscale user via that user's ref store, returning the frame's on-disk root
-// (<fs-dir>/<user>/<uuid>) and its UUID. The frame name is resolved as a ref:
+// resolveFrameRootFS maps a frame name to a concrete frame for the given
+// namespace, returning its on-disk root (<fs-dir>/<namespace>/<uuid>) and UUID.
+// The frame name is resolved as a ref:
 // the reserved "default" for a bare/empty login, a named ref otherwise, or a
 // fresh unattached frame for an unbound default. An unknown name is an error.
-// See resolveFrameForUser for the full resolution rules.
-func resolveFrameRootFS(tailscaleUser, frameName string) (rootFS string, uuid frameid.ID, err error) {
-	uuid, framePath, _, err := resolveFrameForUser(tailscaleUser, frameName)
+// See resolveFrameForNamespace for the full resolution rules.
+func resolveFrameRootFS(namespace, frameName string) (rootFS string, uuid frameid.ID, err error) {
+	uuid, framePath, _, err := resolveFrameForNamespace(namespace, frameName)
 	if err != nil {
 		return "", frameid.Nil, err
 	}
@@ -50,12 +50,12 @@ func resolveFrameRootFS(tailscaleUser, frameName string) (rootFS string, uuid fr
 // Only non-empty values are included, so a shell can test
 // [ -n "$THUNDERSNAP_HOST" ] to detect availability. THUNDERSNAP_FRAME is
 // always set (a frame UUID is always available for a resolved frame).
-func thundersnapSessionEnv(tailscaleUser string, uuid frameid.ID) []string {
+func thundersnapSessionEnv(namespace string, uuid frameid.ID) []string {
 	var env []string
 	if h := getTsnetHostname(); h != "" {
 		env = append(env, "THUNDERSNAP_HOST="+h)
 	}
-	env = append(env, "THUNDERSNAP_FRAME="+frameDescriptor(tailscaleUser, uuid))
+	env = append(env, "THUNDERSNAP_FRAME="+frameDescriptor(namespace, uuid))
 	return env
 }
 
@@ -68,10 +68,10 @@ func thundersnapSessionEnv(tailscaleUser string, uuid frameid.ID) []string {
 // VMX request header. vshd anchors the shared PID/mount/UTS namespaces for that
 // rootfs (containerns.Manager) and joins them via the in-binary `ts nsenter`,
 // so the enter-container-ns code is byte-identical to the in-VM vshd.
-func runContainerSession(s ssh.Session, tailscaleUser, frameName, targetUser string, logErr func(string, ...any)) error {
+func runContainerSession(s ssh.Session, namespace, frameName, targetUser string, logErr func(string, ...any)) error {
 	// Resolve the frame name to its canonical fs/<user>/<uuid> path via the
 	// user's ref store, then prepare its rootfs.
-	rootFS, uuid, err := resolveFrameRootFS(tailscaleUser, frameName)
+	rootFS, uuid, err := resolveFrameRootFS(namespace, frameName)
 	if err != nil {
 		return err
 	}
@@ -107,7 +107,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, frameName, targetUser str
 	defer conn.Close()
 
 	ptyReq, winCh, isPty := s.Pty()
-	writeVshdRequest(conn, framePathHdr, targetUser, isPty, sessionCommand(s), thundersnapSessionEnv(tailscaleUser, uuid))
+	writeVshdRequest(conn, framePathHdr, targetUser, isPty, sessionCommand(s), thundersnapSessionEnv(namespace, uuid))
 
 	return proxyVshdSession(s, conn, isPty, ptyReq, winCh, nil, nil)
 }
@@ -304,17 +304,17 @@ func prepareVMXRootFS(vmxRootFS string) error {
 }
 
 // runVMXSession handles a VMX session: a container running inside a shared VM.
-// Multiple frames can share the same outer VM (keyed by tailscaleUser/isolationName).
-func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targetUser string, logErr func(string, ...any)) error {
-	safeTailscaleUser := sanitizeForPath(tailscaleUser)
+// Multiple frames can share the same outer VM (keyed by namespace/isolationName).
+func runVMXSession(s ssh.Session, namespace, isolationName, frameName, targetUser string, logErr func(string, ...any)) error {
 	safeIsolationName := sanitizeForPath(isolationName)
 
-	// The user's fs directory (becomes virtiofs root)
-	userFsDir := filepath.Join(*flagFsDir, safeTailscaleUser)
+	// Policy loading validated namespace as one safe path component, so use
+	// it verbatim to preserve the canonical frame path.
+	namespaceFsDir := filepath.Join(*flagFsDir, namespace)
 
-	// Resolve the frame name to its canonical fs/<user>/<uuid> path via the
-	// user's ref store, then prepare the frame's rootfs (same as container mode).
-	frameRootFS, uuid, err := resolveFrameRootFS(tailscaleUser, frameName)
+	// Resolve the frame name to its canonical fs/<namespace>/<uuid> path via the
+	// namespace's ref store, then prepare the frame's rootfs (same as container mode).
+	frameRootFS, uuid, err := resolveFrameRootFS(namespace, frameName)
 	if err != nil {
 		return err
 	}
@@ -324,7 +324,7 @@ func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targe
 
 	// Prepare the outer VM's minimal rootfs
 	initPrefix := ".vmx-" + safeIsolationName
-	vmxRootFS := filepath.Join(userFsDir, initPrefix)
+	vmxRootFS := filepath.Join(namespaceFsDir, initPrefix)
 	if err := prepareVMXRootFS(vmxRootFS); err != nil {
 		return fmt.Errorf("prepare VMX rootfs: %w", err)
 	}
@@ -333,11 +333,11 @@ func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targe
 	controlMux := makeVMXControlHandler(frameRootFS)
 
 	// Get or create the shared VMX session
-	ms, err := vmxSessions.getOrCreateVMX(safeTailscaleUser, safeIsolationName, userFsDir, initPrefix, *flagVmDir, controlMux)
+	ms, err := vmxSessions.getOrCreateVMX(namespace, safeIsolationName, namespaceFsDir, initPrefix, *flagVmDir, controlMux)
 	if err != nil {
 		return fmt.Errorf("start VMX: %w", err)
 	}
-	defer vmxSessions.releaseVMX(safeTailscaleUser, safeIsolationName)
+	defer vmxSessions.releaseVMX(namespace, safeIsolationName)
 
 	// Connect to vshd in the VM
 	conn, err := connectToVshd(ms.vsockPath, ms.panicked)
@@ -347,10 +347,10 @@ func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targe
 	defer conn.Close()
 
 	// Send VMX protocol header: VMX\0framePath\0targetUser\0pty\0argCount\0args...
-	// framePath is the frame's UUID, relative to the virtiofs root (userFsDir,
-	// i.e. fs/<user>): the frame lives at fs/<user>/<uuid> on the host.
+	// framePath is the frame's UUID, relative to the virtiofs root (namespaceFsDir,
+	// i.e. fs/<namespace>): the frame lives at fs/<namespace>/<uuid> on the host.
 	ptyReq, winCh, isPty := s.Pty()
-	writeVshdRequest(conn, uuid.String(), targetUser, isPty, sessionCommand(s), thundersnapSessionEnv(tailscaleUser, uuid))
+	writeVshdRequest(conn, uuid.String(), targetUser, isPty, sessionCommand(s), thundersnapSessionEnv(namespace, uuid))
 
 	// Proxy SSH I/O over the vshdproto TLV stream.
 	return proxyVshdSession(s, conn, isPty, ptyReq, winCh, ms.done, ms.panicked)
@@ -358,16 +358,16 @@ func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targe
 
 // runVMXOuterShell handles a direct shell into the outer VMX VM (no container).
 // This is useful for debugging the VMX environment.
-func runVMXOuterShell(s ssh.Session, tailscaleUser, isolationName, targetUser string, logErr func(string, ...any)) error {
-	safeTailscaleUser := sanitizeForPath(tailscaleUser)
+func runVMXOuterShell(s ssh.Session, namespace, isolationName, targetUser string, logErr func(string, ...any)) error {
 	safeIsolationName := sanitizeForPath(isolationName)
 
-	// The user's fs directory (becomes virtiofs root)
-	userFsDir := filepath.Join(*flagFsDir, safeTailscaleUser)
+	// Policy loading validated namespace as one safe path component, so use
+	// it verbatim to preserve the canonical frame path.
+	namespaceFsDir := filepath.Join(*flagFsDir, namespace)
 
 	// Prepare the outer VM's minimal rootfs
 	initPrefix := ".vmx-" + safeIsolationName
-	vmxRootFS := filepath.Join(userFsDir, initPrefix)
+	vmxRootFS := filepath.Join(namespaceFsDir, initPrefix)
 	if err := prepareVMXRootFS(vmxRootFS); err != nil {
 		return fmt.Errorf("prepare VMX rootfs: %w", err)
 	}
@@ -376,11 +376,11 @@ func runVMXOuterShell(s ssh.Session, tailscaleUser, isolationName, targetUser st
 	controlMux := makeVMXControlHandler(vmxRootFS)
 
 	// Get or create the shared VMX session
-	ms, err := vmxSessions.getOrCreateVMX(safeTailscaleUser, safeIsolationName, userFsDir, initPrefix, *flagVmDir, controlMux)
+	ms, err := vmxSessions.getOrCreateVMX(namespace, safeIsolationName, namespaceFsDir, initPrefix, *flagVmDir, controlMux)
 	if err != nil {
 		return fmt.Errorf("start VMX: %w", err)
 	}
-	defer vmxSessions.releaseVMX(safeTailscaleUser, safeIsolationName)
+	defer vmxSessions.releaseVMX(namespace, safeIsolationName)
 
 	// Connect to vshd in the VM
 	conn, err := connectToVshd(ms.vsockPath, ms.panicked)

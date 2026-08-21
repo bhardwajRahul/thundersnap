@@ -42,7 +42,7 @@ func countRefs(fsDir string) int {
 		if !ue.IsDir() {
 			continue
 		}
-		names, err := userRefStore(ue.Name()).List()
+		names, err := namespaceRefStore(ue.Name()).List()
 		if err != nil {
 			continue
 		}

@@ -935,9 +935,11 @@ func newSSHServer(lc *tailscale.LocalClient) *ssh.Server {
 				}
 			}
 
-			// Resolve capability from policy (in test mode uses DefaultCap)
+			// Authentication/policy use the principal. Persistent frame/ref state
+			// uses the independently configured workspace namespace.
 			cap := ResolveCap(who, globalPolicy)
-			log.Printf("Resolved cap for %s: role=%s isolation=%s", tailscaleUser, cap.Role, cap.Isolation)
+			namespace := globalPolicy.NamespaceForPrincipal(tailscaleUser)
+			log.Printf("Resolved principal %s to namespace %s: role=%s isolation=%s", tailscaleUser, namespace, cap.Role, cap.Isolation)
 
 			// Helper to log error to both server log and client
 			logErr := func(format string, args ...any) {
@@ -949,6 +951,11 @@ func newSSHServer(lc *tailscale.LocalClient) *ssh.Server {
 			// Parse SSH username to extract target user and frame name.
 			// See parseSSHUser for format documentation.
 			parsedIsolation, vmxIsolation, targetUser, frameName := parseSSHUser(s.User())
+			// A bare SSH login arrives with the Tailscale principal as the SSH
+			// username. Treat it as the selected namespace's default frame.
+			if frameName == tailscaleUser {
+				frameName = namespace
+			}
 			if parsedIsolation != "container" {
 				cap.Isolation = parsedIsolation
 			}
@@ -959,7 +966,7 @@ func newSSHServer(lc *tailscale.LocalClient) *ssh.Server {
 			// ignored here and surfaced authoritatively by the session function
 			// below; the greeting just falls back to the requested target user.
 			runAsUser := targetUser
-			if rootFS, _, rerr := resolveFrameRootFS(tailscaleUser, frameName); rerr == nil {
+			if rootFS, _, rerr := resolveFrameRootFS(namespace, frameName); rerr == nil {
 				runAsUser = selectTargetUser(rootFS, targetUser)
 			}
 
@@ -979,14 +986,14 @@ func newSSHServer(lc *tailscale.LocalClient) *ssh.Server {
 				if frameName == "" {
 					// Direct shell into outer VM
 					greet("* Hello <%s>, connecting you to outer VM <%s>\r\n", tailscaleUser, vmxIsolation)
-					if err := runVMXOuterShell(s, tailscaleUser, vmxIsolation, targetUser, logErr); err != nil {
+					if err := runVMXOuterShell(s, namespace, vmxIsolation, targetUser, logErr); err != nil {
 						logErr("VMX outer shell failed: %v", err)
 						s.Exit(1)
 					}
 				} else {
 					// Container inside VM
 					greet("* Hello <%s>, connecting you to <%s> in <%s> (VMX/%s)\r\n", tailscaleUser, runAsUser, frameName, vmxIsolation)
-					if err := runVMXSession(s, tailscaleUser, vmxIsolation, frameName, targetUser, logErr); err != nil {
+					if err := runVMXSession(s, namespace, vmxIsolation, frameName, targetUser, logErr); err != nil {
 						logErr("VMX session failed: %v", err)
 						s.Exit(1)
 					}
@@ -999,7 +1006,7 @@ func newSSHServer(lc *tailscale.LocalClient) *ssh.Server {
 					suffix = " (no isolation)"
 				}
 				greet("* Hello <%s>, connecting you to <%s> in <%s>%s\r\n", tailscaleUser, runAsUser, frameName, suffix)
-				if err := runContainerSession(s, tailscaleUser, frameName, targetUser, logErr); err != nil {
+				if err := runContainerSession(s, namespace, frameName, targetUser, logErr); err != nil {
 					logErr("Container session failed: %v", err)
 					s.Exit(1)
 				}
@@ -1042,10 +1049,13 @@ func newSSHServer(lc *tailscale.LocalClient) *ssh.Server {
 					containerName = sshUser[idx+1:]
 				}
 
-				// Resolve the frame name to its canonical fs/<user>/<uuid> path
-				// via the user's ref store, then set up the root filesystem
-				// (same setup as container sessions).
-				rootFS, _, err := resolveFrameRootFS(tailscaleUser, containerName)
+				// Resolve the frame name in the principal's workspace namespace,
+				// then set up the root filesystem (same as container sessions).
+				namespace := globalPolicy.NamespaceForPrincipal(tailscaleUser)
+				if containerName == tailscaleUser {
+					containerName = namespace
+				}
+				rootFS, _, err := resolveFrameRootFS(namespace, containerName)
 				if err != nil {
 					log.Printf("SFTP session failed: %v", err)
 					return
@@ -1471,21 +1481,20 @@ func sanitizeForPath(s string) string {
 	return result
 }
 
-// tailscaleUserFromRootFS extracts the tailscale user from a frame's rootFS
-// path, which has the shape "<fsDir>/<tailscale-user>/<uuid>". The user is the
-// first path component relative to flagFsDir; an error is returned when the
-// relative path has fewer than two components (so the user can't be determined).
-func tailscaleUserFromRootFS(rootFS string) (string, error) {
+// namespaceFromRootFS extracts the namespace from a frame rootFS path of the
+// form <fsDir>/<namespace>/<uuid>. An error is returned when there are fewer
+// than two relative path components.
+func namespaceFromRootFS(rootFS string) (string, error) {
 	rootFSRel, _ := filepath.Rel(*flagFsDir, rootFS)
 	parts := strings.Split(rootFSRel, string(filepath.Separator))
 	if len(parts) < 2 {
-		return "", fmt.Errorf("cannot determine tailscale user from rootFS path")
+		return "", fmt.Errorf("cannot determine namespace from rootFS path")
 	}
 	return parts[0], nil
 }
 
 // frameUUIDFromRootFS extracts the frame UUID from a frame's rootFS path, which
-// has the shape "<fsDir>/<tailscale-user>/<uuid>". The UUID is the second path
+// has the shape "<fsDir>/<namespace>/<uuid>". The UUID is the second path
 // component relative to flagFsDir; an error is returned when the relative path
 // has fewer than two components or the UUID cannot be parsed.
 func frameUUIDFromRootFS(rootFS string) (frameid.ID, error) {
@@ -1877,7 +1886,7 @@ func enterSessionEnv(rootFS, uuidStr string) []string {
 	if err != nil {
 		return nil
 	}
-	user, err := tailscaleUserFromRootFS(rootFS)
+	user, err := namespaceFromRootFS(rootFS)
 	if err != nil {
 		return nil
 	}
@@ -2430,12 +2439,12 @@ func makeForkHandler(rootFS string) http.HandlerFunc {
 				jsonError(w, fmt.Sprintf("invalid ref name: %v", err), http.StatusBadRequest)
 				return
 			}
-			user, err := tailscaleUserFromRootFS(rootFS)
+			user, err := namespaceFromRootFS(rootFS)
 			if err != nil {
 				jsonError(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			if userRefStore(user).Exists(req.RefName) {
+			if namespaceRefStore(user).Exists(req.RefName) {
 				jsonError(w, fmt.Sprintf("ref %q already exists", req.RefName), http.StatusConflict)
 				return
 			}
@@ -2450,12 +2459,12 @@ func makeForkHandler(rootFS string) http.HandlerFunc {
 			return
 		}
 		if req.RefName != "" {
-			user, err := tailscaleUserFromRootFS(rootFS)
+			user, err := namespaceFromRootFS(rootFS)
 			if err != nil {
 				jsonError(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			if err := userRefStore(user).Create(req.RefName, uuid); err != nil {
+			if err := namespaceRefStore(user).Create(req.RefName, uuid); err != nil {
 				log.Printf("failed to create ref %s for forked frame %s: %v", req.RefName, uuid, err)
 				jsonError(w, fmt.Sprintf("create ref: %v", err), http.StatusInternalServerError)
 				return
@@ -2748,7 +2757,7 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 	}
 
 	// Extract tailscale user from rootFS path: fs/<tailscale-user>/<uuid>
-	user, err := tailscaleUserFromRootFS(c.rootFS)
+	user, err := namespaceFromRootFS(c.rootFS)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, DeleteFrameResponse{
 			Status:  "error",
@@ -2757,8 +2766,8 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	refStore := userRefStore(user)
-	frameStore := userFrameStore(user)
+	refStore := namespaceRefStore(user)
+	frameStore := namespaceFrameStore(user)
 
 	// Resolve the target frame to a UUID. `ts frame --delete <uuid>` addresses
 	// the frame directly; a FrameName is a ref resolved through the user's ref
@@ -2809,7 +2818,7 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		frameID = ref.UUID
 		refNames = []string{req.FrameName}
 	}
-	framePath := framePathForUserUUID(user, frameID)
+	framePath := framePathForNamespaceUUID(user, frameID)
 
 	// Prevent deleting the current frame.
 	if framePath == c.rootFS {
@@ -2979,7 +2988,7 @@ func (c *controlServer) handleListFrames(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	user, err := tailscaleUserFromRootFS(c.rootFS)
+	user, err := namespaceFromRootFS(c.rootFS)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, ListFramesResponse{
 			Status: "error",
@@ -2988,8 +2997,8 @@ func (c *controlServer) handleListFrames(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	frameStore := userFrameStore(user)
-	refStore := userRefStore(user)
+	frameStore := namespaceFrameStore(user)
+	refStore := namespaceRefStore(user)
 
 	uuids, err := frameStore.List()
 	if err != nil {
@@ -3018,7 +3027,7 @@ func (c *controlServer) handleListFrames(w http.ResponseWriter, r *http.Request)
 	var frameInfos []FrameInfo
 	for _, uuid := range uuids {
 		// Determine status based on active control servers.
-		sessionCount := getActiveFrameCount(framePathForUserUUID(user, uuid))
+		sessionCount := getActiveFrameCount(framePathForNamespaceUUID(user, uuid))
 		status := "stopped"
 		if sessionCount > 0 {
 			status = fmt.Sprintf("%d", sessionCount)
@@ -3159,7 +3168,7 @@ func (c *controlServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 // handleCreateWithUUID handles frame creation using the UUID-based API.
 // Frames are created at fs/<user>/<uuid>/ and optionally a ref is bound.
 func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, req CreateRequest, stream, isTTY bool) {
-	user, err := tailscaleUserFromRootFS(c.rootFS)
+	user, err := namespaceFromRootFS(c.rootFS)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, CreateResponse{
 			Status:  "error",
@@ -3209,8 +3218,8 @@ func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, req CreateRe
 		}
 	}
 
-	frameStore := userFrameStore(user)
-	refStore := userRefStore(user)
+	frameStore := namespaceFrameStore(user)
+	refStore := namespaceRefStore(user)
 
 	// If a ref name is provided, validate it and check it doesn't already exist
 	if req.RefName != "" {
@@ -3235,7 +3244,7 @@ func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, req CreateRe
 	}
 
 	// Build the per-user frame path using UUID.
-	framePath := framePathForUserUUID(user, uuid)
+	framePath := framePathForNamespaceUUID(user, uuid)
 
 	frameMeta := &frames.Frame{
 		Rootfs:    rootfsSpec,
@@ -3304,10 +3313,10 @@ func parseSourceFrames(user string, req CreateRequest) ([3]string, error) {
 			continue
 		}
 		id, err := frameid.Parse(value)
-		if err != nil || !userFrameStore(user).Exists(id) {
+		if err != nil || !namespaceFrameStore(user).Exists(id) {
 			return out, fmt.Errorf("source frame %q not found", value)
 		}
-		out[i] = framePathForUserUUID(user, id)
+		out[i] = framePathForNamespaceUUID(user, id)
 	}
 	return out, nil
 }

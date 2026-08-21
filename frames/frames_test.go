@@ -12,10 +12,10 @@ import (
 	"github.com/tailscale/thundersnap/frameid"
 )
 
-func TestUserStoreIsolation(t *testing.T) {
+func TestNamespaceStoreIsolation(t *testing.T) {
 	dir := t.TempDir()
-	alice := NewUserStore(dir, "alice")
-	bob := NewUserStore(dir, "bob")
+	alice := NewNamespaceStore(dir, "alice")
+	bob := NewNamespaceStore(dir, "bob")
 
 	aliceUUID := frameid.MustNew()
 	bobUUID := frameid.MustNew()
@@ -27,7 +27,7 @@ func TestUserStoreIsolation(t *testing.T) {
 		t.Fatalf("bob create: %v", err)
 	}
 
-	// Metadata lands under the per-user fs/<user> dir, and Path resolves there.
+	// Metadata lands under the namespace's fs directory, and Path resolves there.
 	wantPath := filepath.Join(dir, "fs", "alice", aliceUUID.String())
 	if alice.Path(aliceUUID) != wantPath {
 		t.Errorf("alice Path = %s, want %s", alice.Path(aliceUUID), wantPath)
@@ -36,7 +36,7 @@ func TestUserStoreIsolation(t *testing.T) {
 		t.Errorf("alice metadata not at fs/alice/<uuid>.jsonc: %v", err)
 	}
 
-	// A user only sees their own frames.
+	// A store only sees frames in its namespace.
 	if !alice.Exists(aliceUUID) || alice.Exists(bobUUID) {
 		t.Errorf("alice sees aliceUUID=%v bobUUID=%v, want true/false", alice.Exists(aliceUUID), alice.Exists(bobUUID))
 	}

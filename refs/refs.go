@@ -15,13 +15,12 @@
 //	  refs/<refname>.jsonc   # ref config, autorun, reflog
 //	  id/<refname>/          # private state per ref (keys, tsnet, etc.)
 //
-// Per-user structure (a Store created with NewUserStore(stateDir, user)): refs
-// and identity state are namespaced under the owning user so a user only ever
-// sees their own refs:
+// Namespaced structure (a Store created with NewNamespaceStore): refs and
+// identity state are grouped by workspace namespace:
 //
 //	<state-dir>/
-//	  refs/<user>/<refname>.jsonc
-//	  id/<user>/<refname>/
+//	  refs/<namespace>/<refname>.jsonc
+//	  id/<namespace>/<refname>/
 package refs
 
 import (
@@ -80,13 +79,12 @@ type Ref struct {
 	Reflog []ReflogEntry `json:"reflog,omitempty"`
 }
 
-// Store manages refs in a state directory. When user is non-empty, refs and
-// identity state are namespaced under that user (refs/<user>/, id/<user>/) so a
-// user only ever sees their own refs; when user is empty the flat legacy layout
-// (refs/, id/) is used.
+// Store manages refs in a state directory. When namespace is non-empty, refs
+// and identity state live under refs/<namespace>/ and id/<namespace>/; an empty
+// namespace selects the flat legacy layout.
 type Store struct {
-	stateDir string
-	user     string
+	stateDir  string
+	namespace string
 }
 
 // NewStore creates a new ref store rooted at stateDir using the flat layout.
@@ -94,16 +92,16 @@ func NewStore(stateDir string) *Store {
 	return &Store{stateDir: stateDir}
 }
 
-// NewUserStore creates a ref store namespaced under user (refs/<user>/,
-// id/<user>/). A user only ever sees their own refs.
-func NewUserStore(stateDir, user string) *Store {
-	return &Store{stateDir: stateDir, user: user}
+// NewNamespaceStore creates a ref store under refs/<namespace>/ and
+// id/<namespace>/.
+func NewNamespaceStore(stateDir, namespace string) *Store {
+	return &Store{stateDir: stateDir, namespace: namespace}
 }
 
 // refsDir returns the path to the refs directory.
 func (s *Store) refsDir() string {
-	if s.user != "" {
-		return filepath.Join(s.stateDir, "refs", s.user)
+	if s.namespace != "" {
+		return filepath.Join(s.stateDir, "refs", s.namespace)
 	}
 	return filepath.Join(s.stateDir, "refs")
 }
@@ -115,8 +113,8 @@ func (s *Store) refPath(name string) string {
 
 // idDir returns the path to a ref's private identity directory.
 func (s *Store) idDir(name string) string {
-	if s.user != "" {
-		return filepath.Join(s.stateDir, "id", s.user, name)
+	if s.namespace != "" {
+		return filepath.Join(s.stateDir, "id", s.namespace, name)
 	}
 	return filepath.Join(s.stateDir, "id", name)
 }

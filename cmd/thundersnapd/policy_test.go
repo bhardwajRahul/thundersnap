@@ -4,6 +4,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -186,6 +187,9 @@ func TestLoadPolicyFile(t *testing.T) {
 
 	content := `{
   // This is a comment
+  "namespaces": {
+    "alice@example.com": "alice@example.com",
+  },
   "grants": [
     {
       "src": ["autogroup:member"],
@@ -213,6 +217,12 @@ func TestLoadPolicyFile(t *testing.T) {
 	if len(policy.Grants) != 1 {
 		t.Errorf("len(Grants) = %d, want 1", len(policy.Grants))
 	}
+	if got := policy.NamespaceForPrincipal("alice@example.com"); got != "alice@example.com" {
+		t.Errorf("alice namespace = %q, want alice@example.com", got)
+	}
+	if got := policy.NamespaceForPrincipal("bob@example.com"); got != defaultNamespace {
+		t.Errorf("unmapped namespace = %q, want %q", got, defaultNamespace)
+	}
 
 	cap := policy.MatchGrant("alice@example.com", nil)
 	if cap == nil {
@@ -220,6 +230,43 @@ func TestLoadPolicyFile(t *testing.T) {
 	}
 	if cap.Role != "developer" {
 		t.Errorf("Role = %q, want developer", cap.Role)
+	}
+}
+
+func TestNamespaceForPrincipal(t *testing.T) {
+	policy := &PolicyFile{Namespaces: map[string]string{
+		"alice@example.com": "alice",
+		"old@example.com":   "old@example.com",
+	}}
+	for _, tt := range []struct {
+		principal, want string
+	}{
+		{"alice@example.com", "alice"},
+		{"old@example.com", "old@example.com"},
+		{"bob@example.com", "shared"},
+		{"unknown", "shared"},
+	} {
+		if got := policy.NamespaceForPrincipal(tt.principal); got != tt.want {
+			t.Errorf("NamespaceForPrincipal(%q) = %q, want %q", tt.principal, got, tt.want)
+		}
+	}
+	if got := (*PolicyFile)(nil).NamespaceForPrincipal("anyone"); got != "shared" {
+		t.Errorf("nil policy namespace = %q, want shared", got)
+	}
+}
+
+func TestLoadPolicyFileRejectsInvalidNamespace(t *testing.T) {
+	for _, namespace := range []string{"", ".", "..", "../bob", `alice\\bob`} {
+		t.Run(namespace, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "policy.jsonc")
+			content := `{"namespaces":{"alice":` + fmt.Sprintf("%q", namespace) + `}}`
+			if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadPolicyFile(path); err == nil {
+				t.Fatalf("LoadPolicyFile accepted invalid namespace %q", namespace)
+			}
+		})
 	}
 }
 

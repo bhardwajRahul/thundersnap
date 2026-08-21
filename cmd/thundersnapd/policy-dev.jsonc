@@ -3,6 +3,8 @@
   // This is a copy of policy.jsonc — edit as needed for testing.
   // The dev daemon uses this instead of /etc/thundersnap/policy.jsonc so
   // policy changes for testing don't affect the main daemon.
+  // Unlisted principals use the shared workspace namespace.
+  "namespaces": {},
   "grants": [
     {
       "src": ["autogroup:member"],

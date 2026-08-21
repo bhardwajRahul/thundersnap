@@ -135,6 +135,10 @@ Status legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked
   SCAFFOLD: `resolveMCPUser` + `mcpAuthMiddleware` + `mcpUserKey` context
   plumbing in place. Test mode returns `testModeUser`. Production `peerIsTrustedAperture`/`peerWhoIsLogin` are TODO stubs (return false/"unknown") —
   wire to tsnet LocalClient when the production HTTP listener is hardened.
+  The temporary `unknown` principal currently maps through policy like every
+  other principal and therefore uses the default `shared` workspace namespace;
+  this makes MCP see the default frames without pretending the identity bug is
+  fixed.
   T8 e2e covers the test-mode path now; production identity is future.
 - [ ] **`--mcp-register-url` flag (opt-in auto-register).** When set, run a
   `maintainRegistration` goroutine (copy the ~40-line loop from

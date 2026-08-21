@@ -7,6 +7,12 @@
   // - dst: where the connection goes (required for Tailscale compat, ignored locally)
   // - app: capabilities granted for the connection
   //
+  // Workspace namespaces are independent of authentication and grants.
+  // Unlisted principals use the "shared" namespace. To retain an old
+  // per-user directory, map its principal to that directory name, for example:
+  // "namespaces": { "alice@example.com": "alice@example.com" },
+  "namespaces": {},
+
   // For more information, see:
   // https://tailscale.com/kb/1337/acl-syntax#grants
   "grants": [

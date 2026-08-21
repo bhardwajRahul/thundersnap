@@ -664,7 +664,7 @@ func (q *snapQueue) finishJob(job *snapJob, ok bool) {
 func forkFrame(rootFS string) (frameid.ID, error) {
 	q := globalSnapQueue
 
-	user, err := tailscaleUserFromRootFS(rootFS)
+	user, err := namespaceFromRootFS(rootFS)
 	if err != nil {
 		return frameid.Nil, fmt.Errorf("fork: %w", err)
 	}
@@ -675,7 +675,7 @@ func forkFrame(rootFS string) (frameid.ID, error) {
 	if err != nil {
 		return frameid.Nil, fmt.Errorf("generate frame UUID: %w", err)
 	}
-	framePath := framePathForUserUUID(user, uuid)
+	framePath := framePathForNamespaceUUID(user, uuid)
 
 	// Build the new frame's sidecar from the source frame's metadata (same
 	// base snaps, taints, isolation). History is cloned too. The new frame's

@@ -126,7 +126,7 @@ func (id *innerDaemon) Close() {
 func setupInnerDaemon(t *testing.T, d *daemonInstance, env *testEnv, outerRef, outerUUID string) *innerDaemon {
 	t.Helper()
 
-	framePath := filepath.Join(env.root, "fs", testUser, outerUUID)
+	framePath := filepath.Join(env.root, "fs", "shared", outerUUID)
 
 	// --- 1. Copy binaries into the frame rootfs ---
 

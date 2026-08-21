@@ -21,7 +21,7 @@ import (
 
 // newTestControlServer wires up a controlServer whose rootFS encodes the given
 // tailscale user under flagFsDir, so the per-user store handlers (which derive
-// the user via tailscaleUserFromRootFS) resolve to <dataDir>/refs/<user>. It
+// the user via namespaceFromRootFS) resolve to <dataDir>/refs/<user>. It
 // returns the server plus a ref store scoped to that user for verification.
 func newTestControlServer(t *testing.T, user string) (*controlServer, *refs.Store) {
 	t.Helper()
@@ -33,7 +33,7 @@ func newTestControlServer(t *testing.T, user string) (*controlServer, *refs.Stor
 	flagFsDir = &fsDir
 	t.Cleanup(func() { flagFsDir = old })
 	cs := &controlServer{rootFS: filepath.Join(fsDir, user, frameid.MustNew().String())}
-	return cs, userRefStore(user)
+	return cs, namespaceRefStore(user)
 }
 
 func TestRefHandlers(t *testing.T) {
@@ -230,7 +230,7 @@ func TestRefDeleteForceScrubsFrameIdentity(t *testing.T) {
 
 	uuid := frameid.MustNew()
 	cs := &controlServer{rootFS: filepath.Join(fsDir, user, uuid.String())}
-	refStore := userRefStore(user)
+	refStore := namespaceRefStore(user)
 	if err := refStore.Create("secret-ref", uuid); err != nil {
 		t.Fatalf("create ref: %v", err)
 	}
@@ -342,7 +342,7 @@ func TestRefHandlersValidation(t *testing.T) {
 }
 
 // TestResolveFrameForUser drives the real production resolver
-// (resolveFrameForUser) against a real per-user ref store. It pins the
+// (resolveFrameForNamespace) against a real per-user ref store. It pins the
 // resolution branches the canonical fs/<user>/<uuid> layout depends on:
 //   - a named ref resolves to its bound UUID and the fs/<user>/<uuid> path,
 //   - a raw UUID for an existing frame resolves directly (no ref needed),
@@ -363,7 +363,7 @@ func TestResolveFrameForUser(t *testing.T) {
 	flagFsDir = &fsDir
 	t.Cleanup(func() { flagFsDir = old })
 
-	store := userRefStore(user)
+	store := namespaceRefStore(user)
 	debUUID := frameid.MustNew()
 	if err := store.Create("deb", debUUID); err != nil {
 		t.Fatalf("create deb ref: %v", err)
@@ -375,7 +375,7 @@ func TestResolveFrameForUser(t *testing.T) {
 
 	// A named ref resolves to its UUID and the fs/<user>/<uuid> path.
 	t.Run("named", func(t *testing.T) {
-		uuid, path, attached, err := resolveFrameForUser(user, "deb")
+		uuid, path, attached, err := resolveFrameForNamespace(user, "deb")
 		if err != nil {
 			t.Fatalf("resolve deb: %v", err)
 		}
@@ -393,7 +393,7 @@ func TestResolveFrameForUser(t *testing.T) {
 	// Empty name and the bare-login username both resolve the default ref.
 	for _, name := range []string{"", user} {
 		t.Run("default_"+name, func(t *testing.T) {
-			uuid, path, attached, err := resolveFrameForUser(user, name)
+			uuid, path, attached, err := resolveFrameForNamespace(user, name)
 			if err != nil {
 				t.Fatalf("resolve %q: %v", name, err)
 			}
@@ -413,11 +413,11 @@ func TestResolveFrameForUser(t *testing.T) {
 	// Create a frame with no ref binding and verify it can be resolved by UUID.
 	t.Run("raw_uuid", func(t *testing.T) {
 		rawUUID := frameid.MustNew()
-		frameStore := userFrameStore(user)
+		frameStore := namespaceFrameStore(user)
 		if err := frameStore.Create(rawUUID, &frames.Frame{}); err != nil {
 			t.Fatalf("create frame: %v", err)
 		}
-		uuid, path, attached, err := resolveFrameForUser(user, rawUUID.String())
+		uuid, path, attached, err := resolveFrameForNamespace(user, rawUUID.String())
 		if err != nil {
 			t.Fatalf("resolve raw uuid: %v", err)
 		}
@@ -436,7 +436,7 @@ func TestResolveFrameForUser(t *testing.T) {
 	// A UUID that doesn't exist as a frame is an error (not a ref fallback).
 	t.Run("uuid_not_found", func(t *testing.T) {
 		nonExistentUUID := frameid.MustNew()
-		_, _, _, err := resolveFrameForUser(user, nonExistentUUID.String())
+		_, _, _, err := resolveFrameForNamespace(user, nonExistentUUID.String())
 		if err == nil {
 			t.Error("resolve non-existent UUID should error")
 		}
@@ -444,7 +444,7 @@ func TestResolveFrameForUser(t *testing.T) {
 
 	// An unknown name is a hard error: no implicit frame creation.
 	t.Run("unknown", func(t *testing.T) {
-		if _, _, _, err := resolveFrameForUser(user, "nope"); err == nil {
+		if _, _, _, err := resolveFrameForNamespace(user, "nope"); err == nil {
 			t.Error("resolve unknown name should error")
 		}
 	})
@@ -454,13 +454,13 @@ func TestResolveFrameForUser(t *testing.T) {
 	// minting a fresh UUID each time.
 	t.Run("default_unbound_sole_frame_reuse", func(t *testing.T) {
 		const u = "carol"
-		frameStore := userFrameStore(u)
+		frameStore := namespaceFrameStore(u)
 		rawUUID := frameid.MustNew()
 		if err := frameStore.Create(rawUUID, &frames.Frame{}); err != nil {
 			t.Fatalf("create carol sole frame: %v", err)
 		}
 		// First resolution lands on the existing frame.
-		uuid1, path1, attached1, err := resolveFrameForUser(u, "")
+		uuid1, path1, attached1, err := resolveFrameForNamespace(u, "")
 		if err != nil {
 			t.Fatalf("first resolve: %v", err)
 		}
@@ -471,7 +471,7 @@ func TestResolveFrameForUser(t *testing.T) {
 			t.Error("attached = true, want false for unbound default")
 		}
 		// A second resolution is stable: same frame, not a fresh UUID.
-		uuid2, _, _, err := resolveFrameForUser(u, "")
+		uuid2, _, _, err := resolveFrameForNamespace(u, "")
 		if err != nil {
 			t.Fatalf("second resolve: %v", err)
 		}
@@ -483,23 +483,23 @@ func TestResolveFrameForUser(t *testing.T) {
 		}
 	})
 
-	// Refs are per-user: bob has no "deb", so it must error, and bob's
-	// unbound default (with no frames at all) yields a fresh, unattached frame.
-	t.Run("per_user_isolation", func(t *testing.T) {
-		if _, _, _, err := resolveFrameForUser("bob", "deb"); err == nil {
-			t.Error("bob resolving alice's ref should error")
+	// Distinct namespaces remain isolated. Principal-to-namespace mapping is
+	// tested in policy_test; the resolver receives only the selected namespace.
+	t.Run("namespace_isolation", func(t *testing.T) {
+		if _, _, _, err := resolveFrameForNamespace("private", "deb"); err == nil {
+			t.Error("private namespace resolving alice's ref should error")
 		}
-		uuid, path, attached, err := resolveFrameForUser("bob", "")
+		uuid, path, attached, err := resolveFrameForNamespace("private", "")
 		if err != nil {
-			t.Fatalf("resolve bob default: %v", err)
+			t.Fatalf("resolve private default: %v", err)
 		}
 		if attached {
-			t.Error("bob's unbound default should be unattached")
+			t.Error("private namespace's unbound default should be unattached")
 		}
 		if uuid == frameid.Nil {
 			t.Error("unattached default should still mint a fresh uuid")
 		}
-		if want := filepath.Join(fsDir, "bob", uuid.String()); path != want {
+		if want := filepath.Join(fsDir, "private", uuid.String()); path != want {
 			t.Errorf("path = %q, want %q", path, want)
 		}
 	})
@@ -520,7 +520,7 @@ func TestHandleReflogDefaultsToUniqueRef(t *testing.T) {
 
 	uuid := frameid.MustNew()
 	cs := &controlServer{rootFS: filepath.Join(fsDir, user, uuid.String())}
-	refStore := userRefStore(user)
+	refStore := namespaceRefStore(user)
 
 	// Create a single ref pointing to this frame
 	if err := refStore.Create("myref", uuid); err != nil {
