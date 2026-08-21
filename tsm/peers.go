@@ -26,7 +26,12 @@ type PeerResult struct {
 
 // CheckPeersForSnapshot queries multiple peers in parallel to find which ones
 // have a given snapshot (by checking if the .tsm file exists).
-func CheckPeersForSnapshot(peers []PeerInfo, snapshotID string) []PeerResult {
+//
+// httpClient is used for the peer HEAD requests; pass a tsnet-dialing client
+// (so *.ts.net peer URLs are reachable over the tailnet). If nil, a short-
+// timeout http.DefaultClient is used, which only works when peer URLs are
+// reachable from the host network (e.g. loopback in tests).
+func CheckPeersForSnapshot(peers []PeerInfo, snapshotID string, httpClient *http.Client) []PeerResult {
 	results := make([]PeerResult, len(peers))
 	var wg sync.WaitGroup
 
@@ -38,7 +43,7 @@ func CheckPeersForSnapshot(peers []PeerInfo, snapshotID string) []PeerResult {
 			baseURL := strings.TrimSuffix(p.URL, "/")
 			tsmURL := baseURL + "/bupdate/" + snapshotID + ".tsm"
 
-			exists, err := checkURLExists(tsmURL)
+			exists, err := checkURLExists(httpClient, tsmURL)
 
 			results[idx] = PeerResult{
 				PeerURL:  baseURL,
@@ -54,12 +59,17 @@ func CheckPeersForSnapshot(peers []PeerInfo, snapshotID string) []PeerResult {
 }
 
 // checkURLExists does a HEAD request to check if a URL exists.
-func checkURLExists(url string) (bool, error) {
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+// httpClient may be nil, in which case a short-timeout client is used; pass a
+// tsnet-dialing client so the request reaches the peer over the tailnet.
+func checkURLExists(httpClient *http.Client, url string) (bool, error) {
+	client := httpClient
+	if client == nil {
+		client = &http.Client{
+			Timeout: 5 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	}
 
 	resp, err := client.Head(url)

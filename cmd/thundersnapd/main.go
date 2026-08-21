@@ -727,6 +727,21 @@ func main() {
 
 	meshState := newMeshState(myFQDN)
 	globalMeshState = meshState // Set global for control socket access
+	// Wire the tsnet-dialing HTTP client into the mesh state so that mesh
+	// lookups (who-has, download-snap) reach peers over the tailnet, not the
+	// host stack. The host stack cannot resolve/route *.ts.net addresses
+	// when tsnet runs in userspace mode, so a plain http.DefaultClient would
+	// silently fail (connection refused -> treated as "peer doesn't have
+	// the snap"). The ping loop and all mesh fetch paths share this one
+	// client. See meshState.meshHTTPClient.
+	meshState.httpClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return srv.Dial(ctx, network, addr)
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
 	httpMux := http.NewServeMux()
 
 	// Mesh discovery endpoint
@@ -3677,8 +3692,10 @@ func handleWhoHas(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Check all peers for the snapshot
-	results := tsm.CheckPeersForSnapshot(peers, req.SnapshotID)
+	// Check all peers for the snapshot. Use the mesh's tsnet-dialing HTTP
+	// client so peer URLs in the *.ts.net domain are reachable over the
+	// tailnet, not the host stack (which cannot route userspace tsnet).
+	results := tsm.CheckPeersForSnapshot(peers, req.SnapshotID, globalMeshState.meshHTTPClient())
 
 	// Filter to peers that have the snapshot
 	var peersWithSnap []WhoHasPeerInfo
@@ -3842,8 +3859,10 @@ func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*t
 		}
 	}
 
-	// Find a peer with the snapshot
-	results := tsm.CheckPeersForSnapshot(peers, snapshotID)
+	// Find a peer with the snapshot. Use the mesh's tsnet-dialing HTTP client
+	// so peer URLs in the *.ts.net domain are reachable over the tailnet.
+	meshClient := globalMeshState.meshHTTPClient()
+	results := tsm.CheckPeersForSnapshot(peers, snapshotID, meshClient)
 	var peersWithSnap []tsm.PeerResult
 	for _, r := range results {
 		if r.HasSnap {
@@ -3869,6 +3888,10 @@ func doDownloadSnap(snapshotID string, progressWriter io.Writer, isTTY bool) (*t
 		SnapsDir:       *flagSnapsDir,
 		BaseURL:        baseURL,
 		ProgressWriter: progressWriter,
+
+		// Use the same tsnet-dialing HTTP client so chunk/stamp/tsm/tsc
+		// fetches reach the peer over the tailnet, not the host stack.
+		HTTPClient: meshClient,
 
 		// Create the target directory as a btrfs subvolume.
 		CreateTargetDir: func(path, parentStamp string) error {
@@ -4210,6 +4233,16 @@ type meshState struct {
 	myURL  string
 	myFQDN string
 	peers  map[string]*meshPeer // keyed by hostname
+
+	// httpClient dials through tsnet (srv.Dial) so that peer URLs in the
+	// *.ts.net domain are reachable. It is nil in test mode (no tsnet), where
+	// peer URLs are loopback and http.DefaultClient works. Callers that talk
+	// to mesh peers (who-has, download-snap) MUST use this client, not a plain
+	// http.Client/DefaultClient: the host network stack cannot resolve or
+	// route tsnet's userspace .ts.net addresses, so lookups would silently
+	// fail with connection refused (and checkURLExists treats that as "peer
+	// doesn't have the snap", making who-has return empty with no error).
+	httpClient *http.Client
 }
 
 func newMeshState(myFQDN string) *meshState {
@@ -4222,6 +4255,17 @@ func newMeshState(myFQDN string) *meshState {
 		myFQDN: myFQDN,
 		peers:  make(map[string]*meshPeer),
 	}
+}
+
+// meshHTTPClient returns the mesh-state's tsnet-dialing HTTP client for use
+// by mesh operations that must reach peers over the tailnet. It falls back to
+// http.DefaultClient when the mesh has no tsnet transport (test mode), where
+// peer URLs are loopback addresses the host stack can reach directly.
+func (m *meshState) meshHTTPClient() *http.Client {
+	if m != nil && m.httpClient != nil {
+		return m.httpClient
+	}
+	return http.DefaultClient
 }
 
 // recordPeer records or updates a peer that has been seen
@@ -4368,15 +4412,10 @@ func (m *meshState) pingLoop(ctx context.Context, srv *tsnet.Server, lc *tailsca
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	// Create an HTTP client that uses tsnet for dialing (not the host's network)
-	tsClient := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return srv.Dial(ctx, network, addr)
-			},
-		},
-		Timeout: 10 * time.Second,
-	}
+	// Use the mesh state's tsnet-dialing HTTP client, which is shared with the
+	// who-has/download-snap fetch paths so discovery and lookup use the same
+	// transport (and can both reach *.ts.net over the tailnet).
+	tsClient := m.meshHTTPClient()
 
 	// Run immediately, then on ticker
 	m.pingAllPeers(ctx, lc, tsClient)
