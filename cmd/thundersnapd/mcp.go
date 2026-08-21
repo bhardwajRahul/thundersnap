@@ -27,13 +27,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -41,6 +41,7 @@ import (
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/mcpexec"
 	"github.com/tailscale/thundersnap/tsm"
+	"golang.org/x/sys/unix"
 )
 
 // --- Globals set by main() from flags (production-only; empty in test mode) --
@@ -275,6 +276,75 @@ func isWithinRootFS(path, rootFS string) bool {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// openParentUnderRoot walks the parent directories of rel starting from a dir
+// fd opened on rootFS, creating any missing parent with mkdirat when
+// createMissingDirs is true. Every component is opened with O_NOFOLLOW, so a
+// symlink planted at any ancestor by the (unprivileged) frame user cannot
+// redirect the host-root daemon's write outside the frame rootfs: the kernel
+// returns ELOOP instead of following the link. Newly created parent
+// directories are fchown'd to (chownUID, chownGID) when chownNewDirs is true so
+// they end up owned by the frame user, matching a user-run `mkdir -p`.
+//
+// It returns a dir fd for the parent of the final component (caller closes it)
+// and the final component name. rel must already be cleaned/contained by the
+// caller (isWithinRootFS).
+func openParentUnderRoot(rootFS, rel string, createMissingDirs, chownNewDirs bool, chownUID, chownGID int) (parentFd int, name string, err error) {
+	parentFd = -1
+	comps := strings.Split(rel, string(filepath.Separator))
+	// Drop empty components (leading slash from the Clean("/"+path) prefix,
+	// or a trailing slash). A fully empty rel means the target is rootFS
+	// itself, which is not a writable file.
+	filtered := comps[:0]
+	for _, c := range comps {
+		if c != "" {
+			filtered = append(filtered, c)
+		}
+	}
+	if len(filtered) == 0 {
+		return -1, "", fmt.Errorf("path is empty")
+	}
+	name = filtered[len(filtered)-1]
+	parents := filtered[:len(filtered)-1]
+
+	cur, err := unix.Open(rootFS, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, "", fmt.Errorf("open frame rootfs: %w", err)
+	}
+	for _, c := range parents {
+		fd, oerr := unix.Openat(cur, c, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if oerr != nil {
+			switch {
+			case errors.Is(oerr, unix.ENOENT) && createMissingDirs:
+				if mkerr := unix.Mkdirat(cur, c, 0o755); mkerr != nil {
+					unix.Close(cur)
+					return -1, "", fmt.Errorf("mkdir %s: %w", c, mkerr)
+				}
+				fd, oerr = unix.Openat(cur, c, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+				if oerr != nil {
+					unix.Close(cur)
+					return -1, "", fmt.Errorf("open created dir %s: %w", c, oerr)
+				}
+				if chownNewDirs {
+					if cerr := unix.Fchown(fd, chownUID, chownGID); cerr != nil {
+						unix.Close(fd)
+						unix.Close(cur)
+						return -1, "", fmt.Errorf("chown created dir %s: %w", c, cerr)
+					}
+				}
+			case errors.Is(oerr, unix.ELOOP):
+				unix.Close(cur)
+				return -1, "", fmt.Errorf("refusing to traverse symlink %q in path", c)
+			default:
+				unix.Close(cur)
+				return -1, "", oerr
+			}
+		}
+		unix.Close(cur)
+		cur = fd
+	}
+	return cur, name, nil
 }
 
 // --- Command builders (ported from aperture chat/sandbox) -------------------
@@ -608,102 +678,60 @@ func mcpCreateFileToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 		return textResult(fmt.Sprintf("path %q escapes the frame", params.Path), true)
 	}
 
-	// Refuse to clobber a symlink (the exec builder did the same). A symlink
-	// at the target would let a tool write outside the frame via a link.
-	if info, err := os.Lstat(hostPath); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			return textResult(fmt.Sprintf("Error: refusing to overwrite symlink %s", params.Path), true)
-		}
-		if info.IsDir() {
-			return textResult(fmt.Sprintf("Error: %s is a directory", params.Path), true)
-		}
-	}
-
-	// Create parent directories as needed. Chown only the directories we
-	// actually create (not pre-existing ancestors) so user-owned files land in
-	// a tree owned by the frame user, matching what `mkdir -p` run as that user
-	// would produce. Walk downward from the first missing ancestor.
 	uid, gid := 0, 0
 	if params.User == "user" {
 		uid, gid = tsm.ThundersnapUID, tsm.ThundersnapGID
 	}
-	parent := filepath.Dir(hostPath)
-	if err := os.MkdirAll(parent, 0o755); err != nil {
+
+	// Walk the parent directories from a dir fd on rootFS, creating any
+	// missing ancestor with mkdirat and refusing to traverse a symlink at any
+	// component (O_NOFOLLOW). The frame user is unprivileged and can plant
+	// symlinks inside the frame; without this walk a symlinked ancestor could
+	// redirect this host-root write outside the frame rootfs.
+	parentFd, name, err := openParentUnderRoot(rootFS, rel, true, params.User == "user", uid, gid)
+	if err != nil {
 		return textResult(fmt.Sprintf("create parent dirs for %s: %v", params.Path, err), true)
 	}
-	if params.User == "user" {
-		if err := chownCreatedDirs(parent, rootFS, uid, gid); err != nil {
-			return textResult(fmt.Sprintf("chown parent dirs for %s: %v", params.Path, err), true)
+	defer unix.Close(parentFd)
+
+	// Open the target with O_NOFOLLOW so a symlink at the final component is
+	// refused (ELOOP) rather than followed, and O_TRUNC to overwrite in place
+	// (the exec path did the same). O_CREAT only takes effect for a new file;
+	// an existing file keeps its mode because open(2) ignores mode on an
+	// existing inode. A directory target fails with EISDIR.
+	fd, err := unix.Openat(parentFd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_TRUNC, 0o644)
+	if err != nil {
+		switch {
+		case errors.Is(err, unix.ELOOP):
+			return textResult(fmt.Sprintf("Error: refusing to overwrite symlink %s", params.Path), true)
+		case errors.Is(err, unix.EISDIR):
+			return textResult(fmt.Sprintf("Error: %s is a directory", params.Path), true)
+		default:
+			return textResult(fmt.Sprintf("open %s: %v", params.Path, err), true)
 		}
 	}
-
-	// Preserve an existing file's mode; default 0644 for a new file. Write is
-	// atomic enough for our purposes (the exec path overwrote in place too);
-	// owner is restored below for a new file, and left untouched for an
-	// existing one (os.WriteFile does not chown).
-	mode := os.FileMode(0o644)
-	if info, err := os.Lstat(hostPath); err == nil {
-		mode = info.Mode()
-	}
-	if err := os.WriteFile(hostPath, []byte(params.FileText), mode); err != nil {
+	if _, err := unix.Write(fd, []byte(params.FileText)); err != nil {
+		unix.Close(fd)
 		return textResult(fmt.Sprintf("write %s: %v", params.Path, err), true)
 	}
-	// For a newly created file written as root, chown it to the frame user so
-	// shell jobs running as that user can overwrite it. An existing file keeps
-	// its owner (os.WriteFile preserves it). Lchown so a (defensive) symlink
-	// target is not followed.
+	if err := unix.Fsync(fd); err != nil {
+		// Not fatal; the exec path didn't fsync at all.
+		log.Printf("create_file fsync %s: %v", params.Path, err)
+	}
+	// Match the prior behaviour: a file written as root is chown'd to the
+	// frame user so shell jobs running as that user can overwrite it.
 	if params.User == "user" {
-		if err := os.Lchown(hostPath, uid, gid); err != nil {
-			return textResult(fmt.Sprintf("chown %s: %v", params.Path, err), true)
+		if cerr := unix.Fchown(fd, uid, gid); cerr != nil {
+			unix.Close(fd)
+			return textResult(fmt.Sprintf("chown %s: %v", params.Path, cerr), true)
 		}
 	}
+	unix.Close(fd)
 
 	if ctx.Err() == context.DeadlineExceeded {
 		return textResult(fmt.Sprintf("create_file timed out writing %s", params.Path), true)
 	}
 	return textResult(fmt.Sprintf("Created %s (%d bytes)", params.Path, len(params.FileText)), false)
-}
-
-// chownCreatedDirs walks the path from rootFS down to dir, chowning each
-// component that is not already owned by (uid,gid). It stops at the first
-// ancestor that already has the right owner (a pre-existing user-owned dir
-// needs no change), so it touches only the freshly created parents.
-func chownCreatedDirs(dir, rootFS string, uid, gid int) error {
-	absRoot, err := filepath.Abs(rootFS)
-	if err != nil {
-		return err
-	}
-	absDir, err := filepath.Abs(dir)
-	if err != nil {
-		return err
-	}
-	rel, err := filepath.Rel(absRoot, absDir)
-	if err != nil || rel == "." {
-		return nil
-	}
-	components := strings.Split(rel, string(filepath.Separator))
-	cur := absRoot
-	for _, comp := range components {
-		if comp == "" {
-			continue
-		}
-		cur = filepath.Join(cur, comp)
-		info, err := os.Lstat(cur)
-		if err != nil {
-			return err
-		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return nil
-		}
-		if stat.Uid == uint32(uid) && stat.Gid == uint32(gid) {
-			continue
-		}
-		if err := os.Lchown(cur, uid, gid); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // mcpStrReplaceToolHandler is the ToolHandler for str_replace.
@@ -765,12 +793,53 @@ func mcpStrReplaceToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 		return textResult(fmt.Sprintf("path %q escapes the frame", params.Path), true)
 	}
 
-	content, err := os.ReadFile(hostPath)
+	// Walk the parent dirs from a dir fd on rootFS with O_NOFOLLOW so a
+	// symlink planted at an ancestor by the frame user cannot redirect the
+	// host-root read/write outside the frame rootfs. str_replace never creates
+	// parents (the target must already exist).
+	parentFd, name, err := openParentUnderRoot(rootFS, rel, false, false, 0, 0)
 	if err != nil {
-		if os.IsNotExist(err) {
+		return textResult(fmt.Sprintf("resolve %s: %v", params.Path, err), true)
+	}
+	defer unix.Close(parentFd)
+
+	// O_NOFOLLOW refuses a symlink at the target (ELOOP) instead of following
+	// it. O_RDWR without O_CREAT keeps the existing inode (owner/mode
+	// preserved). A missing file is ENOENT; a directory is EISDIR.
+	fd, err := unix.Openat(parentFd, name, unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		switch {
+		case errors.Is(err, unix.ENOENT):
 			return textResult(fmt.Sprintf("Error: %s not found", params.Path), true)
+		case errors.Is(err, unix.ELOOP):
+			return textResult(fmt.Sprintf("Error: refusing to replace symlink %s", params.Path), true)
+		case errors.Is(err, unix.EISDIR):
+			return textResult(fmt.Sprintf("Error: %s is a directory", params.Path), true)
+		default:
+			return textResult(fmt.Sprintf("open %s: %v", params.Path, err), true)
 		}
-		return textResult(fmt.Sprintf("read %s: %v", params.Path, err), true)
+	}
+	defer unix.Close(fd)
+
+	var content []byte
+	tmp := make([]byte, 4096)
+	for {
+		n, rerr := unix.Read(fd, tmp)
+		if n > 0 {
+			content = append(content, tmp[:n]...)
+		}
+		if rerr != nil {
+			if errors.Is(rerr, unix.EINTR) {
+				continue
+			}
+			unix.Close(fd)
+			return textResult(fmt.Sprintf("read %s: %v", params.Path, rerr), true)
+		}
+		if n == 0 {
+			// A raw read(2) on a regular file returns (0, nil) at EOF (the
+			// io.EOF sentinel is only an os.File wrapper); n==0 is our EOF signal.
+			break
+		}
 	}
 
 	oldBytes := []byte(params.OldStr)
@@ -783,19 +852,15 @@ func mcpStrReplaceToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 	}
 
 	newContent := bytes.Replace(content, oldBytes, []byte(params.NewStr), 1)
-	// Preserve the existing file mode; os.WriteFile truncates the existing
-	// inode (no chown, no mode change for an existing file) so owner/perm
-	// survive. Stat first to surface a directory/pipe/etc. as a clean error.
-	info, err := os.Lstat(hostPath)
-	if err != nil {
-		return textResult(fmt.Sprintf("stat %s: %v", params.Path, err), true)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return textResult(fmt.Sprintf("Error: refusing to replace symlink %s", params.Path), true)
-	}
-	if err := os.WriteFile(hostPath, newContent, info.Mode()); err != nil {
+	if _, err := unix.Pwrite(fd, newContent, 0); err != nil {
 		return textResult(fmt.Sprintf("write %s: %v", params.Path, err), true)
 	}
+	// Truncate to the new length in case the replacement shrank the file;
+	// ftruncate on the same fd keeps the inode (owner/mode) intact.
+	if err := unix.Ftruncate(fd, int64(len(newContent))); err != nil {
+		return textResult(fmt.Sprintf("truncate %s: %v", params.Path, err), true)
+	}
+	unix.Fsync(fd)
 
 	if ctx.Err() == context.DeadlineExceeded {
 		return textResult(fmt.Sprintf("str_replace timed out writing %s", params.Path), true)

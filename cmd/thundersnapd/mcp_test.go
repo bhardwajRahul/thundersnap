@@ -13,9 +13,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/sys/unix"
 )
 
 // TestTextResultIsErrorSemantics pins the IsError contract the MCP tools rely
@@ -472,4 +474,73 @@ func TestMCPWaitParamsArrayShorthand(t *testing.T) {
 			t.Errorf("empty object jobs = %+v", w.Jobs)
 		}
 	})
+}
+
+// TestOpenParentUnderRootRejectsSymlinkAncestor verifies the host-side
+// create_file/str_replace path walk refuses to traverse a symlink planted at
+// an ancestor by the (unprivileged) frame user, so a host-root write cannot
+// escape the frame rootfs. Regression test for the FATAL confinement hole.
+func TestOpenParentUnderRootRejectsSymlinkAncestor(t *testing.T) {
+	rootFS := t.TempDir()
+	// Plant a symlink inside the frame: <root>/link -> /tmp (outside the frame).
+	target := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(rootFS, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Walking through "link/sub/file" must fail (ELOOP), not create dirs in
+	// the outside target.
+	_, _, err := openParentUnderRoot(rootFS, "link/sub/file", true, false, 0, 0)
+	if err == nil {
+		t.Fatal("walk through symlinked ancestor succeeded; should have been refused")
+	}
+	// And nothing should have been created in the escaped target.
+	if _, derr := os.Stat(filepath.Join(target, "sub")); derr == nil {
+		t.Errorf("dir was created in the symlink target outside the frame: %s/sub", target)
+	}
+}
+
+// TestOpenParentUnderRootCreatesMissingParents verifies the walk creates
+// missing ancestors (chown'd to the frame user) and returns a writable parent.
+func TestOpenParentUnderRootCreatesMissingParents(t *testing.T) {
+	rootFS := t.TempDir()
+	const uid, gid = 7575, 7575
+	parentFd, name, err := openParentUnderRoot(rootFS, "a/b/c.txt", true, true, uid, gid)
+	if err != nil {
+		t.Fatalf("openParentUnderRoot: %v", err)
+	}
+	defer unixClose(parentFd)
+	if name != "c.txt" {
+		t.Errorf("name = %q, want c.txt", name)
+	}
+	// The created dirs must exist and be owned by the frame user.
+	for _, d := range []string{"a", "a/b"} {
+		info, err := os.Stat(filepath.Join(rootFS, d))
+		if err != nil {
+			t.Fatalf("Stat %s: %v", d, err)
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			t.Fatalf("Stat_t for %s", d)
+		}
+		if st.Uid != uid || st.Gid != gid {
+			t.Errorf("dir %s owner = %d:%d, want %d:%d", d, st.Uid, st.Gid, uid, gid)
+		}
+	}
+	// A parent-symlink at the *final* component must be refused by the
+	// caller's O_NOFOLLOW open, but the walk itself should still succeed for a
+	// clean final name. Verify a plain file can be created via the returned fd.
+	fd, err := unixOpenat(parentFd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o644)
+	if err != nil {
+		t.Fatalf("openat final: %v", err)
+	}
+	defer unixClose(fd)
+	if _, err := unix.Write(fd, []byte("ok")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+func unixClose(fd int) { _ = unix.Close(fd) }
+func unixOpenat(dirfd int, name string, flags int, mode uint32) (int, error) {
+	return unix.Openat(dirfd, name, flags, mode)
 }

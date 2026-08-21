@@ -287,8 +287,16 @@ func callToolResultText(result *mcp.CallToolResult) string {
 // initial scope check and then fail when the nested launch or wait handler
 // resolves the scope again.
 func nestedCallToolRequest(req *mcp.CallToolRequest, arguments json.RawMessage) *mcp.CallToolRequest {
+	// req.Params may be nil for a request that supplied only transport
+	// metadata (e.g. the X-Aperture-Conversation-Id header) and no body; the
+	// scope resolver tolerates that, so tolerate it here too instead of
+	// nil-derefing req.Params.Meta.
+	var meta mcp.Meta
+	if req != nil && req.Params != nil {
+		meta = req.Params.Meta
+	}
 	return &mcp.CallToolRequest{
-		Params: &mcp.CallToolParamsRaw{Meta: req.Params.Meta, Arguments: arguments},
+		Params: &mcp.CallToolParamsRaw{Meta: meta, Arguments: arguments},
 		Extra:  req.Extra,
 	}
 }
@@ -683,7 +691,14 @@ func mcpJobsWaitToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 			for _, j := range jobs {
 				if !j.terminal() {
 					j.writeMu.Lock()
-					err = vshdproto.WriteFrame(j.conn, vshdproto.FrameSignal, vshdproto.EncodeSignal(int32(sig)))
+					// j.conn is set to nil by collectMCPJob under l.mu once the
+					// connection tears down; a job observed as non-terminal can
+					// still race with teardown and have a nil conn, which would
+					// panic WriteFrame. Skip signaling in that case -- the job
+					// is already stopping.
+					if j.conn != nil {
+						err = vshdproto.WriteFrame(j.conn, vshdproto.FrameSignal, vshdproto.EncodeSignal(int32(sig)))
+					}
 					j.writeMu.Unlock()
 					if err != nil {
 						l.mu.Unlock()
