@@ -832,3 +832,51 @@ func TestAllocatedVsLogicalSize(t *testing.T) {
 	}
 	t.Logf("Backing file: size=%d", fi.Size())
 }
+
+// TestServerBoundsRejection verifies the server rejects NBD commands that
+// fall outside the advertised export size, and that a rejected write does
+// not extend the backing file past the export. Regression test for the
+// missing bounds checks found in code review.
+func TestServerBoundsRejection(t *testing.T) {
+	tmpDir := t.TempDir()
+	backingPath := filepath.Join(tmpDir, "backing.sparse")
+
+	backend, err := OpenSparseFile(backingPath)
+	if err != nil {
+		t.Fatalf("OpenSparseFile: %v", err)
+	}
+	defer backend.Close()
+
+	const exportSize = 1 << 20 // 1 MiB
+	server := NewServer(ServerConfig{Backend: backend, ExportSize: exportSize})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	go func() { _ = server.Serve(ln) }()
+	defer server.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	// A write whose tail crosses the export boundary must be rejected
+	// (EINVAL, error code 22) and must NOT extend the backing file.
+	client, err := Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer client.Close()
+
+	writeErr := client.Write(make([]byte, 4096), exportSize-512)
+	if writeErr == nil {
+		t.Fatal("write past export size succeeded; should have been rejected")
+	}
+
+	// Backing file must not have grown beyond the export size.
+	fi, err := os.Stat(backingPath)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.Size() > exportSize {
+		t.Errorf("backing file grew to %d past export size %d after rejected write", fi.Size(), exportSize)
+	}
+}

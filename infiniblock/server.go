@@ -7,9 +7,23 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"sync"
 )
+
+// maxOptionLen caps the size of a single handshake option payload read from
+// the client. NBD option payloads are small (export names, info requests); a
+// client that claims a huge length would otherwise drive an unbounded
+// allocation and OOM the daemon. Reject with NBD_REP_ERR_TOO_BIG.
+const maxOptionLen = 1 << 20 // 1 MiB
+
+// maxRequestLen caps the Length field of a single NBD command. The kernel
+// nbd client issues at most ~1 MiB requests; a malicious or buggy client
+// claiming up to 4 GiB would otherwise make([]byte, req.Length) and OOM the
+// daemon. 32 MiB is a generous ceiling; oversized requests are rejected with
+// EINVAL and the connection is dropped.
+const maxRequestLen = 32 << 20 // 32 MiB
 
 // Server is an NBD server backed by a sparse file.
 type Server struct {
@@ -21,6 +35,7 @@ type Server struct {
 	mu       sync.Mutex
 	shutdown bool
 	conns    map[net.Conn]struct{}
+	wg       sync.WaitGroup // tracks in-flight handleConn goroutines
 }
 
 // ServerConfig configures an NBD server.
@@ -73,23 +88,40 @@ func (s *Server) Serve(ln net.Listener) error {
 			return err
 		}
 		s.mu.Lock()
+		if s.shutdown {
+			s.mu.Unlock()
+			conn.Close()
+			continue
+		}
 		s.conns[conn] = struct{}{}
+		s.wg.Add(1)
 		s.mu.Unlock()
 		go s.handleConn(conn)
 	}
 }
 
-// Close shuts down the server.
+// Close shuts down the server. It stops accepting new connections, drops
+// in-flight connections, and waits for all handleConn goroutines to finish
+// before returning, so callers may safely close the backend (which would
+// otherwise race with goroutines still issuing pread/pwrite/fallocate).
 func (s *Server) Close() error {
 	s.mu.Lock()
 	s.shutdown = true
-	for conn := range s.conns {
-		conn.Close()
+	conns := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
 	}
 	s.mu.Unlock()
+	// Close the listener first so Serve's Accept loop unblocks and exits;
+	// no new connections can be registered after shutdown is set (Serve
+	// re-checks it under s.mu before Add'ing the WaitGroup).
 	if s.listener != nil {
-		return s.listener.Close()
+		s.listener.Close()
 	}
+	for _, c := range conns {
+		c.Close()
+	}
+	s.wg.Wait()
 	return nil
 }
 
@@ -107,6 +139,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.mu.Lock()
 		delete(s.conns, conn)
 		s.mu.Unlock()
+		s.wg.Done()
 	}()
 
 	if err := s.handshake(conn); err != nil {
@@ -177,6 +210,22 @@ func (s *Server) handshake(conn net.Conn) error {
 		var optLen uint32
 		if err := binary.Read(br, binary.BigEndian, &optLen); err != nil {
 			return err
+		}
+		if optLen > maxOptionLen {
+			// Reject oversized option payloads before allocating. For
+			// fixed-newstyle clients, reply NBD_REP_ERR_TOO_BIG and keep
+			// haggling; for non-fixed-newstyle clients the spec says to
+			// disconnect.
+			if fixedNewstyle {
+				if err := s.sendOptReply(bw, optCode, nbdRepErrTooBig, nil); err != nil {
+					return err
+				}
+				if err := bw.Flush(); err != nil {
+					return err
+				}
+				continue
+			}
+			return fmt.Errorf("option %d payload too big: %d", optCode, optLen)
 		}
 
 		// Read option data
@@ -306,6 +355,31 @@ func (s *Server) sendOptReply(w io.Writer, opt uint32, replyType uint32, data []
 	return nil
 }
 
+// validateRequest checks req against the export size and the protocol's
+// int64/length limits. It returns a non-zero NBD error code (nbdEInval or
+// nbdEOverflow) if the request would read/write/trim outside the advertised
+// export or exceed maxRequestLen. Callers that receive a non-zero code must
+// drop the connection (the request is not safe to service, and for writes the
+// client's data has not been consumed).
+func (s *Server) validateRequest(req Request) uint32 {
+	if req.Length > maxRequestLen {
+		return nbdEInval
+	}
+	if req.Offset > s.exportSize {
+		return nbdEInval
+	}
+	// offset+length must not exceed exportSize (also catches wraparound).
+	if uint64(req.Length) > s.exportSize-req.Offset {
+		return nbdEInval
+	}
+	// ReadAt/WriteAt take int64 offsets; reject anything that would overflow.
+	end := req.Offset + uint64(req.Length)
+	if req.Offset > math.MaxInt64 || end > math.MaxInt64 {
+		return nbdEOverflow
+	}
+	return nbdEOK
+}
+
 // transmission handles the transmission phase (actual I/O).
 func (s *Server) transmission(conn net.Conn) error {
 	br := bufio.NewReader(conn)
@@ -323,11 +397,21 @@ func (s *Server) transmission(conn net.Conn) error {
 
 		switch req.Type {
 		case nbdCmdRead:
+			if ec := s.validateRequest(req); ec != nbdEOK {
+				WriteSimpleReply(bw, req.Handle, ec)
+				bw.Flush()
+				return fmt.Errorf("invalid read request: off=%d len=%d", req.Offset, req.Length)
+			}
 			if err := s.handleRead(bw, req); err != nil {
 				return err
 			}
 
 		case nbdCmdWrite:
+			if ec := s.validateRequest(req); ec != nbdEOK {
+				WriteSimpleReply(bw, req.Handle, ec)
+				bw.Flush()
+				return fmt.Errorf("invalid write request: off=%d len=%d", req.Offset, req.Length)
+			}
 			// Read the data from client
 			data := make([]byte, req.Length)
 			if _, err := io.ReadFull(br, data); err != nil {
@@ -347,6 +431,11 @@ func (s *Server) transmission(conn net.Conn) error {
 			}
 
 		case nbdCmdTrim:
+			if ec := s.validateRequest(req); ec != nbdEOK {
+				WriteSimpleReply(bw, req.Handle, ec)
+				bw.Flush()
+				return fmt.Errorf("invalid trim request: off=%d len=%d", req.Offset, req.Length)
+			}
 			if err := s.handleTrim(bw, req); err != nil {
 				return err
 			}

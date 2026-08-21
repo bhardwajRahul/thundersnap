@@ -1,6 +1,7 @@
 // Package infiniblock implements an NBD (Network Block Device) server
-// backed by a sparse file. It advertises a huge virtual size (1 EiB)
-// but only allocates disk space for blocks that are actually written.
+// backed by a sparse file. It advertises a large virtual size (15 TiB by
+// default; see DefaultExportSize) but only allocates disk space for blocks
+// that are actually written.
 // TRIM commands punch holes in the backing file to reclaim space.
 package infiniblock
 

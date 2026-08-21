@@ -6,7 +6,8 @@
 //
 // The backing file is created if it doesn't exist. It's a sparse file
 // that only allocates disk space for blocks that are actually written.
-// The NBD export advertises 1 EiB of virtual space.
+// The NBD export advertises 15 TiB of virtual space by default
+// (see infiniblock.DefaultExportSize; busybox nbd-client compatibility).
 //
 // TRIM commands from the client punch holes in the backing file to
 // reclaim disk space.
@@ -25,7 +26,7 @@ import (
 var (
 	backing    = getopt.StringLong("backing", 'b', "", "path to backing sparse file (required)")
 	addr       = getopt.StringLong("addr", 'a', ":10809", "address to listen on")
-	exportSize = getopt.Uint64Long("size", 's', infiniblock.DefaultExportSize, "export size in bytes (default 1 EiB)")
+	exportSize = getopt.Uint64Long("size", 's', infiniblock.DefaultExportSize, "export size in bytes (default 15 TiB)")
 	help       = getopt.BoolLong("help", 'h', "show help")
 )
 
