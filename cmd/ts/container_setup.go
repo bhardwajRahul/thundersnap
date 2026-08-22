@@ -6,12 +6,14 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -940,46 +942,114 @@ func cmdContainerInit(args []string) {
 	// Signal that setup is complete
 	fmt.Println("READY")
 
-	// Set up SIGCHLD handler to reap zombies. As PID 1, orphaned processes
-	// get reparented to us, and we need to wait() on them or they become zombies.
-	sigchld := make(chan os.Signal, 16)
-	signal.Notify(sigchld, syscall.SIGCHLD)
+	log.Printf("container-init ready, PID 1 reaper active")
 
-	// Also handle SIGTERM for graceful shutdown
+	// --- Robust PID 1 reaper + bounded shutdown ---
+	//
+	// As PID 1 of the container PID namespace, orphaned descendants (e.g. detached
+	// grandchildren of an MCP job's shell) reparent to us; if we don't wait() on
+	// them they stay zombies. A field failure on a Linux-VM-on-macOS host showed
+	// zombies accumulating and the frame eventually wedging. The root cause is
+	// the textbook-fragile Go pattern `signal.Notify(SIGCHLD) + Wait4(-1,
+	// WNOHANG)` sharing the main loop: standard signals coalesce, and Go drops a
+	// SIGCHLD when the (16-slot) channel is full and no goroutine is blocked
+	// receiving, so under bursty MCP load a reaped batch can be followed by a
+	// lost wakeup and stranded zombies.
+	//
+	// This implementation follows what real container inits (tini, containerd)
+	// do:
+	//   - a *dedicated* reaper goroutine decoupled from shutdown;
+	//   - a *periodic safety-net reap* so a dropped/lost SIGCHLD can never strand
+	//     a zombie (1s worst-case reap latency even if every signal is lost);
+	//   - a generously buffered channel to ride bursty exits;
+	//   - EINTR/ECHILD treated as "nothing to reap right now", never fatal.
+	//
+	// The shutdown select only handles SIGTERM and stdin-EOF, so a (now
+	// impossible) stall in the reap path can never delay process exit.
+	sigDone := make(chan struct{})
+	startReaper(sigDone)
+
+	// SIGTERM: clean exit so orchestrators see a normal shutdown signal.
 	sigterm := make(chan os.Signal, 1)
 	signal.Notify(sigterm, syscall.SIGTERM)
 
-	// Wait for stdin to close (shutdown signal) while reaping zombies
+	// Parent (containerns.Manager.stopEntry) closes our stdin to request exit.
+	// vshd's spliceContainerSession does NOT close stdin, so EOF reliably means
+	// "the manager wants us gone".
 	stdinClosed := make(chan struct{})
 	go func() {
-		// Read until EOF
 		buf := make([]byte, 1)
 		for {
-			_, err := os.Stdin.Read(buf)
-			if err != nil {
+			if _, err := os.Stdin.Read(buf); err != nil {
 				break
 			}
 		}
 		close(stdinClosed)
 	}()
 
-	for {
-		select {
-		case <-sigchld:
-			// Reap all zombies
-			for {
-				var status syscall.WaitStatus
-				pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
-				if err != nil || pid <= 0 {
-					break
-				}
+	select {
+	case <-sigterm:
+		log.Printf("container-init: SIGTERM, exiting")
+		os.Exit(0)
+	case <-stdinClosed:
+		log.Printf("container-init: stdin closed, exiting")
+		os.Exit(0)
+	}
+}
+
+// reapInterval bounds how long a zombie can survive if its SIGCHLD was lost or
+// coalesced. A dedicated reaper goroutine wakes on SIGCHLD *and* on this
+// ticker, so missed signals can never strand zombies. 1s is far below any
+// user-visible latency and trivially cheap (one WNOHANG sweep).
+const reapInterval = 1 * time.Second
+
+// startReaper runs a dedicated goroutine that reaps all zombie descendants.
+// It drains every available zombie on each SIGCHLD and on a periodic ticker
+// (the safety net). SIGCHLD is a standard signal and coalesces; Go's
+// signal.Notify also drops a signal when the channel is full and nothing is
+// blocked receiving, so the ticker is what makes reaping robust under bursty
+// load. The goroutine exits when sigDone is closed (process is shutting down).
+//
+// container-init spawns no os/exec children of its own, so Wait4(-1,...) here
+// cannot steal a child that os/exec.Cmd.Wait is tracking (the classic
+// PID-1-in-Go conflict); it only reaps namespace orphans reparented to PID 1.
+func startReaper(sigDone chan struct{}) {
+	sigchld := make(chan os.Signal, 256)
+	signal.Notify(sigchld, syscall.SIGCHLD)
+	go func() {
+		ticker := time.NewTicker(reapInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sigchld:
+				reapAll()
+			case <-ticker.C:
+				reapAll()
+			case <-sigDone:
+				return
 			}
-		case <-sigterm:
-			// Graceful shutdown requested
-			os.Exit(0)
-		case <-stdinClosed:
-			// Parent closed our stdin - time to exit
-			os.Exit(0)
+		}
+	}()
+}
+
+// reapAll drains every currently-zombieable child with WNOHANG. It loops until
+// no child is available (0) or there are no children at all (ECHILD, treated as
+// "nothing to do" since PID 1 may legitimately have no descendants between
+// sessions). EINTR is retried within the call; any other error aborts the sweep
+// (it will be retried on the next signal/tick). A WNOHANG sweep never blocks.
+func reapAll() {
+	for {
+		var status syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
+		switch {
+		case err == nil && pid > 0:
+			// Reaped one; keep draining.
+			continue
+		case err == syscall.EINTR:
+			continue
+		default:
+			// pid == 0 (no zombie ready) or ECHILD (no children): nothing to reap.
+			return
 		}
 	}
 }

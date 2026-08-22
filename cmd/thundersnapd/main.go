@@ -121,6 +121,8 @@ type controlServerManager struct {
 type managedControlServer struct {
 	server   *controlServer
 	refCount int
+	stopping bool
+	stopped  chan struct{}
 }
 
 var controlServers = &controlServerManager{
@@ -134,6 +136,12 @@ func (m *controlServerManager) getOrCreateControlServer(rootFS string) (*control
 	defer m.mu.Unlock()
 
 	if ms, ok := m.servers[rootFS]; ok {
+		if ms.stopping {
+			stopped := ms.stopped
+			m.mu.Unlock()
+			<-stopped
+			return m.getOrCreateControlServer(rootFS)
+		}
 		ms.refCount++
 		log.Printf("Reusing control server for %s (refCount=%d)", rootFS, ms.refCount)
 		return ms.server, nil
@@ -158,22 +166,47 @@ func (m *controlServerManager) getOrCreateControlServer(rootFS string) (*control
 }
 
 // releaseControlServer decrements the reference count and closes the server if zero.
+//
+// Do not wait for the listener's Accept loop while holding m.mu. Closing a
+// listener normally wakes Accept immediately, but that has not been reliable
+// for every Unix-socket implementation (in particular under some VM/filesystem
+// combinations). Holding this mutex across Close turns a stuck control-server
+// teardown into a daemon-wide session deadlock: unrelated frames cannot even
+// acquire their control-server entry.
 func (m *controlServerManager) releaseControlServer(rootFS string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	ms, ok := m.servers[rootFS]
 	if !ok {
+		m.mu.Unlock()
 		return
 	}
 
 	ms.refCount--
 	log.Printf("Released control server for %s (refCount=%d)", rootFS, ms.refCount)
-	if ms.refCount <= 0 {
-		ms.server.Close()
-		delete(m.servers, rootFS)
-		log.Printf("Closed control server for %s", rootFS)
+	if ms.refCount > 0 {
+		m.mu.Unlock()
+		return
 	}
+
+	// Mark the entry stopping, then tear it down without holding m.mu. Keep the
+	// entry visible so a concurrent caller for this same rootFS waits instead of
+	// racing a new bind against the old listener.
+	ms.stopping = true
+	ms.stopped = make(chan struct{})
+	m.mu.Unlock()
+
+	if err := ms.server.Close(); err != nil {
+		log.Printf("warning: failed to close control server for %s: %v", rootFS, err)
+	}
+
+	m.mu.Lock()
+	if m.servers[rootFS] == ms {
+		delete(m.servers, rootFS)
+	}
+	close(ms.stopped)
+	m.mu.Unlock()
+	log.Printf("Closed control server for %s", rootFS)
 }
 
 // getActiveFrameCount returns the number of active sessions for a frame.
@@ -1705,11 +1738,29 @@ type controlServer struct {
 	done     chan struct{}
 }
 
+// controlServerCloseTimeout bounds waiting for the Accept loop after closing
+// its listener. Close normally wakes Accept immediately, but a stuck Unix
+// socket/virtiofs implementation must not hold controlServerManager.mu forever.
+const controlServerCloseTimeout = 2 * time.Second
+
 // Close shuts down the control server and removes the socket file.
 func (c *controlServer) Close() error {
-	c.listener.Close()
-	<-c.done
-	os.Remove(c.sockPath)
+	closeErr := c.listener.Close()
+	select {
+	case <-c.done:
+	case <-time.After(controlServerCloseTimeout):
+		// The listener is closed and the socket path can safely be unlinked even
+		// if the serving goroutine is still stuck in Accept. In particular, do
+		// not make a new session in this or another frame wait forever for it.
+		log.Printf("control server %s did not stop after listener close", c.sockPath)
+	}
+	removeErr := os.Remove(c.sockPath)
+	if closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+		return closeErr
+	}
+	if removeErr != nil && !os.IsNotExist(removeErr) {
+		return removeErr
+	}
 	return nil
 }
 

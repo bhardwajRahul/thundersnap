@@ -55,6 +55,23 @@ type entry struct {
 // It is a variable so tests can exercise the escalation path quickly.
 var initShutdownTimeout = 10 * time.Second
 
+// stopEntryDelay is a test-only knob that inserts a synchronous delay at the
+// start of stopEntry (after marking the entry stopping, before reaping it).
+// It simulates the slow init/cgroup/btrfs teardown observed on a slower arm64
+// VM, widening the window in which a concurrent GetOrCreate for the same
+// rootfs observes the entry mid-teardown and blocks on e.stopped. Real callers
+// never experience this delay unless they opt in via TS_TEST_STOP_ENTRY_DELAY
+// (parsed in an init() below); production is unchanged.
+var stopEntryDelay time.Duration
+
+func init() {
+	if v := os.Getenv("TS_TEST_STOP_ENTRY_DELAY"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			stopEntryDelay = d
+		}
+	}
+}
+
 // New creates a namespace manager. cgroupMgr is required: every container is
 // placed in a delegated cgroup and a fresh cgroup namespace before it starts.
 func New(cgroupMgr *cgroup.Manager) *Manager {
@@ -306,6 +323,10 @@ func (m *Manager) Release(rootFS string) {
 // entry for rootFS. The caller must have set e.stopping while holding m.mu.
 func (m *Manager) stopEntry(rootFS string, e *entry) {
 	log.Printf("Shutting down container namespace for %s (initPid=%d)", rootFS, e.initPid)
+	if stopEntryDelay > 0 {
+		log.Printf("TEST: injecting %s stopEntry delay for %s", stopEntryDelay, rootFS)
+		time.Sleep(stopEntryDelay)
+	}
 	_ = e.initStdin.Close()
 
 	waited := make(chan error, 1)
@@ -320,6 +341,16 @@ func (m *Manager) stopEntry(rootFS string, e *entry) {
 	}
 
 	if m.cgroupMgr != nil {
+		// Kill any detached leftover that escaped container-init's PID-1 shutdown
+		// (setsid/nohup jobs, nested-thundersnap children) before removing the
+		// cgroup. Otherwise such a survivor keeps the container cgroup non-empty,
+		// RemoveContainer's rmdir returns EBUSY, the cgroup dir persists with stale
+		// limits/procs, and the next GetOrCreate (which reuses the same
+		// cgroupName derived from rootFS) inherits a poisoned cgroup that can wedge
+		// the fresh container-init's startup. Best-effort: log and proceed.
+		if err := m.cgroupMgr.KillContainer(e.cgroupName); err != nil {
+			log.Printf("warning: failed to kill leftover processes in cgroup for %s: %v", rootFS, err)
+		}
 		if err := m.cgroupMgr.RemoveContainer(e.cgroupName); err != nil {
 			log.Printf("warning: failed to remove cgroup for %s: %v", rootFS, err)
 		}

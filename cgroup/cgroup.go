@@ -102,6 +102,25 @@ func (m *Manager) KillSession(name string) error {
 	return nil
 }
 
+// KillContainer writes cgroup.kill at the root of a delegated container cgroup,
+// which (per cgroup2 semantics) terminates every process in that subtree
+// *including* detached descendants that escaped the container-init's PID-1
+// shutdown (setsid/nohup jobs, nested-thundersnap children living under the
+// same cgroup hierarchy). It is a one-shot: writing 1 kills current members and
+// the file does not persist as "armed". The container-init itself is normally
+// already dead by the time this is called (stopEntry SIGKILLs it), but a
+// detached leftover could otherwise keep the cgroup non-empty and make the
+// subsequent RemoveContainer fail with EBUSY, leaving a stale cgroup that
+// poisons the next incarnation (reused name, stale limits/procs). Best-effort:
+// the caller logs and proceeds regardless.
+func (m *Manager) KillContainer(name string) error {
+	path := filepath.Join(cgroupRoot, name, "cgroup.kill")
+	if err := os.WriteFile(path, []byte("1"), 0644); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("kill container cgroup %s: %w", path, err)
+	}
+	return nil
+}
+
 // RemoveSession removes a session leaf after its process has exited.
 func (m *Manager) RemoveSession(name string) error {
 	path := filepath.Join(cgroupRoot, name)

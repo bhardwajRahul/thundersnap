@@ -24,11 +24,13 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/crypto/ssh"
 )
 
 // startDaemonWithHTTP is startDaemon but also serves the HTTP mux (and thus
@@ -1334,4 +1336,212 @@ func uuidParse(s string) (struct{}, error) {
 		return struct{}{}, fmt.Errorf("not a UUID: %q", s)
 	}
 	return struct{}{}, nil
+}
+
+// sshExecDeadline is sshExec with a bounded dial deadline so a wedged frame is
+// reported as a stall instead of hanging for the full 10s sshConfig timeout.
+// It returns the elapsed time so a caller can assert it stayed well under the
+// deadline. Used by the container-init churn/wedge reproduction.
+func sshExecDeadline(t *testing.T, d *daemonInstance, user, cmd string, deadline time.Duration) (string, int, time.Duration, error) {
+	t.Helper()
+	config := &ssh.ClientConfig{
+		User:            user,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         deadline,
+	}
+	start := time.Now()
+	client, err := ssh.Dial("tcp", d.addr, config)
+	if err != nil {
+		return "", -1, time.Since(start), fmt.Errorf("dial: %w", err)
+	}
+	defer client.Close()
+	session, err := client.NewSession()
+	if err != nil {
+		return "", -1, time.Since(start), fmt.Errorf("new session: %w", err)
+	}
+	defer session.Close()
+	output, err := session.CombinedOutput(cmd)
+	elapsed := time.Since(start)
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*ssh.ExitError); ok {
+			exitCode = exitErr.ExitStatus()
+		} else {
+			return string(output), -1, elapsed, fmt.Errorf("run command: %w", err)
+		}
+	}
+	return string(output), exitCode, elapsed, nil
+}
+
+// TestContainerInitReapUnderChurn reproduces the field failure where a frame
+// wedges under bursty MCP load (Linux VM on macOS): zombies accumulate that
+// container-init never reaps, and once the last session exits the frame can no
+// longer start sessions at all.
+//
+// It drives the exact production pattern with no lingering SSH session, so the
+// container-init refcount (in host vshd) hits 0 on every job exit, exercising
+// the teardown/recreate path repeatedly. Each job backgrounds a TERM-trapped
+// grandchild that survives the session's teardown escalation and reparents to
+// container-init, where it must be reaped. After the churn loop:
+//
+//   - an SSH probe to the same frame must answer quickly (permanent-wedge
+//     canary: if a fresh container-init can't start for this rootfs, every
+//     new session hangs in GetOrCreate's 10s READY wait);
+//   - ps in-frame must show no defunct/zombie (<defunct> or STAT 'Z')
+//     processes (reaper canary);
+//   - an SSH probe to an unrelated sibling frame must also answer quickly
+//     (global-stall canary).
+//
+// The test is written to FAIL on the field symptom, never to skip.
+func TestContainerInitReapUnderChurn(t *testing.T) {
+	// Simulate the slow init/cgroup/btrfs teardown observed on the arm64
+	// thunderboot VM: inject a stopEntry delay so a concurrent same-frame probe
+	// is forced to observe the entry mid-teardown (a window that is vanishingly
+	// small on a fast Linux box). This is a test-only knob in containerns,
+	// gated behind an env var so production is unaffected.
+	t.Setenv("TS_TEST_STOP_ENTRY_DELAY", "250ms")
+	env := newTestEnv(t)
+	d, httpBase := startDaemonWithHTTP(t, env)
+	session := mcpClient(t, httpBase)
+
+	createFrameForMCP(t, d, "churnframe")
+	installBusyboxAppletsInFrame(t, d, "churnframe", "sleep", "ps")
+	// A sibling frame as a global-stall canary.
+	createFrameForMCP(t, d, "siblingframe")
+	installBusyboxAppletsInFrame(t, d, "siblingframe", "sleep")
+
+	const iterations = 25
+	for i := 0; i < iterations; i++ {
+		// Background a TERM-trapped grandchild, then exit the foreground shell.
+		// The grandchild survives the session's teardown (SIGHUP then SIGKILL)
+		// long enough to be reparented to container-init, where it exits and
+		// must be reaped. With no lingering session, container-init is torn
+		// down and recreated each iteration (the production wedge path).
+		job := startAndWaitMCPBash(t, session, map[string]any{
+			"command": "(trap '' TERM; sleep 0.3) & echo started-$i",
+			"frame":   "churnframe",
+			"user":    "root",
+			"workdir": "/work",
+		})
+		if job["state"] != "exited" || job["exit_code"] != float64(0) {
+			t.Fatalf("churn iteration %d: %+v", i, job)
+		}
+	}
+
+	// --- permanent-wedge canary (same frame) ---
+	// If a fresh container-init can't come up for this rootfs (cgroup residue,
+	// stuck mount, etc.), every new session stalls in GetOrCreate's 10s READY
+	// wait. Require a fast answer.
+	out, exit, elapsed, perr := sshExecDeadline(t, d, "root@churnframe", "echo churn-alive", 4*time.Second)
+	if perr != nil || exit != 0 {
+		t.Fatalf("churnframe SSH wedged after churn: out=%q exit=%d elapsed=%v err=%v", out, exit, elapsed, perr)
+	}
+	t.Logf("churnframe answered in %v: %q", elapsed, strings.TrimSpace(out))
+
+	// --- reaper canary ---
+	// ps lists every process in the container PID namespace. Any leftover
+	// trapped sleeper OR a defunct/zombie means reaping broke. Allow a brief
+	// grace for the final torn-down grandchild to be reaped by the safety-net
+	// ticker (reapInterval <= 1s).
+	deadline := time.Now().Add(3 * time.Second)
+	var psOut string
+	for {
+		psOut, exit, perr = sshExec(t, d, "root@churnframe", "ps -o pid,ppid,stat,comm")
+		if perr != nil || exit != 0 {
+			t.Fatalf("churnframe ps: exit=%d err=%v", exit, perr)
+		}
+		if !strings.Contains(psOut, "sleep") && !strings.Contains(psOut, "defunct") && !strings.Contains(psOut, " Z") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("churnframe has unreaped leftover processes after churn:\n%s", psOut)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Logf("churnframe ps after churn:\n%s", psOut)
+
+	// --- global-stall canary (sibling frame) ---
+	out, exit, elapsed, perr = sshExecDeadline(t, d, "root@siblingframe", "echo sibling-alive", 4*time.Second)
+	if perr != nil || exit != 0 {
+		t.Fatalf("siblingframe SSH stalled (global wedge): out=%q exit=%d elapsed=%v err=%v", out, exit, elapsed, perr)
+	}
+	t.Logf("siblingframe answered in %v: %q", elapsed, strings.TrimSpace(out))
+}
+
+// TestContainerInitReapUnderConcurrentChurn is the stress variant: it hammers
+// one frame with overlapping MCP jobs that each strand a TERM-trapped grandchild
+// (no lingering session), so the container-init refcount churns through 0 and
+// the teardown/recreate path runs under contention. After the burst it asserts
+// (a) a fresh SSH echo answers quickly (permanent-wedge canary: a fresh
+// container-init must come up for this rootfs) and (b) in-frame ps shows no
+// leftover trapped sleepers or defunct/zombie processes (reaper canary). A
+// sibling frame is checked too as a global-stall canary.
+//
+// Unlike a continuous-probe stress test (which is prone to harness false
+// positives when a probe races the 250ms stopEntry window), this variant runs a
+// bounded burst then checks liveness once the burst has drained, mirroring the
+// production pattern: a burst of MCP jobs, then the next session must work.
+func TestContainerInitReapUnderConcurrentChurn(t *testing.T) {
+	t.Setenv("TS_TEST_STOP_ENTRY_DELAY", "150ms")
+	env := newTestEnv(t)
+	d, httpBase := startDaemonWithHTTP(t, env)
+	session := mcpClient(t, httpBase)
+
+	createFrameForMCP(t, d, "concframe")
+	installBusyboxAppletsInFrame(t, d, "concframe", "sleep", "ps")
+	createFrameForMCP(t, d, "concsibling")
+	installBusyboxAppletsInFrame(t, d, "concsibling", "sleep")
+
+	const burst = 20
+	var burstWg sync.WaitGroup
+	for i := 0; i < burst; i++ {
+		i := i
+		burstWg.Add(1)
+		go func() {
+			defer burstWg.Done()
+			out, isErr := callTool(t, session, "jobs", map[string]any{
+				"launch": []any{map[string]any{
+					"command": fmt.Sprintf("(trap '' TERM; sleep 0.4) & echo burst-%d", i),
+					"frame":   "concframe", "user": "root", "workdir": "/work", "hard_timeout": 30,
+				}},
+				"wait": map[string]any{"jobs": []any{}, "until": "all_exit", "timeout": 30},
+			})
+			if isErr {
+				t.Errorf("burst job %d: %s", i, out)
+			}
+		}()
+	}
+	burstWg.Wait()
+	// Let the last trapped sleepers (0.4s) exit and be reaped by the safety-net
+	// ticker (reapInterval <= 1s).
+	time.Sleep(2 * time.Second)
+
+	// --- permanent-wedge canary (same frame) ---
+	out, exit, elapsed, perr := sshExecDeadline(t, d, "root@concframe", "echo conc-alive", 5*time.Second)
+	if perr != nil || exit != 0 {
+		t.Fatalf("concframe SSH wedged after concurrent churn: out=%q exit=%d elapsed=%v err=%v", out, exit, elapsed, perr)
+	}
+	t.Logf("concframe answered in %v: %q", elapsed, strings.TrimSpace(out))
+
+	// --- global-stall canary (sibling frame) ---
+	out, exit, elapsed, perr = sshExecDeadline(t, d, "root@concsibling", "echo sibling-alive", 5*time.Second)
+	if perr != nil || exit != 0 {
+		t.Fatalf("siblingframe SSH stalled (global wedge) after concurrent churn: out=%q exit=%d elapsed=%v err=%v", out, exit, elapsed, perr)
+	}
+	t.Logf("siblingframe answered in %v: %q", elapsed, strings.TrimSpace(out))
+
+	// --- reaper canary: no defunct/zombies ---
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		psOut, exit, perr := sshExec(t, d, "root@concframe", "ps -o pid,ppid,stat,comm")
+		if perr != nil || exit != 0 {
+			t.Fatalf("concframe ps after burst: exit=%d err=%v", exit, perr)
+		}
+		if !strings.Contains(psOut, "sleep") && !strings.Contains(psOut, "defunct") && !strings.Contains(psOut, " Z") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("concframe has unreaped leftover processes after concurrent churn:\n%s", psOut)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
