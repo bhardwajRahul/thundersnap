@@ -84,7 +84,8 @@ mixing independent chats.
 
 This is the single public command-execution tool. It launches zero or more
 supervised non-PTY jobs and can then wait for them in the same serialized MCP
-request:
+request. For finite work, prefer combining launch and wait in one call rather
+than making a redundant launch call followed by a wait call:
 
 ```json
 {
@@ -106,16 +107,20 @@ and `hard_timeout` (default/maximum 7200 seconds).
 The tool accepts at least one of `launch` or `wait`:
 
 - `launch` only starts jobs and returns `reason:"started"` immediately.
-- `wait` only monitors existing `wait.job_ids`; omitted IDs mean every job in
+- `wait` only monitors existing jobs; omit `wait.jobs` to monitor every job in
   the conversation.
 - `launch` plus `wait` starts every job first, then selects exactly those new
-  jobs. `wait.job_ids` is rejected in this form to avoid ambiguity.
+  jobs. This combined form is preferred for finite work. **Never specify
+  `wait.jobs` when `launch` is present**; the wait automatically selects the
+  jobs launched by this call.
 
 Wait conditions are `output`, `any_exit`, and `all_exit`. `after_revision`
-provides the existing race-free event cursor. A wait timeout is a successful
-snapshot and never kills jobs. With `include_output:true`, each returned job
-includes the final 16 KiB of its combined log plus `output_truncated`; the
-complete combined/stdout/stderr logs remain in the frame.
+provides the existing race-free event cursor. The optional `pre_signal` is
+sent once up front, before waiting, and is normally omitted; it is not sent
+when the timeout expires. A wait timeout is a successful snapshot and never
+kills jobs. With `include_output:true`, each returned job includes the final
+16 KiB of its combined log plus `output_truncated`; the complete
+combined/stdout/stderr logs remain in the frame.
 
 The short job ID is unique within the conversation task list. The real
 server-side key includes the user and conversation ID.

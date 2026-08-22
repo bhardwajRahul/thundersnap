@@ -302,16 +302,16 @@ func nestedCallToolRequest(req *mcp.CallToolRequest, arguments json.RawMessage) 
 }
 
 // mcpWaitParams is the wait sub-object of the jobs tool. It accepts the
-// canonical object form {"jobs":[...],"until":...,"timeout":...,"signal":...}
+// canonical object form {"jobs":[...],"until":...,"timeout":...,"pre_signal":...}
 // and a common shorthand where the whole value is just the jobs array,
 // [{"id":..,"offset":..}, ...]. The array form is a frequent LLM mistake
 // (the schema says wait is an object whose first property is jobs); tolerating
 // it turns a hard unmarshal error into a successful wait.
 type mcpWaitParams struct {
-	Jobs    []mcpWaitJob `json:"jobs"`
-	Until   string       `json:"until"`
-	Timeout int          `json:"timeout"`
-	Signal  string       `json:"signal"`
+	Jobs      []mcpWaitJob `json:"jobs"`
+	Until     string       `json:"until"`
+	Timeout   int          `json:"timeout"`
+	PreSignal string       `json:"pre_signal"`
 }
 
 func (w *mcpWaitParams) UnmarshalJSON(data []byte) error {
@@ -648,10 +648,10 @@ func mcpJobsWaitToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 		return textResult(err.Error(), true)
 	}
 	var params struct {
-		Jobs    []mcpWaitJob `json:"jobs"`
-		Until   string       `json:"until"`
-		Timeout int          `json:"timeout"`
-		Signal  string       `json:"signal"`
+		Jobs      []mcpWaitJob `json:"jobs"`
+		Until     string       `json:"until"`
+		Timeout   int          `json:"timeout"`
+		PreSignal string       `json:"pre_signal"`
 	}
 	if len(req.Params.Arguments) > 0 {
 		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
@@ -664,7 +664,7 @@ func mcpJobsWaitToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 	if params.Until != "output" && params.Until != "any_exit" && params.Until != "all_exit" {
 		return textResult(fmt.Sprintf("invalid until %q (want output, any_exit, or all_exit)", params.Until), true)
 	}
-	sig, err := parseJobSignal(params.Signal)
+	sig, err := parseJobSignal(params.PreSignal)
 	if err != nil {
 		return textResult(err.Error(), true)
 	}

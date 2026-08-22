@@ -229,8 +229,8 @@ func callToolForConversation(t *testing.T, session *mcp.ClientSession, conversat
 			jobs[i] = map[string]any{"id": id, "offset": 0}
 		}
 		wait := map[string]any{"jobs": jobs, "until": args["until"], "timeout": args["timeout"]}
-		if signal, ok := args["signal"]; ok {
-			wait["signal"] = signal
+		if signal, ok := args["pre_signal"]; ok {
+			wait["pre_signal"] = signal
 		}
 		args = map[string]any{"wait": wait}
 		name = "jobs"
@@ -1059,13 +1059,13 @@ func TestMCPBackgroundJobWaitAndKill(t *testing.T) {
 	// Signals are delivered to the shared vshdsession process group without
 	// escalation. STOP and CONT are both accepted; the job remains tracked.
 	out, isErr = callTool(t, session, "jobs_wait", map[string]any{
-		"job_ids": []string{started.JobID}, "until": "all_exit", "timeout": 1, "signal": "STOP",
+		"job_ids": []string{started.JobID}, "until": "all_exit", "timeout": 1, "pre_signal": "STOP",
 	})
 	if isErr || !strings.Contains(out, `"reason":"timeout"`) {
 		t.Fatalf("STOP wait: isErr=%v output=%q", isErr, out)
 	}
 	out, isErr = callTool(t, session, "jobs_wait", map[string]any{
-		"job_ids": []string{started.JobID}, "until": "output", "timeout": 1, "signal": "CONT",
+		"job_ids": []string{started.JobID}, "until": "output", "timeout": 1, "pre_signal": "CONT",
 	})
 	if isErr {
 		t.Fatalf("CONT wait: %s", out)

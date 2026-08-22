@@ -974,14 +974,15 @@ func newMCPServer() *mcp.Server {
 		"additionalProperties": false,
 	}
 	waitSchema := map[string]any{
-		"type": "object",
+		"type":        "object",
+		"description": "Optional wait. When launch is present, omit jobs: the wait automatically selects only jobs launched by this call.",
 		"properties": map[string]any{
-			"jobs": map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{
+			"jobs": map[string]any{"type": "array", "description": "Optional when waiting for existing jobs; do not provide when launch is present.", "items": map[string]any{"type": "object", "properties": map[string]any{
 				"id": map[string]any{"type": "string"}, "offset": map[string]any{"type": "integer", "minimum": 0},
 			}, "required": []string{"id", "offset"}, "additionalProperties": false}},
-			"until":   map[string]any{"type": "string", "enum": []string{"output", "any_exit", "all_exit"}},
-			"timeout": map[string]any{"type": "integer", "minimum": 1, "maximum": 60, "description": "Observation timeout; never stops jobs."},
-			"signal":  map[string]any{"type": "string", "enum": []string{"HUP", "INT", "TERM", "USR1", "USR2", "STOP", "CONT"}, "description": "Optional signal sent once to each selected running job's process group before waiting."},
+			"until":      map[string]any{"type": "string", "enum": []string{"output", "any_exit", "all_exit"}},
+			"timeout":    map[string]any{"type": "integer", "minimum": 1, "maximum": 60, "description": "Optional observation timeout; never stops jobs."},
+			"pre_signal": map[string]any{"type": "string", "enum": []string{"HUP", "INT", "TERM", "USR1", "USR2", "STOP", "CONT"}, "description": "Optional. Omit unless you explicitly want to signal jobs before waiting. Sent once up front to each selected running job's process group; never sent after the timeout."},
 		}, "additionalProperties": false,
 	}
 	s.AddTool(&mcp.Tool{
@@ -989,11 +990,11 @@ func newMCPServer() *mcp.Server {
 		Description: "Launch independent shell jobs concurrently and optionally wait. Put dependent steps in one multiline " +
 			"shell script (for example set -ex followed by one command per line). Wait jobs use raw combined-log byte offsets " +
 			"and return next_offset. While running, output ends after the last CR/LF; after exit, the final partial line is included. " +
-			"An optional wait signal is sent once without escalation. A wait timeout never stops jobs.",
+			"The optional pre_signal is sent once up front, before waiting, without escalation; omit it for normal observation. A wait timeout only returns a snapshot and never stops jobs. When launch is present with wait, never specify wait.jobs: the wait automatically selects the jobs launched by this call.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"launch": map[string]any{"type": "array", "items": launchSchema, "description": "Jobs to start in array order. Commands run concurrently after they are started. For sequential finite work, include wait in this same call rather than launching first and making a separate wait call."},
+				"launch": map[string]any{"type": "array", "items": launchSchema, "description": "Jobs to start concurrently. For finite work, strongly prefer including wait in this same call; do not launch and then make a redundant separate wait call."},
 				"wait":   waitSchema,
 			},
 		},
