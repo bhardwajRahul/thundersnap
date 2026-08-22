@@ -13,6 +13,7 @@ fi
 kernel_version=6.12.8
 kernel_url="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$kernel_version.tar.xz"
 kernel_sha256=2291da065ca04b715c89ee50362aec3f021a7414bc963f1b56736682c8122979
+common_config="$repo/vm/kernel.config"
 fragment="$repo/build/thunderboot/kernel-arm64.fragment"
 out=$(realpath -m "${1:-$repo/thunderboot-out/Image}")
 cache=${THUNDERBOOT_KERNEL_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/thunderboot/kernel-$kernel_version-arm64"}
@@ -41,32 +42,47 @@ build="$cache/build"
 rm -rf "$build"
 mkdir -p "$build"
 
-# Start from the architecture's maintained default and merge only the appliance
-# requirements. A fragment is easier to review across kernel updates than a
-# generated multi-thousand-line .config.
-make -C "$source" O="$build" defconfig
-"$source/scripts/kconfig/merge_config.sh" -m -O "$build" "$build/.config" "$fragment"
-make -C "$source" O="$build" olddefconfig
+# Start from an empty ARM64 configuration, then merge the common feature set
+# from vm/kernel.config and the explicit Apple VZ hardware requirements. Feed
+# the merged file through allnoconfig before olddefconfig: this prevents x86-only
+# and unrelated hardware choices from surviving the architecture conversion.
+: >"$build/.config"
+"$source/scripts/kconfig/merge_config.sh" -m -O "$build" \
+	"$build/.config" "$common_config" "$fragment"
+cp "$build/.config" "$build/all.config"
+KCONFIG_ALLCONFIG="$build/all.config" make -C "$source" O="$build" ARCH=arm64 allnoconfig
+make -C "$source" O="$build" ARCH=arm64 olddefconfig
 
-# Fail rather than silently accepting a renamed or dependency-disabled option.
-while IFS= read -r line; do
-	case "$line" in
-	CONFIG_*=n)
-		key=${line%%=*}
-		required="# $key is not set"
-		;;
-	CONFIG_*=y|CONFIG_*='"'*'"')
-		key=${line%%=*}
-		required=$line
-		;;
-	*) continue ;;
-	esac
-	if ! grep -Fqx "$required" "$build/.config"; then
-		echo "kernel configuration did not preserve required setting: $line" >&2
-		grep -E "^${key}=|^# ${key} is not set" "$build/.config" >&2 || true
-		exit 1
-	fi
-done <"$fragment"
+# Fail rather than silently accepting a renamed or dependency-disabled ARM64
+# hardware option. The common config is the x86 Cloud Hypervisor config and
+# intentionally contains architecture-specific symbols that do not exist on
+# ARM64, so it is used as a feature source rather than checked line-for-line.
+for required_fragment in "$fragment"; do
+	while IFS= read -r line; do
+		case "$line" in
+		CONFIG_*=n)
+			key=${line%%=*}
+			required="# $key is not set"
+			# Kconfig omits a disabled symbol when its parent menu is
+			# disabled. Treat that as n, but reject an enabled value.
+			if ! grep -Fqx "$required" "$build/.config" &&
+				! grep -Eq "^${key}=" "$build/.config"; then
+				continue
+			fi
+			;;
+		CONFIG_*=y|CONFIG_*='"'*'"')
+			key=${line%%=*}
+			required=$line
+			;;
+		*) continue ;;
+		esac
+		if ! grep -Fqx "$required" "$build/.config"; then
+			echo "kernel configuration did not preserve required setting: $line" >&2
+			grep -E "^${key}=|^# ${key} is not set" "$build/.config" >&2 || true
+			exit 1
+		fi
+	done <"$required_fragment"
+done
 
 jobs=${THUNDERBOOT_KERNEL_JOBS:-$(getconf _NPROCESSORS_ONLN)}
 # Kbuild expects a date string, not SOURCE_DATE_EPOCH's integer. This also

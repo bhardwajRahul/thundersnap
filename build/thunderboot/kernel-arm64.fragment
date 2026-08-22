@@ -1,64 +1,85 @@
-# ARM64 thunderboot appliance requirements layered on Linux arm64 defconfig.
-# Keep boot-critical storage, networking, and control drivers built in.
+# ARM64 hardware and console requirements for Apple Virtualization.framework.
+#
+# The common appliance functionality comes from vm/kernel.config, which is
+# also the x86-64 Cloud Hypervisor guest configuration. This fragment adds
+# ARM64 boot/platform support and explicitly removes unrelated hardware and
+# hypervisor families inherited from that cross-architecture base.
 CONFIG_LOCALVERSION="-thunderboot"
 CONFIG_LOCALVERSION_AUTO=n
 CONFIG_MODULES=n
-CONFIG_BLK_DEV_INITRD=y
-CONFIG_RD_ZSTD=y
-CONFIG_INITRAMFS_PRESERVE_MTIME=n
-CONFIG_DEVTMPFS=y
-CONFIG_DEVTMPFS_MOUNT=y
-CONFIG_IP_PNP=y
-CONFIG_IP_PNP_DHCP=y
+CONFIG_ARM64=y
+CONFIG_64BIT=y
+CONFIG_MMU=y
+CONFIG_ARM64_4K_PAGES=y
+# Keep the architecture defaults for VA/PA sizing; 52-bit VA/PA is valid on
+# Apple silicon and the kernel automatically falls back when unavailable.
+CONFIG_SMP=y
+
+# VZLinuxBootLoader and Apple platform firmware/interrupt plumbing.
+CONFIG_EFI=y
+CONFIG_EFI_STUB=y
+CONFIG_ACPI=y
+CONFIG_PCI=y
+CONFIG_PCI_MSI=y
+CONFIG_PCI_ECAM=y
+CONFIG_PCI_HOST_GENERIC=y
+CONFIG_PVPANIC=y
+CONFIG_PVPANIC_MMIO=y
+CONFIG_PVPANIC_PCI=y
+
+# Apple VZ virtio devices: block, network, console, filesystem, and vsock.
+# Keep both transports enabled: Apple has used virtio-mmio, while virtio-pci
+# is cheap insurance against a VZ device-model change.
 CONFIG_VIRTIO=y
 CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_PCI_LEGACY=y
 CONFIG_VIRTIO_MMIO=y
 CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_NET=y
 CONFIG_VIRTIO_CONSOLE=y
-CONFIG_HW_RANDOM_VIRTIO=y
-CONFIG_VIRTIO_BALLOON=y
-CONFIG_VSOCKETS=y
+CONFIG_VIRTIO_FS=y
 CONFIG_VIRTIO_VSOCKETS=y
-CONFIG_BLK_DEV_NBD=y
-CONFIG_MD=y
-CONFIG_BLK_DEV_MD=y
-CONFIG_MD_RAID0=y
-CONFIG_MD_RAID1=y
-CONFIG_BCACHE=y
-CONFIG_BTRFS_FS=y
-CONFIG_BTRFS_FS_POSIX_ACL=y
-CONFIG_FUSE_FS=y
-CONFIG_OVERLAY_FS=y
-CONFIG_CGROUPS=y
-CONFIG_MEMCG=y
-CONFIG_BLK_CGROUP=y
-CONFIG_CFS_BANDWIDTH=y
-CONFIG_CGROUP_PIDS=y
-CONFIG_CGROUP_FREEZER=y
-CONFIG_CGROUP_HUGETLB=y
-CONFIG_CPUSETS=y
-CONFIG_CGROUP_DEVICE=y
-CONFIG_CGROUP_CPUACCT=y
-CONFIG_CGROUP_PERF=y
-CONFIG_CGROUP_BPF=y
-CONFIG_NAMESPACES=y
-CONFIG_UTS_NS=y
-CONFIG_IPC_NS=y
-CONFIG_USER_NS=y
-CONFIG_PID_NS=y
-CONFIG_NET_NS=y
-CONFIG_SECCOMP=y
-CONFIG_SECCOMP_FILTER=y
-CONFIG_TMPFS=y
-CONFIG_TMPFS_POSIX_ACL=y
-CONFIG_TMPFS_XATTR=y
-CONFIG_POSIX_MQUEUE=y
-CONFIG_UNIX98_PTYS=y
-CONFIG_FHANDLE=y
-CONFIG_INOTIFY_USER=y
-CONFIG_FANOTIFY=y
-CONFIG_DEBUG_INFO_NONE=y
-CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=n
-CONFIG_DEBUG_INFO_DWARF4=n
-CONFIG_DEBUG_INFO_DWARF5=n
+CONFIG_HW_RANDOM=y
+CONFIG_HW_RANDOM_VIRTIO=y
+
+# Apple documents hvc0 for VZ's virtio console. Keep a 16550/PL011 console
+# too, since it is useful with alternate ARM64 firmware and diagnostics.
+CONFIG_SERIAL_EARLYCON=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_8250_NR_UARTS=1
+CONFIG_SERIAL_8250_RUNTIME_UARTS=1
+CONFIG_SERIAL_AMBA_PL011=y
+CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
+CONFIG_HVC_DRIVER=y
+
+# These features are inherited by the common x86 config but are not needed by
+# the ARM64 VZ appliance. Keeping the negative declarations here prevents an
+# architecture conversion from bringing in board, desktop, or nested-hypervisor
+# support merely because it was enabled in vm/kernel.config.
+CONFIG_VIRTUALIZATION=n
+CONFIG_KVM=n
+CONFIG_PTP_1588_CLOCK_KVM=n
+CONFIG_XEN=n
+CONFIG_HYPERV=n
+CONFIG_VFIO=n
+CONFIG_USB_SUPPORT=n
+CONFIG_SOUND=n
+CONFIG_DRM=n
+CONFIG_MEDIA_SUPPORT=n
+CONFIG_WLAN=n
+CONFIG_BT=n
+CONFIG_SCSI=n
+CONFIG_ATA=n
+CONFIG_MMC=n
+CONFIG_I2C=n
+CONFIG_SPI=n
+CONFIG_CAN=n
+CONFIG_FIREWIRE=n
+CONFIG_INFINIBAND=n
+CONFIG_WWAN=n
+CONFIG_NFC=n
+CONFIG_HID=n
+CONFIG_MTD=n
+CONFIG_WATCHDOG=n
+CONFIG_HWMON=n

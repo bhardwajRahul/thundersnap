@@ -141,8 +141,9 @@ infiniblockd:
 	@mkdir -p $(BIN)
 	go build -o $(BIN)/$@ ./cmd/$@
 
-# Generate the untracked x86-64 Cloud Hypervisor and kernel artifacts used by
-# Linux/KVM tests. See README.thunderboot-builder.md.
+# Generate the untracked x86-64 Cloud Hypervisor kernel artifacts used by
+# Linux/KVM tests. vm/kernel.config is also the shared amd64 appliance config.
+# See README.thunderboot-builder.md.
 thunderboot-vm-artifacts:
 	./scripts/fetch-thunderboot-vm-artifacts.sh
 

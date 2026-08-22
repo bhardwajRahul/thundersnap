@@ -12,6 +12,8 @@ cloud_hypervisor_sha256=899bfad0113fddae440b03bc8eee6e806dd5188946d33cc06cfdf5e8
 kernel_version=6.12.8
 kernel_url="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$kernel_version.tar.xz"
 kernel_sha256=2291da065ca04b715c89ee50362aec3f021a7414bc963f1b56736682c8122979
+# This is also the canonical amd64 appliance kernel configuration. Keep the
+# Cloud Hypervisor and amd64 appliance paths on one tested common config.
 kernel_config="$repo/vm/kernel.config"
 
 mkdir -p "$vm_dir"
