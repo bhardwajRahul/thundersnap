@@ -53,6 +53,15 @@ CONFIG_SERIAL_AMBA_PL011=y
 CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
 CONFIG_HVC_DRIVER=y
 
+# VZLinuxBootLoader does not provide EFI, but Apple exposes an AMBA PL031
+# compatible RTC to the Linux guest. Lima issue #2905 documents rtc_pl031 as
+# the required driver. Keep the class, boot-time clock restore, and driver
+# built in so the kernel can set time before userspace and TLS.
+CONFIG_RTC_CLASS=y
+CONFIG_RTC_HCTOSYS=y
+CONFIG_RTC_HCTOSYS_DEVICE="rtc0"
+CONFIG_RTC_DRV_PL031=y
+
 # These features are inherited by the common x86 config but are not needed by
 # the ARM64 VZ appliance. Keeping the negative declarations here prevents an
 # architecture conversion from bringing in board, desktop, or nested-hypervisor
