@@ -86,11 +86,64 @@ func boot() error {
 		// command line. Do not persist it in appliance metadata or logs.
 		env = append(env, "TS_AUTHKEY="+authKey)
 	}
-	args := []string{
-		// Keep thundersnapd's ordinary log output unchanged. The tiny relay
-		// mirrors it to the host's virtio-vsock listener while preserving the
-		// serial console as the primary diagnostic path.
-		"/bin/thunderboot-logrelay",
+	// Stay PID 1 and supervise the daemon (fix #1: a reaping PID 1). The old
+	// design Exec'd into thunderboot-logrelay, making the relay PID 1 — but it
+	// never reaped, which was the root cause of the permanent-wedge bug. See
+	// runSupervisor.
+	return runSupervisor(env)
+}
+
+// runSupervisor makes PID 1 (this process) the appliance's permanent reaper
+// and lifecycle supervisor, fixing the root cause of the thunderboot
+// permanent-wedge bug (see container-init-wedged-plan2.md, fix #1).
+//
+// Background: a container session's host-side chain is vshd -> `ts nsenter`
+// (stage1, host PID ns) -> fork stage2 (`ts session-serve`, container PID ns).
+// When the session is torn down via cgroup.kill while stage2 is alive, stage1
+// and stage2 are SIGKILLed together; if stage1 loses the reap race, stage2's
+// zombie is orphaned and reparents to the VM's PID 1. stage2 is a member of its
+// container PID namespace, so when that namespace's container-init later exits,
+// the kernel's zap_pid_ns_processes() blocks waiting for the zombie to be
+// reaped — and the VM's PID 1 (formerly logrelay, which never reaped) never
+// reaps it. containerns.stopEntry's cmd.Wait on container-init then hangs
+// unboundedly, e.stopped is never closed, and every future session to that
+// frame blocks in GetOrCreate on <-stopped. Permanent wedge.
+//
+// The fix: PID 1 itself reaps. This function spawns thundersnapd as a tracked
+// child and runs a global wait4(-1) loop, so any orphaned descendant that
+// reparents to PID 1 is reaped and zap_pid_ns_processes can complete. When
+// thundersnapd dies, PID 1 exits with the daemon's status — the one legitimate
+// PID-1 exit, which tears down the VM (PID-1 exit reaps the whole namespace).
+//
+// The relay (thunderboot-logrelay) is still used, but now as a fire-and-forget
+// transport child: thundersnapd's stdout/stderr are piped through it to the
+// host's virtio-vsock listener (and to the serial console). PID 1 reaps the
+// relay when it dies; if the relay dies first, the daemon's log writes get
+// EPIPE (Go ignores SIGPIPE on fd 1/2) and the daemon keeps running with silent
+// logging. PID 1's own logs go to the inherited serial console directly (NOT
+// through the relay), so boot/abort diagnostics survive a relay failure.
+func runSupervisor(env []string) error {
+	// Pipe: thundersnapd stdout/stderr -> relay -> (vsock + serial).
+	r, w, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("create daemon log pipe: %w", err)
+	}
+
+	// Spawn the relay (fire-and-forget). It inherits the serial console as its
+	// own stdout/stderr and mirrors the daemon's piped output to the host.
+	relay := exec.Command("/bin/thunderboot-logrelay")
+	relay.Stdin = r
+	relay.Stdout = os.Stdout
+	relay.Stderr = os.Stderr
+	relay.Env = env
+	if err := relay.Start(); err != nil {
+		r.Close()
+		w.Close()
+		return fmt.Errorf("start thunderboot-logrelay: %w", err)
+	}
+
+	// Spawn the daemon. Its stdout+stderr feed the relay's pipe.
+	daemonArgs := []string{
 		"/bin/thundersnapd",
 		"--policy=/bin/thundersnap-policy.jsonc",
 		"--data-dir=/var/lib/thundersnap",
@@ -98,8 +151,56 @@ func boot() error {
 		"--libexec-dir=/bin",
 		"--vm-dir=/bin",
 	}
-	log.Printf("executing thundersnapd as PID 1")
-	return syscall.Exec(args[0], args, env)
+	daemon := exec.Command(daemonArgs[0], daemonArgs[1:]...)
+	daemon.Stdin = os.Stdin
+	daemon.Stdout = w
+	daemon.Stderr = w
+	daemon.Env = env
+	if err := daemon.Start(); err != nil {
+		r.Close()
+		w.Close()
+		_ = relay.Process.Signal(syscall.SIGKILL)
+		_, _ = relay.Process.Wait()
+		return fmt.Errorf("start thundersnapd: %w", err)
+	}
+	// Close our copies of the pipe so the write end reaches EOF only when the
+	// daemon exits (otherwise the relay never sees EOF).
+	r.Close()
+	w.Close()
+
+	daemonPid := daemon.Process.Pid
+	log.Printf("executing thundersnapd (pid %d) under PID-1 supervision; global reaper active", daemonPid)
+
+	// Global reaper (tini/dumb-init pattern): PID 1 has nothing else to do, so a
+	// single blocking wait4(-1) suffices — no signal channel, no WNOHANG ticker.
+	// This reaps every orphaned descendant that reparents to PID 1 (the fix),
+	// plus the relay when it dies. We intentionally do NOT daemon.Wait(): that
+	// would race this global loop. When the daemon dies, exit with its status to
+	// tear down the VM (the one legitimate PID-1 exit).
+	for {
+		var ws syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &ws, 0, nil)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			// ECHILD (no children left): the daemon is gone; fall through to exit.
+			log.Printf("wait4 returned %v; exiting", err)
+			break
+		}
+		if pid == daemonPid {
+			if ws.Signaled() {
+				log.Printf("thundersnapd killed by signal %d; exiting", ws.Signal())
+				os.Exit(128 + int(ws.Signal()))
+			}
+			log.Printf("thundersnapd exited status %d; exiting", ws.ExitStatus())
+			os.Exit(ws.ExitStatus())
+		}
+		// Another child (e.g. the relay) died. Reap and keep supervising the
+		// daemon (fire-and-forget: a dead relay must not tear down the VM).
+		log.Printf("reaped child pid %d status %v", pid, ws)
+	}
+	return nil // unreachable in normal operation
 }
 
 func installAppliance() error {
