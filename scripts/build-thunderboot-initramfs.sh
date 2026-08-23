@@ -7,6 +7,9 @@ case "$source_date_epoch" in
 ''|*[!0-9]*) echo "SOURCE_DATE_EPOCH must be a non-negative integer" >&2; exit 1 ;;
 esac
 include_nested_vm=${THUNDERBOOT_INCLUDE_NESTED_VM:-1}
+version=${THUNDERSNAP_VERSION:-$(./scripts/version.sh)}
+[ -n "$version" ] || { echo "THUNDERSNAP_VERSION must not be empty" >&2; exit 1; }
+ldflags="-s -w -X github.com/tailscale/thundersnap/version.Version=$version"
 case "$include_nested_vm" in
 0|1) ;;
 *) echo "THUNDERBOOT_INCLUDE_NESTED_VM must be 0 or 1" >&2; exit 1 ;;
@@ -18,7 +21,7 @@ mkdir -p "$(dirname "$out")" "$root"/bin "$root"/dev/pts "$root"/proc \
   "$root"/var/lib/thundersnap "$root"/bootconfig
 
 build() {
-	CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "$root/$1" "./cmd/$2"
+	CGO_ENABLED=0 go build -trimpath -ldflags="$ldflags" -o "$root/$1" "./cmd/$2"
 }
 build init thunderboot-init
 build bin/thundersnapd thundersnapd

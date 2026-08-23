@@ -27,6 +27,11 @@ find_limactl() {
 
 limactl=$(find_limactl)
 
+# Compute the version on the host, where the caller's VCS metadata is
+# available. The Lima VM only sees the mounted working tree and must not be
+# responsible for deciding which revision is being built.
+version=${THUNDERSNAP_VERSION:-$(cd "$repo" && ./scripts/version.sh)}
+
 usage() {
 	cat <<EOF
 usage: $0 start|shell|build|verify|stop|delete|status
@@ -65,7 +70,8 @@ shell)
 	;;
 build)
 	start
-	exec "$limactl" shell --workdir /work/thundersnap "$instance" -- ./scripts/build-thunderboot-appliance.sh
+	exec "$limactl" shell --workdir /work/thundersnap "$instance" -- \
+		env "THUNDERSNAP_VERSION=$version" ./scripts/build-thunderboot-appliance.sh
 	;;
 verify)
 	start

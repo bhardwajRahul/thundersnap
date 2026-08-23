@@ -156,7 +156,7 @@ thunderboot-vm-artifacts:
 
 # Build and package the ARM64 Aperture kernel/initramfs in pinned Lima.
 thunderboot-appliance-arm64:
-	./scripts/thunderboot-builder.sh build
+	THUNDERSNAP_VERSION="$(VERSION)" ./scripts/thunderboot-builder.sh build
 
 verify-thunderboot-appliance-arm64:
 	./scripts/thunderboot-builder.sh verify

@@ -11,6 +11,9 @@ if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != aarch64 ]; then
 fi
 
 cd "$repo"
+version=${THUNDERSNAP_VERSION:-$(./scripts/version.sh)}
+[ -n "$version" ] || { echo "THUNDERSNAP_VERSION must not be empty" >&2; exit 1; }
+export THUNDERSNAP_VERSION=$version
 if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
 	SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 	export SOURCE_DATE_EPOCH
