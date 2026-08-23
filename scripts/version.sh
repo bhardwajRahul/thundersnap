@@ -8,6 +8,12 @@
 # git repository is not available at *runtime* (binaries run inside containers
 # and VMs with no checkout), so this runs at *build* time and bakes the result in.
 #
+# A single leading "v" is stripped from the final string (see printver below) so
+# that a tag like "v0.03" yields the version string "0.03", matching the Debian
+# convention that package versions begin with a digit and matching the v-less
+# form used in .deb/.rpm/.tgz filenames. This keeps `ts --version`, `ts version`,
+# the package filename, and dpkg's Version field all reporting the same string.
+#
 # Resolution order:
 #   1. $THUNDERSNAP_VERSION   explicit override (CI, release tarballs)
 #   2. `git describe`          plain git repos AND jj repos colocated with git
@@ -22,9 +28,18 @@
 # build does. It never exits non-zero: a build must always get a version string.
 set -u
 
+# printver prints its argument with a single leading "v" removed, so a tag
+# "v0.03" produces the version string "0.03". This normalizes every resolution
+# path below to the same v-less form used in package filenames and dpkg's
+# Version field. It is a no-op for strings that don't start with "v".
+printver() {
+	v="$1"
+	printf '%s\n' "${v#v}"
+}
+
 # 1. Explicit override.
 if [ -n "${THUNDERSNAP_VERSION:-}" ]; then
-	printf '%s\n' "$THUNDERSNAP_VERSION"
+	printver "$THUNDERSNAP_VERSION"
 	exit 0
 fi
 
@@ -33,7 +48,7 @@ fi
 if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
 	v=$(git describe --tags --always --dirty 2>/dev/null || true)
 	if [ -n "$v" ]; then
-		printf '%s\n' "$v"
+		printver "$v"
 		exit 0
 	fi
 fi
@@ -70,7 +85,7 @@ if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
 		if [ -n "$(jj diff --summary 2>/dev/null)" ]; then
 			out="$out-dirty"
 		fi
-		printf '%s\n' "$out"
+		printver "$out"
 		exit 0
 	fi
 fi
@@ -79,7 +94,7 @@ fi
 if [ -f ./VERSION ]; then
 	v=$(cat ./VERSION 2>/dev/null)
 	if [ -n "$v" ]; then
-		printf '%s\n' "$v"
+		printver "$v"
 		exit 0
 	fi
 fi

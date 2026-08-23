@@ -40,12 +40,21 @@ type Build struct {
 	Tmp string
 	// Go is the path to the Go binary to use for building.
 	Go string
-	// Version is the sanitized version string used for package file names,
-	// e.g. "1.2.3" (see getVersion). It is NOT what binaries report via
-	// --version; use EmbedVersion for that.
+	// Version is a sanitized version string used for package file names
+	// by the tgz and rpm targets (see getVersion). It strips a leading "v"
+	// and wraps a bare commit hash (no tags) as "0.0.0-<hash>" so the file
+	// name is sortable. The deb targets use EmbedVersion instead (see
+	// pkgs.go), so dpkg's Version field matches `ts version` and the filename.
+	//
+	// For tagged builds Version and EmbedVersion are the same string; they
+	// differ only for bare-commit builds, which cannot occur once any tag
+	// exists.
 	Version string
-	// EmbedVersion is the raw "git describe"-style string baked into binaries
-	// via -ldflags (X version.Version); what `ts --version` prints.
+	// EmbedVersion is the raw version string baked into binaries via
+	// -ldflags (X version.Version), i.e. what `ts --version` and `ts version`
+	// print (computed by scripts/version.sh, which strips a leading "v").
+	// The deb targets also use this for both the dpkg Version field and the
+	// .deb filename so all three report the same string.
 	EmbedVersion string
 	// Time is the timestamp of the build.
 	Time time.Time
@@ -255,11 +264,17 @@ func findGo(repo string) (string, error) {
 	return p, nil
 }
 
-// getVersion returns a version string for the current build.
-// It tries "git describe --tags --always --dirty" first. If no tags
-// exist, the output will be just a commit hash like "60d15db", which
-// gets formatted as "0.0.0-60d15db". Tagged versions like "v1.2.3"
-// are returned as "1.2.3".
+// getVersion returns a version string for the current build for use as the
+// tgz and rpm file-name version. It runs "git describe --tags --always
+// --dirty", strips a leading "v", and — if there are no tags so the result is
+// just a bare commit hash like "60d15db" — wraps it as "0.0.0-60d15db" so the
+// file name is still sortable. Tagged versions like "v1.2.3" are returned as
+// "1.2.3".
+//
+// This is intentionally distinct from rawVersion (EmbedVersion), which is
+// what `ts --version`/`ts version` print and what the deb targets use for
+// both dpkg's Version field and the .deb filename; for tagged builds the two
+// are identical, differing only in the no-tag bare-hash wrapping here.
 func getVersion(repo string) string {
 	cmd := exec.Command("git", "describe", "--tags", "--always", "--dirty")
 	cmd.Dir = repo
@@ -279,15 +294,17 @@ func getVersion(repo string) string {
 	return v
 }
 
-// rawVersion returns the raw "git describe"-style version string for embedding
-// into binaries via -ldflags (X version.Version), i.e. what `ts --version`
-// prints. It prefers scripts/version.sh — which also handles the jj-only
-// fallback and the THUNDERSNAP_VERSION override — and falls back to an inline
-// "git describe" if the script is missing (older/dist checkouts), finally
-// "unknown" so a build always gets a string.
+// rawVersion returns the raw version string for embedding into binaries via
+// -ldflags (X version.Version), i.e. what `ts --version` and `ts version`
+// print. It prefers scripts/version.sh — which runs `git describe --tags
+// --always --dirty`, strips a leading "v" so a tag "v0.03" yields "0.03",
+// handles the jj-only fallback and the THUNDERSNAP_VERSION override, and
+// falls back to an inline "git describe" (then "unknown") if the script is
+// missing (older/dist checkouts) so a build always gets a string.
 //
-// This is intentionally distinct from getVersion, which sanitizes the string
-// for Debian/RPM package file names.
+// The deb targets use this (as b.EmbedVersion) for both the dpkg Version field
+// (with nfpm VersionSchema "none" to prevent semver re-serialization) and the
+// .deb filename, so dpkg, the filename, and `ts version` all match.
 func rawVersion(repo string) string {
 	if script, err := filepath.Abs(filepath.Join(repo, "scripts", "version.sh")); err == nil {
 		out, err := exec.Command(script).Output()

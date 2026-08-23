@@ -247,16 +247,24 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 		return nil, err
 	}
 	info := nfpm.WithDefaults(&nfpm.Info{
-		Name:        "thundersnap",
-		Arch:        arch,
-		Platform:    "linux",
-		Version:     b.Version,
-		Maintainer:  "Tailscale Inc <info@tailscale.com>",
-		Description: "Thundersnap: tsnet-based SSH server with isolated container environments",
-		Homepage:    "https://github.com/tailscale/thundersnap",
-		License:     "BSD-3-Clause",
-		Section:     "net",
-		Priority:    "extra",
+		Name:     "thundersnap",
+		Arch:     arch,
+		Platform: "linux",
+		Version:  b.EmbedVersion,
+		// Disable nfpm's semver parsing of Version: by default (VersionSchema
+		// "semver"), nfpm re-parses a git-describe string like "0.03-12-gabcdef"
+		// as semver and reserializes it to "0.3.0~12-gabcdef" (core version
+		// "0.3.0" + tilde-joined prerelease), which does not match the package
+		// filename and is not what `ts version` reports. With "none", the
+		// Version string is passed through verbatim, so dpkg's Version field,
+		// the .deb filename, and `ts version` all show the same string.
+		VersionSchema: "none",
+		Maintainer:    "Tailscale Inc <info@tailscale.com>",
+		Description:   "Thundersnap: tsnet-based SSH server with isolated container environments",
+		Homepage:      "https://github.com/tailscale/thundersnap",
+		License:       "BSD-3-Clause",
+		Section:       "net",
+		Priority:      "extra",
 		Overridables: nfpm.Overridables{
 			Contents: contents,
 			Depends: []string{
@@ -277,7 +285,7 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 		return nil, err
 	}
 
-	filename := fmt.Sprintf("thundersnap_%s_%s.deb", b.Version, arch)
+	filename := fmt.Sprintf("thundersnap_%s_%s.deb", b.EmbedVersion, arch)
 	log.Printf("Building %s", filename)
 	f, err := os.Create(filepath.Join(b.Out, filename))
 	if err != nil {
@@ -491,16 +499,20 @@ func (t *debDevTarget) Build(b *Build) ([]string, error) {
 		return nil, err
 	}
 	info := nfpm.WithDefaults(&nfpm.Info{
-		Name:        "thundersnap-dev",
-		Arch:        arch,
-		Platform:    "linux",
-		Version:     b.Version,
-		Maintainer:  "Tailscale Inc <info@tailscale.com>",
-		Description: "Thundersnap development daemon: runs alongside thundersnap for blue/green deployment",
-		Homepage:    "https://github.com/tailscale/thundersnap",
-		License:     "BSD-3-Clause",
-		Section:     "net",
-		Priority:    "extra",
+		Name:     "thundersnap-dev",
+		Arch:     arch,
+		Platform: "linux",
+		Version:  b.EmbedVersion,
+		// See the deb target above: "none" keeps the raw git-describe
+		// Version verbatim instead of nfpm re-serializing it as semver,
+		// so dpkg's Version field matches the filename and `ts version`.
+		VersionSchema: "none",
+		Maintainer:    "Tailscale Inc <info@tailscale.com>",
+		Description:   "Thundersnap development daemon: runs alongside thundersnap for blue/green deployment",
+		Homepage:      "https://github.com/tailscale/thundersnap",
+		License:       "BSD-3-Clause",
+		Section:       "net",
+		Priority:      "extra",
 		Overridables: nfpm.Overridables{
 			Contents: contents,
 			Scripts: nfpm.Scripts{
@@ -516,7 +528,7 @@ func (t *debDevTarget) Build(b *Build) ([]string, error) {
 		return nil, err
 	}
 
-	filename := fmt.Sprintf("thundersnap-dev_%s_%s.deb", b.Version, arch)
+	filename := fmt.Sprintf("thundersnap-dev_%s_%s.deb", b.EmbedVersion, arch)
 	log.Printf("Building %s", filename)
 	f, err := os.Create(filepath.Join(b.Out, filename))
 	if err != nil {
