@@ -18,15 +18,23 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/tailscale/thundersnap/version"
 )
 
 var (
-	addr = flag.String("addr", ":8080", "address to listen on")
-	dir  = flag.String("dir", ".", "directory to serve")
+	addr        = flag.String("addr", ":8080", "address to listen on")
+	dir         = flag.String("dir", ".", "directory to serve")
+	versionFlag = flag.Bool("version", false, "print version and exit")
 )
 
 func main() {
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("trivial-httpd %s\n", version.String())
+		os.Exit(0)
+	}
 
 	absDir, err := filepath.Abs(*dir)
 	if err != nil {

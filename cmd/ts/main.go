@@ -36,12 +36,14 @@ import (
 	"github.com/tailscale/thundersnap/thunderclient"
 	"github.com/tailscale/thundersnap/thunderproto"
 	"github.com/tailscale/thundersnap/tsm"
+	"github.com/tailscale/thundersnap/version"
 	"github.com/tailscale/thundersnap/vshdproto"
 	"golang.org/x/term"
 )
 
 var sockPath = getopt.StringLong("sock", 0, "/id/thunder.sock", "path to control socket")
 var help = getopt.BoolLong("help", 'h', "show this help and exit")
+var showVersion = getopt.BoolLong("version", 0, "print version and exit")
 
 // usage prints the main help to stderr and exits 1. It is the handler for
 // malformed/missing top-level arguments; an explicit --help goes through
@@ -93,6 +95,10 @@ func main() {
 	}
 	args := getopt.Args()
 
+	if *showVersion {
+		fmt.Printf("ts %s\n", version.String())
+		os.Exit(0)
+	}
 	if *help {
 		printMainHelp(os.Stdout)
 		os.Exit(0)
@@ -107,6 +113,8 @@ func main() {
 	switch cmd {
 	case "ping":
 		cmdPing(cmdArgs)
+	case "version":
+		cmdVersion(cmdArgs)
 	case "snap":
 		cmdSnap(cmdArgs)
 	case "snaps":
@@ -223,6 +231,9 @@ type ControlRequest struct {
 type ControlResponse struct {
 	Status  string `json:"status"`
 	Message string `json:"message,omitempty"`
+	// Version is set by the /version endpoint (and only meaningful then): the
+	// server's build version string, for the client/server version handshake.
+	Version string `json:"version,omitempty"`
 }
 
 // progressRenderer renders NDJSON "progress" events to stderr for the four
@@ -301,6 +312,93 @@ func doPing(sockPath string) error {
 
 	fmt.Println(result.Message)
 	return nil
+}
+
+// cmdVersion implements `ts version`: it reports the build version of the ts
+// client AND of the thundersnapd it is talking to, printing the single agreed
+// version on success or an error on mismatch/unreachability. The successful
+// output is exactly one line: the version running on both client and server.
+func cmdVersion(args []string) {
+	opts, helpFlag := newCmdOpts("version", "")
+	parseCmd(opts, "version", args)
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "version", opts)
+		os.Exit(0)
+	}
+	if opts.NArgs() > 0 {
+		fmt.Fprintln(os.Stderr, "error: version takes no arguments")
+		os.Exit(1)
+	}
+
+	res := runVersion(*sockPath)
+	switch {
+	case res.err != nil:
+		fmt.Fprintf(os.Stderr, "error: %v\n", res.err)
+		os.Exit(1)
+	case !res.matched:
+		fmt.Fprintf(os.Stderr, "error: version mismatch: client %q, server %q\n", res.clientVer, res.serverVer)
+		os.Exit(1)
+	default:
+		fmt.Println(res.clientVer)
+	}
+}
+
+// versionResult is the outcome of `ts version`: the client and server versions
+// (server empty on error), whether they matched, and any transport error.
+type versionResult struct {
+	clientVer string
+	serverVer string
+	matched   bool
+	err       error
+}
+
+// runVersion is the testable core of `ts version`: it fetches the server's
+// build version and compares it to the client's, without printing or exiting.
+func runVersion(sockPath string) versionResult {
+	clientVer := version.String()
+	serverVer, err := getServerVersion(sockPath)
+	if err != nil {
+		return versionResult{clientVer: clientVer, err: err}
+	}
+	return versionResult{
+		clientVer: clientVer,
+		serverVer: serverVer,
+		matched:   serverVer == clientVer,
+	}
+}
+
+// getServerVersion asks thundersnapd for its build version over the control
+// socket. It returns the server's version string, or an error if the daemon is
+// unreachable or did not report a version.
+func getServerVersion(sockPath string) (string, error) {
+	client := thunderclient.NewHTTPClient(sockPath)
+
+	req := ControlRequest{Command: "version"}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := client.Post("http://localhost/version", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("server returned status %d", resp.StatusCode)
+	}
+
+	var result ControlResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+	if result.Status != "ok" {
+		return "", fmt.Errorf("server returned status %q", result.Status)
+	}
+	if result.Version == "" {
+		return "", fmt.Errorf("server did not report a version")
+	}
+	return result.Version, nil
 }
 
 // meshPort is the HTTP port for mesh discovery (TSTS in leetspeak = 7575)

@@ -36,6 +36,7 @@ import (
 
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/thunderboot"
+	"github.com/tailscale/thundersnap/version"
 	"golang.org/x/term"
 )
 
@@ -58,9 +59,14 @@ func main() {
 	testOnly := getopt.BoolLong("testonly", 0, "Set up and mount storage, then power off")
 	cpus := getopt.IntLong("cpus", 0, 1, "Appliance virtual CPU count")
 	help := getopt.BoolLong("help", 'h', "Show help")
+	showVersion := getopt.BoolLong("version", 0, "Print version and exit")
 
 	getopt.Parse()
 
+	if *showVersion {
+		fmt.Printf("thunderboot %s\n", version.String())
+		os.Exit(0)
+	}
 	if *help {
 		getopt.Usage()
 		os.Exit(0)

@@ -696,6 +696,33 @@ func testSSHContainerBasic(t *testing.T, d *daemonInstance) {
 		t.Fatalf("bare ts in default frame: expected exit code 0, got %d (output: %q)", exitCode, output)
 	}
 
+	// `ts version` queries the daemon's version and must agree with the client's.
+	// Since make e2e builds ts and thundersnapd from the same source tree with the
+	// same scripts/version.sh output, the two versions are identical, so this is
+	// the success path: exit 0 and a single line equal to the client's version.
+	// `ts --version` (offline) prints "ts <v>"; `ts version` prints the bare "<v>".
+	withFlag, _, err := sshExec(t, d, "root@", "ts --version")
+	if err != nil {
+		t.Fatalf("ts --version failed: %v", err)
+	}
+	withFlag = strings.TrimSpace(withFlag)
+	const tsPrefix = "ts "
+	if !strings.HasPrefix(withFlag, tsPrefix) {
+		t.Fatalf("ts --version output %q does not start with %q", withFlag, tsPrefix)
+	}
+	wantVer := strings.TrimPrefix(withFlag, tsPrefix)
+
+	output, exitCode, err = sshExec(t, d, "root@", "ts version")
+	if err != nil {
+		t.Fatalf("ts version failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("ts version: expected exit code 0, got %d (output: %q)", exitCode, output)
+	}
+	if got := strings.TrimSpace(output); got != wantVer {
+		t.Errorf("ts version output = %q, want %q (client version)", got, wantVer)
+	}
+
 	// Create a new frame using ts frame, with a ref name
 	// ts frame --ref=testframe <snapshot-spec>
 	output, exitCode, err = sshExec(t, d, "root@", "ts frame --ref=testframe nil:nil:nil")

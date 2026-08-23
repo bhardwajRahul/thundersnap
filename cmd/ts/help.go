@@ -142,6 +142,21 @@ socket is wired up correctly.`,
 Nothing else is printed on success.`,
 	},
 	{
+		name:     "version",
+		category: "other",
+		short:    "print the build version, checking client == server",
+		long: `Prints the thundersnap build version. The client first asks the
+thundersnapd it is connected to for its version; if the client and server
+versions match, the single agreed version is printed. If they differ, or the
+daemon can't be reached, an error is printed and the exit code is non-zero.
+
+Use "ts --version" to print only the client's built-in version without
+contacting the daemon (useful when no thundersnapd is running).`,
+		outputs: `On success: the version string, one line (the version running on
+both client and server). On mismatch or unreachability: nothing on
+stdout; an error message on stderr and a non-zero exit code.`,
+	},
+	{
 		name:     "ref",
 		category: "other",
 		short:    "manage refs (named pointers to frames)",

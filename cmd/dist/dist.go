@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"github.com/tailscale/thundersnap/release/dist/tspkgs"
+	"github.com/tailscale/thundersnap/version"
 )
 
 func main() {
+	version.HandleFlag("dist")
 	log.SetFlags(0)
 	if len(os.Args) < 2 {
 		usage()

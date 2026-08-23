@@ -43,6 +43,7 @@ import (
 	"github.com/tailscale/thundersnap/thunderproto"
 	"github.com/tailscale/thundersnap/thundersnap"
 	"github.com/tailscale/thundersnap/tsm"
+	"github.com/tailscale/thundersnap/version"
 	gossh "golang.org/x/crypto/ssh"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
@@ -521,7 +522,13 @@ func main() {
 	testListen := getopt.StringLong("test-listen", 0, "", "Test mode: listen on this local TCP address (e.g. 127.0.0.1:2222) instead of tsnet")
 	testUser := getopt.StringLong("test-user", 0, "", "Test mode: use this identity for all SSH connections (e.g. test@example.com)")
 	testHTTPListen := getopt.StringLong("test-http-listen", 0, "", "Test mode: also serve the HTTP mux (metrics, bupdate, MCP) on this local TCP address (e.g. 127.0.0.1:7575)")
+	showVersion := getopt.BoolLong("version", 0, "Print version and exit")
 	getopt.Parse()
+
+	if *showVersion {
+		fmt.Printf("thundersnapd %s\n", version.String())
+		return
+	}
 
 	// Set up the state directory now (rather than further down) since the
 	// auth-url and status file paths, derived from it below, are needed by
@@ -1818,6 +1825,7 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", handlePing)
+	mux.HandleFunc("/version", handleVersion)
 	mux.HandleFunc("/snap", cs.handleSnap)
 	mux.HandleFunc("/fork", makeForkHandler(cs.rootFS))
 	mux.HandleFunc("/create", cs.handleCreate)
@@ -2226,6 +2234,9 @@ type ControlRequest struct {
 type ControlResponse struct {
 	Status  string `json:"status"`
 	Message string `json:"message,omitempty"`
+	// Version is set by /version (and only meaningful then): the daemon's build
+	// version, for the client/server version handshake (ts version).
+	Version string `json:"version,omitempty"`
 }
 
 // requireMethod enforces the HTTP method for a handler. It writes a 405 and
@@ -2269,6 +2280,32 @@ func handlePing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ControlResponse{
 		Status:  "ok",
 		Message: "pong",
+	})
+}
+
+// handleVersion handles POST /version - reports the daemon's build version.
+// It mirrors /ping (POST a ControlRequest with Command="version") and returns
+// the daemon's embedded version string, which `ts version` compares against the
+// client's own version.
+func handleVersion(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+
+	var req ControlRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Command != "version" {
+		http.Error(w, "unknown command", http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, ControlResponse{
+		Status:  "ok",
+		Version: version.String(),
 	})
 }
 

@@ -14,13 +14,20 @@
 # Note: cmd/ts requires CGO_ENABLED=0 because it runs inside containers/VMs
 # where dynamically linked binaries may not work. The Makefile handles this.
 
-DIST_CMD = go run ./cmd/dist
+DIST_CMD = go run -ldflags "$(VERSION_LDFLAGS)" ./cmd/dist
 
 # Default output directory for packages
 OUT ?= dist
 
 # Output directory for local binaries
 BIN ?= ./bin
+
+# Build version injected into every binary via -ldflags (X github.com/.../version.Version).
+# Computed by scripts/version.sh: "git describe --tags --always --dirty" for git and
+# colocated-jj repos, with a jj-only fallback and explicit override. Override with
+# THUNDERSNAP_VERSION=... to pin a release build.
+VERSION ?= $(shell ./scripts/version.sh)
+VERSION_LDFLAGS = -X github.com/tailscale/thundersnap/version.Version=$(VERSION)
 
 .PHONY: all test e2e e2e-tb not_e2e binaries ts vshd thundersnapd thunderboot infiniblockd \
         thunderboot-vm-artifacts thunderboot-appliance-arm64 verify-thunderboot-appliance-arm64 \
@@ -120,26 +127,26 @@ binaries: ts vshd thundersnapd thunderboot
 # Binaries that need CGO_ENABLED=0 (run inside containers/VMs)
 ts:
 	@mkdir -p $(BIN)
-	CGO_ENABLED=0 go build -o $(BIN)/$@ ./cmd/$@
+	CGO_ENABLED=0 go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN)/$@ ./cmd/$@
 
 vshd:
 	@mkdir -p $(BIN)
-	CGO_ENABLED=0 go build -o $(BIN)/$@ ./cmd/$@
+	CGO_ENABLED=0 go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN)/$@ ./cmd/$@
 
 # Binaries that can use default CGO setting
 # thundersnapd: CGO_ENABLED=0 so the nested test (nested_test.go) can run it
 # inside a minimal container rootfs that lacks shared libraries.
 thundersnapd:
 	@mkdir -p $(BIN)
-	CGO_ENABLED=0 go build -o $(BIN)/$@ ./cmd/$@
+	CGO_ENABLED=0 go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN)/$@ ./cmd/$@
 
 thunderboot:
 	@mkdir -p $(BIN)
-	go build -o $(BIN)/$@ ./cmd/$@
+	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN)/$@ ./cmd/$@
 
 infiniblockd:
 	@mkdir -p $(BIN)
-	go build -o $(BIN)/$@ ./cmd/$@
+	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN)/$@ ./cmd/$@
 
 # Generate the untracked x86-64 Cloud Hypervisor kernel artifacts used by
 # Linux/KVM tests. vm/kernel.config is also the shared amd64 appliance config.

@@ -40,8 +40,13 @@ type Build struct {
 	Tmp string
 	// Go is the path to the Go binary to use for building.
 	Go string
-	// Version is the version string for the build.
+	// Version is the sanitized version string used for package file names,
+	// e.g. "1.2.3" (see getVersion). It is NOT what binaries report via
+	// --version; use EmbedVersion for that.
 	Version string
+	// EmbedVersion is the raw "git describe"-style string baked into binaries
+	// via -ldflags (X version.Version); what `ts --version` prints.
+	EmbedVersion string
 	// Time is the timestamp of the build.
 	Time time.Time
 
@@ -72,6 +77,7 @@ func NewBuild(repo, out string) (*Build, error) {
 		Out:          out,
 		Go:           goTool,
 		Version:      getVersion(repo),
+		EmbedVersion: rawVersion(repo),
 		Time:         time.Now().UTC(),
 		goBuildLimit: make(chan struct{}, runtime.NumCPU()),
 	}, nil
@@ -151,7 +157,11 @@ func (b *Build) BuildGoBinary(path string, env map[string]string) (string, error
 
 	log.Printf("Building %s (with env %s)", path, strings.Join(envStrs, " "))
 	buildDir := b.TmpDir()
-	cmd := exec.Command(b.Go, "build", "-v", "-trimpath", "-o", buildDir, path)
+	// Bake the version into the binary (X version.Version), so `ts --version`
+	// and the client/server version check work on shipped packages. The value
+	// is quoted-inert for go's -ldflags argument passing (no spaces).
+	ldflags := "-X github.com/tailscale/thundersnap/version.Version=" + b.EmbedVersion
+	cmd := exec.Command(b.Go, "build", "-v", "-trimpath", "-ldflags", ldflags, "-o", buildDir, path)
 	cmd.Dir = b.Repo
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	for k, v := range env {
@@ -267,4 +277,34 @@ func getVersion(repo string) string {
 		return "0.0.0-" + v
 	}
 	return v
+}
+
+// rawVersion returns the raw "git describe"-style version string for embedding
+// into binaries via -ldflags (X version.Version), i.e. what `ts --version`
+// prints. It prefers scripts/version.sh — which also handles the jj-only
+// fallback and the THUNDERSNAP_VERSION override — and falls back to an inline
+// "git describe" if the script is missing (older/dist checkouts), finally
+// "unknown" so a build always gets a string.
+//
+// This is intentionally distinct from getVersion, which sanitizes the string
+// for Debian/RPM package file names.
+func rawVersion(repo string) string {
+	if script, err := filepath.Abs(filepath.Join(repo, "scripts", "version.sh")); err == nil {
+		out, err := exec.Command(script).Output()
+		if err == nil {
+			if v := strings.TrimSpace(string(out)); v != "" {
+				return v
+			}
+		}
+	}
+	cmd := exec.Command("git", "describe", "--tags", "--always", "--dirty")
+	cmd.Dir = repo
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "unknown"
+	}
+	if v := strings.TrimSpace(string(out)); v != "" {
+		return v
+	}
+	return "unknown"
 }

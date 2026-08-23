@@ -14,6 +14,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -21,17 +22,24 @@ import (
 
 	"github.com/pborman/getopt/v2"
 	"github.com/tailscale/thundersnap/infiniblock"
+	"github.com/tailscale/thundersnap/version"
 )
 
 var (
-	backing    = getopt.StringLong("backing", 'b', "", "path to backing sparse file (required)")
-	addr       = getopt.StringLong("addr", 'a', ":10809", "address to listen on")
-	exportSize = getopt.Uint64Long("size", 's', infiniblock.DefaultExportSize, "export size in bytes (default 15 TiB)")
-	help       = getopt.BoolLong("help", 'h', "show help")
+	backing     = getopt.StringLong("backing", 'b', "", "path to backing sparse file (required)")
+	addr        = getopt.StringLong("addr", 'a', ":10809", "address to listen on")
+	exportSize  = getopt.Uint64Long("size", 's', infiniblock.DefaultExportSize, "export size in bytes (default 15 TiB)")
+	help        = getopt.BoolLong("help", 'h', "show help")
+	showVersion = getopt.BoolLong("version", 0, "print version and exit")
 )
 
 func main() {
 	getopt.Parse()
+
+	if *showVersion {
+		fmt.Printf("infiniblockd %s\n", version.String())
+		os.Exit(0)
+	}
 
 	if *help {
 		getopt.Usage()

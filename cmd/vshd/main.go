@@ -36,6 +36,7 @@ import (
 	"github.com/tailscale/thundersnap/cgroup"
 	"github.com/tailscale/thundersnap/containerns"
 	"github.com/tailscale/thundersnap/tsm"
+	"github.com/tailscale/thundersnap/version"
 	"github.com/tailscale/thundersnap/vshdproto"
 	"github.com/tailscale/thundersnap/vshdsession"
 )
@@ -705,7 +706,13 @@ func main() {
 	tsPath := flag.String("ts", "", "path to the ts binary used for nsenter (default: derived from vshd's location)")
 	cgroupParent := flag.String("cgroup-parent", "", "parent cgroup name for per-session resource limits (host mode; empty disables)")
 	lifecycleFd := flag.Int("lifecycle-fd", -1, "file descriptor to monitor; vshd exits when this fd closes (used for parent-death cleanup)")
+	versionFlag := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("vshd %s\n", version.String())
+		os.Exit(0)
+	}
 
 	log.Printf("vshd starting up")
 
